@@ -29,6 +29,7 @@ Three sources name what only the engine knows. `slot` is the frame slot an `allo
 The abi legalisation leaves every call, entry and return in piece form, each piece a scalar at the place the convention gave it (see [the ir](../ir.md)). Selection never classifies. It reads the places.
 
 - An entry copies each parameter out of its register, or reloads it from an incoming slot at its offset.
+- An entry with parameters that nothing placed is refused as `unplaced`, naming its function, since nothing says where they arrive.
 - A call or a return materialises its constant pieces first, then copies each piece into its register or spills it to an outgoing slot at its offset. The rule for `call.placed` or `ret.placed` supplies the call or return form. The instruction of that form that calls or returns reads the pieces' registers and writes the results' registers, and the results are copied out of theirs.
 - A piece at an operand place, a stack piece whose size scales, and a result on the stack are refused as `placed`.
 
