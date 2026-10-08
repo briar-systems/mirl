@@ -12,7 +12,9 @@ A target holds
 - `arch` and `system`, the names of its rows in mink's architecture and system catalogs, where the system must run the architecture,
 - `caps`, its capability declarations,
 - `data`, the facts data layout reads,
-- `convention`, the calling convention its calls are made under (see [Argument passing](#argument-passing)).
+- `convention`, the calling convention its calls are made under (see [Argument passing](#argument-passing)),
+- `baseline`, the extensions code for it may assume, in masc's spelling, from which `mirl.target.machine.open` makes masc's selection, the registers it gives and the convention resolved through them,
+- `addresses`, how code reaches an address (see [Addresses](#addresses)).
 
 `mirl.target.declared(t)` says whether a target is complete. Every declaration has an unstated zero case, so a row left zeroed reads as incomplete and never as an answer. A list that may rightly be empty sits under a case of its own, so an empty list is a stated answer.
 
@@ -122,6 +124,12 @@ The integers are signless, so a convention that extends a narrow integer by the 
 The call's **statement** says how its language passes aggregates (by the platform's C rules, or each by reference to a copy the caller makes) and how many of its arguments are named. Both have an unstated zero case, which is refused.
 
 The one row is `lp64d`, the RISC-V convention of RV64 with hardware double precision, to the RISC-V ELF psABI 1.0.
+
+## Addresses
+
+A target states its address model, or `uncarried` when it has none yet and no address is selected. The model is the relocation model, `static`, `pie` or `pic`, and the access each thread-local model of the ir is reached by: local exec, initial exec, general dynamic through the runtime function `lookup` names, a descriptor, a per variable thunk or an index into the thread's module table. `mirl.target.address.reach(model, defined, preemptible, tls)` says how one symbol is reached: absolutely, by its distance from the code, through the global offset table, or by its thread-local access. Selection reads this and never a target's name, and names relocations by mink's kinds.
+
+RV64 Linux is `pie` and reaches local dynamic as general dynamic through `__tls_get_addr`.
 
 ## Attributes
 

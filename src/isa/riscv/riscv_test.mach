@@ -5,6 +5,7 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -18,8 +19,11 @@ use std.allocator.page;
 use std.collections.slice.Slice;
 use std.collections.vector;
 use std.filesystem;
+use io:   std.io.writer;
 use diag: std.print;
 
+use masc.core.effect;
+use mirl.ir.global.Tls;
 use mirl.ir.id;
 use mirl.ir.module;
 use mirl.ir.module.Module;
@@ -29,18 +33,32 @@ use mirl.ir.text.parse.refusal.Refusal;
 use mirl.ir.text.printer;
 use mirl.isa.riscv.declared;
 use mirl.isa.riscv.rules;
+use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class.Memory;
+use mirl.machine.class.Physical;
 use mf: mirl.machine.function;
+use mi: mirl.machine.instruction;
 use mirl.machine.instruction.InstructionData;
 use mirl.machine.operand.Block;
 use mirl.machine.operand.Instruction;
 use mirl.machine.select.engine;
+use mirl.machine.select.engine.Calls;
 use mirl.machine.select.engine.Error;
+use mirl.machine.select.engine.Selected;
 use mirl.machine.select.engine.Selector;
 use mirl.machine.text.equal;
 use mirl.machine.text.item;
-use reader:  mirl.machine.text.parse;
-use targets: mirl.target;
+use reader:   mirl.machine.text.parse;
+use printing: mirl.machine.text.print;
+use targets:  mirl.target;
 use mirl.target.Target;
+use mirl.target.address;
+use mirl.target.address.Access;
+use mirl.target.address.Addresses;
+use mirl.target.machine;
+use mirl.target.machine.Machine;
 
 use masc.core.diagnostic;
 use masc.core.extension;
@@ -111,6 +129,28 @@ rec Fixture {
     selection: extension.Selection;
     s:         Selector;
     target:    *Target;
+    mc:        Machine;
+    opened:    bool;
+    at:        Locations;
+}
+
+# select a function of the fixture, its calls clobbering what the target's
+# convention says, with the clobbers they state
+#[testing]
+fun selected_with(x: *Fixture, f: id.Function) res[Selected, Error] {
+    var calls: Calls = Calls{clobbered: Slice[rf.Id]{data: nil, size: 0}, at: ?x.at};
+    if (x.opened) { calls.clobbered = x.mc.convention.clobbered; }
+    ret engine.select(?x.s, ?x.m, f, ?calls);
+}
+
+# select a function of the fixture
+#[testing]
+fun selected(x: *Fixture, f: id.Function) res[mf.Function, Error] {
+    val got: res[Selected, Error] = selected_with(x, f);
+    if (sel got.err) { ret res[mf.Function, Error].err{got.err}; }
+    var out: Selected = got.ok;
+    vector.dnit[Clobber](?out.clobbers);
+    ret res[mf.Function, Error].ok{out.function};
 }
 
 # make a fixture of ir text, selecting the extensions a spelling names, for the target the text names
@@ -129,11 +169,24 @@ fun setup(x: *Fixture, text: View, spelling: str) bool {
     val made: res[Selector, Error] = engine.init(?x.a, ?rules.TABLE, x.target, ?riscv_set.SET, ?x.selection);
     if (sel made.err) { ret false; }
     x.s = made.ok;
+    # a target that states no baseline has no machine, makes no call and its
+    # calls clobber nothing, and any other refusal fails the fixture
+    val opened: err[machine.Error] = machine.open(?x.mc, ?x.a, x.target);
+    x.opened = sel opened.ok;
+    if (sel opened.err) {
+        val why: machine.Error = opened.err;
+        if (!(sel why.baseline)) { ret false; }
+    }
+    val at: res[Locations, location.Error] = location.init(?x.a, ?riscv_register.FILE, Slice[*Memory]{data: nil, size: 0});
+    if (sel at.err) { ret false; }
+    x.at = at.ok;
     ret true;
 }
 
 #[testing]
 fun teardown(x: *Fixture) {
+    location.dnit(?x.at);
+    if (x.opened) { machine.close(?x.mc); }
     engine.dnit(?x.s);
     extension.release(?x.selection);
     module.dnit(?x.m);
@@ -207,13 +260,17 @@ fun matches(name: str, spelling: str) u32 {
     for (n < unit.items.len) {
         val at: opt[id.Function] = nth(?x, n);
         if (sel at.none) { ret 4; }
-        val got: res[mf.Function, Error] = engine.select(?x.s, ?x.m, at.some);
-        if (sel got.err) { ret 5; }
+        val got: res[mf.Function, Error] = selected(?x, at.some);
+        if (sel got.err) {
+            refusal(got.err);
+            ret 5;
+        }
         var f: mf.Function = got.ok;
         fin { mf.dnit(?f); }
         val same: res[bool, printer.Error] = equal.same_function(?x.m, ?f, ?x.m, ?unit.items.data[n].function);
         if (sel same.err) { ret 6; }
         if (!same.ok) {
+            show(?x.m, at.some, f);
             diag.eprintlnf("{}: function {} is not its machine text", name, n);
             ret 7;
         }
@@ -223,6 +280,29 @@ fun matches(name: str, spelling: str) u32 {
     val extra: opt[id.Function] = nth(?x, n);
     if (sel extra.some) { ret 8; }
     ret 0;
+}
+
+# say why selection refused, for a failing test's output
+#[testing]
+fun refusal(e: Error) {
+    if (sel e.unmatched) { diag.eprintlnf("unmatched instruction {}", e.unmatched.instruction.index); }
+    or (sel e.machine)   { diag.eprintln("the machine form refused an instruction"); }
+    or (sel e.placed)    { diag.eprintln("a piece at a place selection does not carry"); }
+    or (sel e.transfer)  { diag.eprintln("a piece form expansion that neither calls nor returns"); }
+    or (sel e.lookup)    { diag.eprintln("no thread lookup function"); }
+    or (sel e.unlocated) { diag.eprintln("a clobber the locations do not number"); }
+    or (sel e.aggregate) { diag.eprintln("an aggregate value"); }
+    or                   { diag.eprintln("selection refused"); }
+}
+
+# print a selected function to standard error, so a failing comparison shows what came out
+#[testing]
+fun show(m: *Module, at: id.Function, f: mf.Function) {
+    var items: [1]item.Item;
+    items[0].symbol   = id.Symbol.function{at};
+    items[0].function = f;
+    var out: io.Writer = filesystem.writer(filesystem.STDERR);
+    printing.print(?out, m, Slice[item.Item]{data: ?items[0], size: 1});
 }
 
 # the mnemonic of the row an instruction of a machine block is
@@ -235,10 +315,10 @@ fun mnemonic_at(f: *mf.Function, b: u32, k: usize) str {
 }
 
 #[testing]
-val CLZ: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, ptr) -> () {\n^entry(%x: i64, %p: ptr):\n    %c = clz %x\n    store %p, %c, align 8\n    ret\n}\n";
+val CLZ: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, ptr) -> () placed [register 0 10 fixed exact, register 0 11 fixed exact] {\n^entry(%x: i64, %p: ptr):\n    %c = clz %x\n    store %p, %c, align 8\n    ret.placed places []\n}\n";
 
 #[testing]
-val MUL: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, i64, ptr) -> () {\n^entry(%x: i64, %y: i64, %p: ptr):\n    %m = mul %x, %y\n    store %p, %m, align 8\n    ret\n}\n";
+val MUL: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, i64, ptr) -> () placed [register 0 10 fixed exact, register 0 11 fixed exact, register 0 12 fixed exact] {\n^entry(%x: i64, %y: i64, %p: ptr):\n    %m = mul %x, %y\n    store %p, %m, align 8\n    ret.placed places []\n}\n";
 
 # the extension forms when m, zba and zbb are selected, the base expansions when not
 test riscv__a_function_selects_the_extension_forms_when_selected_and_the_base_expansions_when_not {
@@ -253,7 +333,7 @@ test riscv__a_function_selects_the_extension_forms_when_selected_and_the_base_ex
     fin { teardown(?x); }
     val at: opt[id.Function] = nth(?x, 0);
     if (sel at.none) { ret 5; }
-    val got: res[mf.Function, Error] = engine.select(?x.s, ?x.m, at.some);
+    val got: res[mf.Function, Error] = selected(?x, at.some);
     if (sel got.err) { ret 5; }
     var f: mf.Function = got.ok;
     fin { mf.dnit(?f); }
@@ -272,7 +352,7 @@ test riscv__a_function_selects_the_extension_forms_when_selected_and_the_base_ex
     fin { teardown(?y); }
     val mul: opt[id.Function] = nth(?y, 0);
     if (sel mul.none) { ret 9; }
-    val refused: res[mf.Function, Error] = engine.select(?y.s, ?y.m, mul.some);
+    val refused: res[mf.Function, Error] = selected(?y, mul.some);
     if (sel refused.ok) {
         var g: mf.Function = refused.ok;
         mf.dnit(?g);
@@ -297,7 +377,7 @@ test riscv__a_kept_store_is_selected_whole_and_keeps_its_mark {
     fin { teardown(?x); }
     val at: opt[id.Function] = nth(?x, 0);
     if (sel at.none) { ret 4; }
-    val got: res[mf.Function, Error] = engine.select(?x.s, ?x.m, at.some);
+    val got: res[mf.Function, Error] = selected(?x, at.some);
     if (sel got.err) { ret 4; }
     var f: mf.Function = got.ok;
     fin { mf.dnit(?f); }
@@ -318,10 +398,10 @@ test riscv__a_kept_store_is_selected_whole_and_keeps_its_mark {
 }
 
 #[testing]
-val SHIFT_BOUNDED: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, i64, ptr) -> () {\n^entry(%x: i64, %c: i64, %p: ptr):\n    %s = shl %x, %c bounded\n    store %p, %s, align 8\n    ret\n}\n";
+val SHIFT_BOUNDED: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, i64, ptr) -> () placed [register 0 10 fixed exact, register 0 11 fixed exact, register 0 12 fixed exact] {\n^entry(%x: i64, %c: i64, %p: ptr):\n    %s = shl %x, %c bounded\n    store %p, %s, align 8\n    ret.placed places []\n}\n";
 
 #[testing]
-val SHIFT_BARE: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, i64, ptr) -> () {\n^entry(%x: i64, %c: i64, %p: ptr):\n    %s = shl %x, %c\n    store %p, %s, align 8\n    ret\n}\n";
+val SHIFT_BARE: str = "target \"riscv64-linux\"\nfunction @f: fun(i64, i64, ptr) -> () placed [register 0 10 fixed exact, register 0 11 fixed exact, register 0 12 fixed exact] {\n^entry(%x: i64, %c: i64, %p: ptr):\n    %s = shl %x, %c\n    store %p, %s, align 8\n    ret.placed places []\n}\n";
 
 # a shift by a variable count selects to the plain instruction only when its count is marked bounded
 test riscv__a_variable_shift_selects_only_when_its_count_is_bounded {
@@ -330,23 +410,146 @@ test riscv__a_variable_shift_selects_only_when_its_count_is_bounded {
     fin { teardown(?x); }
     val at: opt[id.Function] = nth(?x, 0);
     if (sel at.none) { ret 2; }
-    val got: res[mf.Function, Error] = engine.select(?x.s, ?x.m, at.some);
+    val got: res[mf.Function, Error] = selected(?x, at.some);
     if (sel got.err) { ret 3; }
     var f: mf.Function = got.ok;
     fin { mf.dnit(?f); }
-    if (!str_equals(mnemonic_at(?f, 0, 0), "sll")) { ret 4; }
+    # after the three parameters are copied out of their registers
+    if (!str_equals(mnemonic_at(?f, 0, 3), "sll")) { ret 4; }
 
     var y: Fixture;
     if (!setup(?y, view_of(SHIFT_BARE), "rv64i")) { ret 5; }
     fin { teardown(?y); }
     val bare: opt[id.Function] = nth(?y, 0);
     if (sel bare.none) { ret 6; }
-    val refused: res[mf.Function, Error] = engine.select(?y.s, ?y.m, bare.some);
+    val refused: res[mf.Function, Error] = selected(?y, bare.some);
     if (sel refused.ok) {
         var g: mf.Function = refused.ok;
         mf.dnit(?g);
         ret 7;
     }
     if (!(sel refused.err.unmatched)) { ret 8; }
+    ret 0;
+}
+
+# the fixture of a corpus file's ir text
+#[testing]
+fun load(x: *Fixture, name: str, spelling: str) bool {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val ir: opt[vector.Vector[u8]] = corpus(?a, name, ".mirl");
+    if (sel ir.none) { ret false; }
+    ret setup(x, View{data: ir.some.data, len: ir.some.len}, spelling);
+}
+
+# a call, an entry and a return place each piece where the convention put it:
+# into its register, at its outgoing slot or from its incoming one, and each
+# call the selection makes states every register the convention clobbers
+test riscv__calls_entries_and_returns_place_their_pieces_and_state_their_clobbers {
+    if (matches("riscv_calls", "rv64gc") != 0) { ret 1; }
+    var x: Fixture;
+    if (!load(?x, "riscv_calls", "rv64gc")) { ret 2; }
+    fin { teardown(?x); }
+    val at: opt[id.Function] = nth(?x, 0);
+    if (sel at.none) { ret 3; }
+    val got: res[Selected, Error] = selected_with(?x, at.some);
+    if (sel got.err) { ret 4; }
+    var out: Selected = got.ok;
+    fin { engine.release(?out); }
+    val clobbered: Slice[rf.Id] = x.mc.convention.clobbered;
+    if (clobbered.size == 0) { ret 5; }
+    var calls: usize = 0;
+    var k:     usize = 0;
+    for (k < out.function.instructions.len) {
+        val i: Instruction = Instruction{index: k::u32};
+        if (mi.transfer(mf.file(?out.function), mf.data(?out.function, i)).transfer == effect.CALL) {
+            # every clobbered register of the convention, in its order, at this call
+            var seen: usize = 0;
+            var c:    usize = 0;
+            for (c < out.clobbers.len) {
+                val k2: Clobber = out.clobbers.data[c];
+                if (k2.instruction.index == i.index) {
+                    if (seen >= clobbered.size) { ret 6; }
+                    val want: opt[u32] = location.locate(?x.at, Physical.register{clobbered.data[seen]});
+                    if (sel want.none)            { ret 7; }
+                    if (want.some != k2.location) { ret 8; }
+                    seen = seen + 1;
+                }
+                c = c + 1;
+            }
+            if (seen != clobbered.size) { ret 9; }
+            calls = calls + 1;
+        }
+        k = k + 1;
+    }
+    if (calls != 2 || out.clobbers.len != 2 * clobbered.size) { ret 10; }
+    ret 0;
+}
+
+#[testing]
+val TLS_LOCAL_EXEC:      str = "target \"riscv64-linux\"\nglobal @v: i64 linkage global visibility default tls local_exec = i64 0\nfunction @__tls_get_addr: fun(ptr) -> (ptr)\nfunction @f: fun(ptr) -> () placed [register 0 10 fixed exact] {\n^entry(%p: ptr):\n    store %p, ptr @v, align 8\n    ret.placed places []\n}\n";
+#[testing]
+val TLS_INITIAL_EXEC:    str = "target \"riscv64-linux\"\nglobal @v: i64 linkage global visibility default tls initial_exec = i64 0\nfunction @__tls_get_addr: fun(ptr) -> (ptr)\nfunction @f: fun(ptr) -> () placed [register 0 10 fixed exact] {\n^entry(%p: ptr):\n    store %p, ptr @v, align 8\n    ret.placed places []\n}\n";
+#[testing]
+val TLS_LOCAL_DYNAMIC:   str = "target \"riscv64-linux\"\nglobal @v: i64 linkage global visibility default tls local_dynamic = i64 0\nfunction @__tls_get_addr: fun(ptr) -> (ptr)\nfunction @f: fun(ptr) -> () placed [register 0 10 fixed exact] {\n^entry(%p: ptr):\n    store %p, ptr @v, align 8\n    ret.placed places []\n}\n";
+#[testing]
+val TLS_GENERAL_DYNAMIC: str = "target \"riscv64-linux\"\nglobal @v: i64 linkage global visibility default tls general_dynamic = i64 0\nfunction @__tls_get_addr: fun(ptr) -> (ptr)\nfunction @f: fun(ptr) -> () placed [register 0 10 fixed exact] {\n^entry(%p: ptr):\n    store %p, ptr @v, align 8\n    ret.placed places []\n}\n";
+
+#[testing]
+val TLS_TEXTS:  [4]str = [4]str{TLS_LOCAL_EXEC, TLS_INITIAL_EXEC, TLS_LOCAL_DYNAMIC, TLS_GENERAL_DYNAMIC};
+#[testing]
+val TLS_MODELS: [4]Tls = [4]Tls{Tls.local_exec{}, Tls.initial_exec{}, Tls.local_dynamic{}, Tls.general_dynamic{}};
+
+# the instructions each access the target may declare selects to, none for one the table has no sequence for
+#[testing]
+val LOCAL_EXEC_SEQUENCE:      [3]str = [3]str{"lui", "add", "addi"};
+#[testing]
+val INITIAL_EXEC_SEQUENCE:    [3]str = [3]str{"auipc", "ld", "add"};
+#[testing]
+val GENERAL_DYNAMIC_SEQUENCE: [5]str = [5]str{"auipc", "addi", "auipc", "jalr", "addi"};
+
+#[testing]
+fun sequence(a: Access) Slice[str] {
+    if (sel a.local_exec)      { ret Slice[str]{data: ?LOCAL_EXEC_SEQUENCE[0], size: 3}; }
+    if (sel a.initial_exec)    { ret Slice[str]{data: ?INITIAL_EXEC_SEQUENCE[0], size: 3}; }
+    if (sel a.general_dynamic) { ret Slice[str]{data: ?GENERAL_DYNAMIC_SEQUENCE[0], size: 5}; }
+    ret Slice[str]{data: nil, size: 0};
+}
+
+# one walk over the thread-local models of the ir: each selects the access
+# sequence of the access the target declares for it, with its relocations
+# and the lookup's call as the golden text holds them
+test riscv__each_thread_local_model_selects_the_sequence_of_its_declared_access {
+    if (matches("riscv_tls", "rv64gc") != 0) { ret 1; }
+    var k: usize = 0;
+    for (k < 4) {
+        var x: Fixture;
+        if (!setup(?x, view_of(TLS_TEXTS[k]), "rv64gc")) { ret 2; }
+        fin { teardown(?x); }
+        val model: Addresses = x.target.addresses;
+        if (!(sel model.model)) { ret 3; }
+        val want: Slice[str] = sequence(address.access(?model.model, TLS_MODELS[k]));
+        if (want.size == 0) { ret 4; }
+        val at: opt[id.Function] = nth(?x, 0);
+        if (sel at.none) { ret 5; }
+        val got: res[mf.Function, Error] = selected(?x, at.some);
+        if (sel got.err) {
+            refusal(got.err);
+            ret 6;
+        }
+        var f: mf.Function = got.ok;
+        fin { mf.dnit(?f); }
+        # the entry's copy, the sequence, the store and the return
+        if (mf.instructions(?f, Block{index: 0}).size != want.size + 3) { ret 7; }
+        var i: usize = 0;
+        for (i < want.size) {
+            if (!str_equals(mnemonic_at(?f, 0, i + 1), want.data[i])) {
+                diag.eprintlnf("model {}: instruction {} is not {}", k, i, want.data[i]);
+                ret 8;
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
     ret 0;
 }

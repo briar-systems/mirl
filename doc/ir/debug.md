@@ -61,6 +61,8 @@ A record is not an instruction. No instruction walk sees it, and it carries no s
 - A copy of a region of blocks, in the same function or another, gives each copy its source's records at the same positions, reading through the map as an operand does.
 - A snapshot copies them and a restore puts them back.
 
+A pass that builds a value at the head of a block moves the records standing there to where it is built with `mirl.ir.body.hand`, so they read it from their first point. A pass that moves a variable's value into memory turns its record into the storage form with `mirl.ir.body.store_binding`: the variable is bound to the storage the instruction it names addresses, which describes it at every point, and the record stands nowhere from then on.
+
 When what a record reads goes, through an erased instruction, a removed parameter or an erased block, the record becomes `unavailable` at its point. It is never deleted, since that would leave the variable's earlier value standing as a stale answer. A pass that removes a value it can still describe salvages the record first with `mirl.ir.body.rebind`, giving it another operand and an expression that recovers the variable from it. `mirl.ir.body.salvage` finds that expression from the step table: when an operand is the result of an instruction a step row names, with a constant operand where the row takes one, it reads the instruction's other operand through that step, and otherwise it answers `unavailable`. Dead code removal salvages every record that reads a value it removes this way, through as many removed instructions as the chain holds.
 
 Records are made through the builder, by `mirl.build.bind_at`, at the builder's cursor and with no sticky attribute. `copy_binding` copies one through a map.
