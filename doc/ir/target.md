@@ -76,7 +76,7 @@ A target declares the convention its calls are made under in `convention`: the r
 | `floats` | the widest float passed in float registers, or none |
 | `passing`, `returning` | the argument and result registers by masc's names, each class in the order taken |
 | `preserved`, `reserved` | the registers a callee preserves whole, and those no call clobbers and nothing allocates |
-| `stack` | none, or a stack in memory with its alignment at a call, its red zone and its shadow space |
+| `stack` | none, or a stack in memory with its alignment at a call, its red zone, its shadow space, where a call leaves the return address (`link`) and its frame pointer with the frame record it heads (`pointer`) |
 | `indirect` | what carries the address of a result passed by reference, and where a callee hands it back |
 | `variadic` | where unnamed arguments travel, the count a caller sets, and how a callee reaches them |
 | `half` | whether a 16-bit float travels as a float or as an integer |
