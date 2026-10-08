@@ -1,0 +1,1367 @@
+# the selection engine: ir functions into the machine form by a target's table
+#
+# the engine walks a function block by block. it chooses a rule for every
+# instruction from the last to the first, so a root covers the instructions
+# that feed it before they are reached, then emits the chosen expansions in
+# order. block arguments become one parallel copy per edge, sequenced so no
+# copy clobbers a value another still reads. the engine holds no target
+# knowledge: every fact is the table's, the ir opcode rows' or masc's rows'.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.fail.keep;
+use mirl.fold.algebra;
+
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use ir:    mirl.ir.opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.ValueData;
+use mirl.machine.class;
+use mirl.machine.class.Class;
+use mf: mirl.machine.function;
+use mi: mirl.machine.instruction;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Symbol;
+use mirl.machine.operand.Virtual;
+use mirl.machine.pseudo;
+use mirl.machine.select.rule;
+use mirl.machine.select.rule.Emit;
+use mirl.machine.select.rule.Match;
+use mirl.machine.select.rule.Node;
+use mirl.machine.select.rule.Ref;
+use mirl.machine.select.rule.Rule;
+use mirl.machine.select.rule.Slot;
+use mirl.machine.select.rule.Source;
+use mirl.machine.select.rule.Table;
+use mirl.slice;
+use mirl.target.record.Target;
+
+use masc.core.extension;
+use rows: masc.core.row;
+use mset: masc.core.set;
+
+val NONE: u32 = 0xffffffff;
+
+# a table that breaks the schema
+# ---
+# rule:     the rule's index in its list
+# constant: the rule is a materialisation rule, or the jump when `rule` is NONE
+# what:     what it breaks
+pub rec Defect {
+    rule:     u32;
+    constant: bool;
+    what:     str;
+}
+
+pub val NO_NODES:      str = "rule with no pattern, or a materialisation rule with one";
+pub val TOO_MANY:      str = "pattern of more nodes than MAX_NODES";
+pub val UNKNOWN_IR:    str = "node of an opcode the ir has no row for";
+pub val LATER_PARENT:  str = "node covering an operand of itself or a later node";
+pub val NO_OPERAND:    str = "node covering an operand its parent's row does not have";
+pub val TWICE:         str = "operand covered by two nodes";
+pub val NO_EXPANSION:  str = "rule that emits nothing";
+pub val WIDE:          str = "emitted instruction of more operands than a row has";
+pub val UNKNOWN_NODE:  str = "reference to a node the pattern does not have";
+pub val COVERED_VALUE: str = "register of an operand a node covers";
+pub val NO_SUBJECT:    str = "materialisation rule naming a node, or a rule naming the constant";
+pub val UNSTATED:      str = "source or reference left unstated";
+pub val TEMPORARY:     str = "temporary past MAX_FRESH";
+pub val JUMP:          str = "jump that is not one instruction to edge 0";
+
+# what selection was asked to select
+# ---
+# opcode:   an ir instruction of this opcode
+# constant: a constant to materialise into a register
+pub tag Operation: u8 {
+    opcode: ir.Opcode;
+    constant;
+}
+
+# an operation no rule matches, a missing rule or a missing legalisation
+# ---
+# operation:     what it is
+# instruction:   the ir instruction, or the one using the constant
+# operands:      the types of its first operands, as many as a row fixes
+# operand_count: how many operands it has
+# results:       the types of its first results, as many as a row states
+# result_count:  how many results it has
+pub rec Unmatched {
+    operation:     Operation;
+    instruction:   id.Instruction;
+    operands:      [$length_of(ir.Operands)]Type;
+    operand_count: u32;
+    results:       [$length_of(ir.Results)]Type;
+    result_count:  u32;
+}
+
+# why selection refused
+# ---
+# alloc:     the allocator refused storage
+# module:    the module refused a read
+# types:     the type table refused a read
+# table:     the table breaks the schema
+# unmatched: no rule matches an operation
+# unheld:    no class of the table holds a value of this type
+# removed:   a value whose definition was removed
+# machine:   the machine form refused an instruction the table built
+pub tag Error: u8 {
+    alloc:     allocator.Error;
+    module:    module.Error;
+    types:     types.Error;
+    table:     Defect;
+    unmatched: Unmatched;
+    unheld:    Type;
+    removed:   id.Value;
+    machine:   mf.Error;
+}
+
+# a table made ready for one target and instruction set
+# ---
+# a:         the allocator its index and every selection take
+# table:     the table
+# target:    the target, whose capabilities guard hooks read
+# set:       masc's instruction set for the target
+# selection: the extensions the target selects, closed by masc
+# first:     per ir opcode, where its rules start in `order`, one past the last
+# order:     the rules' indices grouped by opcode, each group by cost, the
+#            least first, and rules of one cost in table order
+# constants: the constant rules' indices in the same order
+pub rec Selector {
+    a:         *allocator.Allocator;
+    table:     *Table;
+    target:    *Target;
+    set:       *mset.Set;
+    selection: *extension.Selection;
+    first:     Slice[u32];
+    order:     Slice[u32];
+    constants: Slice[u32];
+}
+
+# sort rule indices by their rules' cost, keeping indices of one cost in the
+# order given, by a merge of ever longer runs
+# ---
+# rules:   the rules the indices name
+# list:    the indices
+# n:       how many there are
+# scratch: room for n indices
+fun by_cost(rules: rule.Rules, list: *u32, n: usize, scratch: *u32) {
+    var from: *u32  = list;
+    var to:   *u32  = scratch;
+    var run:  usize = 1;
+    for (run < n) {
+        var lo: usize = 0;
+        for (lo < n) {
+            var mid: usize = lo + run;
+            if (mid > n) { mid = n; }
+            var hi: usize = mid + run;
+            if (hi > n) { hi = n; }
+            var l: usize = lo;
+            var r: usize = mid;
+            var k: usize = lo;
+            for (k < hi) {
+                if (l < mid && (r >= hi || rules.at[from[l]].cost <= rules.at[from[r]].cost)) {
+                    to[k] = from[l];
+                    l     = l + 1;
+                }
+                or {
+                    to[k] = from[r];
+                    r     = r + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        val swap: *u32 = from;
+        from = to;
+        to   = swap;
+        run  = run * 2;
+    }
+    if (from != list) {
+        var k: usize = 0;
+        for (k < n) {
+            list[k] = from[k];
+            k       = k + 1;
+        }
+    }
+}
+
+fun defect(rule: u32, constant: bool, what: str) Error {
+    ret Error.table{Defect{rule: rule, constant: constant, what: what}};
+}
+
+fun ref_ok(r: Ref, nodes: u32) opt[str] {
+    if (sel r.unstated) { ret opt[str].some{UNSTATED}; }
+    if (sel r.constant) {
+        if (nodes != 0) { ret opt[str].some{NO_SUBJECT}; }
+        ret opt[str].none{};
+    }
+    if (nodes == 0)                                    { ret opt[str].some{NO_SUBJECT}; }
+    if (sel r.operand && r.operand.node::u32 >= nodes) { ret opt[str].some{UNKNOWN_NODE}; }
+    if (sel r.result && r.result.node::u32 >= nodes)   { ret opt[str].some{UNKNOWN_NODE}; }
+    ret opt[str].none{};
+}
+
+# whether a node covers operand `at` of node `parent`
+fun covered(r: *Rule, parent: u8, at: u8) bool {
+    var j: u32 = 1;
+    for (j < r.nodes.len) {
+        if (r.nodes.at[j].parent == parent && r.nodes.at[j].operand == at) { ret true; }
+        j = j + 1;
+    }
+    ret false;
+}
+
+fun source_ok(r: *Rule, s: Source) opt[str] {
+    val n: u32 = r.nodes.len;
+    if (sel s.unstated) { ret opt[str].some{UNSTATED}; }
+    if (sel s.value) {
+        if (n == 0)                                  { ret opt[str].some{NO_SUBJECT}; }
+        if (s.value.node::u32 >= n)                  { ret opt[str].some{UNKNOWN_NODE}; }
+        if (covered(r, s.value.node, s.value.index)) { ret opt[str].some{COVERED_VALUE}; }
+    }
+    if (sel s.bits)    { ret ref_ok(s.bits, n); }
+    if (sel s.derived) { ret ref_ok(s.derived.of, n); }
+    if (sel s.symbol)  { ret ref_ok(s.symbol.of, n); }
+    if (sel s.fresh) {
+        if (s.fresh.index::u32 >= rule.MAX_FRESH) { ret opt[str].some{TEMPORARY}; }
+        ret ref_ok(s.fresh.like, n);
+    }
+    ret opt[str].none{};
+}
+
+fun expansion_ok(r: *Rule) opt[str] {
+    if (r.expansion.len == 0) { ret opt[str].some{NO_EXPANSION}; }
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *Emit = ?r.expansion.at[e];
+        if (emit.operands.len > rows.MAX_OPERANDS) { ret opt[str].some{WIDE}; }
+        var k: u32 = 0;
+        for (k < emit.operands.len) {
+            val bad: opt[str] = source_ok(r, emit.operands.at[k]);
+            if (sel bad.some) { ret bad; }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+    var t: u32 = 0;
+    for (t < r.tests.len) {
+        val bad: opt[str] = ref_ok(r.tests.at[t].at, r.nodes.len);
+        if (sel bad.some) { ret bad; }
+        t = t + 1;
+    }
+    ret opt[str].none{};
+}
+
+# whether a rule keeps the schema
+fun rule_ok(r: *Rule) opt[str] {
+    if (r.nodes.len == 0)             { ret opt[str].some{NO_NODES}; }
+    if (r.nodes.len > rule.MAX_NODES) { ret opt[str].some{TOO_MANY}; }
+    var i: u32 = 0;
+    for (i < r.nodes.len) {
+        val n:   *Node       = ?r.nodes.at[i];
+        val row: opt[ir.Row] = ir.row(n.opcode);
+        if (sel row.none) { ret opt[str].some{UNKNOWN_IR}; }
+        if (i > 0) {
+            if (n.parent::u32 >= i) { ret opt[str].some{LATER_PARENT}; }
+            var parent: opt[ir.Row] = ir.row(r.nodes.at[n.parent].opcode);
+            if (sel parent.none)                          { ret opt[str].some{UNKNOWN_IR}; }
+            if (n.operand::u32 >= ir.fixed(?parent.some)) { ret opt[str].some{NO_OPERAND}; }
+            var j: u32 = 1;
+            for (j < i) {
+                if (r.nodes.at[j].parent == n.parent && r.nodes.at[j].operand == n.operand) { ret opt[str].some{TWICE}; }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret expansion_ok(r);
+}
+
+fun constant_ok(r: *Rule) opt[str] {
+    if (r.nodes.len != 0) { ret opt[str].some{NO_NODES}; }
+    ret expansion_ok(r);
+}
+
+fun jump_ok(t: *Table) bool {
+    if (t.jump.len != 1) { ret false; }
+    val emit: *Emit = ?t.jump.at[0];
+    var k:    u32   = 0;
+    var aims: u32   = 0;
+    for (k < emit.operands.len) {
+        val s: Source = emit.operands.at[k];
+        if (sel s.target) {
+            if (s.target != 0) { ret false; }
+            aims = aims + 1;
+        }
+        or (!(sel s.literal)) { ret false; }
+        k = k + 1;
+    }
+    ret aims == 1;
+}
+
+# make a table ready for a target, checking it against the schema once
+# ---
+# a:         the allocator the index and every selection take
+# table:     the table
+# target:    the target
+# set:       masc's instruction set for the target
+# selection: the extensions the target selects
+# ret:       the selector, or the first defect of the table
+pub fun init(a: *allocator.Allocator, table: *Table, target: *Target, set: *mset.Set, selection: *extension.Selection) res[Selector, Error] {
+    var i: u32 = 0;
+    for (i < table.rules.len) {
+        val bad: opt[str] = rule_ok(?table.rules.at[i]);
+        if (sel bad.some) { ret res[Selector, Error].err{defect(i, false, bad.some)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.constants.len) {
+        val bad: opt[str] = constant_ok(?table.constants.at[i]);
+        if (sel bad.some) { ret res[Selector, Error].err{defect(i, true, bad.some)}; }
+        i = i + 1;
+    }
+    if (!jump_ok(table)) { ret res[Selector, Error].err{defect(NONE, true, JUMP)}; }
+    val count:  u32                        = ir.rows();
+    val firsts: res[*u32, allocator.Error] = allocator.zallocate[u32](a, count::usize + 1);
+    if (sel firsts.err) { ret res[Selector, Error].err{Error.alloc{firsts.err}}; }
+    val first: *u32  = firsts.ok;
+    var size:  usize = table.rules.len::usize;
+    if (size == 0) { size = 1; }
+    val orders: res[*u32, allocator.Error] = allocator.zallocate[u32](a, size);
+    if (sel orders.err) {
+        allocator.deallocate[u32](a, first, count::usize + 1);
+        ret res[Selector, Error].err{Error.alloc{orders.err}};
+    }
+    val order: *u32 = orders.ok;
+    i = 0;
+    for (i < table.rules.len) {
+        val op: u32 = table.rules.at[i].nodes.at[0].opcode.index;
+        first[op + 1] = first[op + 1] + 1;
+        i             = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        first[i + 1] = first[i + 1] + first[i];
+        i            = i + 1;
+    }
+    # each group fills in table order, its cursor the count placed so far
+    val cursors: res[*u32, allocator.Error] = allocator.zallocate[u32](a, count::usize);
+    if (sel cursors.err) {
+        allocator.deallocate[u32](a, first, count::usize + 1);
+        allocator.deallocate[u32](a, order, size);
+        ret res[Selector, Error].err{Error.alloc{cursors.err}};
+    }
+    val cursor: *u32 = cursors.ok;
+    i = 0;
+    for (i < table.rules.len) {
+        val op: u32 = table.rules.at[i].nodes.at[0].opcode.index;
+        order[first[op] + cursor[op]] = i;
+        cursor[op]                    = cursor[op] + 1;
+        i                             = i + 1;
+    }
+    allocator.deallocate[u32](a, cursor, count::usize);
+    var many: usize = table.constants.len::usize;
+    if (many == 0) { many = 1; }
+    val fixed: res[*u32, allocator.Error] = allocator.zallocate[u32](a, many);
+    if (sel fixed.err) {
+        allocator.deallocate[u32](a, first, count::usize + 1);
+        allocator.deallocate[u32](a, order, size);
+        ret res[Selector, Error].err{Error.alloc{fixed.err}};
+    }
+    val constants: *u32  = fixed.ok;
+    var wide:      usize = size;
+    if (many > wide) { wide = many; }
+    val scratches: res[*u32, allocator.Error] = allocator.zallocate[u32](a, wide);
+    if (sel scratches.err) {
+        allocator.deallocate[u32](a, first, count::usize + 1);
+        allocator.deallocate[u32](a, order, size);
+        allocator.deallocate[u32](a, constants, many);
+        ret res[Selector, Error].err{Error.alloc{scratches.err}};
+    }
+    i = 0;
+    for (i < count) {
+        by_cost(table.rules, ?order[first[i]], (first[i + 1] - first[i])::usize, scratches.ok);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.constants.len) {
+        constants[i] = i;
+        i            = i + 1;
+    }
+    by_cost(table.constants, constants, table.constants.len::usize, scratches.ok);
+    allocator.deallocate[u32](a, scratches.ok, wide);
+    ret res[Selector, Error].ok{Selector{
+        a:         a,
+        table:     table,
+        target:    target,
+        set:       set,
+        selection: selection,
+        first:     Slice[u32]{data: first, size: count::usize + 1},
+        order:     Slice[u32]{data: order, size: size},
+        constants: Slice[u32]{data: constants, size: many},
+    }};
+}
+
+# give back a selector's index
+pub fun dnit(s: *Selector) err[allocator.Error] {
+    var failed: err[allocator.Error] = err[allocator.Error].ok{};
+    keep(?failed, slice.release[u32](s.a, s.first));
+    keep(?failed, slice.release[u32](s.a, s.order));
+    keep(?failed, slice.release[u32](s.a, s.constants));
+    ret failed;
+}
+
+# the rule an instruction chose and what its pattern matched
+# ---
+# rule:     the rule's index in the table
+# found:    what the pattern matched
+# consumes: one bit per node that emits nothing of its own
+rec Choice {
+    rule:     u32;
+    found:    Match;
+    consumes: u32;
+}
+
+# one parallel copy's move into a block parameter
+# ---
+# dest:   the parameter's register
+# source: the argument's register, NONE for a constant
+# value:  the argument
+rec Move {
+    dest:   u32;
+    source: u32;
+    value:  id.Value;
+}
+
+# the state of one function's selection
+# ---
+# registers: per ir value, its virtual register or NONE
+# secret:    per virtual register, whether it holds a secret value
+# held:      per type, the index of the hold that holds it, NONE when unknown
+# blocks:    per ir block, its machine block or NONE
+# consumed:  per ir instruction, whether a pattern covers it and it emits nothing
+# shared:    per ir instruction, whether a later pattern covers it and reads its
+#            operands, so the values it reads are kept in registers
+# position:  per ir instruction of the current block, its place in the block
+# impure:    per place of the current block, how many instructions before it
+#            trap or touch memory
+# choices:   the current block's choices, its last instruction's first
+# targets:   the machine block of each edge of the current root
+# moves:     the current edge's moves
+# loc:       per virtual register, where a parallel copy holds its value
+# pred:      per virtual register, the register a parallel copy fills it from
+# ready:     the parallel copy's destinations free to be written
+# todo:      the parallel copy's destinations
+rec State {
+    s:         *Selector;
+    m:         *Module;
+    f:         id.Function;
+    body:      *Body;
+    out:       *mf.Function;
+    registers: vector.Vector[u32];
+    secret:    vector.Vector[bool];
+    held:      vector.Vector[u32];
+    blocks:    vector.Vector[u32];
+    consumed:  vector.Vector[bool];
+    shared:    vector.Vector[bool];
+    position:  vector.Vector[u32];
+    impure:    vector.Vector[u32];
+    choices:   vector.Vector[Choice];
+    targets:   vector.Vector[u32];
+    moves:     vector.Vector[Move];
+    loc:       vector.Vector[u32];
+    pred:      vector.Vector[u32];
+    ready:     vector.Vector[u32];
+    todo:      vector.Vector[u32];
+}
+
+fun release(st: *State) {
+    vector.dnit[u32](?st.registers);
+    vector.dnit[bool](?st.secret);
+    vector.dnit[u32](?st.held);
+    vector.dnit[u32](?st.blocks);
+    vector.dnit[bool](?st.consumed);
+    vector.dnit[bool](?st.shared);
+    vector.dnit[u32](?st.position);
+    vector.dnit[u32](?st.impure);
+    vector.dnit[Choice](?st.choices);
+    vector.dnit[u32](?st.targets);
+    vector.dnit[Move](?st.moves);
+    vector.dnit[u32](?st.loc);
+    vector.dnit[u32](?st.pred);
+    vector.dnit[u32](?st.ready);
+    vector.dnit[u32](?st.todo);
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun push_u32(v: *vector.Vector[u32], x: u32) err[Error] {
+    val p: res[usize, allocator.Error] = vector.push[u32](v, x);
+    if (sel p.err) { ret alloc_err(p.err); }
+    ret err[Error].ok{};
+}
+
+# grow a list to at least `n` entries, each new one `x`
+fun grow(v: *vector.Vector[u32], n: usize, x: u32) err[Error] {
+    val room: res[usize, allocator.Error] = vector.ensure[u32](v, n);
+    if (sel room.err) { ret alloc_err(room.err); }
+    for (v.len < n) { vector.push[u32](v, x); }
+    ret err[Error].ok{};
+}
+
+fun grow_bool(v: *vector.Vector[bool], n: usize) err[Error] {
+    val room: res[usize, allocator.Error] = vector.ensure[bool](v, n);
+    if (sel room.err) { ret alloc_err(room.err); }
+    for (v.len < n) { vector.push[bool](v, false); }
+    ret err[Error].ok{};
+}
+
+fun instruction(st: *State, i: id.Instruction) *InstructionData {
+    ret ?st.body.instructions.data[i.index];
+}
+
+fun value(st: *State, v: id.Value) *ValueData {
+    ret ?st.body.values.data[v.index];
+}
+
+# whether an instruction of an opcode neither traps nor touches memory
+fun pure(op: ir.Opcode) bool {
+    val r: opt[ir.Row] = ir.row(op);
+    if (sel r.none) { ret false; }
+    ret sel r.some.effects.traps[0].unstated && !r.some.effects.reads && !r.some.effects.writes;
+}
+
+# whether an instruction of an opcode declassifies its operand
+fun declassifies(op: ir.Opcode) bool {
+    val r: opt[ir.Row] = ir.row(op);
+    ret sel r.some && sel r.some.secrecy.declassifies;
+}
+
+# operand `s.index` of node `s.node`, as the pattern states it
+fun operand_at(st: *State, mt: *Match, s: Slot) opt[id.Value] {
+    if (s.node::u32 >= mt.count) { ret opt[id.Value].none{}; }
+    val d: *InstructionData = instruction(st, mt.nodes[s.node]);
+    var k: u32              = s.index::u32;
+    if (k < 2 && ((mt.swapped >> s.node::u32) & 1) != 0) { k = 1 - k; }
+    if (k::usize >= d.operands.len)                      { ret opt[id.Value].none{}; }
+    ret opt[id.Value].some{d.operands.data[k]};
+}
+
+fun result_at(st: *State, mt: *Match, s: Slot) opt[id.Value] {
+    if (s.node::u32 >= mt.count) { ret opt[id.Value].none{}; }
+    val d: *InstructionData = instruction(st, mt.nodes[s.node]);
+    if (s.index::usize >= d.results.len) { ret opt[id.Value].none{}; }
+    ret opt[id.Value].some{d.results.data[s.index]};
+}
+
+fun ref_at(st: *State, mt: *Match, r: Ref) opt[id.Value] {
+    if (sel r.operand)                   { ret operand_at(st, mt, r.operand); }
+    if (sel r.result)                    { ret result_at(st, mt, r.result); }
+    if (sel r.constant && mt.count == 0) { ret opt[id.Value].some{mt.subject}; }
+    ret opt[id.Value].none{};
+}
+
+# the constant a value is, none for any other value
+fun constant_of(st: *State, v: id.Value) res[opt[ConstantData], Error] {
+    val d: *ValueData = value(st, v);
+    if (!(sel d.def.constant)) { ret res[opt[ConstantData], Error].ok{opt[ConstantData].none{}}; }
+    val c: res[ConstantData, module.Error] = module.constant_data(st.m, d.def.constant);
+    if (sel c.err) { ret res[opt[ConstantData], Error].err{Error.module{c.err}}; }
+    ret res[opt[ConstantData], Error].ok{opt[ConstantData].some{c.ok}};
+}
+
+# the bits of a number of at most 64 bits, an integer's sign extended from
+# its width and a float's as they are, none for any other value
+fun bits_of(st: *State, v: id.Value) res[opt[i64], Error] {
+    val got: res[opt[ConstantData], Error] = constant_of(st, v);
+    if (sel got.err)     { ret res[opt[i64], Error].err{got.err}; }
+    if (sel got.ok.none) { ret res[opt[i64], Error].ok{opt[i64].none{}}; }
+    val c:     ConstantData = got.ok.some;
+    var ty:    Type;
+    var words: Slice[u64];
+    if (sel c.integer) {
+        ty    = c.integer.type;
+        words = c.integer.words;
+    }
+    or (sel c.float) {
+        ty    = c.float.type;
+        words = c.float.words;
+    }
+    or (sel c.zero) { ty = c.zero; }
+    or              { ret res[opt[i64], Error].ok{opt[i64].none{}}; }
+    val shape: res[types.Shape, types.Error] = types.shape(?st.m.types, ty);
+    if (sel shape.err) { ret res[opt[i64], Error].err{Error.types{shape.err}}; }
+    val scalar: bool = sel shape.ok.integer || sel shape.ok.float || sel shape.ok.pointer;
+    if (sel c.zero && scalar) { ret res[opt[i64], Error].ok{opt[i64].some{0}}; }
+    var width:  u32  = 0;
+    var signed: bool = false;
+    if (sel shape.ok.integer) {
+        width  = shape.ok.integer.width;
+        signed = true;
+    }
+    or (sel shape.ok.float) {
+        val f: opt[types.Row] = types.row(shape.ok.float.format);
+        if (sel f.none) { ret res[opt[i64], Error].err{Error.types{types.Error.format{shape.ok.float.format}}}; }
+        width = f.some.width;
+    }
+    or              { ret res[opt[i64], Error].ok{opt[i64].none{}}; }
+    if (width > 64) { ret res[opt[i64], Error].ok{opt[i64].none{}}; }
+    var x: u64 = 0;
+    if (words.size > 0) { x = words.data[0]; }
+    if (width < 64) {
+        val mask: u64 = (1u64 << width::u64) - 1;
+        x = x & mask;
+        if (signed && ((x >> (width - 1)::u64) & 1) != 0) { x = x | ~mask; }
+    }
+    ret res[opt[i64], Error].ok{opt[i64].some{x:~i64}};
+}
+
+# the bits of the constant a reference names
+fun ref_bits(st: *State, mt: *Match, r: Ref) res[opt[i64], Error] {
+    val v: opt[id.Value] = ref_at(st, mt, r);
+    if (sel v.none) { ret res[opt[i64], Error].ok{opt[i64].none{}}; }
+    ret bits_of(st, v.some);
+}
+
+# the bits a reference names, which the guard admitted
+fun immediate(st: *State, mt: *Match, r: Ref) res[i64, Error] {
+    val got: res[opt[i64], Error] = ref_bits(st, mt, r);
+    if (sel got.err)     { ret res[i64, Error].err{got.err}; }
+    if (sel got.ok.none) { ret res[i64, Error].err{defect(NONE, false, UNSTATED)}; }
+    ret res[i64, Error].ok{got.ok.some};
+}
+
+# the address constant a reference names, which the guard admitted
+fun address(st: *State, mt: *Match, r: Ref) res[ConstantData, Error] {
+    val v: opt[id.Value] = ref_at(st, mt, r);
+    if (sel v.none) { ret res[ConstantData, Error].err{defect(NONE, false, UNKNOWN_NODE)}; }
+    val c: res[opt[ConstantData], Error] = constant_of(st, v.some);
+    if (sel c.err)     { ret res[ConstantData, Error].err{c.err}; }
+    if (sel c.ok.none) { ret res[ConstantData, Error].err{defect(NONE, false, UNSTATED)}; }
+    ret res[ConstantData, Error].ok{c.ok.some};
+}
+
+# whether every node of a rule matches, its operands swapped as `swapped` says
+fun matches(st: *State, r: *Rule, root: id.Instruction, swapped: u32, mt: *Match) res[bool, Error] {
+    mt.nodes[0] = root;
+    mt.count    = r.nodes.len;
+    mt.swapped  = swapped;
+    val place: Place = instruction(st, root).place;
+    if (!(sel place.placed)) { ret res[bool, Error].ok{false}; }
+    val home: id.Block = place.placed;
+    var i:    u32      = 1;
+    for (i < r.nodes.len) {
+        val n:  *Node         = ?r.nodes.at[i];
+        val at: opt[id.Value] = operand_at(st, mt, Slot{node: n.parent, index: n.operand});
+        if (sel at.none) { ret res[bool, Error].ok{false}; }
+        val d: *ValueData = value(st, at.some);
+        if (!(sel d.def.result))                 { ret res[bool, Error].ok{false}; }
+        if (d.def.result.index != n.result::u32) { ret res[bool, Error].ok{false}; }
+        val x:  id.Instruction   = d.def.result.instruction;
+        val xd: *InstructionData = instruction(st, x);
+        if (xd.opcode.index != n.opcode.index)                             { ret res[bool, Error].ok{false}; }
+        if (!(sel xd.place.placed && xd.place.placed.index == home.index)) { ret res[bool, Error].ok{false}; }
+        mt.nodes[i] = x;
+        i           = i + 1;
+    }
+    i = 0;
+    for (i < r.nodes.len) {
+        val want: u32 = r.nodes.at[i].constants;
+        var k:    u32 = 0;
+        for (k < 32) {
+            if (((want >> k) & 1) != 0) {
+                val v: opt[id.Value] = operand_at(st, mt, Slot{node: i::u8, index: k::u8});
+                if (sel v.none) { ret res[bool, Error].ok{false}; }
+                val d: *ValueData = value(st, v.some);
+                if (!(sel d.def.constant)) { ret res[bool, Error].ok{false}; }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{true};
+}
+
+# whether a value's only use is instruction `by`
+fun only_use(st: *State, v: id.Value, by: id.Instruction) bool {
+    val uses: *vector.Vector[id.Instruction] = ?value(st, v).uses;
+    ret uses.len == 1 && uses.data[0].index == by.index;
+}
+
+# which nodes a match consumes, none when it covers what it may not
+#
+# a node is consumed when its parent is and the parent is the only use of its
+# results, and the root counts as consumed unless a later pattern shares it. one that is not consumed is selected again for its other uses, so
+# it must neither trap nor touch memory, and a consumed one that does may
+# move to its root only past instructions that do neither.
+fun consumes(st: *State, r: *Rule, mt: *Match) opt[u32] {
+    var mask: u32 = 1;
+    if (st.shared.data[mt.nodes[0].index]) { mask = 0; }
+    var i: u32 = 1;
+    for (i < r.nodes.len) {
+        val n:      *Node            = ?r.nodes.at[i];
+        val x:      id.Instruction   = mt.nodes[i];
+        val xd:     *InstructionData = instruction(st, x);
+        val parent: id.Instruction   = mt.nodes[n.parent];
+        var sole:   bool             = ((mask >> n.parent::u32) & 1) != 0;
+        var k:      usize            = 0;
+        for (sole && k < xd.results.len) {
+            val v: id.Value = xd.results.data[k];
+            if (k == n.result::usize) { sole = only_use(st, v, parent); }
+            or                        { sole = value(st, v).uses.len == 0; }
+            k = k + 1;
+        }
+        val clean: bool = pure(xd.opcode);
+        if (sole)   { mask = mask | (1u32 << i); }
+        or (!clean) { ret opt[u32].none{}; }
+        if (!clean) {
+            val from: u32 = st.position.data[x.index] + 1;
+            val to:   u32 = st.position.data[mt.nodes[0].index];
+            if (st.impure.data[to] != st.impure.data[from]) { ret opt[u32].none{}; }
+        }
+        i = i + 1;
+    }
+    ret opt[u32].some{mask};
+}
+
+# whether a source can stand at operand `at` of an emitted instruction
+fun admitted(st: *State, mt: *Match, e: *Emit, at: u32, s: Source) res[bool, Error] {
+    if (sel s.bits || sel s.derived) {
+        var r: Ref = Ref.unstated{};
+        if (sel s.bits)    { r = s.bits; }
+        if (sel s.derived) { r = s.derived.of; }
+        val got: res[opt[i64], Error] = ref_bits(st, mt, r);
+        if (sel got.err)     { ret res[bool, Error].err{got.err}; }
+        if (sel got.ok.none) { ret res[bool, Error].ok{false}; }
+        var x: i64 = got.ok.some;
+        if (sel s.derived) { x = s.derived.hook(x); }
+        ret res[bool, Error].ok{mi.fits(e.opcode, at, x)};
+    }
+    if (sel s.literal) { ret res[bool, Error].ok{mi.fits(e.opcode, at, s.literal)}; }
+    if (sel s.symbol) {
+        val v: opt[id.Value] = ref_at(st, mt, s.symbol.of);
+        if (sel v.none) { ret res[bool, Error].ok{false}; }
+        val c: res[opt[ConstantData], Error] = constant_of(st, v.some);
+        if (sel c.err) { ret res[bool, Error].err{c.err}; }
+        ret res[bool, Error].ok{sel c.ok.some && sel c.ok.some.address};
+    }
+    if (sel s.value) {
+        val v: opt[id.Value] = operand_at(st, mt, s.value);
+        ret res[bool, Error].ok{sel v.some};
+    }
+    if (sel s.fresh) {
+        val v: opt[id.Value] = ref_at(st, mt, s.fresh.like);
+        ret res[bool, Error].ok{sel v.some};
+    }
+    if (sel s.result) {
+        if (mt.count == 0) { ret res[bool, Error].ok{s.result == 0}; }
+        val d: *InstructionData = instruction(st, mt.nodes[0]);
+        ret res[bool, Error].ok{s.result::usize < d.results.len};
+    }
+    if (sel s.target) {
+        if (mt.count == 0) { ret res[bool, Error].ok{false}; }
+        val d: *InstructionData = instruction(st, mt.nodes[0]);
+        ret res[bool, Error].ok{s.target::usize < d.edges.len};
+    }
+    ret res[bool, Error].ok{false};
+}
+
+# whether a rule's guard holds of a match: its type tests, its sources, the
+# extensions its rows require and its hook, in that order
+fun guard(st: *State, r: *Rule, mt: *Match) res[bool, Error] {
+    var t: u32 = 0;
+    for (t < r.tests.len) {
+        val test: *rule.Test    = ?r.tests.at[t];
+        val v:    opt[id.Value] = ref_at(st, mt, test.at);
+        if (sel v.none) { ret res[bool, Error].ok{false}; }
+        var ty: Type = value(st, v.some).type;
+        if (test.lanes) {
+            val s: res[types.Shape, types.Error] = types.shape(?st.m.types, ty);
+            if (sel s.err)          { ret res[bool, Error].err{Error.types{s.err}}; }
+            if (!(sel s.ok.vector)) { ret res[bool, Error].ok{false}; }
+            ty = s.ok.vector.element;
+        }
+        val held: res[bool, types.Error] = ir.within(?st.m.types, test.class, ty);
+        if (sel held.err) { ret res[bool, Error].err{Error.types{held.err}}; }
+        if (!held.ok)     { ret res[bool, Error].ok{false}; }
+        t = t + 1;
+    }
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *Emit = ?r.expansion.at[e];
+        if (sel emit.opcode.row && !extension.admits(st.s.selection, emit.opcode.row.requires)) { ret res[bool, Error].ok{false}; }
+        var k: u32 = 0;
+        for (k < emit.operands.len) {
+            val ok: res[bool, Error] = admitted(st, mt, emit, k, emit.operands.at[k]);
+            if (sel ok.err) { ret ok; }
+            if (!ok.ok)     { ret ok; }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+    if (r.hook != nil && !r.hook(mt)) { ret res[bool, Error].ok{false}; }
+    ret res[bool, Error].ok{true};
+}
+
+fun commutative(r: *Rule) u32 {
+    var mask: u32 = 0;
+    var i:    u32 = 0;
+    for (i < r.nodes.len) {
+        if (algebra.algebra(r.nodes.at[i].opcode).commutative) { mask = mask | (1u32 << i); }
+        i = i + 1;
+    }
+    ret mask;
+}
+
+fun unmatched_of(st: *State, i: id.Instruction, op: Operation) Unmatched {
+    val d: *InstructionData = instruction(st, i);
+    var u: Unmatched;
+    u.operation     = op;
+    u.instruction   = i;
+    u.operand_count = d.operands.len::u32;
+    u.result_count  = d.results.len::u32;
+    var k: usize = 0;
+    for (k < d.operands.len && k < $length_of(ir.Operands)) {
+        u.operands[k] = value(st, d.operands.data[k]).type;
+        k             = k + 1;
+    }
+    k = 0;
+    for (k < d.results.len && k < $length_of(ir.Results)) {
+        u.results[k] = value(st, d.results.data[k]).type;
+        k            = k + 1;
+    }
+    ret u;
+}
+
+# the least cost rule for an instruction whose pattern matches and guard
+# holds, the first in table order among rules of one cost
+fun choose(st: *State, i: id.Instruction) res[Choice, Error] {
+    val op: ir.Opcode = instruction(st, i).opcode;
+    var mt: Match;
+    mt.module   = st.m;
+    mt.function = st.f;
+    mt.target   = st.s.target;
+    var k: u32 = st.s.first.data[op.index];
+    for (k < st.s.first.data[op.index + 1]) {
+        val index: u32   = st.s.order.data[k];
+        val r:     *Rule = ?st.s.table.rules.at[index];
+        val swaps: u32   = commutative(r);
+        var mask:  u32   = 0;
+        for {
+            val hit: res[bool, Error] = matches(st, r, i, mask, ?mt);
+            if (sel hit.err) { ret res[Choice, Error].err{hit.err}; }
+            if (hit.ok) {
+                val eaten: opt[u32] = consumes(st, r, ?mt);
+                if (sel eaten.some) {
+                    val held: res[bool, Error] = guard(st, r, ?mt);
+                    if (sel held.err) { ret res[Choice, Error].err{held.err}; }
+                    if (held.ok)      { ret res[Choice, Error].ok{Choice{rule: index, found: mt, consumes: eaten.some}}; }
+                }
+            }
+            if (mask == swaps) { brk; }
+            mask = ((mask | ~swaps) + 1) & swaps;
+        }
+        k = k + 1;
+    }
+    ret res[Choice, Error].err{Error.unmatched{unmatched_of(st, i, Operation.opcode{op})}};
+}
+
+# the class the table holds a type in
+fun class_for(st: *State, ty: Type) res[Class, Error] {
+    val grown: err[Error] = grow(?st.held, ty.index::usize + 1, NONE);
+    if (sel grown.err) { ret res[Class, Error].err{grown.err}; }
+    var at: u32 = st.held.data[ty.index];
+    if (at == NONE) {
+        var h: u32 = 0;
+        for (at == NONE && h < st.s.table.holds.len) {
+            val got: res[bool, types.Error] = ir.within(?st.m.types, st.s.table.holds.at[h].class, ty);
+            if (sel got.err) { ret res[Class, Error].err{Error.types{got.err}}; }
+            if (got.ok)      { at = h; }
+            h = h + 1;
+        }
+        if (at == NONE) { ret res[Class, Error].err{Error.unheld{ty}}; }
+        st.held.data[ty.index] = at;
+    }
+    val holder: rule.Holder = st.s.table.holds.at[at].holder;
+    if (sel holder.hardware) { ret res[Class, Error].ok{class.hardware(mf.file(st.out), holder.hardware)}; }
+    ret res[Class, Error].ok{Class.memory{holder.memory}};
+}
+
+# a new virtual register for a value of a type
+fun virtual(st: *State, ty: Type, secret: bool) res[u32, Error] {
+    val k: res[Class, Error] = class_for(st, ty);
+    if (sel k.err) { ret res[u32, Error].err{k.err}; }
+    val made: res[Virtual, mf.Error] = mf.virtual(st.out, k.ok);
+    if (sel made.err) { ret res[u32, Error].err{Error.machine{made.err}}; }
+    val p: res[usize, allocator.Error] = vector.push[bool](?st.secret, secret);
+    if (sel p.err) { ret res[u32, Error].err{Error.alloc{p.err}}; }
+    ret res[u32, Error].ok{made.ok.index};
+}
+
+# the virtual register a value is held in, made when first asked for
+fun register(st: *State, v: id.Value) res[u32, Error] {
+    if (st.registers.data[v.index] != NONE) { ret res[u32, Error].ok{st.registers.data[v.index]}; }
+    val d: *ValueData = value(st, v);
+    if (sel d.def.removed) { ret res[u32, Error].err{Error.removed{v}}; }
+    val made: res[u32, Error] = virtual(st, d.type, d.secret);
+    if (sel made.err) { ret made; }
+    st.registers.data[v.index] = made.ok;
+    ret made;
+}
+
+fun put(st: *State, b: u32, op: mi.Opcode, operands: *Operand, count: u32, md: Metadata, declassifies: bool) err[Error] {
+    val made: res[Instruction, mf.Error] = mf.append(st.out, Block{index: b}, op, Slice[Operand]{data: operands, size: count::usize}, md, declassifies);
+    if (sel made.err) { ret err[Error].err{Error.machine{made.err}}; }
+    ret err[Error].ok{};
+}
+
+fun copy(st: *State, b: u32, dest: u32, source: u32, md: Metadata) err[Error] {
+    var ops: [2]Operand = [2]Operand{Operand.virtual{Virtual{index: dest}}, Operand.virtual{Virtual{index: source}}};
+    var m:   Metadata   = md;
+    m.secret = st.secret.data[source];
+    ret put(st, b, mi.Opcode.pseudo{pseudo.COPY}, ?ops[0], 2, m, false);
+}
+
+# materialise a constant into register `dest` by the least cost constant rule whose guard holds
+fun materialise(st: *State, b: u32, v: id.Value, dest: u32, user: id.Instruction, md: Metadata) err[Error] {
+    var mt: Match;
+    mt.module   = st.m;
+    mt.function = st.f;
+    mt.target   = st.s.target;
+    mt.count    = 0;
+    mt.subject  = v;
+    var k: u32 = 0;
+    for (k < st.s.table.constants.len) {
+        val r:    *Rule            = ?st.s.table.constants.at[st.s.constants.data[k]];
+        val held: res[bool, Error] = guard(st, r, ?mt);
+        if (sel held.err) { ret err[Error].err{held.err}; }
+        if (held.ok) {
+            var m: Metadata = md;
+            m.secret = false;
+            ret expand(st, b, r, ?mt, dest, m, false);
+        }
+        k = k + 1;
+    }
+    var u: Unmatched;
+    u.operation     = Operation.constant{};
+    u.instruction   = user;
+    u.operands[0]   = value(st, v).type;
+    u.operand_count = 1;
+    ret err[Error].err{Error.unmatched{u}};
+}
+
+# emit a rule's expansion into block `b`
+# ---
+# dest: the register a materialisation rule builds into, NONE for any other
+fun expand(st: *State, b: u32, r: *Rule, mt: *Match, dest: u32, md: Metadata, declassifies: bool) err[Error] {
+    var fresh: [rule.MAX_FRESH]u32;
+    var f:     u32 = 0;
+    for (f < rule.MAX_FRESH) {
+        fresh[f] = NONE;
+        f        = f + 1;
+    }
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *Emit = ?r.expansion.at[e];
+        var ops:  [rows.MAX_OPERANDS]Operand;
+        var k:    u32   = 0;
+        for (k < emit.operands.len) {
+            val s: Source = emit.operands.at[k];
+            if (sel s.value) {
+                val got: opt[id.Value] = operand_at(st, mt, s.value);
+                if (sel got.none) { ret err[Error].err{defect(NONE, false, UNKNOWN_NODE)}; }
+                val v: id.Value   = got.some;
+                val d: *ValueData = value(st, v);
+                if (sel d.def.constant) {
+                    val t: res[u32, Error] = virtual(st, d.type, false);
+                    if (sel t.err) { ret err[Error].err{t.err}; }
+                    val built: err[Error] = materialise(st, b, v, t.ok, mt.nodes[0], md);
+                    if (sel built.err) { ret built; }
+                    ops[k] = Operand.virtual{Virtual{index: t.ok}};
+                }
+                or {
+                    val got: res[u32, Error] = register(st, v);
+                    if (sel got.err) { ret err[Error].err{got.err}; }
+                    ops[k] = Operand.virtual{Virtual{index: got.ok}};
+                }
+            }
+            or (sel s.result) {
+                if (mt.count == 0) { ops[k] = Operand.virtual{Virtual{index: dest}}; }
+                or {
+                    val got: res[u32, Error] = register(st, instruction(st, mt.nodes[0]).results.data[s.result]);
+                    if (sel got.err) { ret err[Error].err{got.err}; }
+                    ops[k] = Operand.virtual{Virtual{index: got.ok}};
+                }
+            }
+            or (sel s.bits) {
+                val got: res[i64, Error] = immediate(st, mt, s.bits);
+                if (sel got.err) { ret err[Error].err{got.err}; }
+                ops[k] = Operand.immediate{got.ok};
+            }
+            or (sel s.derived) {
+                val got: res[i64, Error] = immediate(st, mt, s.derived.of);
+                if (sel got.err) { ret err[Error].err{got.err}; }
+                ops[k] = Operand.immediate{s.derived.hook(got.ok)};
+            }
+            or (sel s.symbol) {
+                val c: res[ConstantData, Error] = address(st, mt, s.symbol.of);
+                if (sel c.err) { ret err[Error].err{c.err}; }
+                val at: ConstantData = c.ok;
+                if (!(sel at.address)) { ret err[Error].err{defect(NONE, false, UNSTATED)}; }
+                ops[k] = Operand.symbol{Symbol{symbol: at.address.symbol, addend: at.address.offset, kind: s.symbol.kind}};
+            }
+            or (sel s.literal) { ops[k] = Operand.immediate{s.literal}; }
+            or (sel s.fresh) {
+                if (fresh[s.fresh.index] == NONE) {
+                    val like: opt[id.Value] = ref_at(st, mt, s.fresh.like);
+                    if (sel like.none) { ret err[Error].err{defect(NONE, false, UNKNOWN_NODE)}; }
+                    val t: res[u32, Error] = virtual(st, value(st, like.some).type, md.secret);
+                    if (sel t.err) { ret err[Error].err{t.err}; }
+                    fresh[s.fresh.index] = t.ok;
+                }
+                ops[k] = Operand.virtual{Virtual{index: fresh[s.fresh.index]}};
+            }
+            or (sel s.target) { ops[k] = Operand.block{Block{index: st.targets.data[s.target]}}; }
+            k = k + 1;
+        }
+        val placed: err[Error] = put(st, b, emit.opcode, ?ops[0], emit.operands.len, md, declassifies);
+        if (sel placed.err) { ret placed; }
+        e = e + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# emit one parallel copy into block `b`, the moves in `st.moves`
+#
+# a destination is written only once no other move still reads it, and a
+# cycle is broken by saving one destination's value in a temporary first.
+# a constant reads no register, so constants are materialised last.
+fun sequence(st: *State, b: u32, user: id.Instruction, md: Metadata) err[Error] {
+    val grown: err[Error] = grow(?st.loc, st.out.virtuals.len, NONE);
+    if (sel grown.err) { ret grown; }
+    val again: err[Error] = grow(?st.pred, st.out.virtuals.len, NONE);
+    if (sel again.err) { ret again; }
+    vector.clear[u32](?st.ready);
+    vector.clear[u32](?st.todo);
+    var i: usize = 0;
+    for (i < st.moves.len) {
+        val mv: Move = st.moves.data[i];
+        if (mv.source != NONE) {
+            st.loc.data[mv.dest]    = NONE;
+            st.pred.data[mv.source] = NONE;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < st.moves.len) {
+        val mv: Move = st.moves.data[i];
+        if (mv.source != NONE) {
+            st.loc.data[mv.source] = mv.source;
+            st.pred.data[mv.dest]  = mv.source;
+            val p: err[Error] = push_u32(?st.todo, mv.dest);
+            if (sel p.err) { ret p; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < st.moves.len) {
+        val mv: Move = st.moves.data[i];
+        if (mv.source != NONE && st.loc.data[mv.dest] == NONE) {
+            val p: err[Error] = push_u32(?st.ready, mv.dest);
+            if (sel p.err) { ret p; }
+        }
+        i = i + 1;
+    }
+    for (st.todo.len > 0) {
+        for (st.ready.len > 0) {
+            val popped: opt[u32] = vector.pop[u32](?st.ready);
+            if (sel popped.none) { brk; }
+            val dest:   u32        = popped.some;
+            val from:   u32        = st.pred.data[dest];
+            val holder: u32        = st.loc.data[from];
+            val moved:  err[Error] = copy(st, b, dest, holder, md);
+            if (sel moved.err) { ret moved; }
+            st.loc.data[from] = dest;
+            if (from == holder && st.pred.data[from] != NONE) {
+                val p: err[Error] = push_u32(?st.ready, from);
+                if (sel p.err) { ret p; }
+            }
+        }
+        val popped: opt[u32] = vector.pop[u32](?st.todo);
+        if (sel popped.none) { brk; }
+        val dest: u32 = popped.some;
+        if (st.loc.data[st.pred.data[dest]] != dest) {
+            val k:     Class                  = mf.class_of(st.out, Virtual{index: dest});
+            val saved: res[Virtual, mf.Error] = mf.virtual(st.out, k);
+            if (sel saved.err) { ret err[Error].err{Error.machine{saved.err}}; }
+            val p: res[usize, allocator.Error] = vector.push[bool](?st.secret, st.secret.data[dest]);
+            if (sel p.err) { ret alloc_err(p.err); }
+            val moved: err[Error] = copy(st, b, saved.ok.index, dest, md);
+            if (sel moved.err) { ret moved; }
+            st.loc.data[dest] = saved.ok.index;
+            val q: err[Error] = push_u32(?st.ready, dest);
+            if (sel q.err) { ret q; }
+        }
+    }
+    i = 0;
+    for (i < st.moves.len) {
+        val mv: Move = st.moves.data[i];
+        if (mv.source == NONE) {
+            val built: err[Error] = materialise(st, b, mv.value, mv.dest, user, md);
+            if (sel built.err) { ret built; }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the moves an edge's arguments make into its target's parameters
+fun moves_of(st: *State, e: *Edge) err[Error] {
+    vector.clear[Move](?st.moves);
+    val params: *vector.Vector[id.Value] = ?st.body.blocks.data[e.block.index].parameters;
+    var i:      usize                    = 0;
+    for (i < e.arguments.len) {
+        val arg:   id.Value = e.arguments.data[i];
+        val param: id.Value = params.data[i];
+        if (arg.index != param.index) {
+            val d: res[u32, Error] = register(st, param);
+            if (sel d.err) { ret err[Error].err{d.err}; }
+            var source: u32        = NONE;
+            val ad:     *ValueData = value(st, arg);
+            if (!(sel ad.def.constant)) {
+                val s: res[u32, Error] = register(st, arg);
+                if (sel s.err) { ret err[Error].err{s.err}; }
+                source = s.ok;
+            }
+            val p: res[usize, allocator.Error] = vector.push[Move](?st.moves, Move{dest: d.ok, source: source, value: arg});
+            if (sel p.err) { ret alloc_err(p.err); }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether a matched node reads a parameter of block `k`
+fun reads_parameter(st: *State, mt: *Match, k: id.Block) bool {
+    var n: u32 = 0;
+    for (n < mt.count) {
+        val d: *InstructionData = instruction(st, mt.nodes[n]);
+        var i: usize            = 0;
+        for (i < d.operands.len) {
+            val def: *ValueData = value(st, d.operands.data[i]);
+            if (sel def.def.parameter && def.def.parameter.block.index == k.index) { ret true; }
+            i = i + 1;
+        }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# resolve the root's edges to machine blocks, emitting each edge's parallel
+# copy before the root when it has one edge whose target it does not read,
+# and in a block of its own ended by the table's jump otherwise
+fun edges(st: *State, b: u32, c: *Choice, md: Metadata) err[Error] {
+    val root: id.Instruction   = c.found.nodes[0];
+    val d:    *InstructionData = instruction(st, root);
+    vector.clear[u32](?st.targets);
+    var k: usize = 0;
+    for (k < d.edges.len) {
+        val e:  *Edge      = ?d.edges.data[k];
+        val to: u32        = st.blocks.data[e.block.index];
+        val p:  err[Error] = push_u32(?st.targets, to);
+        if (sel p.err) { ret p; }
+        val listed: err[Error] = moves_of(st, e);
+        if (sel listed.err) { ret listed; }
+        if (st.moves.len > 0) {
+            if (d.edges.len == 1 && !reads_parameter(st, ?c.found, e.block)) {
+                val done: err[Error] = sequence(st, b, root, md);
+                if (sel done.err) { ret done; }
+            }
+            or {
+                val made: res[Block, mf.Error] = mf.block(st.out);
+                if (sel made.err) { ret err[Error].err{Error.machine{made.err}}; }
+                val own:  u32        = made.ok.index;
+                val done: err[Error] = sequence(st, own, root, md);
+                if (sel done.err) { ret done; }
+                val back: err[Error] = jump(st, own, to, md);
+                if (sel back.err) { ret back; }
+                st.targets.data[k] = own;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# emit the table's jump to machine block `to` at the end of block `b`
+fun jump(st: *State, b: u32, to: u32, md: Metadata) err[Error] {
+    val emit: *Emit = ?st.s.table.jump.at[0];
+    var ops:  [rows.MAX_OPERANDS]Operand;
+    var k:    u32   = 0;
+    for (k < emit.operands.len) {
+        val s: Source = emit.operands.at[k];
+        if (sel s.target)  { ops[k] = Operand.block{Block{index: to}}; }
+        or (sel s.literal) { ops[k] = Operand.immediate{s.literal}; }
+        k = k + 1;
+    }
+    var m: Metadata = md;
+    m.secret = false;
+    ret put(st, b, emit.opcode, ?ops[0], emit.operands.len, m, false);
+}
+
+# choose a rule for every instruction of an ir block, its last first
+fun choose_block(st: *State, k: id.Block) err[Error] {
+    val list: *vector.Vector[id.Instruction] = ?st.body.blocks.data[k.index].instructions;
+    vector.clear[Choice](?st.choices);
+    vector.clear[u32](?st.impure);
+    val first: err[Error] = push_u32(?st.impure, 0);
+    if (sel first.err) { ret first; }
+    var i: usize = 0;
+    for (i < list.len) {
+        val at: id.Instruction = list.data[i];
+        st.position.data[at.index] = i::u32;
+        var count: u32 = st.impure.data[i];
+        if (!pure(instruction(st, at).opcode)) { count = count + 1; }
+        val p: err[Error] = push_u32(?st.impure, count);
+        if (sel p.err) { ret p; }
+        i = i + 1;
+    }
+    i = list.len;
+    for (i > 0) {
+        i = i - 1;
+        val at: id.Instruction = list.data[i];
+        if (!st.consumed.data[at.index]) {
+            val got: res[Choice, Error] = choose(st, at);
+            if (sel got.err) { ret err[Error].err{got.err}; }
+            val c: Choice = got.ok;
+            var n: u32    = 1;
+            for (n < c.found.count) {
+                if (((c.consumes >> n) & 1) != 0) { st.consumed.data[c.found.nodes[n].index] = true; }
+                or                                { st.shared.data[c.found.nodes[n].index] = true; }
+                n = n + 1;
+            }
+            val p: res[usize, allocator.Error] = vector.push[Choice](?st.choices, c);
+            if (sel p.err) { ret alloc_err(p.err); }
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# emit the chosen expansions of an ir block in order
+fun emit_block(st: *State, k: id.Block) err[Error] {
+    val b: u32   = st.blocks.data[k.index];
+    var i: usize = st.choices.len;
+    for (i > 0) {
+        i = i - 1;
+        val c:      *Choice          = ?st.choices.data[i];
+        val d:      *InstructionData = instruction(st, c.found.nodes[0]);
+        val r:      *Rule            = ?st.s.table.rules.at[c.rule];
+        val decl:   bool             = declassifies(d.opcode);
+        val routed: err[Error]       = edges(st, b, c, d.metadata);
+        if (sel routed.err) { ret routed; }
+        val done: err[Error] = expand(st, b, r, ?c.found, NONE, d.metadata, decl);
+        if (sel done.err) { ret done; }
+    }
+    ret err[Error].ok{};
+}
+
+fun run(st: *State) err[Error] {
+    val values: err[Error] = grow(?st.registers, st.body.values.len, NONE);
+    if (sel values.err) { ret values; }
+    val places: err[Error] = grow(?st.position, st.body.instructions.len, 0);
+    if (sel places.err) { ret places; }
+    val eaten: err[Error] = grow_bool(?st.consumed, st.body.instructions.len);
+    if (sel eaten.err) { ret eaten; }
+    val read: err[Error] = grow_bool(?st.shared, st.body.instructions.len);
+    if (sel read.err) { ret read; }
+    var k: usize = 0;
+    for (k < st.body.blocks.len) {
+        if (st.body.blocks.data[k].erased) {
+            val p: err[Error] = push_u32(?st.blocks, NONE);
+            if (sel p.err) { ret p; }
+        }
+        or {
+            val made: res[Block, mf.Error] = mf.block(st.out);
+            if (sel made.err) { ret err[Error].err{Error.machine{made.err}}; }
+            val p: err[Error] = push_u32(?st.blocks, made.ok.index);
+            if (sel p.err) { ret p; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < st.body.blocks.len) {
+        if (!st.body.blocks.data[k].erased) {
+            val chosen: err[Error] = choose_block(st, id.Block{index: k::u32});
+            if (sel chosen.err) { ret chosen; }
+            val emitted: err[Error] = emit_block(st, id.Block{index: k::u32});
+            if (sel emitted.err) { ret emitted; }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# select an ir function into a new machine function
+# ---
+# s:   the selector
+# m:   the module
+# f:   the function, which has a body
+# ret: the machine function, or why selection refused, with nothing left made
+pub fun select(s: *Selector, m: *Module, f: id.Function) res[mf.Function, Error] {
+    val body: res[*Body, module.Error] = module.body(m, f);
+    if (sel body.err) { ret res[mf.Function, Error].err{Error.module{body.err}}; }
+    var out: mf.Function = mf.init(s.a, s.set);
+    var st:  State       = State{
+        s:         s,
+        m:         m,
+        f:         f,
+        body:      body.ok,
+        out:       ?out,
+        registers: vector.init[u32](s.a),
+        secret:    vector.init[bool](s.a),
+        held:      vector.init[u32](s.a),
+        blocks:    vector.init[u32](s.a),
+        consumed:  vector.init[bool](s.a),
+        shared:    vector.init[bool](s.a),
+        position:  vector.init[u32](s.a),
+        impure:    vector.init[u32](s.a),
+        choices:   vector.init[Choice](s.a),
+        targets:   vector.init[u32](s.a),
+        moves:     vector.init[Move](s.a),
+        loc:       vector.init[u32](s.a),
+        pred:      vector.init[u32](s.a),
+        ready:     vector.init[u32](s.a),
+        todo:      vector.init[u32](s.a),
+    };
+    val ran: err[Error] = run(?st);
+    release(?st);
+    if (sel ran.err) {
+        mf.dnit(?out);
+        ret res[mf.Function, Error].err{ran.err};
+    }
+    ret res[mf.Function, Error].ok{out};
+}
