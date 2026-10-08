@@ -33,9 +33,11 @@ An instruction is refused, naming the function, the instruction and the operand,
 
 ## Limits
 
-- Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (masc#41).
-- The object is checked in memory, structurally. Writing it as ELF and reading it back waits for mink#23.
+- Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (#197, masc#41).
+- The object is checked in memory, structurally. Writing it as ELF and reading it back is #198, which waits for mink#23.
 - Function symbols are global with default visibility and carry no size, since IR functions state neither linkage nor visibility (#181) and the size is unknown until masc lays the section out.
-- Debug line and location facts are not carried: masc has no line directives.
-- Global data is not emitted, so the address of a global is refused.
-- A `pseudo copy` between registers is refused: no stage turns it into the target's move yet.
+- Debug line and location facts are not carried until masc states its location API (#200, masc#42).
+- Global data is not emitted, so the address of a global is refused (#196, #181).
+- A `pseudo copy` or `parallel_copy` between registers is refused: no stage turns it into the target's move yet (#195).
+- Memory-shaped operand positions are refused (#43).
+- mirl computes a row's position among the catalog's for `relax.find` until masc keys relaxation by row (#199, masc#139).
