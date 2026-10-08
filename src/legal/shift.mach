@@ -1,0 +1,206 @@
+# shift bounding: a shift whose count the hardware reduces is given a count
+# below the width, and marked so selection emits the plain instruction
+#
+# the ir gives a shift by the width or more one meaning on every target: zero,
+# or the sign fill of an arithmetic right shift. a target whose shift takes the
+# count modulo the width, or leaves it undefined, would give another, so the
+# pass saturates the count in the ir. a count the range analysis proves below
+# the width keeps the bare shift. any other count is bounded around a mask that
+# is all ones exactly when it is in range: a shift that fills with zero is
+# taken by the count masked to the width and the mask, and an arithmetic right
+# shift is taken by the count with every bit set when it is out of range, masked
+# to the width, which fills with the sign. a vector is bounded lane by lane the
+# same way, with no range proof for its count. the widths are powers of two, so
+# the mask to the width is the width less one.
+#
+# the mark says the shift's count is below its width. it is recomputed from
+# scratch on every run: a shift the analysis cannot prove is rebuilt around a
+# count it can, so the mark never outlives its proof. the pass applies where
+# the target's shifts wrap or are undefined and changes nothing where they
+# saturate as the ir does.
+#
+# the bounding is a compare, an extension, a negation, an and, an or and the
+# shift, with no branch and no memory access, so it keeps constant time. a
+# result keeps its secrecy by the secrecy of the instructions it is made of.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+
+use mirl.fold.word;
+use mirl.ir.body;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Opcode;
+use mirl.ir.opcode.Row;
+use mirl.ir.type.Type;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.legal.emit.Site;
+use mirl.pass.analysis;
+use mirl.pass.analysis.range;
+use mirl.pass.analysis.range.Range;
+use mirl.pass.analysis.range.Ranges;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.target.Capabilities;
+
+# the pass: it adds instructions in front of the shifts it rebuilds and never
+# touches an edge or a block
+pub val SHIFT_BOUND: Pass = Pass{name: "shift bound", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
+
+# whether a target's shifts need their count bounded
+fun wanted(caps: *Capabilities) bool {
+    ret sel caps.arithmetic.shifts.wraps || sel caps.arithmetic.shifts.undefined;
+}
+
+# one visit
+# ---
+# site:    the function being rewritten
+# ranges:  the ranges of its values
+# changed: the function was changed
+rec Work {
+    site:    Site;
+    ranges:  *Ranges;
+    changed: bool;
+}
+
+# mark a shift whose count is below its width
+fun mark(w: *Work, i: Instruction) err[Why] {
+    var md: Metadata = w.site.b.instructions.data[i.index].metadata;
+    if (md.flags.bounded) { ret err[Why].ok{}; }
+    md.flags.bounded = true;
+    val r: err[Why] = failure.edit(body.set_metadata(w.site.m, w.site.f, i, md));
+    if (sel r.err) { ret r; }
+    w.changed = true;
+    ret err[Why].ok{};
+}
+
+# the one value a bit sets in every lane where the count is out of range
+fun above(s: *Site, count: Value, width: Value, ty: Type, bits: u32) Value {
+    val out: Value = emit.binary(s, opcode.GE_U, count, width);
+    if (bits == 1) { ret out; }
+    ret emit.unary(s, opcode.NEG, emit.convert(s, opcode.EXT_U, out, ty));
+}
+
+# the one value a bit sets in every lane where the count is in range
+fun below(s: *Site, count: Value, width: Value, ty: Type, bits: u32) Value {
+    val inside: Value = emit.binary(s, opcode.LT_U, count, width);
+    if (bits == 1) { ret inside; }
+    ret emit.unary(s, opcode.NEG, emit.convert(s, opcode.EXT_U, inside, ty));
+}
+
+# rebuild a shift around a count that is below its width, which stands in the
+# shift's slot. the instructions made go ahead of it, and their number is given
+fun saturate(w: *Work, k: Block, n: u32, i: Instruction, lane: Lane, fills: bool) res[u32, Why] {
+    val s:     *Site            = ?w.site;
+    val d:     *InstructionData = ?s.b.instructions.data[i.index];
+    val code:  Opcode           = d.opcode;
+    val x:     Value            = d.operands.data[0];
+    val count: Value            = d.operands.data[1];
+    val ty:    Type             = s.b.values.data[x.index].type;
+
+    val width: res[Value, Why] = emit.constant(s, ty, word.small(lane.bits::u64));
+    if (sel width.err) { ret res[u32, Why].err{width.err}; }
+    val last: res[Value, Why] = emit.constant(s, ty, word.small((lane.bits - 1)::u64));
+    if (sel last.err) { ret res[u32, Why].err{last.err}; }
+
+    emit.open(s, i, k, n);
+    if (fills) {
+        val out:     Value = above(s, count, width.ok, ty, lane.bits);
+        val bounded: Value = emit.binary(s, opcode.AND, emit.binary(s, opcode.OR, count, out), last.ok);
+        emit.close(s, i);
+        emit.flags(s, emit.BOUNDED);
+        emit.binary(s, code, x, bounded);
+    }
+    or {
+        val within:  Value = below(s, count, width.ok, ty, lane.bits);
+        val bounded: Value = emit.binary(s, opcode.AND, count, last.ok);
+        emit.flags(s, emit.BOUNDED);
+        val shifted: Value = emit.binary(s, code, x, bounded);
+        emit.close(s, i);
+        emit.binary(s, opcode.AND, shifted, within);
+    }
+    val built: err[Why] = emit.done(s);
+    if (sel built.err) { ret res[u32, Why].err{built.err}; }
+    w.changed = true;
+    ret res[u32, Why].ok{s.made};
+}
+
+# bound the instruction at an index of a block if it is a shift, answering how
+# many instructions it was given ahead of it
+fun bound(w: *Work, k: Block, n: u32, i: Instruction) res[u32, Why] {
+    val d:   *InstructionData = ?w.site.b.instructions.data[i.index];
+    val row: opt[Row]         = opcode.row(d.opcode);
+    if (sel row.none)                              { ret res[u32, Why].ok{0}; }
+    if (sel row.some.overshift.none)               { ret res[u32, Why].ok{0}; }
+    if (d.operands.len != 2 || d.results.len != 1) { ret res[u32, Why].err{Why.reason{"a shift that does not take a value and a count"}}; }
+    val fills: bool                = sel row.some.overshift.sign;
+    val ty:    Type                = w.site.b.values.data[d.operands.data[0].index].type;
+    val got:   res[opt[Lane], Why] = emit.lane_of(w.site.m, ty);
+    if (sel got.err)     { ret res[u32, Why].err{got.err}; }
+    if (sel got.ok.none) { ret res[u32, Why].err{Why.reason{"a shift of a value that is no integer"}}; }
+    val lane: Lane = got.ok.some;
+    if (lane.lanes == 0) {
+        val r: res[Range, Why] = range.range_at(w.ranges, d.operands.data[1], k);
+        if (sel r.err) { ret res[u32, Why].err{r.err}; }
+        if (word.compare(r.ok.hi, word.small(lane.bits::u64)) < 0) {
+            val m: err[Why] = mark(w, i);
+            if (sel m.err) { ret res[u32, Why].err{m.err}; }
+            ret res[u32, Why].ok{0};
+        }
+    }
+    ret saturate(w, k, n, i, lane, fills);
+}
+
+# bound the shifts of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val ranges: res[*Ranges, Why] = analysis.ranges_of(c.cache, u.f);
+    if (sel ranges.err) { ret res[bool, Why].err{ranges.err}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var w: Work  = Work{site: emit.init(c.m, u.f, got.ok, ?scratch), ranges: ranges.ok, changed: false};
+    var k: usize = 0;
+    for (k < got.ok.blocks.len) {
+        if (!got.ok.blocks.data[k].erased) {
+            var n: usize = 0;
+            for (n < got.ok.blocks.data[k].instructions.len) {
+                arena.reset(?ar);
+                val i:  Instruction   = got.ok.blocks.data[k].instructions.data[n];
+                val at: res[u32, Why] = bound(?w, Block{index: k::u32}, n::u32, i);
+                if (sel at.err) { ret res[bool, Why].err{at.err}; }
+                n = n + at.ok::usize + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{w.changed};
+}
