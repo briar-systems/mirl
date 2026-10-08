@@ -1,0 +1,590 @@
+# loop invariant code motion: a computation whose operands all stand outside a
+# loop runs once before it instead of once per trip
+#
+# loops are taken innermost first, so what leaves an inner loop may leave the
+# loop around it too. an instruction moves to the end of the loop's
+# preheader, the one block that enters the header from outside. a loop entered
+# from several blocks, or through a branch that decides between blocks, gets
+# one by giving every outside edge a block of its own to enter through, and a
+# loop whose header is the entry has no outside edge and stays as it is.
+#
+# an instruction moves when it is plain, every operand is a constant, a value
+# defined outside the loop or the result of an instruction that moves, and its
+# row says it may:
+#
+# - a row that is speculatable moves anywhere, since running it where its
+#   result is not needed is harmless.
+# - a row with no memory effect and stated traps moves only when no trap can
+#   happen where it now runs. a zero divisor, or a signed division overflow,
+#   is excluded by the value ranges at the end of every block that enters the
+#   loop, which hold in the preheader. a trap the ranges do not exclude, or
+#   one that is not a range fact such as a fault, lets the instruction move
+#   only when it stands in the header before any instruction that traps or
+#   writes and stays: the header runs on every entry to the loop, so the trap
+#   would have come first there anyway, in the same order with respect to
+#   everything observable. a row that states no trap and is not speculatable,
+#   such as an allocation, never moves.
+# - a row that only reads memory states a fault, so it follows the header rule
+#   above, and moves only when the memory analysis shows that nothing in the
+#   loop that writes, orders or reaches anywhere may touch what it reads. a
+#   load whose place has no allocation known moves only from a loop with no
+#   such instruction at all. a call, a fence, an atomic or a volatile access is
+#   such an instruction.
+#
+# a volatile or kept instruction never moves, nor an ordered access. the
+# instruction keeps its own metadata record, and the records standing before it
+# stay with the instruction after it, so a record that reads its result keeps
+# reading it, since the result stands at every point it dominated. the pass
+# adds no branch that depends on a value, as a preheader branches
+# unconditionally, so it keeps constant time, and moving an instruction never
+# changes the secrecy of a value.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.body;
+use mirl.ir.cfg.edge;
+use mirl.ir.cfg.edge.Source;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Row;
+use mirl.ir.opcode.row.Traps;
+use mirl.ir.opcode.rule.Trap;
+use types: mirl.ir.type;
+use mirl.ir.value.ValueData;
+use mirl.opt.instance.plain;
+use mirl.opt.instance.reads_only;
+use mirl.opt.instance.row_of;
+use mirl.pass.analysis;
+use mirl.pass.analysis.memory;
+use mirl.pass.analysis.memory.Effect;
+use mirl.pass.analysis.memory.Memory;
+use mirl.pass.analysis.range;
+use mirl.pass.analysis.range.Range;
+use mirl.pass.analysis.range.Ranges;
+use mirl.pass.cache;
+use mirl.pass.failure.Why;
+use mirl.pass.failure.edit;
+use mirl.pass.failure.lost;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+
+# the pass: it moves instructions between blocks and adds blocks only on edges
+# that enter a loop, never to a back edge, so the control flow analyses are
+# dropped whenever it adds one and are valid again when they are next asked
+pub val LICM: Pass = Pass{name: "licm", kind: Kind.optimise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}};
+
+val NONE: u32 = 0xffffffff;
+
+# which fact about a value a trap needs
+val NOT_ZERO:  u8 = 0;
+val NOT_ONES:  u8 = 1;
+val NOT_LEAST: u8 = 2;
+
+# a link in a chain of the loop's instructions that write or order
+# ---
+# at:   the position of its effect
+# next: the next link, or none
+rec Node {
+    at:   u32;
+    next: u32;
+}
+
+# one run over a function
+# ---
+# m, f, b:  the module, the function and its body
+# cache: the cache the analyses are read from
+# l, lp:    the loops and the loop being moved from, valid until the control
+#           flow analyses are dropped
+# mem:      the memory analysis, nil until a load asks for it
+# ranges:   the value ranges, nil until a trap asks for them
+# headers:  the headers of the loops, innermost first
+# marks:    per instruction, whether it is chosen to move
+# picks:    the instructions chosen, in the order they move
+# sources:  the edges into the header from outside the loop
+# outside:  the block each of those edges leaves
+# barriers: the effect of each instruction of the loop that writes or orders
+# nodes:    links of the chains of barriers
+# heads:    for each group of places, the first link of the barriers that touch
+#           it
+# wild:     the first link of the barriers that may touch any group
+# indexed:  barriers, nodes, heads and wild describe the loop
+rec Run {
+    m:        *Module;
+    f:        Function;
+    b:        *Body;
+    cache:    *cache.Cache;
+    l:        *Loops;
+    lp:       u32;
+    mem:      *Memory;
+    ranges:   *Ranges;
+    headers:  vector.Vector[u32];
+    marks:    vector.Vector[u8];
+    picks:    vector.Vector[Instruction];
+    sources:  vector.Vector[Source];
+    outside:  vector.Vector[Block];
+    barriers: vector.Vector[Effect];
+    nodes:    vector.Vector[Node];
+    heads:    map.Map[u64, u32];
+    wild:     u32;
+    indexed:  bool;
+}
+
+fun release_barriers(s: *Run) {
+    var i: usize = 0;
+    for (i < s.barriers.len) {
+        memory.release(?s.barriers.data[i]);
+        i = i + 1;
+    }
+    s.barriers.len = 0;
+}
+
+# forget the loop worked on
+fun reset(s: *Run) {
+    release_barriers(s);
+    s.marks.len   = 0;
+    s.picks.len   = 0;
+    s.sources.len = 0;
+    s.outside.len = 0;
+    s.nodes.len   = 0;
+    map.clear[u64, u32](?s.heads);
+    s.wild    = NONE;
+    s.indexed = false;
+    s.mem     = nil;
+    s.ranges  = nil;
+}
+
+fun drop(s: *Run) {
+    release_barriers(s);
+    vector.dnit[u32](?s.headers);
+    vector.dnit[u8](?s.marks);
+    vector.dnit[Instruction](?s.picks);
+    vector.dnit[Source](?s.sources);
+    vector.dnit[Block](?s.outside);
+    vector.dnit[Effect](?s.barriers);
+    vector.dnit[Node](?s.nodes);
+    map.dnit[u64, u32](?s.heads);
+}
+
+fun need_memory(s: *Run) err[Why] {
+    if (s.mem != nil) { ret err[Why].ok{}; }
+    val got: res[*Memory, Why] = analysis.memory_of(s.cache, s.f);
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    s.mem = got.ok;
+    ret err[Why].ok{};
+}
+
+fun need_ranges(s: *Run) err[Why] {
+    if (s.ranges != nil) { ret err[Why].ok{}; }
+    val got: res[*Ranges, Why] = analysis.ranges_of(s.cache, s.f);
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    s.ranges = got.ok;
+    ret err[Why].ok{};
+}
+
+# whether a value stands outside the loop, or is the result of an instruction
+# chosen to move
+fun invariant(s: *Run, v: Value) bool {
+    val vd: *ValueData = ?s.b.values.data[v.index];
+    if (sel vd.def.constant)  { ret true; }
+    if (sel vd.def.parameter) { ret !loops.contains(s.l, s.lp, vd.def.parameter.block.index); }
+    if (sel vd.def.result) {
+        val at: u32 = vd.def.result.instruction.index;
+        if (s.marks.data[at] != 0) { ret true; }
+        val place: opt[Block] = placed_in(s.b, at);
+        if (sel place.some) { ret !loops.contains(s.l, s.lp, place.some.index); }
+    }
+    ret false;
+}
+
+fun placed_in(b: *Body, i: u32) opt[Block] {
+    val at: *InstructionData = ?b.instructions.data[i];
+    if (sel at.place.placed) { ret opt[Block].some{at.place.placed}; }
+    ret opt[Block].none{};
+}
+
+# whether the ranges of a value at the end of every block entering the loop
+# leave out one value its width has, which is then true in the preheader
+fun excludes(s: *Run, v: Value, which: u8) res[bool, Why] {
+    val shape: res[types.Shape, types.Error] = types.shape(?s.m.types, s.b.values.data[v.index].type);
+    if (sel shape.err)           { ret res[bool, Why].err{Why.ir{module.Error.types{shape.err}}}; }
+    if (!(sel shape.ok.integer)) { ret res[bool, Why].ok{false}; }
+    val width: u32  = shape.ok.integer.width;
+    var x:     Wide = word.zero();
+    if (which == NOT_ONES)  { x = word.ones(width); }
+    if (which == NOT_LEAST) { x = word.least(width); }
+    val ready: err[Why] = need_ranges(s);
+    if (sel ready.err) { ret res[bool, Why].err{ready.err}; }
+    var i: usize = 0;
+    for (i < s.outside.len) {
+        val r: res[Range, Why] = range.range_at(s.ranges, v, s.outside.data[i]);
+        if (sel r.err)            { ret res[bool, Why].err{r.err}; }
+        if (range.holds(r.ok, x)) { ret res[bool, Why].ok{false}; }
+        i = i + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
+
+# whether an instruction's trap cannot happen where it moves to
+fun harmless(s: *Run, d: *InstructionData, t: Trap, header_prefix: bool) res[bool, Why] {
+    if (sel t.zero) {
+        if (header_prefix) { ret res[bool, Why].ok{true}; }
+        ret excludes(s, d.operands.data[t.zero], NOT_ZERO);
+    }
+    if (sel t.overflow) {
+        if (header_prefix) { ret res[bool, Why].ok{true}; }
+        val ones: res[bool, Why] = excludes(s, d.operands.data[t.overflow.divisor], NOT_ONES);
+        if (sel ones.err) { ret ones; }
+        if (ones.ok)      { ret ones; }
+        ret excludes(s, d.operands.data[t.overflow.dividend], NOT_LEAST);
+    }
+    if (sel t.fault) { ret res[bool, Why].ok{header_prefix}; }
+    ret res[bool, Why].ok{false};
+}
+
+fun link(s: *Run, at: u32, head: u32) err[Why] {
+    val pushed: res[usize, allocator.Error] = vector.push[Node](?s.nodes, Node{at: at, next: head});
+    if (sel pushed.err) { ret lost(pushed.err); }
+    ret err[Why].ok{};
+}
+
+# note one barrier, by the group of each place it touches
+fun index(s: *Run, e: Effect) err[Why] {
+    val at:     u32                         = s.barriers.len::u32;
+    val pushed: res[usize, allocator.Error] = vector.push[Effect](?s.barriers, e);
+    if (sel pushed.err) { ret lost(pushed.err); }
+    var anywhere: bool  = e.ordered || e.anywhere;
+    var p:        usize = 0;
+    for (p < e.places.len) {
+        val g: opt[u64] = memory.group(e.places.data[p]);
+        if (!(sel g.some)) { anywhere = true; }
+        p = p + 1;
+    }
+    if (anywhere) {
+        val made: err[Why] = link(s, at, s.wild);
+        if (sel made.err) { ret made; }
+        s.wild = (s.nodes.len - 1)::u32;
+        ret err[Why].ok{};
+    }
+    p = 0;
+    for (p < e.places.len) {
+        val grp: opt[u64] = memory.group(e.places.data[p]);
+        if (sel grp.some) {
+            var key:   u64       = grp.some;
+            val head:  opt[*u32] = map.get[u64, u32](?s.heads, ?key);
+            var first: u32       = NONE;
+            if (sel head.some) { first = @head.some; }
+            val made: err[Why] = link(s, at, first);
+            if (sel made.err) { ret made; }
+            val set: res[bool, allocator.Error] = map.insert[u64, u32](?s.heads, grp.some, (s.nodes.len - 1)::u32);
+            if (sel set.err) { ret lost(set.err); }
+        }
+        p = p + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# note every instruction of the loop that writes memory or orders an access
+fun build_index(s: *Run) err[Why] {
+    if (s.indexed) { ret err[Why].ok{}; }
+    val ready: err[Why] = need_memory(s);
+    if (sel ready.err) { ret ready; }
+    val blocks: Slice[u32] = loops.body(s.l, s.lp);
+    var k:      usize      = 0;
+    for (k < blocks.size) {
+        val list: *vector.Vector[Instruction] = ?s.b.blocks.data[blocks.data[k]].instructions;
+        var j:    usize                       = 0;
+        for (j < list.len) {
+            val d:   *InstructionData = ?s.b.instructions.data[list.data[j].index];
+            val got: res[Row, Why]    = row_of(d);
+            if (sel got.err) { ret err[Why].err{got.err}; }
+            if (got.ok.effects.reads || got.ok.effects.writes) {
+                var e: res[Effect, Why] = memory.effect_of(s.mem, list.data[j]);
+                if (sel e.err) { ret err[Why].err{e.err}; }
+                if (e.ok.writes || e.ok.ordered) {
+                    val noted: err[Why] = index(s, e.ok);
+                    if (sel noted.err) {
+                        memory.release(?e.ok);
+                        ret noted;
+                    }
+                }
+                or { memory.release(?e.ok); }
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    s.indexed = true;
+    ret err[Why].ok{};
+}
+
+# whether any barrier in a chain conflicts with a load's effect
+fun clashes(s: *Run, first: u32, load: Effect) bool {
+    var at: u32 = first;
+    for (at != NONE) {
+        if (memory.conflicts(s.barriers.data[s.nodes.data[at].at], load)) { ret true; }
+        at = s.nodes.data[at].next;
+    }
+    ret false;
+}
+
+# whether nothing in the loop may write what a load reads
+fun untouched(s: *Run, i: Instruction) res[bool, Why] {
+    val built: err[Why] = build_index(s);
+    if (sel built.err) { ret res[bool, Why].err{built.err}; }
+    var e: res[Effect, Why] = memory.effect_of(s.mem, i);
+    if (sel e.err) { ret res[bool, Why].err{e.err}; }
+    fin { memory.release(?e.ok); }
+    if (e.ok.ordered || e.ok.anywhere || e.ok.places.len != 1) { ret res[bool, Why].ok{false}; }
+    val g: opt[u64] = memory.group(e.ok.places.data[0]);
+    if (!(sel g.some))            { ret res[bool, Why].ok{s.barriers.len == 0}; }
+    if (clashes(s, s.wild, e.ok)) { ret res[bool, Why].ok{false}; }
+    var key:  u64       = g.some;
+    val head: opt[*u32] = map.get[u64, u32](?s.heads, ?key);
+    if (sel head.some) { ret res[bool, Why].ok{!clashes(s, @head.some, e.ok)}; }
+    ret res[bool, Why].ok{true};
+}
+
+# whether an instruction of the loop moves
+# ---
+# header_prefix: it stands in the header with nothing before it that traps or
+#                writes and stays, so it runs on every entry before anything
+#                observable
+fun movable(s: *Run, i: Instruction, header_prefix: bool) res[bool, Why] {
+    val d:   *InstructionData = ?s.b.instructions.data[i.index];
+    val got: res[Row, Why]    = row_of(d);
+    if (sel got.err) { ret res[bool, Why].err{got.err}; }
+    var r: Row = got.ok;
+    if (!plain(d, ?r)) { ret res[bool, Why].ok{false}; }
+    var n: usize = 0;
+    for (n < d.operands.len) {
+        if (!invariant(s, d.operands.data[n])) { ret res[bool, Why].ok{false}; }
+        n = n + 1;
+    }
+    val e: opcode.Effects = r.effects;
+    if (e.writes)                   { ret res[bool, Why].ok{false}; }
+    if (e.speculatable)             { ret res[bool, Why].ok{true}; }
+    if (e.reads && !reads_only(?r)) { ret res[bool, Why].ok{false}; }
+    var stated: bool = false;
+    var t:      u32  = 0;
+    for (t < $length_of(Traps)) {
+        val trap: Trap = e.traps[t];
+        if (sel trap.unstated) { brk; }
+        stated = true;
+        val fine: res[bool, Why] = harmless(s, d, trap, header_prefix);
+        if (sel fine.err) { ret fine; }
+        if (!fine.ok)     { ret fine; }
+        t = t + 1;
+    }
+    if (!stated) { ret res[bool, Why].ok{false}; }
+    if (e.reads) { ret untouched(s, i); }
+    ret res[bool, Why].ok{true};
+}
+
+# whether an instruction that stays ends the header prefix
+fun ends_prefix(d: *InstructionData) res[bool, Why] {
+    val got: res[Row, Why] = row_of(d);
+    if (sel got.err) { ret res[bool, Why].err{got.err}; }
+    ret res[bool, Why].ok{got.ok.effects.writes || !(sel got.ok.effects.traps[0].unstated)};
+}
+
+# choose the instructions of the loop that move, in the order they stand in
+# the blocks taken header first and then in reverse postorder, so what an
+# instruction uses is chosen before it
+fun choose(s: *Run) err[Why] {
+    val count: usize                = s.b.instructions.len;
+    val room:  err[allocator.Error] = fill(?s.marks, count);
+    if (sel room.err) { ret lost(room.err); }
+    val blocks: Slice[u32] = loops.body(s.l, s.lp);
+    var k:      usize      = 0;
+    for (k < blocks.size) {
+        var prefix: bool                        = k == 0;
+        val list:   *vector.Vector[Instruction] = ?s.b.blocks.data[blocks.data[k]].instructions;
+        var j:      usize                       = 0;
+        for (j < list.len) {
+            val i:    Instruction    = list.data[j];
+            val take: res[bool, Why] = movable(s, i, prefix);
+            if (sel take.err) { ret err[Why].err{take.err}; }
+            if (take.ok) {
+                s.marks.data[i.index] = 1;
+                val pushed: res[usize, allocator.Error] = vector.push[Instruction](?s.picks, i);
+                if (sel pushed.err) { ret lost(pushed.err); }
+            }
+            or {
+                if (prefix) {
+                    val ends: res[bool, Why] = ends_prefix(?s.b.instructions.data[i.index]);
+                    if (sel ends.err) { ret err[Why].err{ends.err}; }
+                    if (ends.ok)      { prefix = false; }
+                }
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun fill(v: *vector.Vector[u8], n: usize) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < n) {
+        val pushed: res[usize, allocator.Error] = vector.push[u8](v, 0);
+        if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the edges that enter the header from outside the loop
+fun find_sources(s: *Run, header: u32) err[Why] {
+    var seen: map.Map[u32, u32] = map.init[u32, u32](s.m.a);
+    fin { map.dnit[u32, u32](?seen); }
+    val preds: *vector.Vector[Instruction] = ?s.b.blocks.data[header].predecessors;
+    var j:     usize                       = 0;
+    for (j < preds.len) {
+        val i: Instruction      = preds.data[j];
+        val d: *InstructionData = ?s.b.instructions.data[i.index];
+        if (!(sel d.place.placed)) { ret err[Why].err{Why.reason{"an edge into a loop header from an instruction placed in no block"}}; }
+        var key:  u32       = i.index;
+        val had:  opt[*u32] = map.get[u32, u32](?seen, ?key);
+        var rank: u32       = 0;
+        if (sel had.some) { rank = @had.some; }
+        val set: res[bool, allocator.Error] = map.insert[u32, u32](?seen, i.index, rank + 1);
+        if (sel set.err) { ret lost(set.err); }
+        if (!loops.contains(s.l, s.lp, d.place.placed.index)) {
+            var e:    u32 = 0;
+            var left: u32 = rank;
+            for (e::usize < d.edges.len) {
+                if (d.edges.data[e].block.index == header) {
+                    if (left == 0) { brk; }
+                    left = left - 1;
+                }
+                e = e + 1;
+            }
+            if (e::usize >= d.edges.len) { ret err[Why].err{Why.reason{"an edge into a loop header its branch does not hold"}}; }
+            val a: res[usize, allocator.Error] = vector.push[Source](?s.sources, Source{branch: i, edge: e});
+            if (sel a.err) { ret lost(a.err); }
+            val o: res[usize, allocator.Error] = vector.push[Block](?s.outside, d.place.placed);
+            if (sel o.err) { ret lost(o.err); }
+        }
+        j = j + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# the block the hoisted instructions go to: the one block that branches
+# unconditionally to the header from outside, or a new one every outside edge
+# enters through
+fun preheader(s: *Run, header: u32) res[Block, Why] {
+    if (s.sources.len == 1) {
+        val d: *InstructionData = ?s.b.instructions.data[s.sources.data[0].branch.index];
+        if (d.opcode.index == opcode.BR.index && d.edges.len == 1) { ret res[Block, Why].ok{s.outside.data[0]}; }
+    }
+    val made: res[Block, Error] = edge.gather(s.m, s.f, Block{index: header}, Slice[Source]{data: s.sources.data, size: s.sources.len});
+    if (sel made.err) { ret res[Block, Why].err{Why.cfg{made.err}}; }
+    val dropped: err[allocator.Error] = cache.forget(s.cache, s.f);
+    if (sel dropped.err) { ret res[Block, Why].err{Why.alloc{dropped.err}}; }
+    ret res[Block, Why].ok{made.ok};
+}
+
+# move the loop headed by a block, true when something moved
+fun hoist(s: *Run, header: u32) res[bool, Why] {
+    reset(s);
+    val got: res[*Loops, Why] = analysis.loops_of(s.cache, s.f);
+    if (sel got.err) { ret res[bool, Why].err{got.err}; }
+    s.l = got.ok;
+    val lp: opt[u32] = loops.innermost(s.l, header);
+    if (!(sel lp.some)) { ret res[bool, Why].err{Why.reason{"a loop header that no loop holds"}}; }
+    s.lp = lp.some;
+    val found: err[Why] = find_sources(s, header);
+    if (sel found.err)      { ret res[bool, Why].err{found.err}; }
+    if (s.sources.len == 0) { ret res[bool, Why].ok{false}; }
+    val chosen: err[Why] = choose(s);
+    if (sel chosen.err)   { ret res[bool, Why].err{chosen.err}; }
+    if (s.picks.len == 0) { ret res[bool, Why].ok{false}; }
+
+    val into: res[Block, Why] = preheader(s, header);
+    if (sel into.err) { ret res[bool, Why].err{into.err}; }
+    val list: *vector.Vector[Instruction] = ?s.b.blocks.data[into.ok.index].instructions;
+    val end:  Instruction                 = list.data[list.len - 1];
+    var n:    usize                       = 0;
+    for (n < s.picks.len) {
+        val moved: err[Why] = edit(body.relocate(s.m, s.f, s.picks.data[n], end));
+        if (sel moved.err) { ret res[bool, Why].err{moved.err}; }
+        n = n + 1;
+    }
+    val dropped: err[allocator.Error] = cache.drop(s.cache, s.f, analysis.FLOW);
+    if (sel dropped.err) { ret res[bool, Why].err{Why.alloc{dropped.err}}; }
+    ret res[bool, Why].ok{true};
+}
+
+# the headers of a function's loops, innermost first
+fun list_headers(s: *Run) err[Why] {
+    val got: res[*Loops, Why] = analysis.loops_of(s.cache, s.f);
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    var k: u32 = loops.count(got.ok);
+    for (k > 0) {
+        k = k - 1;
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?s.headers, loops.loop(got.ok, k).header);
+        if (sel pushed.err) { ret lost(pushed.err); }
+    }
+    ret err[Why].ok{};
+}
+
+# move what is invariant out of the loops of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    var s: Run;
+    s.m        = c.m;
+    s.f        = u.f;
+    s.b        = got.ok;
+    s.cache    = c.cache;
+    s.headers  = vector.init[u32](c.m.a);
+    s.marks    = vector.init[u8](c.m.a);
+    s.picks    = vector.init[Instruction](c.m.a);
+    s.sources  = vector.init[Source](c.m.a);
+    s.outside  = vector.init[Block](c.m.a);
+    s.barriers = vector.init[Effect](c.m.a);
+    s.nodes    = vector.init[Node](c.m.a);
+    s.heads    = map.init[u64, u32](c.m.a);
+    s.wild     = NONE;
+    fin { drop(?s); }
+    val listed: err[Why] = list_headers(?s);
+    if (sel listed.err) { ret res[bool, Why].err{listed.err}; }
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < s.headers.len) {
+        val r: res[bool, Why] = hoist(?s, s.headers.data[i]);
+        if (sel r.err) { ret r; }
+        if (r.ok)      { changed = true; }
+        i = i + 1;
+    }
+    ret res[bool, Why].ok{changed};
+}
