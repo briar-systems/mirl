@@ -30,12 +30,14 @@ The capability declarations are
 | `widths` | the address spaces and how a pointer into each is held, the register width, the widths integer arithmetic runs natively at, and the integer widths a value holds natively |
 | `vectors` | none, or a vector unit with a register width, the lane counts allowed and the lane types with how each is carried out (packed or by scalar expansion) |
 | `formats` | the number formats computed natively, each with the not-a-number it returns (`canonical`, `propagate` or `unspecified`), or none |
-| `arithmetic` | the widths with a native multiply (low half and high half) and how a shift treats a count at or past the width (`wraps` or `undefined`) |
+| `arithmetic` | the widths with a native multiply of the low half, the multiply forms beyond it (one row per width and sign: the high half or the whole product, as signed, unsigned or mixed operands, or none) and how a shift treats a count at or past the width (`wraps`, `undefined` or `saturates`) |
 | `timing` | the operations that run in constant time, by operation, width and condition, or none |
 | `code` | the alignment of a function entry, a code section and a data section, and the bytes that pad code |
 | `attributes` | the attribute families the target accepts |
 
-These describe what the target does. They do not change what an operation means. A shift by the width or more gives 0 or the sign fill on every target whatever `arithmetic.shifts` says, and legalisation bounds the count where the target would not.
+These describe what the target does. They do not change what an operation means. A shift by the width or more gives 0 or the sign fill on every target whatever `arithmetic.shifts` says, and legalisation bounds the count where the target would not: the shift bounding applies where shifts `wrap` or are `undefined`, and not where they `saturate`.
+
+The ir has no high multiply and no widening multiply. Both are written as a multiply of two extensions, and the high half as that product shifted down by the width and truncated. A target selects the pattern as it stands where it has a form for it: a `high` or `full` row at the width and sign, or a native multiply at twice the width. Where it has none, and multiplies natively at the width, the multiply forms legalisation builds the high half from multiplies at the width. A width the target does not multiply natively is left to the wide integer splitting and the narrow integer widening. A target is a row of each form it has: x86 states `full` rows (a register pair), AArch64 `high` rows at 64 bits and `full` rows at 32, RISC-V `high` rows of all three signs, and a target with none, such as WebAssembly, states none.
 
 ### Narrow arithmetic
 

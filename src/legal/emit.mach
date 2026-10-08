@@ -1,0 +1,187 @@
+# the ground legalisations share: making the instructions that stand in for one
+#
+# a rewrite opens at the instruction it rewrites, makes the instructions that
+# stand in for it ahead of it, and closes by making the last in its slot, which
+# takes its uses. every instruction made reads as the one it rewrites, with its
+# location, site and secrecy, so a secret value is never made public. the
+# builder is the only maker, and the first call it refuses is the rewrite's
+# failure. constants are made in the scratch storage and held by the module.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+
+use mirl.build;
+use mirl.build.Failure;
+use folder: mirl.fold;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.constant.Bits;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.opt.number;
+use mirl.pass.failure.Why;
+
+# one function being rewritten
+# ---
+# m:         the module
+# f:         the function
+# b:         its body
+# scratch:   storage for the constants one rewrite makes
+# bld:       the builder
+# made:      how many instructions the open rewrite made ahead of its last
+# replacing: the open rewrite is making its last instruction
+pub rec Site {
+    m:         *Module;
+    f:         Function;
+    b:         *Body;
+    scratch:   *allocator.Allocator;
+    bld:       build.Builder;
+    made:      u32;
+    replacing: bool;
+}
+
+# the integer a type is, or the lane of a vector of integers
+# ---
+# lane:  the type of one lane, the type itself for a scalar
+# bits:  the width of a lane
+# lanes: how many lanes, zero for a scalar
+pub rec Lane {
+    lane:  Type;
+    bits:  u32;
+    lanes: u32;
+}
+
+# the flags of a shift whose count is below its operand's width
+pub val BOUNDED: Flags = Flags{volatile: false, kept: false, bounded: true};
+
+# a site over a function
+pub fun init(m: *Module, f: Function, b: *Body, scratch: *allocator.Allocator) Site {
+    var s: Site;
+    s.m       = m;
+    s.f       = f;
+    s.b       = b;
+    s.scratch = scratch;
+    s.bld     = build.init(m);
+    build.enter(?s.bld, f);
+    ret s;
+}
+
+# the integer lane of a type, none for any type that is neither an integer nor
+# a vector of integers
+pub fun lane_of(m: *Module, ty: Type) res[opt[Lane], Why] {
+    val shape: res[types.Shape, types.Error] = types.shape(?m.types, ty);
+    if (sel shape.err)        { ret res[opt[Lane], Why].err{Why.ir{module.Error.types{shape.err}}}; }
+    if (sel shape.ok.integer) { ret res[opt[Lane], Why].ok{opt[Lane].some{Lane{lane: ty, bits: shape.ok.integer.width, lanes: 0}}}; }
+    if (sel shape.ok.vector) {
+        val one: res[types.Shape, types.Error] = types.shape(?m.types, shape.ok.vector.element);
+        if (sel one.err)        { ret res[opt[Lane], Why].err{Why.ir{module.Error.types{one.err}}}; }
+        if (sel one.ok.integer) { ret res[opt[Lane], Why].ok{opt[Lane].some{Lane{lane: shape.ok.vector.element, bits: one.ok.integer.width, lanes: shape.ok.vector.lanes}}}; }
+    }
+    ret res[opt[Lane], Why].ok{opt[Lane].none{}};
+}
+
+# the constant of an integer type, or a vector of one, holding x in every lane
+pub fun constant(s: *Site, ty: Type, x: Wide) res[Value, Why] {
+    val got: res[opt[Lane], Why] = lane_of(s.m, ty);
+    if (sel got.err)     { ret res[Value, Why].err{got.err}; }
+    if (sel got.ok.none) { ret res[Value, Why].err{Why.reason{"a constant asked of a type that holds no integer"}}; }
+    val lane:  Lane  = got.ok.some;
+    val n:     usize = word.words_for(lane.bits)::usize;
+    var count: usize = 1;
+    if (lane.lanes != 0) { count = lane.lanes::usize; }
+    val words: res[*u64, allocator.Error] = allocator.zallocate[u64](s.scratch, n);
+    if (sel words.err) { ret res[Value, Why].err{Why.alloc{words.err}}; }
+    var k: usize = 0;
+    for (k < n) {
+        words.ok[k] = x[k];
+        k           = k + 1;
+    }
+    val lanes: res[*Bits, allocator.Error] = allocator.zallocate[Bits](s.scratch, count);
+    if (sel lanes.err) { ret res[Value, Why].err{Why.alloc{lanes.err}}; }
+    k = 0;
+    for (k < count) {
+        lanes.ok[k] = Bits{type: lane.lane, words: Slice[u64]{data: words.ok, size: n}};
+        k           = k + 1;
+    }
+    ret number.place(s.m, s.f, s.scratch, folder.Value{type: ty, lanes: Slice[Bits]{data: lanes.ok, size: count}});
+}
+
+# start a rewrite of origin, which stands at an index of a block: what is made
+# goes ahead of it, in order
+pub fun open(s: *Site, origin: Instruction, k: Block, index: u32) {
+    build.derive(?s.bld, origin);
+    build.at(?s.bld, k, index);
+    s.made      = 0;
+    s.replacing = false;
+}
+
+# the flags of what is made next
+pub fun flags(s: *Site, f: Flags) {
+    build.flags(?s.bld, f);
+}
+
+# make the next instruction, and every one after it, in the slot of origin, in
+# place of it
+pub fun close(s: *Site, origin: Instruction) {
+    build.flags(?s.bld, NO_FLAGS);
+    build.replacing(?s.bld, origin);
+    s.replacing = true;
+}
+
+fun request(code: Opcode, operands: *Value, count: usize, immediates: *Immediate, slots: usize) Request {
+    ret Request{opcode: code, operands: Slice[Value]{data: operands, size: count}, immediates: Slice[Immediate]{data: immediates, size: slots}, targets: Slice[Branch]{data: nil, size: 0}};
+}
+
+fun counted(s: *Site) {
+    if (!s.replacing) { s.made = s.made + 1; }
+}
+
+# make an operation of two operands
+pub fun binary(s: *Site, code: Opcode, a: Value, b: Value) Value {
+    var ops: [2]Value = [2]Value{a, b};
+    counted(s);
+    ret build.value(?s.bld, request(code, ?ops[0], 2, nil, 0));
+}
+
+# make an operation of one operand
+pub fun unary(s: *Site, code: Opcode, a: Value) Value {
+    var ops: [1]Value = [1]Value{a};
+    counted(s);
+    ret build.value(?s.bld, request(code, ?ops[0], 1, nil, 0));
+}
+
+# make a conversion of one operand to a type
+pub fun convert(s: *Site, code: Opcode, a: Value, to: Type) Value {
+    var ops: [1]Value     = [1]Value{a};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{to}};
+    counted(s);
+    ret build.value(?s.bld, request(code, ?ops[0], 1, ?imm[0], 1));
+}
+
+# the end of a rewrite: ok, or the first call the builder refused
+pub fun done(s: *Site) err[Why] {
+    val built: err[Failure] = build.done(?s.bld);
+    if (sel built.err) { ret err[Why].err{Why.build{built.err}}; }
+    ret err[Why].ok{};
+}
