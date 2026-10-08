@@ -6,7 +6,9 @@
 # read through the map. a value from outside the region stands for itself in
 # the same function, and must be bound in the map in another, except a
 # constant, whose value in the copy's function stands for it. the copies keep
-# the source's inlining site, and an inliner sets its own on them.
+# the source's inlining site, and an inliner sets its own on them. each copied
+# block takes its source's value binding records at the same positions among
+# its instructions, each reading through the map as an operand does.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -18,6 +20,7 @@ use std.types.size.usize;
 use std.types.view.View;
 
 use std.allocator;
+use std.allocator.page;
 use std.allocator.testing;
 use std.collections.map;
 use std.collections.slice.Slice;
@@ -30,8 +33,11 @@ use mirl.build.remap;
 use mirl.build.remap.Remap;
 use mirl.ir.block.BlockData;
 use mirl.ir.body;
+use mirl.ir.cfg.block;
 use mirl.ir.cfg.failure.Error;
+use mirl.ir.constant.Bits;
 use mirl.ir.constant.ConstantData;
+use mirl.ir.debug;
 use mirl.ir.debug.Binding;
 use mirl.ir.debug.Location;
 use mirl.ir.debug.Site;
@@ -52,6 +58,12 @@ use mirl.ir.metadata.Metadata;
 use mirl.ir.module;
 use mirl.ir.module.Module;
 use mirl.ir.opcode;
+use mirl.ir.point;
+use mirl.ir.point.Expression;
+use mirl.ir.point.Operand;
+use mirl.ir.point.Point;
+use mirl.ir.point.Reads;
+use mirl.ir.point.Step;
 use types: mirl.ir.type;
 use mirl.ir.type.Type;
 use mirl.ir.value.Declaration;
@@ -184,6 +196,31 @@ fun fill(m: *Module, b: *Builder, from: Function, region: *vector.Vector[Block],
     ret err[Error].ok{};
 }
 
+# copy every value binding record of the region, each at its source's position
+# among its block's instructions, once every instruction is copied
+fun bind(m: *Module, b: *Builder, from: Function, region: *vector.Vector[Block], r: *Remap, w: *Work) err[Error] {
+    var i: usize = 0;
+    for (i < region.len) {
+        var at: usize = 0;
+        var p:  usize = 0;
+        for {
+            val got: res[*Body, module.Error] = module.body(m, from);
+            if (sel got.err) { ret err[Error].err{Error.ir{got.err}}; }
+            val src: *BlockData = ?got.ok.blocks.data[region.data[i].index];
+            if (p >= src.points.len) { brk; }
+            val pt: Point = src.points.data[p];
+            at = body.standing(src, ?src.points.data[p], at);
+            build.at(b, w.blocks.data[i], at::u32);
+            build.copy_binding(b, from, pt, r);
+            val built: err[Failure] = build.done(b);
+            if (sel built.err) { ret err[Error].err{Error.build{built.err}}; }
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
 # copy a region of a function's blocks into a function, the same one or another
 #
 # a refusal leaves the body of to exactly as it was, and r with bindings to
@@ -241,8 +278,13 @@ pub fun region(m: *Module, from: Function, to: Function, blocks: Slice[Block], r
         ret opened;
     }
     val filled: err[Error] = fill(m, ?b, from, ?list, ?inside, r, ?w);
-    if (sel filled.err) { body.rewind(m, to, start.ok); }
-    ret filled;
+    if (sel filled.err) {
+        body.rewind(m, to, start.ok);
+        ret filled;
+    }
+    val bound: err[Error] = bind(m, ?b, from, ?list, r, ?w);
+    if (sel bound.err) { body.rewind(m, to, start.ok); }
+    ret bound;
 }
 
 # copy every block of a function's body into another function, as `region`
@@ -453,5 +495,136 @@ test copy__remaps_every_value_and_keeps_metadata {
         k = k + 1;
     }
     if (checked != 7) { ret 10; }
+    ret 0;
+}
+
+# whether a block's record at a position stands before its instruction at a
+# position, binds a variable and reads a value, none for unavailable
+fun record_is(m: *Module, f: Function, k: Block, r: usize, at: usize, v: debug.Binding, reads: opt[Value]) bool {
+    val d: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel d.err)                                           { ret false; }
+    if (r >= d.ok.points.len || at >= d.ok.instructions.len) { ret false; }
+    val pt:     Point            = d.ok.points.data[r];
+    val before: opt[Instruction] = pt.before;
+    if (!(sel before.some && before.some.index == d.ok.instructions.data[at].index)) { ret false; }
+    if (pt.binding.index != v.index)                                                 { ret false; }
+    val got: Reads = pt.reads;
+    if (sel reads.none) { ret sel got.unavailable; }
+    ret sel got.operand && got.operand.value.index == reads.some.index;
+}
+
+fun points_in(m: *Module, f: Function, k: Block) usize {
+    val d: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel d.err) { ret 99; }
+    ret d.ok.points.len;
+}
+
+fun result_of(m: *Module, f: Function, k: Block, at: usize) Value {
+    val d: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel d.err) { ret Value{index: 0xffffffff}; }
+    val i: res[InstructionData, module.Error] = body.instruction_data(m, f, d.ok.instructions.data[at]);
+    if (sel i.err) { ret Value{index: 0xffffffff}; }
+    ret i.ok.results.data[0];
+}
+
+fun bind_to(b: *Builder, v: debug.Binding, value: Value, e: Expression) {
+    build.bind_at(b, v, Reads.operand{Operand{value: value, expression: e}});
+}
+
+test copy__records_keep_their_points {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val made: res[Module, module.Error] = module.init(?a, View{data: "riscv64", len: 7});
+    if (sel made.err) { ret 1; }
+    var m: Module = made.ok;
+    fin { module.dnit(?m); }
+    var one: [1]Type                = [1]Type{int(?m, 32)};
+    val sig: res[Type, types.Error] = types.intern(?m.types, types.Shape.function{types.Function{params: Slice[Type]{data: ?one[0], size: 1}, results: Slice[Type]{data: ?one[0], size: 1}}});
+    if (sel sig.err) { ret 1; }
+    val file: res[debug.File, debug.Error] = debug.file(?m.debug, View{data: "f.mach", len: 6});
+    if (sel file.err) { ret 1; }
+    val loc: res[debug.Location, debug.Error] = debug.location(?m.debug, debug.Position{file: file.ok, line: 1, column: 1});
+    if (sel loc.err) { ret 1; }
+    val int32: res[debug.Declared, debug.Error] = debug.declare(?m.debug, ?m.types, debug.Entry{key: View{data: "i32", len: 3}, name: View{data: "i32", len: 3}, head: debug.Head.base{debug.Base{encoding: debug.Encoding.signed{}, width: 32}}});
+    if (sel int32.err)         { ret 1; }
+    if (!(sel int32.ok.fresh)) { ret 1; }
+    val i32d: debug.Type                      = int32.ok.fresh;
+    val vx:   res[debug.Binding, debug.Error] = debug.bind(?m.debug, debug.Variable{name: View{data: "x", len: 1}, type: i32d, declared: loc.ok});
+    val vy:   res[debug.Binding, debug.Error] = debug.bind(?m.debug, debug.Variable{name: View{data: "y", len: 1}, type: i32d, declared: loc.ok});
+    if (sel vx.err) { ret 1; }
+    if (sel vy.err) { ret 1; }
+
+    # f(x): x is bound at entry, y to a + 4 before the dead d, and x to d before the sum
+    var b:    Builder        = build.init(?m);
+    val f:    Function       = build.function(?b, FunctionData{name: View{data: "f", len: 1}, signature: sig.ok});
+    var four: [1]u64         = [1]u64{4};
+    val c4:   Constant       = build.constant(?b, ConstantData.integer{Bits{type: one[0], words: Slice[u64]{data: ?four[0], size: 1}}});
+    var decl: [1]Declaration = [1]Declaration{Declaration{type: one[0], secret: false}};
+    build.enter(?b, f);
+    val entry: Block = build.block(?b, Slice[Declaration]{data: ?decl[0], size: 1});
+    build.at_end(?b, entry);
+    var xs: [2]Value = [2]Value{build.parameter(?b, entry, 0), build.parameter(?b, entry, 0)};
+    if (build.failed(?b)) { ret 2; }
+    var plus: [1]Step                       = [1]Step{Step{kind: point.ADD, argument: point.Argument.constant{c4}}};
+    val e4:   res[Expression, module.Error] = module.expression(?m, Slice[Step]{data: ?plus[0], size: 1});
+    if (sel e4.err) { ret 2; }
+    bind_to(?b, vx.ok, xs[0], point.PLAIN);
+    var ax: [2]Value = [2]Value{build.value(?b, request(opcode.ADD, Slice[Value]{data: ?xs[0], size: 2}, no_targets())), xs[0]};
+    bind_to(?b, vy.ok, ax[0], e4.ok);
+    val dead: Value = build.value(?b, request(opcode.ADD, Slice[Value]{data: ?ax[0], size: 2}, no_targets()));
+    bind_to(?b, vx.ok, dead, point.PLAIN);
+    var out: [1]Value = [1]Value{build.value(?b, request(opcode.ADD, Slice[Value]{data: ?ax[0], size: 2}, no_targets()))};
+    build.emit(?b, request(opcode.RET, Slice[Value]{data: ?out[0], size: 1}, no_targets()));
+    if (build.failed(?b)) { ret 2; }
+    val x:   Value = xs[0];
+    val sum: Value = ax[0];
+    if (!record_is(?m, f, entry, 0, 0, vx.ok, opt[Value].some{x}) || !record_is(?m, f, entry, 1, 1, vy.ok, opt[Value].some{sum}) || !record_is(?m, f, entry, 2, 2, vx.ok, opt[Value].some{dead})) { ret 3; }
+
+    # a split moves the records standing before the tail with it, and a merge brings them back
+    val tail: res[Block, Error] = block.split(?m, f, entry, 2);
+    if (sel tail.err)                                                   { ret 4; }
+    if (points_in(?m, f, entry) != 2 || points_in(?m, f, tail.ok) != 1) { ret 4; }
+    if (!record_is(?m, f, tail.ok, 0, 0, vx.ok, opt[Value].some{dead})) { ret 4; }
+    val back: res[Block, Error] = block.merge(?m, f, tail.ok);
+    if (sel back.err)                                                                                                                { ret 5; }
+    if (back.ok.index != entry.index)                                                                                                { ret 5; }
+    if (points_in(?m, f, entry) != 3)                                                                                                { ret 5; }
+    if (!record_is(?m, f, entry, 1, 1, vy.ok, opt[Value].some{sum}) || !record_is(?m, f, entry, 2, 2, vx.ok, opt[Value].some{dead})) { ret 5; }
+
+    # a copy in place gives the copy its source's records, reading the copies
+    var r: Remap = remap.init(?a);
+    fin { remap.dnit(?r); }
+    var blocks: [1]Block   = [1]Block{entry};
+    val copied: err[Error] = region(?m, f, f, Slice[Block]{data: ?blocks[0], size: 1}, ?r);
+    if (sel copied.err) { ret 6; }
+    val twin: opt[Block] = remap.block(?r, entry);
+    if (sel twin.none)                    { ret 6; }
+    if (points_in(?m, f, twin.some) != 3) { ret 6; }
+    val x2:   opt[Value] = remap.value(?r, x);
+    val sum2: opt[Value] = remap.value(?r, sum);
+    if (sel x2.none)                                                           { ret 7; }
+    if (sel sum2.none)                                                         { ret 7; }
+    if (!record_is(?m, f, twin.some, 0, 0, vx.ok, opt[Value].some{x2.some}))   { ret 7; }
+    if (!record_is(?m, f, twin.some, 1, 1, vy.ok, opt[Value].some{sum2.some})) { ret 7; }
+    val dead2: Value = result_of(?m, f, twin.some, 1);
+    if (!record_is(?m, f, twin.some, 2, 2, vx.ok, opt[Value].some{dead2})) { ret 7; }
+    val td: res[BlockData, module.Error] = body.block_data(?m, f, twin.some);
+    if (sel td.err) { ret 7; }
+    val pt: Reads = td.ok.points.data[1].reads;
+    if (!(sel pt.operand && pt.operand.expression.index == e4.ok.index)) { ret 7; }
+
+    # erasing what a record reads leaves it unavailable at its point, and the
+    # records before the erased instruction stand before the next
+    val dd: res[ValueData, module.Error] = body.value_data(?m, f, dead);
+    if (sel dd.err)              { ret 8; }
+    if (!(sel dd.ok.def.result)) { ret 8; }
+    val gone: err[module.Error] = body.erase(?m, f, dd.ok.def.result.instruction);
+    if (sel gone.err)                                                                                                            { ret 8; }
+    if (points_in(?m, f, entry) != 3)                                                                                            { ret 9; }
+    if (!record_is(?m, f, entry, 1, 1, vy.ok, opt[Value].some{sum}) || !record_is(?m, f, entry, 2, 1, vx.ok, opt[Value].none{})) { ret 9; }
+    if (!record_is(?m, f, twin.some, 2, 2, vx.ok, opt[Value].some{dead2}))                                                       { ret 10; }
+    val left: res[ValueData, module.Error] = body.value_data(?m, f, dead);
+    if (sel left.err)           { ret 10; }
+    if (left.ok.bound.len != 0) { ret 10; }
     ret 0;
 }
