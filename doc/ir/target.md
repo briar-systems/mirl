@@ -37,6 +37,15 @@ The capability declarations are
 
 These describe what the target does. They do not change what an operation means. A shift by the width or more gives 0 or the sign fill on every target whatever `arithmetic.shifts` says, and legalisation bounds the count where the target would not.
 
+### Narrow arithmetic
+
+`widths.alu` lists the integer widths the target's arithmetic runs at, and a row states exactly those: x86-64 at 8, 16, 32 and 64, AArch64 and RISC-V at 32 and 64 (RV32 at 32), and a target such as WebAssembly at 32 and 64. An integer operation at any other width, except a condition, is widened by the `narrow` legalisation to the narrowest listed width above it: the operands are extended, the same opcode runs at the wide width and the result is truncated. The pass applies to a target that lists a width above some legal width it does not list, and it reads nothing else of the target.
+
+- A sum, difference, product, `and`, `or`, `xor`, `neg`, `not` and `shl` take either extension, since the bits above the narrow width do not reach the bits below it. Division, remainder and comparisons extend with the sign or with zeros as their opcode reads its operands, and `shr.u` and `shr.s` extend the shifted operand to match. A shift count is always extended with zeros.
+- The shift rule holds at the narrow width: a count of the narrow width or more shifts every bit out at the wide width too.
+- A division by zero traps at the wide width exactly when the narrow one does. A signed division or remainder of the least narrow value by minus one does not trap at the wide width, so the dividend is replaced by the least wide value in that case, which traps there. The opcode row states which operands the trap reads, and the replacement is a select, so the pass adds no branch.
+- A vector of narrow integers and a width above the widest listed are not its job. The counts (`clz`, `ctz`, `popcnt`), `bswap` and the overflow forms are left until the algebra table states them (`mirl.legal.LEFT`).
+
 ## Asking for layout
 
 A front end never computes a size, an alignment or an offset. It asks mirl, and so does the backend and every debug producer, through the same routine.
