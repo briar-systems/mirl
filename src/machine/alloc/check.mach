@@ -1,0 +1,289 @@
+# the allocation checker: a proof that a rewritten function is its virtual
+# form under an assignment that holds
+#
+# the checker trusts nothing the scan built. it computes the virtual form's
+# liveness again and proves that
+#
+# - every virtual register live anywhere has a location the target lets the
+#   allocator assign, of the register's class,
+# - no two values meet in storage one location shares: for each location,
+#   the segments of every virtual register whose location shares its storage
+#   and the location's own holds are sorted and swept once, and a position
+#   held by two owners is refused,
+# - every pinned read and write is in the location its row fixes, and
+# - the rewritten function has the virtual form's blocks and instructions in
+#   order, with every operand the form's own but each virtual register
+#   replaced by its location, so every rewritten operand names a register of
+#   its class, and every instruction of it passed its row's check when made.
+#
+# with v virtual registers of s segments each, sharing at most k locations,
+# and h holds, the sweep is O((v s k + h) log (v s k + h)), the class and pin
+# checks are linear in the virtual registers and their uses, and the shape
+# check is linear in the operands.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.machine.alloc.allowed;
+use mirl.machine.alloc.allowed.Allowed;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.live.Hold;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Segment;
+use mirl.machine.alloc.live.Site;
+use mirl.machine.alloc.live.Use;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.operand.Virtual;
+
+# no location or owner
+pub val NONE: u32 = 0xffffffff;
+
+# two values in storage one location shares at one position
+# ---
+# location: the location
+# position: the position
+# first:    one owner, a virtual register
+# second:   the other, a virtual register, or NONE for a value the location
+#           holds of its own
+pub rec Meeting {
+    location: u32;
+    position: u32;
+    first:    u32;
+    second:   u32;
+}
+
+# why the checker refused an allocation
+# ---
+# alloc:      the allocator refused storage
+# live:       the virtual form's liveness was refused
+# count:      an assignment of another number of virtual registers than the form's
+# unassigned: a live virtual register with no location
+# outside:    a virtual register at a location the target does not allow
+# class:      a virtual register at a location outside its class
+# meet:       two values in storage one location shares at one position
+# unpinned:   a pinned read or write outside the location its row fixes
+# shape:      a rewritten instruction that is not the form's under the assignment
+pub tag Failure: u8 {
+    alloc: allocator.Error;
+    live:  live.Error;
+    count;
+    unassigned: Virtual;
+    outside:    Virtual;
+    class:      Virtual;
+    meet:       Meeting;
+    unpinned:   Site;
+    shape:      Site;
+}
+
+# one owner's positions in one location's storage
+rec Item {
+    location: u32;
+    from:     u32;
+    to:       u32;
+    owner:    u32;
+}
+
+fun by_place(a: *Item, b: *Item) i64 {
+    if (a.location != b.location) {
+        if (a.location < b.location) { ret -1; }
+        ret 1;
+    }
+    if (a.from < b.from)   { ret -1; }
+    if (a.from > b.from)   { ret 1; }
+    if (a.owner < b.owner) { ret -1; }
+    if (a.owner > b.owner) { ret 1; }
+    ret 0;
+}
+
+fun fail(f: Failure) err[Failure] {
+    ret err[Failure].err{f};
+}
+
+fun alloc_fail(e: allocator.Error) err[Failure] {
+    ret fail(Failure.alloc{e});
+}
+
+# every live virtual register's location, its class and its pins
+fun assigned(l: *Live, f: *Function, at: *Locations, x: *Allowed, locations: Slice[u32]) err[Failure] {
+    var v: u32 = 0;
+    for (v::usize < f.virtuals.len) {
+        val vr:   Virtual        = Virtual{index: v};
+        val segs: Slice[Segment] = live.segments(l, vr);
+        if (segs.size > 0) {
+            val loc: u32 = locations.data[v];
+            if (loc == NONE || loc >= location.count(at))                           { ret fail(Failure.unassigned{vr}); }
+            if (!allowed.admits(x, loc))                                            { ret fail(Failure.outside{vr}); }
+            if (!class.holds(function.class_of(f, vr), location.physical(at, loc))) { ret fail(Failure.class{vr}); }
+            val us: Slice[Use] = live.uses(l, vr);
+            var k:  usize      = 0;
+            for (k < us.size) {
+                if (us.data[k].fixed != live.NONE && us.data[k].fixed != loc) { ret fail(Failure.unpinned{Site{instruction: us.data[k].instruction, operand: us.data[k].operand}}); }
+                k = k + 1;
+            }
+        }
+        v = v + 1;
+    }
+    ret err[Failure].ok{};
+}
+
+fun push_item(items: *vector.Vector[Item], it: Item) err[Failure] {
+    val p: res[usize, allocator.Error] = vector.push[Item](items, it);
+    if (sel p.err) { ret alloc_fail(p.err); }
+    ret err[Failure].ok{};
+}
+
+# the sweep of every location's owners for two that meet
+fun apart(l: *Live, f: *Function, at: *Locations, locations: Slice[u32], items: *vector.Vector[Item]) err[Failure] {
+    var v: u32 = 0;
+    for (v::usize < f.virtuals.len) {
+        val segs: Slice[Segment] = live.segments(l, Virtual{index: v});
+        if (segs.size > 0) {
+            val alias: Slice[u32] = location.shares(at, locations.data[v]);
+            var k:     usize      = 0;
+            for (k < alias.size) {
+                var j: usize = 0;
+                for (j < segs.size) {
+                    val p: err[Failure] = push_item(items, Item{location: alias.data[k], from: segs.data[j].from, to: segs.data[j].to, owner: v});
+                    if (sel p.err) { ret p; }
+                    j = j + 1;
+                }
+                k = k + 1;
+            }
+        }
+        v = v + 1;
+    }
+    var loc: u32 = 0;
+    for (loc < location.count(at)) {
+        val hs: Slice[Hold] = live.holds(l, loc);
+        var k:  usize       = 0;
+        for (k < hs.size) {
+            val p: err[Failure] = push_item(items, Item{location: loc, from: hs.data[k].from, to: hs.data[k].to, owner: hs.data[k].owner});
+            if (sel p.err) { ret p; }
+            k = k + 1;
+        }
+        loc = loc + 1;
+    }
+    sort.sort_by[Item](items.data, items.len, by_place);
+    var i:     usize = 0;
+    var reach: u32   = 0;
+    var by:    u32   = NONE;
+    for (i < items.len) {
+        val it: Item = items.data[i];
+        if (i == 0 || items.data[i - 1].location != it.location) {
+            reach = 0;
+            by    = NONE;
+        }
+        if (it.from < reach && by != it.owner) {
+            var first:  u32 = it.owner;
+            var second: u32 = by;
+            if (first == NONE) {
+                first  = by;
+                second = NONE;
+            }
+            ret fail(Failure.meet{Meeting{location: it.location, position: it.from, first: first, second: second}});
+        }
+        if (it.to > reach) {
+            reach = it.to;
+            by    = it.owner;
+        }
+        i = i + 1;
+    }
+    ret err[Failure].ok{};
+}
+
+fun same_opcode(a: Opcode, b: Opcode) bool {
+    if (sel a.row) { ret sel b.row && b.row == a.row; }
+    ret sel b.pseudo && b.pseudo == a.pseudo;
+}
+
+fun rewritten(at: *Locations, locations: Slice[u32], r: Register) Register {
+    if (sel r.physical) { ret r; }
+    ret Register.physical{location.physical(at, locations.data[r.virtual.index])};
+}
+
+# whether an operand of the result is the form's under the assignment
+fun stands(at: *Locations, locations: Slice[u32], o: Operand, got: Operand) bool {
+    if (sel o.virtual) {
+        val loc: u32 = locations.data[o.virtual.index];
+        if (loc == NONE) { ret false; }
+        ret sel got.physical && class.same_physical(got.physical, location.physical(at, loc));
+    }
+    if (sel o.tied) {
+        val dest:   Register = o.tied.dest;
+        val source: Register = o.tied.source;
+        if (sel dest.virtual && locations.data[dest.virtual.index] == NONE)     { ret false; }
+        if (sel source.virtual && locations.data[source.virtual.index] == NONE) { ret false; }
+        ret sel got.tied && (operand.same_register(got.tied.dest, rewritten(at, locations, dest)) && operand.same_register(got.tied.source, rewritten(at, locations, source)));
+    }
+    ret operand.same(o, got);
+}
+
+fun shaped(f: *Function, at: *Locations, locations: Slice[u32], result: *Function) err[Failure] {
+    if (result.blocks.len != f.blocks.len || result.virtuals.len != 0) { ret fail(Failure.shape{Site{instruction: Instruction{index: NONE}, operand: NONE}}); }
+    var k: usize = 0;
+    for (k < f.blocks.len) {
+        val want: Slice[Instruction] = function.instructions(f, Block{index: k::u32});
+        val have: Slice[Instruction] = function.instructions(result, Block{index: k::u32});
+        if (want.size != have.size) { ret fail(Failure.shape{Site{instruction: Instruction{index: NONE}, operand: NONE}}); }
+        var i: usize = 0;
+        for (i < want.size) {
+            val a:    *InstructionData = function.data(f, want.data[i]);
+            val b:    *InstructionData = function.data(result, have.data[i]);
+            val site: Site             = Site{instruction: want.data[i], operand: NONE};
+            if (!same_opcode(a.opcode, b.opcode) || a.operands.size != b.operands.size || a.declassifies != b.declassifies) { ret fail(Failure.shape{site}); }
+            var n: usize = 0;
+            for (n < a.operands.size) {
+                if (!stands(at, locations, a.operands.data[n], b.operands.data[n])) { ret fail(Failure.shape{Site{instruction: want.data[i], operand: n::u32}}); }
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    ret err[Failure].ok{};
+}
+
+# prove an allocation
+# ---
+# a:         the allocator the proof takes
+# f:         the virtual form
+# at:        the locations of its target
+# clobbers:  the locations its instructions leave undefined beyond their rows
+# x:         the locations the target lets the allocator assign
+# locations: each virtual register's location, NONE for one with none
+# result:    the rewritten function
+# ret:       ok, or the first fact that does not hold
+pub fun check(a: *allocator.Allocator, f: *Function, at: *Locations, clobbers: Slice[Clobber], x: *Allowed, locations: Slice[u32], result: *Function) err[Failure] {
+    if (locations.size != f.virtuals.len) { ret fail(Failure.count{}); }
+    val got: res[Live, live.Error] = live.compute(a, f, at, clobbers);
+    if (sel got.err) { ret fail(Failure.live{got.err}); }
+    var l: Live = got.ok;
+    fin { live.dnit(?l); }
+    val placed: err[Failure] = assigned(?l, f, at, x, locations);
+    if (sel placed.err) { ret placed; }
+    var items: vector.Vector[Item] = vector.init[Item](a);
+    fin { vector.dnit[Item](?items); }
+    val kept: err[Failure] = apart(?l, f, at, locations, ?items);
+    if (sel kept.err) { ret kept; }
+    ret shaped(f, at, locations, result);
+}

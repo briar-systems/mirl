@@ -11,7 +11,8 @@ A target holds
 - `name`, its spelling, used for diagnostics and lookup only,
 - `arch` and `system`, the names of its rows in mink's architecture and system catalogs, where the system must run the architecture,
 - `caps`, its capability declarations,
-- `data`, the facts data layout reads.
+- `data`, the facts data layout reads,
+- `convention`, the calling convention its calls are made under (see [Argument passing](#argument-passing)).
 
 `mirl.target.declared(t)` says whether a target is complete. Every declaration has an unstated zero case, so a row left zeroed reads as incomplete and never as an answer. A list that may rightly be empty sits under a case of its own, so an empty list is a stated answer.
 
@@ -46,6 +47,7 @@ mirl.target.size(?l, ty)          # res[u64, Error], bytes
 mirl.target.align(?l, ty)         # res[u64, Error], a power of two
 mirl.target.extent(?l, ty)        # res[Extent, Error], size and alignment together
 mirl.target.offset(?l, ty, i)     # res[u64, Error], member i of a structure or union
+mirl.target.offsets(?l, ty, out)  # err[Error], every member of a structure in one walk
 ```
 
 `of` takes the target a module names (found by `mirl.target.by_name(module.target)`) and the module's type table. The query is for any IR type.
@@ -62,7 +64,36 @@ A request that cannot be answered is refused with a reason. The reasons are an u
 
 ## Argument passing
 
-How a function's arguments and results are passed is not in the IR. A `call` states only the signature, and a function states only its function type. The calling convention is chosen below the IR from the function type and the system and architecture the target names, and a front end does not compute it. This version of the library does not yet expose a query for it, because the machine layer that applies calling conventions is not built.
+How a function's arguments and results are passed is not in the IR. A `call` states only the signature, and a function states only its function type. A front end never computes it. It asks `mirl.target.abi`, and the backend asks the same routine once per call site.
+
+A target declares the convention its calls are made under in `convention`: the row of the convention, or `uncarried` for a convention mirl has no row for yet, whose calls are refused. A **convention** is a row for one architecture, system and ABI, as data:
+
+| field | what it states |
+|---|---|
+| `results`, `arguments` | the result classifier and the argument classifier |
+| `file` | the masc register file its registers are named in, none where there is none |
+| `word` | the bits of one argument word |
+| `floats` | the widest float passed in float registers, or none |
+| `passing`, `returning` | the argument and result registers by masc's names, each class in the order taken |
+| `preserved`, `reserved` | the registers a callee preserves whole, and those no call clobbers and nothing allocates |
+| `stack` | none, or a stack in memory with its alignment at a call, its red zone and its shadow space |
+| `indirect` | what carries the address of a result passed by reference, and where a callee hands it back |
+| `variadic` | where unnamed arguments travel, the count a caller sets, and how a callee reaches them |
+| `half` | whether a 16-bit float travels as a float or as an integer |
+
+A row is resolved once against a masc selection of its register file (`mirl.target.abi.resolve`), which looks its names up, groups the argument and result registers by class and computes the registers a call clobbers.
+
+```
+val c: *Convention = mirl.target.abi.of(target);                    # res[*Convention, Error]
+val r: Resolved    = mirl.target.abi.resolve(a, c, ?registers);     # res[Resolved, Unresolved]
+mirl.target.abi.classify(a, ?layout, ?r, signature, statement)      # res[Assignment, Error]
+```
+
+`classify` describes each argument and result type through the **type view**, a tree of nodes whose every size, alignment and offset was asked of the data layout, and runs the row's result classifier and then its argument classifier over it. It is the only caller of a row's classifiers. The **assignment** it returns states, for each argument and result, whether it travels by value or by reference to a copy the caller makes and owns, and its **pieces**: for each piece a place (a register by masc's identity, a stack offset, or an operand of the target's own call form), the offset and size of the bytes it carries, how the offset and size scale, and how the rest of its place is filled.
+
+The call's **statement** says how its language passes aggregates (by the platform's C rules, or each by reference to a copy the caller makes) and how many of its arguments are named. Both have an unstated zero case, which is refused.
+
+The one row is `lp64d`, the RISC-V convention of RV64 with hardware double precision, to the RISC-V ELF psABI 1.0.
 
 ## Attributes
 
