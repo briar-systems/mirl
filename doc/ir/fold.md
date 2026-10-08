@@ -40,6 +40,10 @@ The folder decides nothing by opcode name. The row decides everything but the ar
 
 Every row that reads or writes memory, transfers control, computes an address from a pointer or has declared secrecy is unfoldable. These are `load`, `store`, `alloca`, `ptr.add`, `br`, `cbr`, `call`, `ret`, `ptrtoint`, `inttoptr`, `unreachable`, `fence`, `mem.copy`, `mem.fill` and every atomic opcode. Every other row folds, including the vector opcodes, the reductions and `declassify`.
 
+## Secrecy
+
+An operand carries a flag saying whether it is secret, and `folded` says whether the results are secret by the row's secrecy rule. A caller that places the results as constants never places a public constant over a secret result: folding never produces a public value from a secret computation, so the constant folding pass leaves such an instruction in place.
+
 ## Not-a-number results
 
 A float operation that gives a not-a-number gives one with a sign and payload that the IR leaves unspecified. The folder gives one valid choice. A not-a-number operand gives itself quieted, the first such operand when there are several, and an invalid operation gives the format's canonical quiet not-a-number. A caller compares the folder's result as a not-a-number and never by its bits.

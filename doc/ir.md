@@ -252,6 +252,8 @@ The library refuses the edits that would make a secret value public by a path ot
 - `supplant`, which puts one instruction in the place of another, refuses a result that is secret where the one it replaces gave a public result.
 - `set_metadata`, which replaces an instruction's metadata record whole, may raise the secrecy mark and refuses to lower it on any instruction, with or without results, so a mark never drifts from what was declared through this edit.
 
+Folding never produces a public value from a secret computation. An instruction that is secret by declaration or by its operands, or whose fold the folder marks secret, stays in place, since a constant of a module is public.
+
 The verifier states the same facts as a rule (see section 8). Every result must be secret exactly as its row's secrecy rule gives, and no edge may pass a secret value to a public parameter.
 
 ### 7.1 Constant time
