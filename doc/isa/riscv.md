@@ -42,9 +42,9 @@ The declared operations are in `declared.mach`, each with the job that closes it
 
 Some operations select only for the operands a base form covers.
 
-- A shift selects for a constant count. RISC-V takes a variable count modulo the width and the ir gives 0 or the sign fill, so a variable shift waits for the shift bounding that marks a count it has bounded (#55).
+- A shift by a variable count selects only when it carries the bounded mark. RISC-V takes the count modulo the width and the ir gives 0 or the sign fill, so the shift bounding legalisation bounds the count and marks the shift, and the rule then emits `sll`, `srl` or `sra`, with the `w` forms for 32 bits on RV64.
 - Division and remainder select to the instruction, which does not trap. The zero and overflow checks are inserted before selection (#54).
-- A multiply of two registers needs M, and without it names `mul`. A narrower multiply form waits for #55.
+- A multiply of two registers needs M, and without it names `mul`. The high half of a product, which M gives as `mulh`, `mulhu` and `mulhsu`, is declared in the target and not yet selected: the pattern of extensions, a multiply and a shift selects as those pieces.
 - Arithmetic at 8 and 16 bits, and a signed comparison of conditions, has no rule. The target's ALU widths are 32 and 64, so narrower arithmetic is promoted before selection.
 - `fmin`, `fmax`, `ffloor`, `fceil`, `fint` and `fnearest` select to Zfa rows and have no base form. A select of floats has no rule. A 64 bit float constant needs RV64.
 - Half precision selects with Zfh and is otherwise legalised away (#53), and so are integers wider than the register (#51).
