@@ -23,6 +23,7 @@ use std.collections.map;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
+use mirl.fail.keep;
 use mirl.ir.block.BlockData;
 use mirl.ir.function.Body;
 use mirl.ir.function.FunctionData;
@@ -1026,6 +1027,189 @@ pub fun erase_block(m: *Module, f: Function, k: Block) err[Error] {
         i                                             = i + 1;
     }
     d.erased = true;
+    ret err[Error].ok{};
+}
+
+# put the block one branch alone enters in that branch's place: every use of
+# its parameters moves to the argument the edge passes, the branch is erased,
+# the block's instructions take its slot, and the block is erased
+# ---
+# m:    the module
+# f:    the function
+# jump: a placed instruction of one edge and no used result, the only edge
+#       into a block other than its own and the entry
+# ret:  ok, or why it was refused, the body left as it was
+pub fun splice(m: *Module, f: Function, jump: Instruction) err[Error] {
+    val got: res[*Body, Error] = module.body(m, f);
+    if (sel got.err) { ret err[Error].err{got.err}; }
+    val b:  *Body             = got.ok;
+    val at: res[Block, Error] = placed(b, jump);
+    if (sel at.err) { ret err[Error].err{at.err}; }
+    val into: Block            = at.ok;
+    val d:    *InstructionData = ?b.instructions.data[jump.index];
+    if (d.edges.len != 1) { ret err[Error].err{Error.edge{d.edges.len::u32}}; }
+    val k:    Block      = d.edges.data[0].block;
+    val open: err[Error] = live(b, k);
+    if (sel open.err)                                 { ret open; }
+    if (k.index == 0)                                 { ret err[Error].err{Error.entry{}}; }
+    if (k.index == into.index)                        { ret err[Error].err{Error.same{k}}; }
+    if (b.blocks.data[k.index].predecessors.len != 1) { ret err[Error].err{Error.reached{k}}; }
+    var i: usize = 0;
+    for (i < d.results.len) {
+        if (b.values.data[d.results.data[i].index].uses.len != 0) { ret err[Error].err{Error.used{d.results.data[i]}}; }
+        i = i + 1;
+    }
+    val params: *vector.Vector[Value] = ?b.blocks.data[k.index].parameters;
+    val args:   *vector.Vector[Value] = ?d.edges.data[0].arguments;
+    i = 0;
+    for (i < args.len) {
+        var j: usize = 0;
+        for (j < params.len) {
+            if (args.data[i].index == params.data[j].index) { ret err[Error].err{Error.circular{args.data[i]}}; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < args.len) {
+        var moving: usize = 0;
+        var j:      usize = 0;
+        for (j < args.len) {
+            if (args.data[j].index == args.data[i].index) { moving = moving + b.values.data[params.data[j].index].uses.len; }
+            j = j + 1;
+        }
+        val room: res[usize, allocator.Error] = vector.reserve[Instruction](?b.values.data[args.data[i].index].uses, moving);
+        if (sel room.err) { ret refuse(room.err); }
+        i = i + 1;
+    }
+    val tail: *vector.Vector[Instruction] = ?b.blocks.data[k.index].instructions;
+    val list: *vector.Vector[Instruction] = ?b.blocks.data[into.index].instructions;
+    val room: res[usize, allocator.Error] = vector.reserve[Instruction](list, tail.len);
+    if (sel room.err) { ret refuse(room.err); }
+
+    i = 0;
+    for (i < params.len) {
+        move_uses(b, params.data[i], args.data[i]);
+        i = i + 1;
+    }
+    val p: usize = slot(b, into, jump);
+    take_out(b, jump);
+    var n: usize = list.len;
+    for (n > p) {
+        n                       = n - 1;
+        list.data[n + tail.len] = list.data[n];
+    }
+    i = 0;
+    for (i < tail.len) {
+        list.data[p + i]                              = tail.data[i];
+        b.instructions.data[tail.data[i].index].place = Place.placed{into};
+        i                                             = i + 1;
+    }
+    list.len = list.len + tail.len;
+    tail.len = 0;
+    i        = 0;
+    for (i < params.len) {
+        b.values.data[params.data[i].index].def = Def.removed{};
+        i                                       = i + 1;
+    }
+    b.blocks.data[k.index].erased = true;
+    ret err[Error].ok{};
+}
+
+# how far a body's lists reach, so a refused edit can be taken back to it
+# ---
+# blocks:       its number of blocks
+# values:       its number of values
+# instructions: its number of instructions
+pub rec Mark {
+    blocks:       u32;
+    values:       u32;
+    instructions: u32;
+}
+
+# where a body's lists end now
+pub fun mark(m: *Module, f: Function) res[Mark, Error] {
+    val got: res[*Body, Error] = module.body(m, f);
+    if (sel got.err) { ret res[Mark, Error].err{got.err}; }
+    ret res[Mark, Error].ok{Mark{blocks: got.ok.blocks.len::u32, values: got.ok.values.len::u32, instructions: got.ok.instructions.len::u32}};
+}
+
+# take back every block, value and instruction made since a mark, leaving the
+# body as it was at the mark
+#
+# what was made since may be used, entered and listed only by what was made
+# since, so what came before is left exactly as it was. it never allocates.
+# ---
+# m:   the module
+# f:   the function
+# at:  a mark of the body
+# ret: ok, or why it was refused with the body left as it was, or the first
+#      release the allocator refused once everything was taken back
+pub fun rewind(m: *Module, f: Function, at: Mark) err[Error] {
+    val got: res[*Body, Error] = module.body(m, f);
+    if (sel got.err) { ret err[Error].err{got.err}; }
+    val b: *Body = got.ok;
+    if (at.blocks::usize > b.blocks.len)             { ret err[Error].err{Error.block{Block{index: at.blocks}}}; }
+    if (at.values::usize > b.values.len)             { ret err[Error].err{Error.value{Value{index: at.values}}}; }
+    if (at.instructions::usize > b.instructions.len) { ret err[Error].err{Error.instruction{Instruction{index: at.instructions}}}; }
+    var i: usize = at.values::usize;
+    for (i < b.values.len) {
+        val v: *ValueData = ?b.values.data[i];
+        var u: usize      = 0;
+        for (u < v.uses.len) {
+            if (v.uses.data[u].index < at.instructions) { ret err[Error].err{Error.used{Value{index: i::u32}}}; }
+            u = u + 1;
+        }
+        if (sel v.def.parameter) {
+            if (v.def.parameter.block.index < at.blocks) { ret err[Error].err{Error.parameter{v.def.parameter.index}}; }
+        }
+        i = i + 1;
+    }
+    i = at.blocks::usize;
+    for (i < b.blocks.len) {
+        val k: *BlockData = ?b.blocks.data[i];
+        var u: usize      = 0;
+        for (u < k.predecessors.len) {
+            if (k.predecessors.data[u].index < at.instructions) { ret err[Error].err{Error.reached{Block{index: i::u32}}}; }
+            u = u + 1;
+        }
+        u = 0;
+        for (u < k.instructions.len) {
+            if (k.instructions.data[u].index < at.instructions) { ret err[Error].err{Error.occupied{Block{index: i::u32}}}; }
+            u = u + 1;
+        }
+        i = i + 1;
+    }
+
+    var failed: err[allocator.Error] = err[allocator.Error].ok{};
+    i = b.instructions.len;
+    for (i > at.instructions::usize) {
+        i = i - 1;
+        if (!(sel b.instructions.data[i].place.erased)) { take_out(b, Instruction{index: i::u32}); }
+        keep(?failed, instruction.release(?b.instructions.data[i]));
+    }
+    b.instructions.len = at.instructions::usize;
+    i                  = at.values::usize;
+    for (i < b.values.len) {
+        val def: Def = b.values.data[i].def;
+        if (sel def.constant) {
+            val key: u32 = def.constant.index;
+            map.remove[u32, Value](?b.constants, ?key);
+        }
+        keep(?failed, vector.dnit[Instruction](?b.values.data[i].uses));
+        i = i + 1;
+    }
+    b.values.len = at.values::usize;
+    i            = at.blocks::usize;
+    for (i < b.blocks.len) {
+        keep(?failed, vector.dnit[Value](?b.blocks.data[i].parameters));
+        keep(?failed, vector.dnit[Instruction](?b.blocks.data[i].instructions));
+        keep(?failed, vector.dnit[Instruction](?b.blocks.data[i].predecessors));
+        i = i + 1;
+    }
+    b.blocks.len = at.blocks::usize;
+    if (sel failed.err) { ret refuse(failed.err); }
     ret err[Error].ok{};
 }
 
