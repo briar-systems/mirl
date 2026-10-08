@@ -7,11 +7,14 @@
 # is built, since the builder types an instruction from its operands. a block's
 # instructions go to the position their line stands at whatever order they are
 # built in. the third refuses what is left: a value nothing defines, or one
-# that is only defined by an instruction that needs it.
+# that is only defined by an instruction that needs it. value binding records
+# are bound last, once every value they read is built, each at the position
+# its line stands at among its block's instruction lines.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -36,8 +39,15 @@ use mirl.ir.instruction.InstructionData;
 use mirl.ir.instruction.Request;
 use mirl.ir.metadata.Bindings;
 use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.UNBOUND;
 use mirl.ir.module;
 use mirl.ir.opcode;
+use mirl.ir.point;
+use mirl.ir.point.Expression;
+use mirl.ir.point.Operand;
+use mirl.ir.point.Reads;
+use mirl.ir.point.Step;
 use mirl.ir.text.parse.debug;
 use mirl.ir.text.parse.lexer;
 use mirl.ir.text.parse.lexer.Token;
@@ -65,6 +75,21 @@ rec Line {
     column: u32;
 }
 
+# a value binding record line
+# ---
+# at:     the start of the line
+# block:  the block it stands in, by position in the body
+# before: how many instruction lines of its block stand before it
+# line:   where it starts
+# column: where it starts
+rec Record {
+    at:     Mark;
+    block:  usize;
+    before: u32;
+    line:   u32;
+    column: u32;
+}
+
 # a branch target while its arguments are being read
 # ---
 # block: the block it enters
@@ -76,7 +101,8 @@ rec Target {
     count: usize;
 }
 
-# the lists one instruction is read into
+# the lists one instruction is read into, and the storage bindings its
+# metadata names
 rec Parts {
     operands: vector.Vector[Value];
     args:     vector.Vector[Value];
@@ -87,6 +113,7 @@ rec Parts {
     branches: vector.Vector[Branch];
     bindings: vector.Vector[Binding];
     results:  vector.Vector[Token];
+    storage:  Bindings;
 }
 
 fun parts(p: *Parser) Parts {
@@ -100,6 +127,7 @@ fun parts(p: *Parser) Parts {
         branches: vector.init[Branch](p.a),
         bindings: vector.init[Binding](p.a),
         results:  vector.init[Token](p.a),
+        storage:  UNBOUND,
     };
 }
 
@@ -352,7 +380,7 @@ fun metadata(p: *Parser, x: *Parts) {
             state.fail_at(p, t.line, t.column, Reason.ir{list.err});
             ret;
         }
-        build.bind(?p.b, list.ok);
+        x.storage = list.ok;
     }
 }
 
@@ -441,6 +469,15 @@ fun instruction(p: *Parser, f: Function, blocks: *vector.Vector[Block], lines: *
         state.fail_at(p, ln.line, ln.column, Reason.results{d.ok.results.len::u32});
         ret;
     }
+    if (x.storage.index != UNBOUND.index) {
+        var md: Metadata = d.ok.metadata;
+        md.bindings = x.storage;
+        val set: err[module.Error] = body.set_metadata(p.m, f, made, md);
+        if (sel set.err) {
+            state.fail_at(p, ln.line, ln.column, Reason.ir{set.err});
+            ret;
+        }
+    }
     var k: usize = 0;
     for (k < x.results.len && state.ok(p)) {
         val v: Value = build.result(?p.b, made, k::u32);
@@ -451,25 +488,100 @@ fun instruction(p: *Parser, f: Function, blocks: *vector.Vector[Block], lines: *
     state.built(p, ln.line, ln.column);
 }
 
+# save a record line, to bind once every instruction is built
+fun note(p: *Parser, blocks: *vector.Vector[Block], before: u32, records: *vector.Vector[Record]) {
+    if (blocks.len == 0) {
+        state.expected(p, "a block label");
+        ret;
+    }
+    val at:  Mark = state.mark(p);
+    val ln:  u32  = p.tok.line;
+    val col: u32  = p.tok.column;
+    state.skip_line(p);
+    state.expect_end(p);
+    state.push[Record](p, records, Record{at: at, block: blocks.len - 1, before: before, line: ln, column: col});
+}
+
+# the kind of step a word names
+fun step_kind(p: *Parser, t: Token) opt[point.Kind] {
+    var i: u32 = 0;
+    for (i::usize < point.rows()) {
+        val r: opt[point.Row] = point.row(point.Kind{index: i});
+        if (sel r.some && lexer.spelled(t.text, r.some.name)) { ret opt[point.Kind].some{point.Kind{index: i}}; }
+        i = i + 1;
+    }
+    state.fail_at(p, t.line, t.column, Reason.unknown{Named{what: "salvage step", name: t.raw}});
+    ret opt[point.Kind].none{};
+}
+
+# read what a record gives its variable
+fun reads(p: *Parser, at: Record) Reads {
+    if (state.accept_word(p, "unavailable")) { ret Reads.unavailable{}; }
+    state.expect(p, lexer.EQUALS, "=");
+    val v:     Value               = operand(p);
+    var steps: vector.Vector[Step] = vector.init[Step](p.a);
+    fin { vector.dnit[Step](?steps); }
+    for (state.ok(p) && state.accept(p, lexer.COMMA)) {
+        val t: Token = state.expect(p, lexer.WORD, "a salvage step");
+        if (!state.ok(p)) { brk; }
+        val kind: opt[point.Kind] = step_kind(p, t);
+        if (sel kind.none) { brk; }
+        val r: opt[point.Row] = point.row(kind.some);
+        if (sel r.none)                { brk; }
+        if (sel r.some.takes.constant) { state.push[Step](p, ?steps, Step{kind: kind.some, argument: point.Argument.constant{ty.constant(p)}}); }
+        or                             { state.push[Step](p, ?steps, Step{kind: kind.some, argument: point.Argument.to{ty.ty(p)}}); }
+    }
+    if (!state.ok(p)) { ret Reads.unavailable{}; }
+    val e: res[Expression, module.Error] = module.expression(p.m, Slice[Step]{data: steps.data, size: steps.len});
+    if (sel e.err) {
+        state.fail_at(p, at.line, at.column, Reason.ir{e.err});
+        ret Reads.unavailable{};
+    }
+    ret Reads.operand{Operand{value: v, expression: e.ok}};
+}
+
+# bind one record line at its point
+fun record(p: *Parser, blocks: *vector.Vector[Block], r: Record) {
+    state.rewind(p, r.at);
+    state.expect_word(p, "bind");
+    val v:    u32   = debug.ref(p, ?p.vars, "variable");
+    val gave: Reads = reads(p, r);
+    state.expect_end(p);
+    if (!state.ok(p)) { ret; }
+    build.at(?p.b, blocks.data[r.block], r.before);
+    build.bind_at(?p.b, Binding{index: v}, gave);
+    state.built(p, r.line, r.column);
+}
+
 # read the body of function f, from its `{`
 pub fun function(p: *Parser, f: Function, at: Mark) {
     state.rewind(p, at);
     map.clear_by[View, u32](?p.values);
     map.clear_by[View, u32](?p.blocks);
     build.enter(?p.b, f);
-    var blocks: vector.Vector[Block] = vector.init[Block](p.a);
-    var lines:  vector.Vector[Line]  = vector.init[Line](p.a);
+    var blocks:  vector.Vector[Block]  = vector.init[Block](p.a);
+    var lines:   vector.Vector[Line]   = vector.init[Line](p.a);
+    var records: vector.Vector[Record] = vector.init[Record](p.a);
     fin {
         vector.dnit[Block](?blocks);
         vector.dnit[Line](?lines);
+        vector.dnit[Record](?records);
     }
     state.expect(p, lexer.LBRACE, "{");
     state.expect_end(p);
+    var count: u32 = 0;
     for (state.ok(p) && !state.is(p, lexer.RBRACE)) {
         if (state.is(p, lexer.END))         { state.expected(p, "}"); }
         or (state.accept(p, lexer.NEWLINE)) {}
-        or (state.is(p, lexer.LABEL))       { header(p, ?blocks); }
-        or                                  { register(p, ?blocks, ?lines); }
+        or (state.is(p, lexer.LABEL)) {
+            header(p, ?blocks);
+            count = 0;
+        }
+        or (state.is_word(p, "bind")) { note(p, ?blocks, count, ?records); }
+        or {
+            register(p, ?blocks, ?lines);
+            count = count + 1;
+        }
     }
 
     var left:     usize = lines.len;
@@ -495,5 +607,10 @@ pub fun function(p: *Parser, f: Function, at: Mark) {
         for (lines.data[i].built) { i = i + 1; }
         ready(p, lines.data[i], ?blame);
         state.fail_at(p, blame.line, blame.column, Reason.unresolved{Named{what: "value", name: blame.raw}});
+    }
+    var r: usize = 0;
+    for (r < records.len && state.ok(p)) {
+        record(p, ?blocks, records.data[r]);
+        r = r + 1;
     }
 }
