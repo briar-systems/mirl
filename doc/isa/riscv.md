@@ -7,7 +7,7 @@
 - The register width comes from the target's `widths.register` declaration. A rule that differs by width carries a hook that reads it. No rule reads an architecture's name.
 - The extensions come from the target's selection, which masc closes over implied extensions once. A rule emits rows, and the engine drops a rule whose row masc does not admit. So M, A (Zaamo, with Zabha for bytes and halves), F and D, Zfh, Zfa, Zicond and the Zba, Zbb and Zbs bit manipulation extensions are each a row's requirement and never a branch in the table.
 - A catalog row that exists once per width (`slli`, `rori`, `ld`) is two named rows, and the one the selection admits is the one the rule takes.
-- `rows.mach` names every row once, by its position in the generated catalog. The table's test checks each name against the mnemonic and width it stands for, so a regenerated catalog that moves a row is a failing test.
+- A rule names each row and each scratch or holding class by the handle masc generates for it (`gen_row.ADD`, `register.X`), so no file here holds a position in masc's catalog or register file. A regenerated catalog that renames a row is a compile error here and never a different instruction.
 
 ## Values
 
@@ -45,6 +45,6 @@ Some operations select only for the operands a base form covers.
 - A shift by a variable count selects only when it carries the bounded mark. RISC-V takes the count modulo the width and the ir gives 0 or the sign fill, so the shift bounding legalisation bounds the count and marks the shift, and the rule then emits `sll`, `srl` or `sra`, with the `w` forms for 32 bits on RV64.
 - Division and remainder select to the instruction, which does not trap. The zero and overflow checks are inserted before selection (#54).
 - A multiply of two registers needs M, and without it names `mul`. The high half of a product, which M gives as `mulh`, `mulhu` and `mulhsu`, is selected whole: the truncation of the product of two extensions shifted down by the register width is one `mulh`, `mulhu` or `mulhsu` (M), for operands as signed, unsigned, and one of each in either order. The 32 bit form on RV64 is left to the rules for its pieces.
-- Arithmetic at 8 and 16 bits, and a signed comparison of conditions, has no rule. The target's ALU widths are 32 and 64, so narrower arithmetic is promoted before selection.
+- A signed comparison of conditions has no rule. Arithmetic at 8 and 16 bits is widened to the target's ALU widths before selection (see [target](../ir/target.md)), except the counts, the byte swap and the overflow forms, which `mirl.legal.LEFT` lists.
 - `fmin`, `fmax`, `ffloor`, `fceil`, `fint` and `fnearest` select to Zfa rows and have no base form. A select of floats has no rule. A 64 bit float constant needs RV64.
 - Half precision selects with Zfh and is otherwise legalised away (#53), and so are integers wider than the register (#51).

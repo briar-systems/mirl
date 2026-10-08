@@ -1,0 +1,945 @@
+# the linear scan of one round over the live intervals of its virtual form
+#
+# virtual registers a tie joins are one bundle, given one location: a bundle
+# is the union of its members' segments, its weight their weights summed and
+# its density that weight over the positions it covers. a tie whose two
+# halves meet, or a bundle whose members meet, cannot be one location, so
+# the round gives the source half of each such tie a value of its own, or the
+# destination half when the source is already one, and stops there. so do
+# members pinned to different locations, whose pins each get a value of
+# their own.
+#
+# the bundles are walked in start order, the bundle number breaking a tie.
+# the active set holds the assigned bundles live at the current position and
+# the inactive set those in a hole, each kept per location as an intrusive
+# list, with a count per location of the active bundles whose location shares
+# its storage, and two heaps, keyed by the end of each active bundle's current
+# segment and the start of each inactive bundle's next, that move a bundle
+# between them as the position passes. a location is free for a bundle when
+# no active bundle holds storage it shares, no inactive bundle holding such
+# storage meets the bundle, and no value of the location's own or of another
+# virtual register's pin holds such storage over the bundle.
+#
+# a pinned bundle may take only its pin. any other takes the free location a
+# copy names, the copy of the most weight first, then the earliest copy, then
+# the lowest location, and otherwise the free location of its class with the
+# lowest number. with none free, the location whose conflicting bundles are
+# the least dense at their densest is found, the lowest number breaking a
+# tie, and those bundles are evicted when the current one is denser, or when
+# it is made only of values of a half's own, which are never carried any
+# other way. otherwise the current bundle is split: a pinned one's pins get
+# values of their own, and any other is spilled, carried in pieces in the
+# next round. a bundle that can be neither placed nor split refuses the
+# function. an evicted or spilled bundle holds nothing for the rest of the
+# round, and the round's assignment stands only when nothing was spilled or
+# given a value of its own.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.heap;
+use std.collections.heap.Heap;
+use std.collections.heap.Min;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.fail.keep;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Lists;
+use mirl.machine.alloc.allowed;
+use mirl.machine.alloc.allowed.Allowed;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Segment;
+use mirl.machine.alloc.live.Site;
+use mirl.machine.alloc.live.Use;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.alloc.spill;
+use mirl.machine.class;
+use mirl.machine.class.Class;
+use mirl.machine.class.Physical;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Virtual;
+use mirl.machine.pseudo;
+use mirl.slice;
+
+# no location, bundle or virtual register
+pub val NONE: u32 = 0xffffffff;
+
+# the pin of a bundle whose members are pinned to different locations
+val CLASH: u32 = 0xfffffffe;
+
+val WAITING:  u8 = 0;
+val ACTIVE:   u8 = 1;
+val INACTIVE: u8 = 2;
+val HANDLED:  u8 = 3;
+val SPILLED:  u8 = 4;
+
+# one half of an operand of an instruction of the form
+# ---
+# instruction: the instruction
+# operand:     the operand position
+# write:       the write, or else the read
+pub rec Half {
+    instruction: Instruction;
+    operand:     u32;
+    write:       bool;
+}
+
+# a bundle no location can hold, which cannot be split
+# ---
+# virtual:  its first member
+# position: its first position
+pub rec Stuck {
+    virtual:  Virtual;
+    position: u32;
+}
+
+# why a round was refused
+# ---
+# alloc:  the allocator refused storage
+# pinned: an operand pinned to a location the target does not let the allocator assign
+# stuck:  a bundle no location can hold and no split can help
+pub tag Error: u8 {
+    alloc:  allocator.Error;
+    pinned: Site;
+    stuck:  Stuck;
+}
+
+# what a round decided
+# ---
+# locations: each virtual register's location, NONE when it holds none
+# spilled:   the virtual registers to carry in pieces, ascending
+# own:       the halves to give a value of their own
+pub rec Result {
+    locations: vector.Vector[u32];
+    spilled:   vector.Vector[u32];
+    own:       vector.Vector[Half];
+}
+
+rec Scan {
+    a:         *allocator.Allocator;
+    f:         *Function;
+    l:         *Live;
+    at:        *Locations;
+    allowed:   *Allowed;
+    kinds:     Slice[u8];
+    out:       *Result;
+    parent:    vector.Vector[u32];
+    of:        vector.Vector[u32];
+    members:   Lists[u32];
+    segs:      Lists[Segment];
+    clashed:   vector.Vector[bool];
+    weight:    vector.Vector[u64];
+    size:      vector.Vector[u64];
+    pin:       vector.Vector[u32];
+    minimal:   vector.Vector[bool];
+    mixed:     vector.Vector[bool];
+    order:     vector.Vector[u64];
+    loc:       vector.Vector[u32];
+    state:     vector.Vector[u8];
+    cursor:    vector.Vector[u32];
+    key:       vector.Vector[u32];
+    next:      vector.Vector[u32];
+    prev:      vector.Vector[u32];
+    actives:   vector.Vector[u32];
+    inactives: vector.Vector[u32];
+    busy:      vector.Vector[u32];
+    rising:    Heap[u64, Min];
+    waking:    Heap[u64, Min];
+    conflicts: vector.Vector[u32];
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun pushed(r: res[usize, allocator.Error]) err[Error] {
+    if (sel r.err) { ret alloc_err(r.err); }
+    ret err[Error].ok{};
+}
+
+fun find(s: *Scan, v: u32) u32 {
+    var x: u32 = v;
+    for (s.parent.data[x] != x) {
+        s.parent.data[x] = s.parent.data[s.parent.data[x]];
+        x                = s.parent.data[x];
+    }
+    ret x;
+}
+
+fun unite(s: *Scan, x: u32, y: u32) {
+    val rx: u32 = find(s, x);
+    val ry: u32 = find(s, y);
+    if (rx == ry) { ret; }
+    if (rx < ry)  { s.parent.data[ry] = rx; }
+    or            { s.parent.data[rx] = ry; }
+}
+
+fun own(s: *Scan, h: Half) err[Error] {
+    ret pushed(vector.push[Half](?s.out.own, h));
+}
+
+# the half of a tie to give its own value: the source, unless it already is one
+fun untie(s: *Scan, u: Use) err[Error] {
+    var write: bool = false;
+    if (s.kinds.data[u.tied] == spill.OWN) { write = true; }
+    ret own(s, Half{instruction: u.instruction, operand: u.operand, write: write});
+}
+
+# join the halves of every tie that never meet, and give a half of each that
+# does a value of its own
+fun ties(s: *Scan) err[Error] {
+    val count: u32 = s.f.virtuals.len::u32;
+    var v:     u32 = 0;
+    for (v < count) {
+        val us: Slice[Use] = live.uses(s.l, Virtual{index: v});
+        var k:  usize      = 0;
+        for (k < us.size) {
+            val u: Use = us.data[k];
+            if (u.write && u.tied != live.NONE && u.tied != v) {
+                val met: opt[u32] = live.overlap(s.l, Virtual{index: v}, Virtual{index: u.tied});
+                if (sel met.some) {
+                    val o: err[Error] = untie(s, u);
+                    if (sel o.err) { ret o; }
+                }
+                or { unite(s, v, u.tied); }
+            }
+            k = k + 1;
+        }
+        v = v + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun by_from(a: *Segment, b: *Segment) i64 {
+    if (a.from < b.from) { ret -1; }
+    if (a.from > b.from) { ret 1; }
+    ret 0;
+}
+
+# each bundle's members and its segments, sorted with the touching merged,
+# and whether any two of its members meet
+fun group(s: *Scan) err[Error] {
+    val count: u32                    = s.f.virtuals.len::u32;
+    var named: vector.Vector[u32]     = vector.init[u32](s.a);
+    var mkeys: vector.Vector[u32]     = vector.init[u32](s.a);
+    var mvals: vector.Vector[u32]     = vector.init[u32](s.a);
+    var skeys: vector.Vector[u32]     = vector.init[u32](s.a);
+    var svals: vector.Vector[Segment] = vector.init[Segment](s.a);
+    fin {
+        vector.dnit[u32](?named);
+        vector.dnit[u32](?mkeys);
+        vector.dnit[u32](?mvals);
+        vector.dnit[u32](?skeys);
+        vector.dnit[Segment](?svals);
+    }
+    var failed: err[allocator.Error] = slice.fill[u32](?named, count::usize, NONE);
+    keep(?failed, slice.fill[u32](?s.of, count::usize, NONE));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    var bundles: u32 = 0;
+    var v:       u32 = 0;
+    for (v < count) {
+        val r: u32 = find(s, v);
+        if (named.data[r] == NONE) {
+            named.data[r] = bundles;
+            bundles       = bundles + 1;
+        }
+        s.of.data[v] = named.data[r];
+        val mk: err[Error] = pushed(vector.push[u32](?mkeys, s.of.data[v]));
+        if (sel mk.err) { ret mk; }
+        val mv: err[Error] = pushed(vector.push[u32](?mvals, v));
+        if (sel mv.err) { ret mv; }
+        val segs: Slice[Segment] = live.segments(s.l, Virtual{index: v});
+        var k:    usize          = 0;
+        for (k < segs.size) {
+            val sk: err[Error] = pushed(vector.push[u32](?skeys, s.of.data[v]));
+            if (sel sk.err) { ret sk; }
+            val sv: err[Error] = pushed(vector.push[Segment](?svals, segs.data[k]));
+            if (sel sv.err) { ret sv; }
+            k = k + 1;
+        }
+        v = v + 1;
+    }
+    val made: res[Lists[u32], allocator.Error] = graph.lists[u32](s.a, bundles, Slice[u32]{data: mkeys.data, size: mkeys.len}, Slice[u32]{data: mvals.data, size: mvals.len});
+    if (sel made.err) { ret alloc_err(made.err); }
+    s.members = made.ok;
+    val raw: res[Lists[Segment], allocator.Error] = graph.lists[Segment](s.a, bundles, Slice[u32]{data: skeys.data, size: skeys.len}, Slice[Segment]{data: svals.data, size: svals.len});
+    if (sel raw.err) { ret alloc_err(raw.err); }
+    var grouped: Lists[Segment] = raw.ok;
+    fin { graph.release[Segment](?grouped); }
+    var room: err[allocator.Error] = slice.fill[bool](?s.clashed, bundles::usize, false);
+    keep(?room, slice.fill[u64](?s.size, bundles::usize, 0));
+    val fr: res[usize, allocator.Error] = vector.reserve[u32](?s.segs.first, bundles::usize + 1);
+    if (sel fr.err) { keep(?room, err[allocator.Error].err{fr.err}); }
+    val ir: res[usize, allocator.Error] = vector.reserve[Segment](?s.segs.items, svals.len);
+    if (sel ir.err)   { keep(?room, err[allocator.Error].err{ir.err}); }
+    if (sel room.err) { ret alloc_err(room.err); }
+    vector.push[u32](?s.segs.first, 0);
+    var b: u32 = 0;
+    for (b < bundles) {
+        val list: Slice[Segment] = graph.list[Segment](?grouped, b);
+        if (list.size > 1) { sort.sort_by[Segment](list.data, list.size, by_from); }
+        val base: usize = s.segs.items.len;
+        var k:    usize = 0;
+        for (k < list.size) {
+            val seg: Segment = list.data[k];
+            val len: usize   = s.segs.items.len;
+            if (len > base && s.segs.items.data[len - 1].to > seg.from) { s.clashed.data[b] = true; }
+            if (len > base && s.segs.items.data[len - 1].to >= seg.from) {
+                if (seg.to > s.segs.items.data[len - 1].to) { s.segs.items.data[len - 1].to = seg.to; }
+            }
+            or { vector.push[Segment](?s.segs.items, seg); }
+            k = k + 1;
+        }
+        k = base;
+        for (k < s.segs.items.len) {
+            s.size.data[b] = s.size.data[b] + (s.segs.items.data[k].to - s.segs.items.data[k].from)::u64;
+            k              = k + 1;
+        }
+        vector.push[u32](?s.segs.first, s.segs.items.len::u32);
+        b = b + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun bundles(s: *Scan) u32 {
+    ret (s.segs.first.len - 1)::u32;
+}
+
+fun members(s: *Scan, b: u32) Slice[u32] {
+    ret graph.list[u32](?s.members, b);
+}
+
+fun segments(s: *Scan, b: u32) Slice[Segment] {
+    ret graph.list[Segment](?s.segs, b);
+}
+
+# the segments of a bundle from its cursor on
+fun ahead(s: *Scan, b: u32) Slice[Segment] {
+    val all: Slice[Segment] = segments(s, b);
+    val c:   usize          = s.cursor.data[b]::usize;
+    ret Slice[Segment]{data: ?all.data[c], size: all.size - c};
+}
+
+# give a half of every tie inside a bundle whose members meet a value of its own
+fun split_clashes(s: *Scan) err[Error] {
+    var b: u32 = 0;
+    for (b < bundles(s)) {
+        if (s.clashed.data[b]) {
+            val ms: Slice[u32] = members(s, b);
+            var m:  usize      = 0;
+            for (m < ms.size) {
+                val us: Slice[Use] = live.uses(s.l, Virtual{index: ms.data[m]});
+                var k:  usize      = 0;
+                for (k < us.size) {
+                    val u: Use = us.data[k];
+                    if (u.write && u.tied != live.NONE && u.tied != ms.data[m]) {
+                        val o: err[Error] = untie(s, u);
+                        if (sel o.err) { ret o; }
+                    }
+                    k = k + 1;
+                }
+                m = m + 1;
+            }
+        }
+        b = b + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# give every pinned half of a bundle's members not already a half's own value
+# a value of its own, false when there is none to give
+fun free_pins(s: *Scan, b: u32) res[bool, Error] {
+    var any: bool       = false;
+    val ms:  Slice[u32] = members(s, b);
+    var m:   usize      = 0;
+    for (m < ms.size) {
+        if (s.kinds.data[ms.data[m]] != spill.OWN) {
+            val us: Slice[Use] = live.uses(s.l, Virtual{index: ms.data[m]});
+            var k:  usize      = 0;
+            for (k < us.size) {
+                if (us.data[k].fixed != live.NONE) {
+                    val o: err[Error] = own(s, Half{instruction: us.data[k].instruction, operand: us.data[k].operand, write: us.data[k].write});
+                    if (sel o.err) { ret res[bool, Error].err{o.err}; }
+                    any = true;
+                }
+                k = k + 1;
+            }
+        }
+        m = m + 1;
+    }
+    ret res[bool, Error].ok{any};
+}
+
+# each bundle's weight, pin, and whether it is only values of a half's own or
+# holds members of more than one class
+fun describe(s: *Scan) err[Error] {
+    val n:      usize                = bundles(s)::usize;
+    var failed: err[allocator.Error] = slice.fill[u64](?s.weight, n, 0);
+    keep(?failed, slice.fill[u32](?s.pin, n, NONE));
+    keep(?failed, slice.fill[bool](?s.minimal, n, true));
+    keep(?failed, slice.fill[bool](?s.mixed, n, false));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    var b: u32 = 0;
+    for (b::usize < n) {
+        val ms:    Slice[u32] = members(s, b);
+        val first: Class      = function.class_of(s.f, Virtual{index: ms.data[0]});
+        var m:     usize      = 0;
+        for (m < ms.size) {
+            val v: u32 = ms.data[m];
+            s.weight.data[b] = s.weight.data[b] + live.weight_of(s.l, Virtual{index: v});
+            if (s.kinds.data[v] != spill.OWN)                                  { s.minimal.data[b] = false; }
+            if (!class.same(function.class_of(s.f, Virtual{index: v}), first)) { s.mixed.data[b] = true; }
+            val us: Slice[Use] = live.uses(s.l, Virtual{index: v});
+            var k:  usize      = 0;
+            for (k < us.size) {
+                val pin: u32 = us.data[k].fixed;
+                if (pin != live.NONE) {
+                    if (!allowed.admits(s.allowed, pin)) { ret err[Error].err{Error.pinned{Site{instruction: us.data[k].instruction, operand: us.data[k].operand}}}; }
+                    if (s.pin.data[b] == NONE)           { s.pin.data[b] = pin; }
+                    or (s.pin.data[b] != pin)            { s.pin.data[b] = CLASH; }
+                }
+                k = k + 1;
+            }
+            m = m + 1;
+        }
+        if (s.pin.data[b] == CLASH) {
+            val freed: res[bool, Error] = free_pins(s, b);
+            if (sel freed.err) { ret err[Error].err{freed.err}; }
+            if (!freed.ok)     { ret err[Error].err{Error.stuck{Stuck{virtual: Virtual{index: ms.data[0]}, position: segments(s, b).data[0].from}}}; }
+        }
+        b = b + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether a bundle is less dense than another, by weight over positions
+fun less(wa: u64, sa: u64, wb: u64, sb: u64) bool {
+    ret wa::u128 * sb::u128 < wb::u128 * sa::u128;
+}
+
+fun link(s: *Scan, heads: *vector.Vector[u32], b: u32, at: u32) {
+    s.prev.data[b] = NONE;
+    s.next.data[b] = heads.data[at];
+    if (heads.data[at] != NONE) { s.prev.data[heads.data[at]] = b; }
+    heads.data[at] = b;
+}
+
+fun unlink(s: *Scan, heads: *vector.Vector[u32], b: u32, at: u32) {
+    if (s.prev.data[b] != NONE) { s.next.data[s.prev.data[b]] = s.next.data[b]; }
+    or                          { heads.data[at] = s.next.data[b]; }
+    if (s.next.data[b] != NONE) { s.prev.data[s.next.data[b]] = s.prev.data[b]; }
+}
+
+fun count_busy(s: *Scan, at: u32, up: bool) {
+    val alias: Slice[u32] = location.shares(s.at, at);
+    var k:     usize      = 0;
+    for (k < alias.size) {
+        if (up) { s.busy.data[alias.data[k]] = s.busy.data[alias.data[k]] + 1; }
+        or      { s.busy.data[alias.data[k]] = s.busy.data[alias.data[k]] - 1; }
+        k = k + 1;
+    }
+}
+
+fun entry(position: u32, b: u32) u64 {
+    ret (position::u64 << 32) | b::u64;
+}
+
+fun activate(s: *Scan, b: u32) err[Error] {
+    s.state.data[b] = ACTIVE;
+    link(s, ?s.actives, b, s.loc.data[b]);
+    count_busy(s, s.loc.data[b], true);
+    s.key.data[b] = segments(s, b).data[s.cursor.data[b]].to;
+    ret pushed(heap.push[u64, Min](?s.rising, entry(s.key.data[b], b)));
+}
+
+fun deactivate(s: *Scan, b: u32) {
+    unlink(s, ?s.actives, b, s.loc.data[b]);
+    count_busy(s, s.loc.data[b], false);
+}
+
+fun sleep(s: *Scan, b: u32) err[Error] {
+    s.state.data[b] = INACTIVE;
+    link(s, ?s.inactives, b, s.loc.data[b]);
+    s.key.data[b] = segments(s, b).data[s.cursor.data[b]].from;
+    ret pushed(heap.push[u64, Min](?s.waking, entry(s.key.data[b], b)));
+}
+
+# move a bundle's cursor to its first segment ending after a position, and
+# say whether it has one
+fun step(s: *Scan, b: u32, p: u32) bool {
+    val all: Slice[Segment] = segments(s, b);
+    var c:   u32            = s.cursor.data[b];
+    for (c::usize < all.size && all.data[c].to <= p) { c = c + 1; }
+    s.cursor.data[b] = c;
+    ret c::usize < all.size;
+}
+
+# the sets at a position: an active bundle whose segment ended waits in a hole
+# or is done, and an inactive one whose next segment began is active again
+fun advance(s: *Scan, p: u32) err[Error] {
+    for {
+        val top: opt[*u64] = heap.peek[u64, Min](?s.rising);
+        if (sel top.none) { brk; }
+        val first: u64 = @top.some;
+        if ((first >> 32) > p::u64) { brk; }
+        heap.pop[u64, Min](?s.rising);
+        val b: u32 = (first & 0xffffffff)::u32;
+        if (s.state.data[b] == ACTIVE && s.key.data[b]::u64 == (first >> 32)) {
+            deactivate(s, b);
+            if (!step(s, b, p)) { s.state.data[b] = HANDLED; }
+            or (segments(s, b).data[s.cursor.data[b]].from <= p) {
+                val again: err[Error] = activate(s, b);
+                if (sel again.err) { ret again; }
+            }
+            or {
+                val slept: err[Error] = sleep(s, b);
+                if (sel slept.err) { ret slept; }
+            }
+        }
+    }
+    for {
+        val top: opt[*u64] = heap.peek[u64, Min](?s.waking);
+        if (sel top.none) { brk; }
+        val first: u64 = @top.some;
+        if ((first >> 32) > p::u64) { brk; }
+        heap.pop[u64, Min](?s.waking);
+        val b: u32 = (first & 0xffffffff)::u32;
+        if (s.state.data[b] == INACTIVE && s.key.data[b]::u64 == (first >> 32)) {
+            unlink(s, ?s.inactives, b, s.loc.data[b]);
+            if (!step(s, b, p)) { s.state.data[b] = HANDLED; }
+            or (segments(s, b).data[s.cursor.data[b]].from <= p) {
+                val woke: err[Error] = activate(s, b);
+                if (sel woke.err) { ret woke; }
+            }
+            or {
+                val slept: err[Error] = sleep(s, b);
+                if (sel slept.err) { ret slept; }
+            }
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# whether a location is of every class a bundle's members are of
+fun fits(s: *Scan, b: u32, at: u32, key: u32) bool {
+    if (location.key_at(s.at, at) != key) { ret false; }
+    if (!s.mixed.data[b])                 { ret true; }
+    val p:  Physical   = location.physical(s.at, at);
+    val ms: Slice[u32] = members(s, b);
+    var m:  usize      = 0;
+    for (m < ms.size) {
+        if (!class.holds(function.class_of(s.f, Virtual{index: ms.data[m]}), p)) { ret false; }
+        m = m + 1;
+    }
+    ret true;
+}
+
+fun held(s: *Scan, b: u32, at: u32) bool {
+    val got: opt[u32] = live.blocked_over(s.l, s.at, at, segments(s, b), members(s, b));
+    ret sel got.some;
+}
+
+# whether a location is free for a bundle over its whole interval
+fun free(s: *Scan, b: u32, at: u32) bool {
+    if (s.busy.data[at] != 0) { ret false; }
+    val mine:  Slice[Segment] = segments(s, b);
+    val alias: Slice[u32]     = location.shares(s.at, at);
+    var k:     usize          = 0;
+    for (k < alias.size) {
+        var w: u32 = s.inactives.data[alias.data[k]];
+        for (w != NONE) {
+            val met: opt[u32] = live.meet(mine, ahead(s, w));
+            if (sel met.some) { ret false; }
+            w = s.next.data[w];
+        }
+        k = k + 1;
+    }
+    ret !held(s, b, at);
+}
+
+# the location a copy of a member names, free for the bundle and of its
+# classes, the copy of the most weight first, then the earliest, then the
+# lowest location
+fun hinted(s: *Scan, b: u32, key: u32) u32 {
+    var best:   u32        = NONE;
+    var weight: u64        = 0;
+    var first:  u32        = NONE;
+    val ms:     Slice[u32] = members(s, b);
+    var m:      usize      = 0;
+    for (m < ms.size) {
+        val us: Slice[Use] = live.uses(s.l, Virtual{index: ms.data[m]});
+        var k:  usize      = 0;
+        for (k < us.size) {
+            val u:       Use              = us.data[k];
+            val d:       *InstructionData = function.data(s.f, u.instruction);
+            val op:      Opcode           = d.opcode;
+            var partner: u32              = NONE;
+            if (sel op.pseudo && (op.pseudo == pseudo.COPY || op.pseudo == pseudo.PARALLEL_COPY)) {
+                val n:    u32 = d.operands.size::u32 / 2;
+                var with: u32 = u.operand + n;
+                if (u.operand >= n) { with = u.operand - n; }
+                val o: Operand = d.operands.data[with];
+                if (sel o.virtual) {
+                    val other: u32 = s.of.data[o.virtual.index];
+                    val st:    u8  = s.state.data[other];
+                    if (st == ACTIVE || st == INACTIVE || st == HANDLED) { partner = s.loc.data[other]; }
+                }
+                or (sel o.physical) {
+                    val got: opt[u32] = location.locate(s.at, o.physical);
+                    if (sel got.some) { partner = got.some; }
+                }
+            }
+            if (partner != NONE && allowed.admits(s.allowed, partner) && fits(s, b, partner, key)) {
+                var better: bool = best == NONE || u.weight > weight;
+                if (!better && u.weight == weight) { better = u.position < first || (u.position == first && partner < best); }
+                if (better && free(s, b, partner)) {
+                    best   = partner;
+                    weight = u.weight;
+                    first  = u.position;
+                }
+            }
+            k = k + 1;
+        }
+        m = m + 1;
+    }
+    ret best;
+}
+
+# the bundles holding storage a location shares that a bundle would meet
+fun gather(s: *Scan, b: u32, at: u32) err[Error] {
+    vector.clear[u32](?s.conflicts);
+    val mine:  Slice[Segment] = segments(s, b);
+    val alias: Slice[u32]     = location.shares(s.at, at);
+    var k:     usize          = 0;
+    for (k < alias.size) {
+        var w: u32 = s.actives.data[alias.data[k]];
+        for (w != NONE) {
+            val p: err[Error] = pushed(vector.push[u32](?s.conflicts, w));
+            if (sel p.err) { ret p; }
+            w = s.next.data[w];
+        }
+        w = s.inactives.data[alias.data[k]];
+        for (w != NONE) {
+            val met: opt[u32] = live.meet(mine, ahead(s, w));
+            if (sel met.some) {
+                val p: err[Error] = pushed(vector.push[u32](?s.conflicts, w));
+                if (sel p.err) { ret p; }
+            }
+            w = s.next.data[w];
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun spill_members(s: *Scan, b: u32) res[bool, Error] {
+    var any: bool       = false;
+    val ms:  Slice[u32] = members(s, b);
+    var m:   usize      = 0;
+    for (m < ms.size) {
+        if (s.kinds.data[ms.data[m]] != spill.OWN) {
+            val p: err[Error] = pushed(vector.push[u32](?s.out.spilled, ms.data[m]));
+            if (sel p.err) { ret res[bool, Error].err{p.err}; }
+            any = true;
+        }
+        m = m + 1;
+    }
+    ret res[bool, Error].ok{any};
+}
+
+fun evict(s: *Scan, w: u32) err[Error] {
+    if (s.state.data[w] == ACTIVE) { deactivate(s, w); }
+    or                             { unlink(s, ?s.inactives, w, s.loc.data[w]); }
+    s.state.data[w] = SPILLED;
+    val spilled: res[bool, Error] = spill_members(s, w);
+    if (sel spilled.err) { ret err[Error].err{spilled.err}; }
+    ret err[Error].ok{};
+}
+
+fun assign(s: *Scan, b: u32, at: u32) err[Error] {
+    s.loc.data[b]    = at;
+    s.cursor.data[b] = 0;
+    ret activate(s, b);
+}
+
+# split a bundle no location takes: a pinned one's pins get values of their
+# own, any other is carried in pieces
+fun split(s: *Scan, b: u32) err[Error] {
+    s.state.data[b] = SPILLED;
+    if (s.pin.data[b] != NONE) {
+        val freed: res[bool, Error] = free_pins(s, b);
+        if (sel freed.err) { ret err[Error].err{freed.err}; }
+        if (freed.ok)      { ret err[Error].ok{}; }
+    }
+    val spilled: res[bool, Error] = spill_members(s, b);
+    if (sel spilled.err) { ret err[Error].err{spilled.err}; }
+    if (!spilled.ok)     { ret err[Error].err{Error.stuck{Stuck{virtual: Virtual{index: members(s, b).data[0]}, position: segments(s, b).data[0].from}}}; }
+    ret err[Error].ok{};
+}
+
+# the densest conflicting bundle's weight and positions at a location, none
+# when a value it cannot evict holds it
+rec Cost {
+    weight: u64;
+    size:   u64;
+}
+
+fun cost(s: *Scan, b: u32, at: u32) res[opt[Cost], Error] {
+    if (held(s, b, at)) { ret res[opt[Cost], Error].ok{opt[Cost].none{}}; }
+    val got: err[Error] = gather(s, b, at);
+    if (sel got.err) { ret res[opt[Cost], Error].err{got.err}; }
+    var c: Cost  = Cost{weight: 0, size: 1};
+    var k: usize = 0;
+    for (k < s.conflicts.len) {
+        val w: u32 = s.conflicts.data[k];
+        if (s.minimal.data[w])                                        { ret res[opt[Cost], Error].ok{opt[Cost].none{}}; }
+        if (less(c.weight, c.size, s.weight.data[w], s.size.data[w])) { c = Cost{weight: s.weight.data[w], size: s.size.data[w]}; }
+        k = k + 1;
+    }
+    ret res[opt[Cost], Error].ok{opt[Cost].some{c}};
+}
+
+fun place(s: *Scan, b: u32) err[Error] {
+    val ms:    Slice[u32] = members(s, b);
+    val start: u32        = segments(s, b).data[0].from;
+    val moved: err[Error] = advance(s, start);
+    if (sel moved.err) { ret moved; }
+    val k:     opt[u32]   = location.key(s.at, function.class_of(s.f, Virtual{index: ms.data[0]}));
+    var cands: Slice[u32] = Slice[u32]{data: nil, size: 0};
+    var one:   [1]u32     = [1]u32{s.pin.data[b]};
+    if (s.pin.data[b] != NONE) { cands = Slice[u32]{data: ?one[0], size: 1}; }
+    or (sel k.some)            { cands = allowed.candidates(s.allowed, k.some); }
+    var key: u32 = NONE;
+    if (sel k.some) { key = k.some; }
+    if (s.pin.data[b] == NONE && key != NONE) {
+        val hint: u32 = hinted(s, b, key);
+        if (hint != NONE) { ret assign(s, b, hint); }
+    }
+    var i: usize = 0;
+    for (i < cands.size) {
+        val at: u32 = cands.data[i];
+        if (fits(s, b, at, key) && free(s, b, at)) { ret assign(s, b, at); }
+        i = i + 1;
+    }
+    var best:  u32  = NONE;
+    var worst: Cost = Cost{weight: 0, size: 1};
+    i = 0;
+    for (i < cands.size) {
+        val at: u32 = cands.data[i];
+        if (fits(s, b, at, key)) {
+            val c: res[opt[Cost], Error] = cost(s, b, at);
+            if (sel c.err) { ret err[Error].err{c.err}; }
+            val got: opt[Cost] = c.ok;
+            if (sel got.some) {
+                if (best == NONE || less(got.some.weight, got.some.size, worst.weight, worst.size)) {
+                    best  = at;
+                    worst = got.some;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (best != NONE && (s.minimal.data[b] || less(worst.weight, worst.size, s.weight.data[b], s.size.data[b]))) {
+        val got: err[Error] = gather(s, b, best);
+        if (sel got.err) { ret got; }
+        var c: usize = 0;
+        for (c < s.conflicts.len) {
+            val out: err[Error] = evict(s, s.conflicts.data[c]);
+            if (sel out.err) { ret out; }
+            c = c + 1;
+        }
+        ret assign(s, b, best);
+    }
+    ret split(s, b);
+}
+
+fun start_order(s: *Scan) err[Error] {
+    var b: u32 = 0;
+    for (b < bundles(s)) {
+        val segs: Slice[Segment] = segments(s, b);
+        if (segs.size > 0) {
+            val p: err[Error] = pushed(vector.push[u64](?s.order, entry(segs.data[0].from, b)));
+            if (sel p.err) { ret p; }
+        }
+        b = b + 1;
+    }
+    sort.sort[u64](s.order.data, s.order.len);
+    ret err[Error].ok{};
+}
+
+fun walk(s: *Scan) err[Error] {
+    val n:      usize                = bundles(s)::usize;
+    val places: usize                = location.count(s.at)::usize;
+    var failed: err[allocator.Error] = slice.fill[u32](?s.loc, n, NONE);
+    keep(?failed, slice.fill[u8](?s.state, n, WAITING));
+    keep(?failed, slice.fill[u32](?s.cursor, n, 0));
+    keep(?failed, slice.fill[u32](?s.key, n, 0));
+    keep(?failed, slice.fill[u32](?s.next, n, NONE));
+    keep(?failed, slice.fill[u32](?s.prev, n, NONE));
+    keep(?failed, slice.fill[u32](?s.actives, places, NONE));
+    keep(?failed, slice.fill[u32](?s.inactives, places, NONE));
+    keep(?failed, slice.fill[u32](?s.busy, places, 0));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    val ordered: err[Error] = start_order(s);
+    if (sel ordered.err) { ret ordered; }
+    var i: usize = 0;
+    for (i < s.order.len) {
+        val placed: err[Error] = place(s, (s.order.data[i] & 0xffffffff)::u32);
+        if (sel placed.err) { ret placed; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun by_number(a: *u32, b: *u32) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+fun finish(s: *Scan) err[Error] {
+    val count:  usize                = s.f.virtuals.len;
+    val filled: err[allocator.Error] = slice.fill[u32](?s.out.locations, count, NONE);
+    if (sel filled.err) { ret alloc_err(filled.err); }
+    var v: usize = 0;
+    for (v < count) {
+        val b:  u32 = s.of.data[v];
+        val st: u8  = s.state.data[b];
+        if (st == ACTIVE || st == INACTIVE || st == HANDLED) { s.out.locations.data[v] = s.loc.data[b]; }
+        v = v + 1;
+    }
+    sort.sort_by[u32](s.out.spilled.data, s.out.spilled.len, by_number);
+    ret err[Error].ok{};
+}
+
+fun steps(s: *Scan) err[Error] {
+    val count:  usize                = s.f.virtuals.len;
+    val filled: err[allocator.Error] = slice.fill[u32](?s.parent, count, 0);
+    if (sel filled.err) { ret alloc_err(filled.err); }
+    var v: usize = 0;
+    for (v < count) {
+        s.parent.data[v] = v::u32;
+        v                = v + 1;
+    }
+    val tied: err[Error] = ties(s);
+    if (sel tied.err)       { ret tied; }
+    if (s.out.own.len != 0) { ret err[Error].ok{}; }
+    val grouped: err[Error] = group(s);
+    if (sel grouped.err) { ret grouped; }
+    val clashes: err[Error] = split_clashes(s);
+    if (sel clashes.err)    { ret clashes; }
+    if (s.out.own.len != 0) { ret err[Error].ok{}; }
+    val described: err[Error] = describe(s);
+    if (sel described.err)  { ret described; }
+    if (s.out.own.len != 0) { ret err[Error].ok{}; }
+    val walked: err[Error] = walk(s);
+    if (sel walked.err) { ret walked; }
+    ret finish(s);
+}
+
+fun scan_dnit(s: *Scan) {
+    vector.dnit[u32](?s.parent);
+    vector.dnit[u32](?s.of);
+    graph.release[u32](?s.members);
+    graph.release[Segment](?s.segs);
+    vector.dnit[bool](?s.clashed);
+    vector.dnit[u64](?s.weight);
+    vector.dnit[u64](?s.size);
+    vector.dnit[u32](?s.pin);
+    vector.dnit[bool](?s.minimal);
+    vector.dnit[bool](?s.mixed);
+    vector.dnit[u64](?s.order);
+    vector.dnit[u32](?s.loc);
+    vector.dnit[u8](?s.state);
+    vector.dnit[u32](?s.cursor);
+    vector.dnit[u32](?s.key);
+    vector.dnit[u32](?s.next);
+    vector.dnit[u32](?s.prev);
+    vector.dnit[u32](?s.actives);
+    vector.dnit[u32](?s.inactives);
+    vector.dnit[u32](?s.busy);
+    heap.dnit[u64, Min](?s.rising);
+    heap.dnit[u64, Min](?s.waking);
+    vector.dnit[u32](?s.conflicts);
+}
+
+# one round's scan over a virtual form
+# ---
+# a:       the allocator the result takes
+# f:       the virtual form
+# l:       its liveness
+# at:      the locations of its target
+# allowed: the locations the target lets the allocator assign
+# kinds:   each virtual register's kind, as the form states it
+# ret:     what the round decided, or why it was refused
+pub fun run(a: *allocator.Allocator, f: *Function, l: *Live, at: *Locations, allowed: *Allowed, kinds: Slice[u8]) res[Result, Error] {
+    var out: Result = Result{locations: vector.init[u32](a), spilled: vector.init[u32](a), own: vector.init[Half](a)};
+    var s:   Scan   = Scan{
+        a:         a,
+        f:         f,
+        l:         l,
+        at:        at,
+        allowed:   allowed,
+        kinds:     kinds,
+        out:       ?out,
+        parent:    vector.init[u32](a),
+        of:        vector.init[u32](a),
+        members:   Lists[u32]{first: vector.init[u32](a), items: vector.init[u32](a)},
+        segs:      Lists[Segment]{first: vector.init[u32](a), items: vector.init[Segment](a)},
+        clashed:   vector.init[bool](a),
+        weight:    vector.init[u64](a),
+        size:      vector.init[u64](a),
+        pin:       vector.init[u32](a),
+        minimal:   vector.init[bool](a),
+        mixed:     vector.init[bool](a),
+        order:     vector.init[u64](a),
+        loc:       vector.init[u32](a),
+        state:     vector.init[u8](a),
+        cursor:    vector.init[u32](a),
+        key:       vector.init[u32](a),
+        next:      vector.init[u32](a),
+        prev:      vector.init[u32](a),
+        actives:   vector.init[u32](a),
+        inactives: vector.init[u32](a),
+        busy:      vector.init[u32](a),
+        rising:    heap.init[u64, Min](a),
+        waking:    heap.init[u64, Min](a),
+        conflicts: vector.init[u32](a),
+    };
+    val done: err[Error] = steps(?s);
+    scan_dnit(?s);
+    if (sel done.err) {
+        release(?out);
+        ret res[Result, Error].err{done.err};
+    }
+    ret res[Result, Error].ok{out};
+}
+
+# give back a result's storage
+pub fun release(r: *Result) err[allocator.Error] {
+    var failed: err[allocator.Error] = vector.dnit[u32](?r.locations);
+    keep(?failed, vector.dnit[u32](?r.spilled));
+    keep(?failed, vector.dnit[Half](?r.own));
+    ret failed;
+}
+
+# whether a round's assignment stands, with nothing spilled and no half
+# given a value of its own
+pub fun settled(r: *Result) bool {
+    ret r.spilled.len == 0 && r.own.len == 0;
+}

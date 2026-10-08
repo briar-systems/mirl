@@ -1,0 +1,302 @@
+# linear scan register allocation of a machine function
+#
+# allocation runs in rounds. each round builds its virtual form from the
+# input and the plan, computes the form's liveness and scans it. a round that
+# spills a bundle or gives a half a value of its own adds that to the plan:
+# a spilled virtual register of the input is carried in pieces from then on,
+# a spilled piece gives every read of its run a reload of its own, and a half
+# given its own value keeps it. the plan only grows and every round that does
+# not settle adds to it, so the rounds end. the round that settles is
+# rewritten under its assignment and the checker proves the result, so a
+# wrong assignment is a refusal and never a miscompile.
+#
+# the input is never changed. a refusal at any step leaves it as it was and
+# gives back everything the rounds made, and an allocation hands back a new
+# function, which the caller puts in the input's place.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.fail.keep;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Lists;
+use mirl.machine.alloc.allowed;
+use mirl.machine.alloc.allowed.Allowed;
+use mirl.machine.alloc.check;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.alloc.plan;
+use mirl.machine.alloc.plan.Plan;
+use mirl.machine.alloc.rewrite;
+use mirl.machine.alloc.scan;
+use mirl.machine.alloc.spill;
+use mirl.machine.alloc.spill.Form;
+use mirl.machine.alloc.spill.Sizes;
+use mirl.machine.class.Physical;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Virtual;
+use mirl.slice;
+
+# what an allocation is given beside the function
+# ---
+# at:       the locations of the function's target
+# allowed:  the locations the target lets the allocator assign
+# clobbers: locations instructions leave undefined beyond their rows, as a
+#           calling convention states them at its calls
+pub rec Request {
+    at:       *Locations;
+    allowed:  Slice[Physical];
+    clobbers: Slice[Clobber];
+}
+
+# an allocated function
+# ---
+# function: the function, every operand a location, the input's slots first
+# spills:   the slots made for values in pieces, ascending
+# used:     the locations assigned, ascending
+# origins:  each instruction's instruction of the input, spill.NONE for one
+#           the allocator inserted
+# rounds:   how many rounds the allocation took
+pub rec Allocation {
+    function: Function;
+    spills:   vector.Vector[Slot];
+    used:     vector.Vector[u32];
+    origins:  vector.Vector[u32];
+    rounds:   u32;
+}
+
+# why a function was not allocated
+# ---
+# alloc:   the allocator refused storage
+# foreign: the locations are of another register file than the function's
+# clobber: a clobber naming an instruction the function or a location the
+#          locations do not have
+# allowed: the allowed locations were refused
+# form:    a round's virtual form was not built
+# live:    a round's liveness was refused
+# scan:    a round's scan was refused
+# rewrite: the rewrite was refused
+# check:   the checker refused the result
+pub tag Error: u8 {
+    alloc: allocator.Error;
+    foreign;
+    clobber: Clobber;
+    allowed: allowed.Error;
+    form:    spill.Error;
+    live:    live.Error;
+    scan:    scan.Error;
+    rewrite: rewrite.Error;
+    check:   check.Failure;
+}
+
+# what every round shares
+rec Context {
+    a:        *allocator.Allocator;
+    f:        *Function;
+    at:       *Locations;
+    x:        Allowed;
+    sizes:    Sizes;
+    clobbers: Lists[u32];
+    p:        Plan;
+}
+
+fun group(c: *Context, clobbers: Slice[Clobber]) err[Error] {
+    var keys:  vector.Vector[u32] = vector.init[u32](c.a);
+    var items: vector.Vector[u32] = vector.init[u32](c.a);
+    fin {
+        vector.dnit[u32](?keys);
+        vector.dnit[u32](?items);
+    }
+    var failed: err[allocator.Error]        = err[allocator.Error].ok{};
+    val kr:     res[usize, allocator.Error] = vector.reserve[u32](?keys, clobbers.size);
+    if (sel kr.err) { keep(?failed, err[allocator.Error].err{kr.err}); }
+    val ir: res[usize, allocator.Error] = vector.reserve[u32](?items, clobbers.size);
+    if (sel ir.err)     { keep(?failed, err[allocator.Error].err{ir.err}); }
+    if (sel failed.err) { ret err[Error].err{Error.alloc{failed.err}}; }
+    var i: usize = 0;
+    for (i < clobbers.size) {
+        val k: Clobber = clobbers.data[i];
+        if (k.instruction.index::usize >= c.f.instructions.len || k.location >= location.count(c.at)) { ret err[Error].err{Error.clobber{k}}; }
+        vector.push[u32](?keys, k.instruction.index);
+        vector.push[u32](?items, k.location);
+        i = i + 1;
+    }
+    val made: res[Lists[u32], allocator.Error] = graph.lists[u32](c.a, c.f.instructions.len::u32, Slice[u32]{data: keys.data, size: keys.len}, Slice[u32]{data: items.data, size: items.len});
+    if (sel made.err) { ret err[Error].err{Error.alloc{made.err}}; }
+    c.clobbers = made.ok;
+    ret err[Error].ok{};
+}
+
+# add what a round decided to the plan
+fun escalate(c: *Context, form: *Form, r: *scan.Result) err[Error] {
+    var pieces: vector.Vector[bool] = vector.init[bool](c.a);
+    fin { vector.dnit[bool](?pieces); }
+    val filled: err[allocator.Error] = slice.fill[bool](?pieces, form.f.virtuals.len, false);
+    if (sel filled.err) { ret err[Error].err{Error.alloc{filled.err}}; }
+    var i: usize = 0;
+    for (i < r.spilled.len) {
+        val v: u32 = r.spilled.data[i];
+        if (spill.kind(form, v) == spill.ORIGINAL) { plan.spill(?c.p, Virtual{index: v}); }
+        or                                         { pieces.data[v] = true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < form.runs.len) {
+        val run: spill.Run = form.runs.data[i];
+        if (pieces.data[run.piece]) { plan.give(?c.p, run.instruction, run.operand, false); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < r.own.len) {
+        val h: scan.Half = r.own.data[i];
+        plan.give(?c.p, Instruction{index: form.sources.data[h.instruction.index]}, h.operand, h.write);
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun by_number(a: *u32, b: *u32) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+# the result of the round that settled, rewritten, proved and handed back
+fun finish(c: *Context, form: *Form, r: *scan.Result, rounds: u32) res[Allocation, Error] {
+    val locations: Slice[u32]                   = Slice[u32]{data: r.locations.data, size: r.locations.len};
+    val written:   res[Function, rewrite.Error] = rewrite.rewrite(c.a, ?form.f, c.at, locations);
+    if (sel written.err) { ret res[Allocation, Error].err{Error.rewrite{written.err}}; }
+    var out:    Allocation         = Allocation{function: written.ok, spills: vector.init[Slot](c.a), used: vector.init[u32](c.a), origins: vector.init[u32](c.a), rounds: rounds};
+    val proved: err[check.Failure] = check.check(c.a, ?form.f, c.at, Slice[Clobber]{data: form.clobbers.data, size: form.clobbers.len}, ?c.x, locations, ?out.function);
+    if (sel proved.err) {
+        release(?out);
+        ret res[Allocation, Error].err{Error.check{proved.err}};
+    }
+    var failed: err[allocator.Error]        = err[allocator.Error].ok{};
+    val sr:     res[usize, allocator.Error] = vector.reserve[Slot](?out.spills, form.spills.len);
+    if (sel sr.err) { keep(?failed, err[allocator.Error].err{sr.err}); }
+    val orr: res[usize, allocator.Error] = vector.reserve[u32](?out.origins, form.sources.len);
+    if (sel orr.err) { keep(?failed, err[allocator.Error].err{orr.err}); }
+    val ur: res[usize, allocator.Error] = vector.reserve[u32](?out.used, locations.size);
+    if (sel ur.err) { keep(?failed, err[allocator.Error].err{ur.err}); }
+    if (sel failed.err) {
+        release(?out);
+        ret res[Allocation, Error].err{Error.alloc{failed.err}};
+    }
+    var i: usize = 0;
+    for (i < form.spills.len) {
+        vector.push[Slot](?out.spills, form.spills.data[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < form.sources.len) {
+        vector.push[u32](?out.origins, form.sources.data[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < locations.size) {
+        if (locations.data[i] != scan.NONE) { vector.push[u32](?out.used, locations.data[i]); }
+        i = i + 1;
+    }
+    sort.sort_by[u32](out.used.data, out.used.len, by_number);
+    var kept: usize = 0;
+    i = 0;
+    for (i < out.used.len) {
+        if (kept == 0 || out.used.data[kept - 1] != out.used.data[i]) {
+            out.used.data[kept] = out.used.data[i];
+            kept                = kept + 1;
+        }
+        i = i + 1;
+    }
+    out.used.len = kept;
+    ret res[Allocation, Error].ok{out};
+}
+
+fun rounds(c: *Context) res[Allocation, Error] {
+    var count: u32 = 0;
+    for {
+        count = count + 1;
+        val built: res[Form, spill.Error] = spill.build(c.a, c.f, ?c.p, c.at, ?c.sizes, ?c.clobbers);
+        if (sel built.err) { ret res[Allocation, Error].err{Error.form{built.err}}; }
+        var form: Form = built.ok;
+        fin { spill.dnit(?form); }
+        val got: res[Live, live.Error] = live.compute(c.a, ?form.f, c.at, Slice[Clobber]{data: form.clobbers.data, size: form.clobbers.len});
+        if (sel got.err) { ret res[Allocation, Error].err{Error.live{got.err}}; }
+        var l: Live = got.ok;
+        fin { live.dnit(?l); }
+        val scanned: res[scan.Result, scan.Error] = scan.run(c.a, ?form.f, ?l, c.at, ?c.x, Slice[u8]{data: form.kinds.data, size: form.kinds.len});
+        if (sel scanned.err) { ret res[Allocation, Error].err{Error.scan{scanned.err}}; }
+        var r: scan.Result = scanned.ok;
+        fin { scan.release(?r); }
+        if (scan.settled(?r)) { ret finish(c, ?form, ?r, count); }
+        val more: err[Error] = escalate(c, ?form, ?r);
+        if (sel more.err) { ret res[Allocation, Error].err{more.err}; }
+    }
+}
+
+fun prepare(c: *Context, r: Request) err[Error] {
+    val x: res[Allowed, allowed.Error] = allowed.init(c.a, r.at, r.allowed);
+    if (sel x.err) { ret err[Error].err{Error.allowed{x.err}}; }
+    c.x = x.ok;
+    val s: res[Sizes, allocator.Error] = spill.sizes(c.a, r.at);
+    if (sel s.err) { ret err[Error].err{Error.alloc{s.err}}; }
+    c.sizes = s.ok;
+    val grouped: err[Error] = group(c, r.clobbers);
+    if (sel grouped.err) { ret grouped; }
+    val p: res[Plan, allocator.Error] = plan.init(c.a, c.f);
+    if (sel p.err) { ret err[Error].err{Error.alloc{p.err}}; }
+    c.p = p.ok;
+    ret err[Error].ok{};
+}
+
+# allocate a function's virtual registers to the locations of its target
+# ---
+# a:   the allocator the allocation takes
+# f:   the function, unchanged whatever the outcome
+# r:   the locations, the allowed set and the clobbers
+# ret: the allocated function, or why it was not allocated
+pub fun allocate(a: *allocator.Allocator, f: *Function, r: Request) res[Allocation, Error] {
+    if (r.at.file != function.file(f)) { ret res[Allocation, Error].err{Error.foreign{}}; }
+    var c: Context = Context{
+        a:        a,
+        f:        f,
+        at:       r.at,
+        x:        Allowed{member: vector.init[u64](a), sorted: vector.init[u32](a), groups: Lists[u32]{first: vector.init[u32](a), items: vector.init[u32](a)}},
+        sizes:    Sizes{bits: vector.init[u64](a)},
+        clobbers: Lists[u32]{first: vector.init[u32](a), items: vector.init[u32](a)},
+        p:        Plan{modes: vector.init[u8](a), base: vector.init[u64](a), own: vector.init[u64](a)},
+    };
+    fin {
+        allowed.dnit(?c.x);
+        spill.release_sizes(?c.sizes);
+        graph.release[u32](?c.clobbers);
+        plan.dnit(?c.p);
+    }
+    val ready: err[Error] = prepare(?c, r);
+    if (sel ready.err) { ret res[Allocation, Error].err{ready.err}; }
+    ret rounds(?c);
+}
+
+# give back an allocation's storage
+pub fun release(x: *Allocation) err[allocator.Error] {
+    var failed: err[allocator.Error] = function.dnit(?x.function);
+    keep(?failed, vector.dnit[Slot](?x.spills));
+    keep(?failed, vector.dnit[u32](?x.used));
+    keep(?failed, vector.dnit[u32](?x.origins));
+    ret failed;
+}

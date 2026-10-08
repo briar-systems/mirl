@@ -11,7 +11,8 @@ A target holds
 - `name`, its spelling, used for diagnostics and lookup only,
 - `arch` and `system`, the names of its rows in mink's architecture and system catalogs, where the system must run the architecture,
 - `caps`, its capability declarations,
-- `data`, the facts data layout reads.
+- `data`, the facts data layout reads,
+- `convention`, the calling convention its calls are made under (see [Argument passing](#argument-passing)).
 
 `mirl.target.declared(t)` says whether a target is complete. Every declaration has an unstated zero case, so a row left zeroed reads as incomplete and never as an answer. A list that may rightly be empty sits under a case of its own, so an empty list is a stated answer.
 
@@ -38,6 +39,15 @@ These describe what the target does. They do not change what an operation means.
 
 The ir has no high multiply and no widening multiply. Both are written as a multiply of two extensions, and the high half as that product shifted down by the width and truncated. A target selects the pattern as it stands where it has a form for it: a `high` or `full` row at the width and sign, or a native multiply at twice the width. Where it has none, and multiplies natively at the width, the multiply forms legalisation builds the high half from multiplies at the width. A width the target does not multiply natively is left to the wide integer splitting and the narrow integer widening. A target is a row of each form it has: x86 states `full` rows (a register pair), AArch64 `high` rows at 64 bits and `full` rows at 32, RISC-V `high` rows of all three signs, and a target with none, such as WebAssembly, states none.
 
+### Narrow arithmetic
+
+`widths.alu` lists the integer widths the target's arithmetic runs at, and a row states exactly those: x86-64 at 8, 16, 32 and 64, AArch64 and RISC-V at 32 and 64 (RV32 at 32), and a target such as WebAssembly at 32 and 64. An integer operation at any other width, except a condition, is widened by the `narrow` legalisation to the narrowest listed width above it: the operands are extended, the same opcode runs at the wide width and the result is truncated. The pass applies to a target that lists a width above some legal width it does not list, and it reads nothing else of the target.
+
+- A sum, difference, product, `and`, `or`, `xor`, `neg`, `not` and `shl` take either extension, since the bits above the narrow width do not reach the bits below it. Division, remainder and comparisons extend with the sign or with zeros as their opcode reads its operands, and `shr.u` and `shr.s` extend the shifted operand to match. A shift count is always extended with zeros.
+- The shift rule holds at the narrow width: a count of the narrow width or more shifts every bit out at the wide width too.
+- A division by zero traps at the wide width exactly when the narrow one does. A signed division or remainder of the least narrow value by minus one does not trap at the wide width, so the dividend is replaced by the least wide value in that case, which traps there. The opcode row states which operands the trap reads, and the replacement is a select, so the pass adds no branch.
+- A vector of narrow integers and a width above the widest listed are not its job. The counts (`clz`, `ctz`, `popcnt`), `bswap` and the overflow forms are left until the algebra table states them (`mirl.legal.LEFT`).
+
 ## Asking for layout
 
 A front end never computes a size, an alignment or an offset. It asks mirl, and so does the backend and every debug producer, through the same routine.
@@ -48,6 +58,7 @@ mirl.target.size(?l, ty)          # res[u64, Error], bytes
 mirl.target.align(?l, ty)         # res[u64, Error], a power of two
 mirl.target.extent(?l, ty)        # res[Extent, Error], size and alignment together
 mirl.target.offset(?l, ty, i)     # res[u64, Error], member i of a structure or union
+mirl.target.offsets(?l, ty, out)  # err[Error], every member of a structure in one walk
 ```
 
 `of` takes the target a module names (found by `mirl.target.by_name(module.target)`) and the module's type table. The query is for any IR type.
@@ -64,7 +75,36 @@ A request that cannot be answered is refused with a reason. The reasons are an u
 
 ## Argument passing
 
-How a function's arguments and results are passed is not in the IR. A `call` states only the signature, and a function states only its function type. The calling convention is chosen below the IR from the function type and the system and architecture the target names, and a front end does not compute it. This version of the library does not yet expose a query for it, because the machine layer that applies calling conventions is not built.
+How a function's arguments and results are passed is not in the IR. A `call` states only the signature, and a function states only its function type. A front end never computes it. It asks `mirl.target.abi`, and the backend asks the same routine once per call site.
+
+A target declares the convention its calls are made under in `convention`: the row of the convention, or `uncarried` for a convention mirl has no row for yet, whose calls are refused. A **convention** is a row for one architecture, system and ABI, as data:
+
+| field | what it states |
+|---|---|
+| `results`, `arguments` | the result classifier and the argument classifier |
+| `file` | the masc register file its registers are named in, none where there is none |
+| `word` | the bits of one argument word |
+| `floats` | the widest float passed in float registers, or none |
+| `passing`, `returning` | the argument and result registers by masc's names, each class in the order taken |
+| `preserved`, `reserved` | the registers a callee preserves whole, and those no call clobbers and nothing allocates |
+| `stack` | none, or a stack in memory with its alignment at a call, its red zone and its shadow space |
+| `indirect` | what carries the address of a result passed by reference, and where a callee hands it back |
+| `variadic` | where unnamed arguments travel, the count a caller sets, and how a callee reaches them |
+| `half` | whether a 16-bit float travels as a float or as an integer |
+
+A row is resolved once against a masc selection of its register file (`mirl.target.abi.resolve`), which looks its names up, groups the argument and result registers by class and computes the registers a call clobbers.
+
+```
+val c: *Convention = mirl.target.abi.of(target);                    # res[*Convention, Error]
+val r: Resolved    = mirl.target.abi.resolve(a, c, ?registers);     # res[Resolved, Unresolved]
+mirl.target.abi.classify(a, ?layout, ?r, signature, statement)      # res[Assignment, Error]
+```
+
+`classify` describes each argument and result type through the **type view**, a tree of nodes whose every size, alignment and offset was asked of the data layout, and runs the row's result classifier and then its argument classifier over it. It is the only caller of a row's classifiers. The **assignment** it returns states, for each argument and result, whether it travels by value or by reference to a copy the caller makes and owns, and its **pieces**: for each piece a place (a register by masc's identity, a stack offset, or an operand of the target's own call form), the offset and size of the bytes it carries, how the offset and size scale, and how the rest of its place is filled.
+
+The call's **statement** says how its language passes aggregates (by the platform's C rules, or each by reference to a copy the caller makes) and how many of its arguments are named. Both have an unstated zero case, which is refused.
+
+The one row is `lp64d`, the RISC-V convention of RV64 with hardware double precision, to the RISC-V ELF psABI 1.0.
 
 ## Attributes
 
