@@ -37,7 +37,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `ptr.add` | `address`, `offset` | none | none | propagates |
 | `br` | none | none | none | no results |
 | `cbr` | `condition` | none | none | no results |
-| `call` | `callee`, then any number of argument operands | `signature` a type | none | declared |
+| `call` | `callee`, then any number of argument operands | `signature` a type, `named` a named argument count | none | declared |
 | `ret` | any number of returned value operands | none | none | no results |
 | `fadd` | `lhs`, `rhs` | none | lanewise | propagates |
 | `flt.o` | `lhs`, `rhs` | none | lanewise | propagates |
@@ -135,6 +135,8 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `mul.ov.u` | `lhs`, `rhs` | none | lanewise | propagates |
 | `clz` | `operand` | none | lanewise | propagates |
 | `ctz` | `operand` | none | lanewise | propagates |
+| `call.placed` | `callee`, then any number of argument operands | `signature` a type, `places` a place list | none | declared |
+| `ret.placed` | any number of returned value operands | `places` a place list | none | no results |
 
 ### `add`
 
@@ -573,12 +575,13 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 ### `call`
 
 - operands: `callee`, then any number of argument operands
-- immediates: `signature` a type
+- immediates: `signature` a type, `named` a named argument count
 - targets: 0
 - typing:
   - `callee` is a pointer
   - the type in `signature` is a function type
   - the tail operands are the parameters of the type in `signature`
+  - `named` is stated, naming no more arguments than the parameters of the type in `signature`
 - results:
   - the results of the type in `signature`
 - effects: reads memory, writes memory
@@ -1990,4 +1993,33 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: lanewise
+
+### `call.placed`
+
+- operands: `callee`, then any number of argument operands
+- immediates: `signature` a type, `places` a place list
+- targets: 0
+- typing:
+  - `callee` is a pointer
+  - the type in `signature` is a function type
+  - the tail operands are the parameters of the type in `signature`
+  - `places` holds one place per parameter and result of the type in `signature`
+- results:
+  - the results of the type in `signature`
+- effects: reads memory, writes memory
+  - traps when the function called traps
+- secrecy: declared
+- vector: none
+
+### `ret.placed`
+
+- operands: any number of returned value operands
+- immediates: `places` a place list
+- targets: 0, ends its block
+- typing:
+  - `places` holds one place per tail operand
+- results: none
+- effects: none
+- secrecy: no results
+- vector: none
 

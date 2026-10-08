@@ -6,6 +6,14 @@
 # order. block arguments become one parallel copy per edge, sequenced so no
 # copy clobbers a value another still reads. the engine holds no target
 # knowledge: every fact is the table's, the ir opcode rows' or masc's rows'.
+#
+# a call, an entry and a return in piece form are lowered here, from the
+# places the abi legalisation recorded: each piece is copied into its
+# register or stored at its outgoing slot before the rule's call form, the
+# call or return the form emits reads those registers and writes the result
+# registers, and the results and an entry's parameters are copied out of
+# theirs. every call an expansion emits leaves the convention's clobbered
+# registers undefined, which the engine states to the allocator as clobbers.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -15,6 +23,8 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
 
 use std.allocator;
 use std.collections.slice.Slice;
@@ -24,27 +34,42 @@ use mirl.fail.keep;
 use mirl.fold.algebra;
 
 use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.Location;
+use mirl.ir.debug.Site;
 use mirl.ir.function.Body;
+use mirl.ir.function.Entry;
 use mirl.ir.id;
 use mirl.ir.instruction.Edge;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.instruction.Place;
 use mirl.ir.metadata.Metadata;
 use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.metadata.UNBOUND;
 use mirl.ir.module;
 use mirl.ir.module.Module;
-use ir:    mirl.ir.opcode;
+use ir: mirl.ir.opcode;
+use mirl.ir.opcode.row.Immediate;
+use ir_place: mirl.ir.place;
+use mirl.ir.place.Placed;
 use types: mirl.ir.type;
 use mirl.ir.type.Type;
 use mirl.ir.value.ValueData;
+use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
 use mirl.machine.class;
 use mirl.machine.class.Class;
 use mirl.machine.class.Physical;
 use mf: mirl.machine.function;
+use mirl.machine.function.Area;
+use mirl.machine.function.SlotData;
 use mi: mirl.machine.instruction;
+use mirl.machine.instruction.Implicit;
 use mirl.machine.operand.Block;
 use mirl.machine.operand.Instruction;
 use mirl.machine.operand.Operand;
+use mirl.machine.operand.Partner;
+use FrameSlot: mirl.machine.operand.Slot;
 use mirl.machine.operand.Symbol;
 use mirl.machine.operand.Virtual;
 use mirl.machine.pseudo;
@@ -60,8 +85,13 @@ use mirl.machine.select.rule.Slot;
 use mirl.machine.select.rule.Source;
 use mirl.machine.select.rule.Table;
 use mirl.slice;
+use mirl.target.address.Addresses;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use target_record: mirl.target.record;
 use mirl.target.record.Target;
 
+use masc.core.effect;
 use masc.core.extension;
 use rf:   masc.core.register;
 use rows: masc.core.row;
@@ -95,6 +125,7 @@ pub val UNSTATED:      str = "source or reference left unstated";
 pub val TEMPORARY:     str = "temporary past MAX_FRESH";
 pub val JUMP:          str = "jump that is not one instruction to edge 0";
 pub val UNKNOWN_CLASS: str = "class the target's register file does not have";
+pub val LATER_PARTNER: str = "partner naming an instruction not before it, or past MAX_FRESH";
 
 # what selection was asked to select
 # ---
@@ -134,6 +165,16 @@ pub rec Unmatched {
 # reach:     a type the target reaches has no class or two in the table
 # removed:   a value whose definition was removed
 # machine:   the machine form refused an instruction the table built
+# aggregate: a value of an aggregate type, which no register holds
+# unlocated: a register a call clobbers that the locations do not number
+# placed:    a piece at a place selection does not carry: an operand place,
+#            a scaled stack place, or a stack place of a result
+# transfer:  a piece form instruction whose expansion neither calls nor returns
+# lookup:    the target's thread lookup function, which the module does not
+#            have, or the target states no address model to name it
+# layout:    the target's layout gives no size for a slot's type
+# unplaced:  a function whose entry has parameters the abi legalisation did
+#            not place, so nothing says where they arrive
 pub tag Error: u8 {
     alloc:     allocator.Error;
     module:    module.Error;
@@ -145,6 +186,38 @@ pub tag Error: u8 {
     reach:     reach.Refusal;
     removed:   id.Value;
     machine:   mf.Error;
+    aggregate: Type;
+    unlocated: rf.Id;
+    placed:    Placed;
+    transfer:  id.Instruction;
+    lookup;
+    layout:   Type;
+    unplaced: id.Function;
+}
+
+# what call lowering states to the register allocator
+# ---
+# clobbered: the registers a call leaves undefined, the convention's
+# at:        the locations the allocator numbers them by
+pub rec Calls {
+    clobbered: Slice[rf.Id];
+    at:        *Locations;
+}
+
+# a selected function and the clobbers its calls state
+# ---
+# function: the machine function
+# clobbers: one per clobbered register of each call it makes
+pub rec Selected {
+    function: mf.Function;
+    clobbers: vector.Vector[Clobber];
+}
+
+# give back a selected function
+pub fun release(x: *Selected) err[allocator.Error] {
+    var failed: err[allocator.Error] = mf.dnit(?x.function);
+    keep(?failed, vector.dnit[Clobber](?x.clobbers));
+    ret failed;
 }
 
 # a table made ready for one target and instruction set
@@ -263,6 +336,7 @@ fun source_ok(file: *rf.File, r: *Rule, s: Source) opt[str] {
         val k: opt[Class] = class.handled(file, s.scratch.class);
         if (sel k.none) { ret opt[str].some{UNKNOWN_CLASS}; }
     }
+    if (sel s.slot && n == 0) { ret opt[str].some{NO_SUBJECT}; }
     ret opt[str].none{};
 }
 
@@ -274,8 +348,12 @@ fun expansion_ok(file: *rf.File, r: *Rule) opt[str] {
         if (emit.operands.len > rows.MAX_OPERANDS) { ret opt[str].some{WIDE}; }
         var k: u32 = 0;
         for (k < emit.operands.len) {
-            val bad: opt[str] = source_ok(file, r, emit.operands.at[k]);
+            val s:   Source   = emit.operands.at[k];
+            val bad: opt[str] = source_ok(file, r, s);
             if (sel bad.some) { ret bad; }
+            if (sel s.partner) {
+                if (s.partner.emit::u32 >= e || e >= rule.MAX_FRESH) { ret opt[str].some{LATER_PARTNER}; }
+            }
             k = k + 1;
         }
         e = e + 1;
@@ -503,12 +581,22 @@ rec Move {
 # pred:      per virtual register, the register a parallel copy fills it from
 # ready:     the parallel copy's destinations free to be written
 # todo:      the parallel copy's destinations
+# calls:     what the calls state to the allocator
+# clobbers:  the clobbers stated so far
+# labels:    how many labels partner operands name so far
+# layout:    the target's data layout, which sizes slots
+# implied:   the implicit locations of the instruction being made
 rec State {
     s:         *Selector;
     m:         *Module;
     f:         id.Function;
     body:      *Body;
     out:       *mf.Function;
+    calls:     *Calls;
+    clobbers:  *vector.Vector[Clobber];
+    labels:    u32;
+    layout:    Layout;
+    implied:   vector.Vector[Implicit];
     registers: vector.Vector[u32];
     secret:    vector.Vector[bool];
     held:      vector.Vector[u32];
@@ -526,7 +614,7 @@ rec State {
     todo:      vector.Vector[u32];
 }
 
-fun release(st: *State) {
+fun drop_state(st: *State) {
     vector.dnit[u32](?st.registers);
     vector.dnit[bool](?st.secret);
     vector.dnit[u32](?st.held);
@@ -542,6 +630,7 @@ fun release(st: *State) {
     vector.dnit[u32](?st.pred);
     vector.dnit[u32](?st.ready);
     vector.dnit[u32](?st.todo);
+    vector.dnit[Implicit](?st.implied);
 }
 
 fun alloc_err(e: allocator.Error) err[Error] {
@@ -758,7 +847,8 @@ fun admitted(st: *State, mt: *Match, e: *Emit, at: u32, s: Source) res[bool, Err
         val v: opt[id.Value] = ref_at(st, mt, s.fresh.like);
         ret res[bool, Error].ok{sel v.some};
     }
-    if (sel s.scratch || sel s.fixed) { ret res[bool, Error].ok{true}; }
+    if (sel s.scratch || sel s.fixed)                { ret res[bool, Error].ok{true}; }
+    if (sel s.slot || sel s.partner || sel s.lookup) { ret res[bool, Error].ok{true}; }
     if (sel s.result) {
         if (mt.count == 0) { ret res[bool, Error].ok{s.result == 0}; }
         val d: *InstructionData = instruction(st, mt.nodes[0]);
@@ -906,6 +996,9 @@ fun virtual_in(st: *State, k: Class, secret: bool) res[u32, Error] {
 
 # a new virtual register for a value of a type
 fun virtual(st: *State, ty: Type, secret: bool) res[u32, Error] {
+    val s: res[types.Shape, types.Error] = types.shape(?st.m.types, ty);
+    if (sel s.err)                                              { ret res[u32, Error].err{Error.types{s.err}}; }
+    if (sel s.ok.array || sel s.ok.structure || sel s.ok.union) { ret res[u32, Error].err{Error.aggregate{ty}}; }
     val k: res[Class, Error] = class_for(st, ty);
     if (sel k.err) { ret res[u32, Error].err{k.err}; }
     ret virtual_in(st, k.ok, secret);
@@ -922,9 +1015,41 @@ fun register(st: *State, v: id.Value) res[u32, Error] {
     ret made;
 }
 
-fun put(st: *State, b: u32, op: mi.Opcode, operands: *Operand, count: u32, md: Metadata, declassifies: bool) err[Error] {
+# append an instruction to block `b`, stating the convention's clobbers at it
+# when it is a call
+fun made(st: *State, b: u32, op: mi.Opcode, operands: *Operand, count: u32, md: Metadata, declassifies: bool) res[Instruction, Error] {
     val made: res[Instruction, mf.Error] = mf.append(st.out, Block{index: b}, op, Slice[Operand]{data: operands, size: count::usize}, md, declassifies);
-    if (sel made.err) { ret err[Error].err{Error.machine{made.err}}; }
+    if (sel made.err) { ret res[Instruction, Error].err{Error.machine{made.err}}; }
+    val at: Instruction = made.ok;
+    if (mi.transfer(mf.file(st.out), mf.data(st.out, at)).transfer != effect.CALL) { ret res[Instruction, Error].ok{at}; }
+    var k: usize = 0;
+    for (k < st.calls.clobbered.size) {
+        val id:  rf.Id    = st.calls.clobbered.data[k];
+        val loc: opt[u32] = location.locate(st.calls.at, Physical.register{id});
+        if (sel loc.none) { ret res[Instruction, Error].err{Error.unlocated{id}}; }
+        val p: res[usize, allocator.Error] = vector.push[Clobber](st.clobbers, Clobber{instruction: at, location: loc.some});
+        if (sel p.err) { ret res[Instruction, Error].err{Error.alloc{p.err}}; }
+        k = k + 1;
+    }
+    ret res[Instruction, Error].ok{at};
+}
+
+fun put(st: *State, b: u32, op: mi.Opcode, operands: *Operand, count: u32, md: Metadata, declassifies: bool) err[Error] {
+    val got: res[Instruction, Error] = made(st, b, op, operands, count, md, declassifies);
+    if (sel got.err) { ret err[Error].err{got.err}; }
+    ret err[Error].ok{};
+}
+
+# state the implicit locations gathered in `st.implied` on an instruction
+fun imply(st: *State, i: Instruction) err[Error] {
+    val stated: err[mf.Error] = mf.imply(st.out, i, Slice[Implicit]{data: st.implied.data, size: st.implied.len});
+    if (sel stated.err) { ret err[Error].err{Error.machine{stated.err}}; }
+    ret err[Error].ok{};
+}
+
+fun note(st: *State, at: Physical, write: bool) err[Error] {
+    val p: res[usize, allocator.Error] = vector.push[Implicit](?st.implied, Implicit{location: at, write: write});
+    if (sel p.err) { ret alloc_err(p.err); }
     ret err[Error].ok{};
 }
 
@@ -969,13 +1094,17 @@ fun materialise(st: *State, b: u32, v: id.Value, dest: u32, user: id.Instruction
 # ---
 # dest: the register a materialisation rule builds into, NONE for any other
 fun expand(st: *State, b: u32, r: *Rule, mt: *Match, dest: u32, md: Metadata, declassifies: bool) err[Error] {
-    var fresh: [rule.MAX_FRESH]u32;
-    var f:     u32 = 0;
+    var fresh:   [rule.MAX_FRESH]u32;
+    var emitted: [rule.MAX_FRESH]Instruction;
+    var labels:  [rule.MAX_FRESH]u32;
+    var f:       u32 = 0;
     for (f < rule.MAX_FRESH) {
-        fresh[f] = NONE;
-        f        = f + 1;
+        fresh[f]  = NONE;
+        labels[f] = NONE;
+        f         = f + 1;
     }
-    var e: u32 = 0;
+    var frame: u32 = NONE;
+    var e:     u32 = 0;
     for (e < r.expansion.len) {
         val emit: *Emit = ?r.expansion.at[e];
         var ops:  [rows.MAX_OPERANDS]Operand;
@@ -1048,11 +1177,240 @@ fun expand(st: *State, b: u32, r: *Rule, mt: *Match, dest: u32, md: Metadata, de
             }
             or (sel s.fixed)  { ops[k] = Operand.physical{Physical.register{s.fixed}}; }
             or (sel s.target) { ops[k] = Operand.block{Block{index: st.targets.data[s.target]}}; }
+            or (sel s.slot) {
+                if (frame == NONE) {
+                    val got: res[u32, Error] = slot_for(st, mt.nodes[0]);
+                    if (sel got.err) { ret err[Error].err{got.err}; }
+                    frame = got.ok;
+                }
+                ops[k] = Operand.slot{FrameSlot{index: frame}};
+            }
+            or (sel s.partner) {
+                val j: u8 = s.partner.emit;
+                if (labels[j] == NONE) {
+                    labels[j] = st.labels;
+                    st.labels = st.labels + 1;
+                    mf.label(st.out, emitted[j], labels[j]);
+                }
+                ops[k] = Operand.partner{Partner{label: labels[j], kind: s.partner.kind}};
+            }
+            or (sel s.lookup) {
+                val got: res[id.Symbol, Error] = lookup(st);
+                if (sel got.err) { ret err[Error].err{got.err}; }
+                ops[k] = Operand.symbol{Symbol{symbol: got.ok, addend: 0, kind: s.lookup}};
+            }
             k = k + 1;
         }
-        val placed: err[Error] = put(st, b, emit.opcode, ?ops[0], emit.operands.len, md, declassifies);
-        if (sel placed.err) { ret placed; }
+        val placed: res[Instruction, Error] = made(st, b, emit.opcode, ?ops[0], emit.operands.len, md, declassifies);
+        if (sel placed.err)     { ret err[Error].err{placed.err}; }
+        if (e < rule.MAX_FRESH) { emitted[e] = placed.ok; }
+        if (emit.implied.len > 0) {
+            vector.clear[Implicit](?st.implied);
+            var n: u32 = 0;
+            for (n < emit.implied.len) {
+                val x:     rule.Implied = emit.implied.at[n];
+                val noted: err[Error]   = note(st, Physical.register{x.register}, x.write);
+                if (sel noted.err) { ret noted; }
+                n = n + 1;
+            }
+            val stated: err[Error] = imply(st, placed.ok);
+            if (sel stated.err) { ret stated; }
+        }
         e = e + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the frame slot an alloca asks for: its type's size at its alignment
+fun slot_for(st: *State, root: id.Instruction) res[u32, Error] {
+    val d:     *InstructionData = instruction(st, root);
+    var ty:    Type             = Type{index: 0};
+    var align: u64              = 1;
+    var typed: bool             = false;
+    var k:     usize            = 0;
+    for (k < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[k];
+        if (sel imm.ty) {
+            if (!typed) {
+                ty    = imm.ty;
+                typed = true;
+            }
+        }
+        if (sel imm.alignment) { align = imm.alignment; }
+        k = k + 1;
+    }
+    val size: res[u64, target_record.Error] = layout.size(?st.layout, ty);
+    if (sel size.err) { ret res[u32, Error].err{Error.layout{ty}}; }
+    val got: res[FrameSlot, mf.Error] = mf.slot(st.out, mf.fixed_slot(size.ok, align));
+    if (sel got.err) { ret res[u32, Error].err{Error.machine{got.err}}; }
+    ret res[u32, Error].ok{got.ok.index};
+}
+
+# the module's function the target's general dynamic thread-local access calls
+fun lookup(st: *State) res[id.Symbol, Error] {
+    val a: Addresses = st.s.target.addresses;
+    if (!(sel a.model)) { ret res[id.Symbol, Error].err{Error.lookup{}}; }
+    val name:  str            = a.model.threads.lookup;
+    val found: opt[id.Symbol] = module.find(st.m, View{data: name, len: str_len(name)});
+    if (sel found.none)             { ret res[id.Symbol, Error].err{Error.lookup{}}; }
+    if (!(sel found.some.function)) { ret res[id.Symbol, Error].err{Error.lookup{}}; }
+    ret res[id.Symbol, Error].ok{found.some};
+}
+
+# the places of an instruction in piece form, none for any other
+fun places_of(d: *InstructionData) opt[Slice[Placed]] {
+    var k: usize = 0;
+    for (k < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[k];
+        if (sel imm.places) { ret opt[Slice[Placed]].some{imm.places}; }
+        k = k + 1;
+    }
+    ret opt[Slice[Placed]].none{};
+}
+
+# the slot a value of a type takes at a stack place of an area
+fun stack_slot(st: *State, ty: Type, area: Area) res[FrameSlot, Error] {
+    val size:  res[u64, target_record.Error] = layout.size(?st.layout, ty);
+    val align: res[u64, target_record.Error] = layout.align(?st.layout, ty);
+    if (sel size.err)  { ret res[FrameSlot, Error].err{Error.layout{ty}}; }
+    if (sel align.err) { ret res[FrameSlot, Error].err{Error.layout{ty}}; }
+    val got: res[FrameSlot, mf.Error] = mf.slot(st.out, SlotData{size: size.ok, per: 0, scale: 0, align: align.ok, area: area});
+    if (sel got.err) { ret res[FrameSlot, Error].err{Error.machine{got.err}}; }
+    ret res[FrameSlot, Error].ok{got.ok};
+}
+
+# the register a piece is sent from, a constant materialised into one of its
+# own, all of them before any piece is placed, since a materialisation may
+# itself call and clobber the registers pieces travel in
+fun source_of(st: *State, b: u32, v: id.Value, user: id.Instruction, md: Metadata) res[u32, Error] {
+    val d: *ValueData = value(st, v);
+    if (!(sel d.def.constant)) { ret register(st, v); }
+    val t: res[u32, Error] = virtual(st, d.type, false);
+    if (sel t.err) { ret t; }
+    val built: err[Error] = materialise(st, b, v, t.ok, user, md);
+    if (sel built.err) { ret res[u32, Error].err{built.err}; }
+    ret t;
+}
+
+# send a piece from its register to its place before a call or a return,
+# noting a register it travels in as read by the transfer
+fun send(st: *State, b: u32, v: id.Value, source: u32, p: Placed, md: Metadata) err[Error] {
+    val d: *ValueData = value(st, v);
+    var m: Metadata   = md;
+    m.secret = st.secret.data[source];
+    if (sel p.place.register) {
+        val at:     Physical   = Physical.register{p.place.register};
+        var ops:    [2]Operand = [2]Operand{Operand.physical{at}, Operand.virtual{Virtual{index: source}}};
+        val put_ok: err[Error] = put(st, b, mi.Opcode.pseudo{pseudo.COPY}, ?ops[0], 2, m, false);
+        if (sel put_ok.err) { ret put_ok; }
+        ret note(st, at, false);
+    }
+    val place: ir_place.Place = p.place;
+    if (sel place.stack) {
+        if (sel p.scale.fixed) {
+            val s: res[FrameSlot, Error] = stack_slot(st, d.type, Area.outgoing{place.stack});
+            if (sel s.err) { ret err[Error].err{s.err}; }
+            var ops: [2]Operand = [2]Operand{Operand.slot{s.ok}, Operand.virtual{Virtual{index: source}}};
+            ret put(st, b, mi.Opcode.pseudo{pseudo.SPILL}, ?ops[0], 2, m, false);
+        }
+    }
+    ret err[Error].err{Error.placed{p}};
+}
+
+# take a piece from its register after a call or at an entry, or from its
+# incoming slot at an entry
+fun take(st: *State, b: u32, v: id.Value, p: Placed, md: Metadata, entry: bool) err[Error] {
+    val dest: res[u32, Error] = register(st, v);
+    if (sel dest.err) { ret err[Error].err{dest.err}; }
+    var m: Metadata = md;
+    m.secret = st.secret.data[dest.ok];
+    if (sel p.place.register) {
+        var ops: [2]Operand = [2]Operand{Operand.virtual{Virtual{index: dest.ok}}, Operand.physical{Physical.register{p.place.register}}};
+        ret put(st, b, mi.Opcode.pseudo{pseudo.COPY}, ?ops[0], 2, m, false);
+    }
+    val place: ir_place.Place = p.place;
+    if (sel place.stack) {
+        if (entry && sel p.scale.fixed) {
+            val s: res[FrameSlot, Error] = stack_slot(st, value(st, v).type, Area.incoming{place.stack});
+            if (sel s.err) { ret err[Error].err{s.err}; }
+            var ops: [2]Operand = [2]Operand{Operand.virtual{Virtual{index: dest.ok}}, Operand.slot{s.ok}};
+            ret put(st, b, mi.Opcode.pseudo{pseudo.RELOAD}, ?ops[0], 2, m, false);
+        }
+    }
+    ret err[Error].err{Error.placed{p}};
+}
+
+# lower a call or a return in piece form: its pieces to their places, the
+# rule's form, the registers the transfer reads and writes, and the results
+# out of their registers
+fun lower_placed(st: *State, b: u32, c: *Choice, r: *Rule, places: Slice[Placed], md: Metadata, declassifies: bool) err[Error] {
+    val root:    id.Instruction     = c.found.nodes[0];
+    val d:       *InstructionData   = instruction(st, root);
+    val results: usize              = d.results.len;
+    val pieces:  usize              = places.size - results;
+    val first:   usize              = d.operands.len - pieces;
+    var sources: vector.Vector[u32] = vector.init[u32](st.s.a);
+    fin { vector.dnit[u32](?sources); }
+    var i: usize = 0;
+    for (i < pieces) {
+        val got: res[u32, Error] = source_of(st, b, d.operands.data[first + i], root, md);
+        if (sel got.err) { ret err[Error].err{got.err}; }
+        val pushed: err[Error] = push_u32(?sources, got.ok);
+        if (sel pushed.err) { ret pushed; }
+        i = i + 1;
+    }
+    vector.clear[Implicit](?st.implied);
+    i = 0;
+    for (i < pieces) {
+        val sent: err[Error] = send(st, b, d.operands.data[first + i], sources.data[i], places.data[i], md);
+        if (sel sent.err) { ret sent; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < results) {
+        val p: Placed = places.data[pieces + i];
+        if (!(sel p.place.register)) { ret err[Error].err{Error.placed{p}}; }
+        val noted: err[Error] = note(st, Physical.register{p.place.register}, true);
+        if (sel noted.err) { ret noted; }
+        i = i + 1;
+    }
+    val before: usize      = mf.instructions(st.out, Block{index: b}).size;
+    val done:   err[Error] = expand(st, b, r, ?c.found, NONE, md, declassifies);
+    if (sel done.err) { ret done; }
+    val list: Slice[Instruction] = mf.instructions(st.out, Block{index: b});
+    var at:   usize              = NONE::usize;
+    var k:    usize              = before;
+    for (k < list.size) {
+        val t: u8 = mi.transfer(mf.file(st.out), mf.data(st.out, list.data[k])).transfer;
+        if (t == effect.CALL || t == effect.RETURN) { at = k; }
+        k = k + 1;
+    }
+    if (at == NONE::usize) { ret err[Error].err{Error.transfer{root}}; }
+    val stated: err[Error] = imply(st, list.data[at]);
+    if (sel stated.err) { ret stated; }
+    i = 0;
+    for (i < results) {
+        val got: err[Error] = take(st, b, d.results.data[i], places.data[pieces + i], md, false);
+        if (sel got.err) { ret got; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# take an entry's parameters from their places, at the head of its block
+fun enter(st: *State, b: u32) err[Error] {
+    val e:      *Entry                   = ?st.body.entry;
+    val params: *vector.Vector[id.Value] = ?st.body.blocks.data[0].parameters;
+    if (!(sel e.placed)) {
+        if (params.len > 0) { ret err[Error].err{Error.unplaced{st.f}}; }
+        ret err[Error].ok{};
+    }
+    var i: usize = 0;
+    for (i < params.len && i < e.placed.len) {
+        val md:  Metadata   = Metadata{location: opt[Location].none{}, site: opt[Site].none{}, flags: NO_FLAGS, secret: false, bindings: UNBOUND};
+        val got: err[Error] = take(st, b, params.data[i], e.placed.data[i], md, true);
+        if (sel got.err) { ret got; }
+        i = i + 1;
     }
     ret err[Error].ok{};
 }
@@ -1277,7 +1635,11 @@ fun choose_block(st: *State, k: id.Block) err[Error] {
 
 # emit the chosen expansions of an ir block in order
 fun emit_block(st: *State, k: id.Block) err[Error] {
-    val b: u32   = st.blocks.data[k.index];
+    val b: u32 = st.blocks.data[k.index];
+    if (k.index == 0) {
+        val entered: err[Error] = enter(st, b);
+        if (sel entered.err) { ret entered; }
+    }
     var i: usize = st.choices.len;
     for (i > 0) {
         i = i - 1;
@@ -1290,8 +1652,15 @@ fun emit_block(st: *State, k: id.Block) err[Error] {
         md.flags.bounded = false;
         val routed: err[Error] = edges(st, b, c, md);
         if (sel routed.err) { ret routed; }
-        val done: err[Error] = expand(st, b, r, ?c.found, NONE, md, decl);
-        if (sel done.err) { ret done; }
+        val pieces: opt[Slice[Placed]] = places_of(d);
+        if (sel pieces.some) {
+            val done: err[Error] = lower_placed(st, b, c, r, pieces.some, md, decl);
+            if (sel done.err) { ret done; }
+        }
+        or {
+            val done: err[Error] = expand(st, b, r, ?c.found, NONE, md, decl);
+            if (sel done.err) { ret done; }
+        }
     }
     ret err[Error].ok{};
 }
@@ -1334,20 +1703,28 @@ fun run(st: *State) err[Error] {
 
 # select an ir function into a new machine function
 # ---
-# s:   the selector
-# m:   the module
-# f:   the function, which has a body
-# ret: the machine function, or why selection refused, with nothing left made
-pub fun select(s: *Selector, m: *Module, f: id.Function) res[mf.Function, Error] {
+# s:     the selector
+# m:     the module
+# f:     the function, which has a body
+# calls: what its calls state to the allocator
+# ret:   the machine function and the clobbers of its calls, or why
+#        selection refused, with nothing left made
+pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls) res[Selected, Error] {
     val body: res[*Body, module.Error] = module.body(m, f);
-    if (sel body.err) { ret res[mf.Function, Error].err{Error.module{body.err}}; }
-    var out: mf.Function = mf.init(s.a, s.set);
-    var st:  State       = State{
+    if (sel body.err) { ret res[Selected, Error].err{Error.module{body.err}}; }
+    var out:      mf.Function            = mf.init(s.a, s.set);
+    var clobbers: vector.Vector[Clobber] = vector.init[Clobber](s.a);
+    var st:       State                  = State{
         s:         s,
         m:         m,
         f:         f,
         body:      body.ok,
         out:       ?out,
+        calls:     calls,
+        clobbers:  ?clobbers,
+        labels:    0,
+        layout:    layout.of(s.target, ?m.types),
+        implied:   vector.init[Implicit](s.a),
         registers: vector.init[u32](s.a),
         secret:    vector.init[bool](s.a),
         held:      vector.init[u32](s.a),
@@ -1365,10 +1742,11 @@ pub fun select(s: *Selector, m: *Module, f: id.Function) res[mf.Function, Error]
         todo:      vector.init[u32](s.a),
     };
     val ran: err[Error] = run(?st);
-    release(?st);
+    drop_state(?st);
     if (sel ran.err) {
         mf.dnit(?out);
-        ret res[mf.Function, Error].err{ran.err};
+        vector.dnit[Clobber](?clobbers);
+        ret res[Selected, Error].err{ran.err};
     }
-    ret res[mf.Function, Error].ok{out};
+    ret res[Selected, Error].ok{Selected{function: out, clobbers: clobbers}};
 }

@@ -18,6 +18,16 @@ An integer narrower than the register is held sign extended to the register, as 
 - Constants: `addi` from x0 builds 12 signed bits, `lui` alone builds a value whose low 12 bits are zero, `lui` and `addiw` (`addi` on RV32) build 32 bits, and six instructions build any 64 bit value. Their costs are 2, 2, 4 and 12, which constant hoisting reads. A float constant is built in an integer register and moved.
 - A kept store selects to a store row that carries the mark. The instructions around it, such as a constant's materialisation, do not.
 
+## Calls, returns and addresses
+
+The abi legalisation puts every call, entry and return in piece form before selection, and the engine places the pieces (see [selection](../machine/select.md)). The table supplies the forms.
+
+- A call to a symbol is `auipc x1` and `jalr x1, x1, 0` under `call_plt_pair`, which the linker may relax. A call through a register is `jalr x1`. A return is `jalr x0, x1, 0`.
+- An `alloca` is the `address` pseudo of a frame slot of its type.
+- The address of a symbol follows the target's relocation model. Under `static` it is `lui` and `addi` (`hi20`, `lo12_i`). Under `pie` a symbol the module defines is `auipc` and `addi` (`pcrel_hi20`, `pcrel_lo12_i`) and any other is `auipc` and a load from the global offset table (`got_pcrel_hi20`). Under `pic` a symbol another module may preempt is reached through the table too, and a function, which states no visibility, always is.
+- A thread-local variable follows the access the target declares for its model. Local exec is `lui`, `add` of `tp` and `addi` (`tprel_hi20`, `tprel_lo12_i`). Initial exec is `auipc`, a load (`tls_got_pcrel_hi20`) and `add` of `tp`. General dynamic is `auipc` and `addi` into `a0` (`tls_gd_pcrel_hi20`), a call to the target's lookup function, which reads and writes `a0`, and a copy out of `a0`.
+- Every pc-relative low part names its high part's instruction as its partner (`pcrel_lo12_i`), the label the relocation is applied at.
+
 ## Cost
 
 A cost is two for each instruction an expansion emits, with a multiply counting three and a divide twelve. It is one less for each instruction the pattern covers and one less when the rule takes its constant operand as an immediate. So a rule that covers more costs less than the rules for its pieces, and no choice rests on the order of rows.
@@ -36,8 +46,7 @@ The declared operations are in `declared.mach`, each with the job that closes it
 
 - Vector operations, because the target holds vectors in no register (scalarisation, #52).
 - `frem`, `mem.copy` and `mem.fill`, which no instruction does (helpers, #54).
-- A call, whose operands and results the calling convention places (#28), and a return with operands. A return with none selects to `jalr`.
-- `alloca`, the address of a frame slot (#29), and the address of a global or function as a constant.
+- A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
 - `atomic.nand` and `atomic.cmpxchg`, a loop of load reserved and store conditional that an expansion cannot hold.
 
 Some operations select only for the operands a base form covers.
