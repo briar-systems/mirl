@@ -1,0 +1,790 @@
+# common subexpression elimination: a computation that repeats an earlier one
+# is replaced by the earlier result
+#
+# the blocks are walked down the dominator tree, so an earlier instruction
+# always dominates the later one it stands for. two instructions are the same
+# computation when they have the same opcode, flags, secrecy, result types,
+# immediates and operands, an operand being the same value or a constant of
+# the same bits, so distinct zeros and nan payloads stay apart. a commutative
+# operation, as the algebra table states it, matches with its operands
+# swapped. they are found through a table keyed by that identity, scoped to the
+# tree, never by comparing pairs.
+#
+# a row that states itself mergeable is a candidate. a row that reads memory,
+# writes none and states no memory ordering is a candidate too, and its
+# instance stands for an earlier one only while nothing between them may write
+# what it reads. the memory analysis states what each instruction may touch.
+# the loads still available are indexed by the group of the place they read,
+# so a write is asked of the loads of its own group alone, and a write that
+# may reach anywhere, an ordered access, or one whose place has no group ends
+# the availability of every load. a block with more than one way in starts
+# with no load available, since a path into it may have written. a volatile
+# or ordered access, and a kept write, are never merged, and a write that is
+# kept ends availability as any other.
+#
+# the survivor keeps its own metadata. both of two merged instructions are
+# equal in secrecy, so no public use comes to read a secret value, and the
+# body edits refuse the rest. the pass adds no branch and reads no secret, so
+# it keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.fold.algebra;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Row;
+use mirl.ir.opcode.rule.Ordering;
+use mirl.ir.value.ValueData;
+use mirl.pass.analysis;
+use mirl.pass.analysis.memory;
+use mirl.pass.analysis.memory.Effect;
+use mirl.pass.analysis.memory.Memory;
+use mirl.pass.cache;
+use mirl.pass.failure.Why;
+use mirl.pass.failure.edit;
+use mirl.pass.failure.lost;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.slice.mix;
+
+# the pass: it removes instructions and values, so only the control flow
+# analyses outlive it
+pub val CSE: Pass = Pass{name: "cse", kind: Kind.optimise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}};
+
+val NONE: u32 = 0xffffffff;
+
+val UNDO_DEAD:    u8 = 1;
+val UNDO_BARRIER: u8 = 2;
+val UNDO_CLEARED: u8 = 3;
+
+# a computation available at this point of the walk
+# ---
+# inst:   the instruction
+# prev:   the older entry of the same computation, or none
+# load:   it reads memory, so it can be ended by a write
+# seq:    when it was made, counting every entry of the walk
+# dead:   a write has ended it
+# group:  the group of the place a load reads, zero for no group
+# next:   the older entry of the same group, or none
+# effect: what a load reads
+rec Entry {
+    inst:   Instruction;
+    prev:   u32;
+    load:   bool;
+    seq:    u32;
+    dead:   bool;
+    group:  u64;
+    next:   u32;
+    effect: Effect;
+}
+
+# the loads of one group
+# ---
+# head:    the newest entry
+# cleared: the entries made up to this count are ended
+rec Bucket {
+    head:    u32;
+    cleared: u32;
+}
+
+# a change of the availability a block's subtree undoes on leaving it
+# ---
+# kind:  which change
+# at:    the entry ended, or the count a barrier or a bucket had before
+# group: the bucket changed
+rec Undo {
+    kind:  u8;
+    at:    u32;
+    group: u64;
+}
+
+# a block of the walk
+# ---
+# block:   the block
+# child:   how many of its children are done
+# entries: how many entries stood before it
+# log:     how many changes stood before it
+rec Frame {
+    block:   u32;
+    child:   usize;
+    entries: usize;
+    log:     usize;
+}
+
+# an instruction as the table sees it
+rec Key {
+    s:    *Sweep;
+    inst: u32;
+}
+
+# one run over a function
+# ---
+# m, f, b: the module, the function and its body
+# dom:     its dominance
+# cache:   the cache the memory analysis is read from
+# mem:     the memory analysis, nil until a load asks for it
+# seen:    for each computation, its newest entry
+# groups:  for each group of loads, its entries
+# entries: the available computations in the order they were made
+# log:     the changes of availability, to undo on leaving a subtree
+# stack:   the blocks of the walk
+# gone:    the instructions of the block being walked that were merged
+# barrier: the entries made up to this count are ended
+# count:   the entries made so far
+# loads:   how many entries are loads
+# changed: something was merged
+# failed:  hashing or comparing found an unreadable constant
+# why:     why
+rec Sweep {
+    m:       *Module;
+    f:       Function;
+    b:       *Body;
+    dom:     *Dominance;
+    cache:   *cache.Cache;
+    mem:     *Memory;
+    seen:    map.MapBy[Key, u32];
+    groups:  map.Map[u64, Bucket];
+    entries: vector.Vector[Entry];
+    log:     vector.Vector[Undo];
+    stack:   vector.Vector[Frame];
+    gone:    vector.Vector[Instruction];
+    barrier: u32;
+    count:   u32;
+    loads:   usize;
+    changed: bool;
+    failed:  bool;
+    why:     Why;
+}
+
+fun fault(s: *Sweep, e: module.Error) {
+    if (s.failed) { ret; }
+    s.failed = true;
+    s.why    = Why.ir{e};
+}
+
+fun hash_wide(h: u64, x: Wide) u64 {
+    var acc: u64 = h;
+    var i:   u32 = 0;
+    for (i < word.words()) {
+        acc = mix(acc, x[i]);
+        i   = i + 1;
+    }
+    ret acc;
+}
+
+fun same_wide(x: Wide, y: Wide) bool {
+    var i: u32 = 0;
+    for (i < word.words()) {
+        if (x[i] != y[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the bits a constant holds when it is a number or a zero, whose bits are all clear
+fun bits_of(d: ConstantData) opt[Wide] {
+    if (sel d.integer) { ret opt[Wide].some{word.of(d.integer.words)}; }
+    if (sel d.float)   { ret opt[Wide].some{word.of(d.float.words)}; }
+    if (sel d.zero)    { ret opt[Wide].some{word.zero()}; }
+    ret opt[Wide].none{};
+}
+
+fun hash_symbol(h: u64, y: Symbol) u64 {
+    if (sel y.function) { ret mix(mix(h, 1), y.function.index::u64); }
+    ret mix(mix(h, 2), y.global.index::u64);
+}
+
+fun same_symbol(x: Symbol, y: Symbol) bool {
+    if (sel x.function) {
+        if (sel y.function) { ret x.function.index == y.function.index; }
+        ret false;
+    }
+    if (sel y.global) { ret x.global.index == y.global.index; }
+    ret false;
+}
+
+fun hash_constant(s: *Sweep, c: Constant) u64 {
+    val got: res[ConstantData, module.Error] = module.constant_data(s.m, c);
+    if (sel got.err) {
+        fault(s, got.err);
+        ret 0;
+    }
+    val d: ConstantData = got.ok;
+    if (sel d.integer) { ret hash_wide(1, word.of(d.integer.words)); }
+    or (sel d.float)   { ret hash_wide(1, word.of(d.float.words)); }
+    or (sel d.zero)    { ret hash_wide(1, word.zero()); }
+    or (sel d.aggregate) {
+        var h: u64   = mix(2, d.aggregate.elements.size::u64);
+        var i: usize = 0;
+        for (i < d.aggregate.elements.size) {
+            h = mix(h, hash_constant(s, d.aggregate.elements.data[i]));
+            i = i + 1;
+        }
+        ret h;
+    }
+    or (sel d.address) {
+        ret mix(hash_symbol(3, d.address.symbol), d.address.offset::u64);
+    }
+}
+
+fun same_constant(s: *Sweep, x: Constant, y: Constant) bool {
+    if (x.index == y.index) { ret true; }
+    val gx: res[ConstantData, module.Error] = module.constant_data(s.m, x);
+    if (sel gx.err) {
+        fault(s, gx.err);
+        ret false;
+    }
+    val gy: res[ConstantData, module.Error] = module.constant_data(s.m, y);
+    if (sel gy.err) {
+        fault(s, gy.err);
+        ret false;
+    }
+    val a: ConstantData = gx.ok;
+    val b: ConstantData = gy.ok;
+    val p: opt[Wide]    = bits_of(a);
+    val q: opt[Wide]    = bits_of(b);
+    if (sel p.some) {
+        if (sel q.some) { ret same_wide(p.some, q.some); }
+        ret false;
+    }
+    if (sel q.some) { ret false; }
+    if (sel a.aggregate) {
+        if (!(sel b.aggregate))                                     { ret false; }
+        if (a.aggregate.elements.size != b.aggregate.elements.size) { ret false; }
+        var i: usize = 0;
+        for (i < a.aggregate.elements.size) {
+            if (!same_constant(s, a.aggregate.elements.data[i], b.aggregate.elements.data[i])) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    if (sel a.address) {
+        if (!(sel b.address)) { ret false; }
+        ret same_symbol(a.address.symbol, b.address.symbol) && a.address.offset == b.address.offset && a.address.type.index == b.address.type.index;
+    }
+    ret false;
+}
+
+fun hash_operand(s: *Sweep, v: Value) u64 {
+    val vd: *ValueData = ?s.b.values.data[v.index];
+    if (sel vd.def.constant) { ret mix(mix(1, vd.type.index::u64), hash_constant(s, vd.def.constant)); }
+    ret mix(2, v.index::u64);
+}
+
+fun same_operand(s: *Sweep, x: Value, y: Value) bool {
+    if (x.index == y.index) { ret true; }
+    val vx: *ValueData = ?s.b.values.data[x.index];
+    val vy: *ValueData = ?s.b.values.data[y.index];
+    if (!(sel vx.def.constant))         { ret false; }
+    if (!(sel vy.def.constant))         { ret false; }
+    if (vx.type.index != vy.type.index) { ret false; }
+    ret same_constant(s, vx.def.constant, vy.def.constant);
+}
+
+fun rank(o: Ordering) u32 {
+    if (sel o.acquire) { ret 1; }
+    if (sel o.release) { ret 2; }
+    if (sel o.acq_rel) { ret 3; }
+    if (sel o.seq_cst) { ret 4; }
+    ret 0;
+}
+
+fun hash_immediate(h: u64, i: Immediate) u64 {
+    if (sel i.ty)        { ret mix(mix(h, 1), i.ty.index::u64); }
+    or (sel i.alignment) { ret mix(mix(h, 2), i.alignment); }
+    or (sel i.ordering)  { ret mix(mix(h, 3), rank(i.ordering)::u64); }
+    or (sel i.lane)      { ret mix(mix(h, 4), i.lane::u64); }
+    or (sel i.lanes) {
+        var acc: u64   = mix(h, 5);
+        var n:   usize = 0;
+        for (n < i.lanes.size) {
+            acc = mix(acc, i.lanes.data[n]::u64);
+            n   = n + 1;
+        }
+        ret acc;
+    }
+}
+
+fun same_immediate(x: Immediate, y: Immediate) bool {
+    if (sel x.ty)        { ret sel y.ty && x.ty.index == y.ty.index; }
+    or (sel x.alignment) { ret sel y.alignment && x.alignment == y.alignment; }
+    or (sel x.ordering)  { ret sel y.ordering && rank(x.ordering) == rank(y.ordering); }
+    or (sel x.lane)      { ret sel y.lane && x.lane == y.lane; }
+    or (sel x.lanes) {
+        if (!(sel y.lanes))               { ret false; }
+        if (x.lanes.size != y.lanes.size) { ret false; }
+        var n: usize = 0;
+        for (n < x.lanes.size) {
+            if (x.lanes.data[n] != y.lanes.data[n]) { ret false; }
+            n = n + 1;
+        }
+        ret true;
+    }
+}
+
+fun hash_key(k: *Key) u64 {
+    val s: *Sweep           = k.s;
+    val d: *InstructionData = ?s.b.instructions.data[k.inst];
+    var h: u64              = mix(0xcbf29ce484222325, d.opcode.index::u64);
+    h = mix(h, d.metadata.secret::u64);
+    h = mix(h, d.metadata.flags.volatile::u64);
+    h = mix(h, d.metadata.flags.kept::u64);
+    var i: usize = 0;
+    for (i < d.results.len) {
+        h = mix(h, s.b.values.data[d.results.data[i].index].type.index::u64);
+        h = mix(h, s.b.values.data[d.results.data[i].index].secret::u64);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.immediates.len) {
+        h = hash_immediate(h, d.immediates.data[i]);
+        i = i + 1;
+    }
+    if (d.operands.len == 2 && algebra.algebra(d.opcode).commutative) {
+        ret mix(h, hash_operand(s, d.operands.data[0]) + hash_operand(s, d.operands.data[1]));
+    }
+    i = 0;
+    for (i < d.operands.len) {
+        h = mix(h, hash_operand(s, d.operands.data[i]));
+        i = i + 1;
+    }
+    ret h;
+}
+
+fun same_key(x: *Key, y: *Key) bool {
+    if (x.inst == y.inst) { ret true; }
+    val s: *Sweep           = x.s;
+    val a: *InstructionData = ?s.b.instructions.data[x.inst];
+    val b: *InstructionData = ?s.b.instructions.data[y.inst];
+    if (a.opcode.index != b.opcode.index)                                       { ret false; }
+    if (!metadata.same_flags(a.metadata.flags, b.metadata.flags))               { ret false; }
+    if (a.metadata.secret != b.metadata.secret)                                 { ret false; }
+    if (a.results.len != b.results.len || a.immediates.len != b.immediates.len) { ret false; }
+    if (a.operands.len != b.operands.len)                                       { ret false; }
+    var i: usize = 0;
+    for (i < a.results.len) {
+        val va: *ValueData = ?s.b.values.data[a.results.data[i].index];
+        val vb: *ValueData = ?s.b.values.data[b.results.data[i].index];
+        if (va.type.index != vb.type.index || va.secret != vb.secret) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.immediates.len) {
+        if (!same_immediate(a.immediates.data[i], b.immediates.data[i])) { ret false; }
+        i = i + 1;
+    }
+    if (a.operands.len == 2 && algebra.algebra(a.opcode).commutative) {
+        val straight: bool = same_operand(s, a.operands.data[0], b.operands.data[0]) && same_operand(s, a.operands.data[1], b.operands.data[1]);
+        if (straight) { ret true; }
+        ret same_operand(s, a.operands.data[0], b.operands.data[1]) && same_operand(s, a.operands.data[1], b.operands.data[0]);
+    }
+    i = 0;
+    for (i < a.operands.len) {
+        if (!same_operand(s, a.operands.data[i], b.operands.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether a row states that its instance may be merged with an equal one
+fun merges(r: *Row) bool {
+    ret r.effects.mergeable;
+}
+
+# whether a row only reads memory, with no ordering to state
+fun reads_only(r: *Row) bool {
+    if (r.effects.mergeable || !r.effects.reads || r.effects.writes) { ret false; }
+    var i: u32 = 0;
+    for (i < opcode.slots(r)) {
+        if (sel r.immediates[i].holds.ordering) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether an instance gives results and may stand for another
+fun plain(d: *InstructionData, r: *Row) bool {
+    ret !r.terminator && d.edges.len == 0 && d.results.len != 0 && !d.metadata.flags.volatile && !d.metadata.flags.kept;
+}
+
+fun bucket(s: *Sweep, g: u64) opt[*Bucket] {
+    val key: u64 = g;
+    ret map.get[u64, Bucket](?s.groups, ?key);
+}
+
+# whether a write or a join has not ended an entry
+fun live(s: *Sweep, e: *Entry) bool {
+    if (e.dead || e.seq <= s.barrier) { ret false; }
+    val b: opt[*Bucket] = bucket(s, e.group);
+    if (sel b.some) { ret e.seq > b.some.cleared; }
+    ret true;
+}
+
+# the bucket of a group that has one
+fun held(s: *Sweep, g: u64) res[*Bucket, Why] {
+    val b: opt[*Bucket] = bucket(s, g);
+    if (!(sel b.some)) { ret res[*Bucket, Why].err{Why.reason{"a group of loads is missing its bucket"}}; }
+    ret res[*Bucket, Why].ok{b.some};
+}
+
+# the bucket of a group, made when the group has none
+fun open(s: *Sweep, g: u64) res[*Bucket, Why] {
+    val b: opt[*Bucket] = bucket(s, g);
+    if (sel b.some) { ret res[*Bucket, Why].ok{b.some}; }
+    val made: res[bool, allocator.Error] = map.insert[u64, Bucket](?s.groups, g, Bucket{head: NONE, cleared: 0});
+    if (sel made.err) { ret res[*Bucket, Why].err{Why.alloc{made.err}}; }
+    ret held(s, g);
+}
+
+fun set_head(s: *Sweep, g: u64, head: u32) err[Why] {
+    val b: res[*Bucket, Why] = held(s, g);
+    if (sel b.err) { ret err[Why].err{b.err}; }
+    b.ok.head = head;
+    ret err[Why].ok{};
+}
+
+fun set_cleared(s: *Sweep, g: u64, count: u32) err[Why] {
+    val b: res[*Bucket, Why] = held(s, g);
+    if (sel b.err) { ret err[Why].err{b.err}; }
+    b.ok.cleared = count;
+    ret err[Why].ok{};
+}
+
+fun push_log(s: *Sweep, u: Undo) err[Why] {
+    val pushed: res[usize, allocator.Error] = vector.push[Undo](?s.log, u);
+    if (sel pushed.err) { ret lost(pushed.err); }
+    ret err[Why].ok{};
+}
+
+# end every load
+fun end_all(s: *Sweep) err[Why] {
+    val r: err[Why] = push_log(s, Undo{kind: UNDO_BARRIER, at: s.barrier, group: 0});
+    if (sel r.err) { ret r; }
+    s.barrier = s.count;
+    ret err[Why].ok{};
+}
+
+fun end_group(s: *Sweep, g: u64) err[Why] {
+    val b: opt[*Bucket] = bucket(s, g);
+    if (!(sel b.some)) { ret err[Why].ok{}; }
+    val r: err[Why] = push_log(s, Undo{kind: UNDO_CLEARED, at: b.some.cleared, group: g});
+    if (sel r.err) { ret r; }
+    ret set_cleared(s, g, s.count);
+}
+
+# end the loads a write may change, and every load for an access that orders
+# or reaches anywhere
+fun end_by(s: *Sweep, w: Effect) err[Why] {
+    if (!w.writes && !w.ordered) { ret err[Why].ok{}; }
+    if (w.ordered || w.anywhere) { ret end_all(s); }
+    var p: usize = 0;
+    for (p < w.places.len) {
+        val g: opt[u64] = memory.group(w.places.data[p]);
+        if (!(sel g.some)) { ret end_all(s); }
+        val b: opt[*Bucket] = bucket(s, g.some);
+        if (sel b.some) {
+            var e: u32 = b.some.head;
+            for (e != NONE) {
+                val at: *Entry = ?s.entries.data[e];
+                if (live(s, at) && memory.conflicts(w, at.effect)) {
+                    val r: err[Why] = push_log(s, Undo{kind: UNDO_DEAD, at: e, group: g.some});
+                    if (sel r.err) { ret r; }
+                    at.dead = true;
+                }
+                e = at.next;
+            }
+        }
+        val r: err[Why] = end_group(s, 0);
+        if (sel r.err) { ret r; }
+        p = p + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun need_memory(s: *Sweep) err[Why] {
+    if (s.mem != nil) { ret err[Why].ok{}; }
+    val got: res[*Memory, Why] = analysis.memory_of(s.cache, s.f);
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    s.mem = got.ok;
+    ret err[Why].ok{};
+}
+
+fun row_of(d: *InstructionData) res[Row, Why] {
+    val found: opt[Row] = opcode.row(d.opcode);
+    if (!(sel found.some)) { ret res[Row, Why].err{Why.reason{"an instruction whose opcode has no row"}}; }
+    ret res[Row, Why].ok{found.some};
+}
+
+# the entry a computation is available as, if it is
+fun find(s: *Sweep, i: Instruction) res[opt[u32], Why] {
+    var k:  Key       = Key{s: s, inst: i.index};
+    val at: opt[*u32] = map.get_by[Key, u32](?s.seen, ?k);
+    if (s.failed)       { ret res[opt[u32], Why].err{s.why}; }
+    if (!(sel at.some)) { ret res[opt[u32], Why].ok{opt[u32].none{}}; }
+    ret res[opt[u32], Why].ok{opt[u32].some{@at.some}};
+}
+
+# make an instruction available
+fun offer(s: *Sweep, i: Instruction, prev: opt[u32], load: bool, effect: Effect, g: u64) err[Why] {
+    var e: Entry;
+    e.inst   = i;
+    e.prev   = NONE;
+    e.load   = load;
+    e.group  = g;
+    e.next   = NONE;
+    e.effect = effect;
+    if (sel prev.some) { e.prev = prev.some; }
+    s.count = s.count + 1;
+    e.seq   = s.count;
+    val at: u32 = s.entries.len::u32;
+    if (load) {
+        val b: res[*Bucket, Why] = open(s, g);
+        if (sel b.err) { ret err[Why].err{b.err}; }
+        e.next = b.ok.head;
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Entry](?s.entries, e);
+    if (sel pushed.err) { ret lost(pushed.err); }
+    var k:   Key                        = Key{s: s, inst: i.index};
+    val set: res[bool, allocator.Error] = map.insert_by[Key, u32](?s.seen, k, at);
+    if (sel set.err) {
+        vector.pop[Entry](?s.entries);
+        ret lost(set.err);
+    }
+    if (load) {
+        s.loads = s.loads + 1;
+        ret set_head(s, g, at);
+    }
+    ret err[Why].ok{};
+}
+
+# stand an instruction down for an earlier one
+fun merge(s: *Sweep, i: Instruction, by: Instruction) err[Why] {
+    val old: *InstructionData = ?s.b.instructions.data[i.index];
+    val new: *InstructionData = ?s.b.instructions.data[by.index];
+    var r:   usize            = 0;
+    for (r < old.results.len) {
+        val done: err[Why] = edit(body.replace(s.m, s.f, old.results.data[r], new.results.data[r], Records.follow{}));
+        if (sel done.err) { ret done; }
+        r = r + 1;
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Instruction](?s.gone, i);
+    if (sel pushed.err) { ret lost(pushed.err); }
+    s.changed = true;
+    ret err[Why].ok{};
+}
+
+# an instruction that touches memory without being merged
+fun touch(s: *Sweep, i: Instruction) err[Why] {
+    if (s.loads == 0) { ret err[Why].ok{}; }
+    var e: res[Effect, Why] = memory.effect_of(s.mem, i);
+    if (sel e.err) { ret err[Why].err{e.err}; }
+    val ended: err[Why] = end_by(s, e.ok);
+    memory.release(?e.ok);
+    ret ended;
+}
+
+fun merge_pure(s: *Sweep, i: Instruction) err[Why] {
+    val at: res[opt[u32], Why] = find(s, i);
+    if (sel at.err)     { ret err[Why].err{at.err}; }
+    if (sel at.ok.some) { ret merge(s, i, s.entries.data[at.ok.some].inst); }
+    var none: Effect;
+    ret offer(s, i, opt[u32].none{}, false, none, 0);
+}
+
+fun merge_load(s: *Sweep, i: Instruction) err[Why] {
+    val need: err[Why] = need_memory(s);
+    if (sel need.err) { ret need; }
+    var e: res[Effect, Why] = memory.effect_of(s.mem, i);
+    if (sel e.err) { ret err[Why].err{e.err}; }
+    if (e.ok.ordered || e.ok.anywhere || e.ok.places.len != 1) {
+        val ended: err[Why] = end_by(s, e.ok);
+        memory.release(?e.ok);
+        ret ended;
+    }
+    var g:   u64      = 0;
+    val grp: opt[u64] = memory.group(e.ok.places.data[0]);
+    if (sel grp.some) { g = grp.some; }
+    val at: res[opt[u32], Why] = find(s, i);
+    if (sel at.err) {
+        memory.release(?e.ok);
+        ret err[Why].err{at.err};
+    }
+    if (sel at.ok.some) {
+        if (live(s, ?s.entries.data[at.ok.some])) {
+            val by: Instruction = s.entries.data[at.ok.some].inst;
+            memory.release(?e.ok);
+            ret merge(s, i, by);
+        }
+    }
+    val offered: err[Why] = offer(s, i, at.ok, true, e.ok, g);
+    if (sel offered.err) { memory.release(?e.ok); }
+    ret offered;
+}
+
+fun step(s: *Sweep, i: Instruction) err[Why] {
+    val d:   *InstructionData = ?s.b.instructions.data[i.index];
+    val got: res[Row, Why]    = row_of(d);
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    var r: Row = got.ok;
+    if (plain(d, ?r) && merges(?r))                                       { ret merge_pure(s, i); }
+    if (plain(d, ?r) && reads_only(?r))                                   { ret merge_load(s, i); }
+    if (r.effects.reads || r.effects.writes || d.metadata.flags.volatile) { ret touch(s, i); }
+    ret err[Why].ok{};
+}
+
+# undo the changes of availability down to a mark
+fun unwind(s: *Sweep, entries: usize, log: usize) err[Why] {
+    for (s.log.len > log) {
+        val u: Undo = s.log.data[s.log.len - 1];
+        s.log.len = s.log.len - 1;
+        if (u.kind == UNDO_DEAD)    { s.entries.data[u.at].dead = false; }
+        if (u.kind == UNDO_BARRIER) { s.barrier = u.at; }
+        if (u.kind == UNDO_CLEARED) {
+            val r: err[Why] = set_cleared(s, u.group, u.at);
+            if (sel r.err) { ret r; }
+        }
+    }
+    for (s.entries.len > entries) {
+        val e: *Entry = ?s.entries.data[s.entries.len - 1];
+        var k: Key    = Key{s: s, inst: e.inst.index};
+        if (e.prev == NONE) { map.remove_by[Key, u32](?s.seen, ?k); }
+        or {
+            val set: res[bool, allocator.Error] = map.insert_by[Key, u32](?s.seen, k, e.prev);
+            if (sel set.err) { ret lost(set.err); }
+        }
+        if (e.load) {
+            val r: err[Why] = set_head(s, e.group, e.next);
+            if (sel r.err) { ret r; }
+            memory.release(?e.effect);
+            s.loads = s.loads - 1;
+        }
+        s.entries.len = s.entries.len - 1;
+    }
+    ret err[Why].ok{};
+}
+
+# walk one block: the loads a way in may have changed are ended, then each
+# instruction is merged or noted, then the merged ones go
+fun block(s: *Sweep, k: u32) err[Why] {
+    val bd: *vector.Vector[Instruction] = ?s.b.blocks.data[k].instructions;
+    if (k != 0 && s.b.blocks.data[k].predecessors.len != 1) {
+        val r: err[Why] = end_all(s);
+        if (sel r.err) { ret r; }
+    }
+    var i: usize = 0;
+    for (i < bd.len) {
+        val r: err[Why] = step(s, bd.data[i]);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < s.gone.len) {
+        val r: err[Why] = edit(body.erase(s.m, s.f, s.gone.data[i]));
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    s.gone.len = 0;
+    ret err[Why].ok{};
+}
+
+fun enter(s: *Sweep, k: u32) err[Why] {
+    val frame:  Frame                       = Frame{block: k, child: 0, entries: s.entries.len, log: s.log.len};
+    val pushed: res[usize, allocator.Error] = vector.push[Frame](?s.stack, frame);
+    if (sel pushed.err) { ret lost(pushed.err); }
+    ret block(s, k);
+}
+
+# walk the dominator tree from the entry
+fun walk(s: *Sweep) err[Why] {
+    val first: err[Why] = enter(s, 0);
+    if (sel first.err) { ret first; }
+    for (s.stack.len != 0) {
+        val top:  *Frame     = ?s.stack.data[s.stack.len - 1];
+        val kids: Slice[u32] = dominance.children(s.dom, top.block);
+        if (top.child < kids.size) {
+            val next: u32 = kids.data[top.child];
+            top.child = top.child + 1;
+            val r: err[Why] = enter(s, next);
+            if (sel r.err) { ret r; }
+        }
+        or {
+            val done: Frame = @top;
+            s.stack.len = s.stack.len - 1;
+            val r: err[Why] = unwind(s, done.entries, done.log);
+            if (sel r.err) { ret r; }
+        }
+    }
+    ret err[Why].ok{};
+}
+
+fun drop(s: *Sweep) {
+    var i: usize = 0;
+    for (i < s.entries.len) {
+        if (s.entries.data[i].load) { memory.release(?s.entries.data[i].effect); }
+        i = i + 1;
+    }
+    map.dnit_by[Key, u32](?s.seen);
+    map.dnit[u64, Bucket](?s.groups);
+    vector.dnit[Entry](?s.entries);
+    vector.dnit[Undo](?s.log);
+    vector.dnit[Frame](?s.stack);
+    vector.dnit[Instruction](?s.gone);
+}
+
+# merge the repeated computations of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val tree: res[*Dominance, Why] = analysis.dominance_of(c.cache, u.f);
+    if (sel tree.err) { ret res[bool, Why].err{tree.err}; }
+    var s: Sweep;
+    s.m       = c.m;
+    s.f       = u.f;
+    s.b       = got.ok;
+    s.dom     = tree.ok;
+    s.cache   = c.cache;
+    s.mem     = nil;
+    s.seen    = map.init_by[Key, u32](c.m.a, hash_key, same_key);
+    s.groups  = map.init[u64, Bucket](c.m.a);
+    s.entries = vector.init[Entry](c.m.a);
+    s.log     = vector.init[Undo](c.m.a);
+    s.stack   = vector.init[Frame](c.m.a);
+    s.gone    = vector.init[Instruction](c.m.a);
+    fin { drop(?s); }
+    val ran: err[Why] = walk(?s);
+    if (sel ran.err) { ret res[bool, Why].err{ran.err}; }
+    ret res[bool, Why].ok{s.changed};
+}
