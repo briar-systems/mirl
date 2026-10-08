@@ -1,0 +1,604 @@
+# value ranges: the unsigned bounds of an integer value where a block reads it
+#
+# a range is two numbers of the value's own width, up to 512 bits, with the
+# folder's multiword arithmetic doing every bound. ir integers are signless, so
+# a reader asks its signed questions of the unsigned range. every answer is
+# sound alone: a value no rule bounds, a cycle, a chain deeper than the fixed
+# bound or a query past the step budget answers the full width of its type. a
+# query the analysis cannot answer at all is a failure, never a range.
+#
+# a range comes from a constant, from the operation that defines the value, from
+# a comparison whose branch edge dominates the reading block, and from the
+# arguments every predecessor passes a block parameter. at a loop header with a
+# back edge the range widens to the full type, unless the loop is counted: the
+# parameter starts at the entry arguments, steps by a constant each trip, and
+# the header leaves the loop once the parameter reaches a bound.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.collections.slice.Slice;
+
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.block.BlockData;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use types: mirl.ir.type;
+use mirl.ir.value.ValueData;
+use mirl.pass.analysis.read;
+use mirl.pass.analysis.read.Konst;
+use mirl.pass.failure.Why;
+
+# the unsigned bounds of a value, both inclusive and both within its width
+# ---
+# lo: the least value it takes
+# hi: the greatest value it takes
+pub rec Range {
+    lo: Wide;
+    hi: Wide;
+}
+
+# the ranges of one function's values, read from its body, graph, dominance and
+# loops, all of which stay valid for as long as the cache holds this
+# ---
+# m: the module
+# f: the function
+# g: its graph
+# d: its dominance
+# l: its loops
+pub rec Ranges {
+    m: *Module;
+    f: Function;
+    g: *Graph;
+    d: *Dominance;
+    l: *Loops;
+}
+
+# the longest chain of definitions a query follows
+val DEPTH: u32 = 12;
+
+# the most definitions a query visits
+val STEPS: u32 = 192;
+
+# the most dominating blocks a query looks to for a guard
+val GUARDS: u32 = 32;
+
+val LT: u32 = 0;
+val LE: u32 = 1;
+val GT: u32 = 2;
+val GE: u32 = 3;
+val EQ: u32 = 4;
+val NE: u32 = 5;
+
+# a comparison opcode read as a relation
+# ---
+# ok:     the opcode is a comparison of two integers
+# rel:    the relation its true answer states of its operands
+# signed: it orders its operands as signed
+rec Relation {
+    ok:     bool;
+    rel:    u32;
+    signed: bool;
+}
+
+# one query in progress
+rec Walk {
+    r:      *Ranges;
+    body:   *Body;
+    steps:  u32;
+    depth:  u32;
+    seen:   [12]u32;
+    held:   u32;
+    failed: bool;
+    why:    Why;
+}
+
+# an empty set of ranges over a function's analyses
+pub fun init(m: *Module, f: Function, g: *Graph, d: *Dominance, l: *Loops) Ranges {
+    ret Ranges{m: m, f: f, g: g, d: d, l: l};
+}
+
+# every value of a width
+pub fun full(width: u32) Range {
+    ret Range{lo: word.zero(), hi: word.ones(width)};
+}
+
+# the one value
+pub fun exactly(x: Wide) Range {
+    ret Range{lo: x, hi: x};
+}
+
+# whether a range holds one value alone
+pub fun single(r: Range) bool {
+    ret word.compare(r.lo, r.hi) == 0;
+}
+
+# whether a range holds a value
+pub fun holds(r: Range, x: Wide) bool {
+    ret word.compare(r.lo, x) <= 0 && word.compare(x, r.hi) <= 0;
+}
+
+fun fault(w: *Walk, e: module.Error) {
+    if (!w.failed) {
+        w.failed = true;
+        w.why    = Why.ir{e};
+    }
+}
+
+fun refuse(w: *Walk, reason: *u8) {
+    if (!w.failed) {
+        w.failed = true;
+        w.why    = Why.reason{reason};
+    }
+}
+
+fun width_of(w: *Walk, v: Value) u32 {
+    if (v.index::usize >= w.body.values.len) {
+        fault(w, module.Error.value{v});
+        ret 1;
+    }
+    val got: res[u32, types.Error] = types.width(?w.r.m.types, w.body.values.data[v.index].type);
+    if (sel got.err) {
+        fault(w, module.Error.types{got.err});
+        ret 1;
+    }
+    ret got.ok;
+}
+
+fun smaller(x: Wide, y: Wide) Wide {
+    if (word.compare(x, y) <= 0) { ret x; }
+    ret y;
+}
+
+fun larger(x: Wide, y: Wide) Wide {
+    if (word.compare(x, y) >= 0) { ret x; }
+    ret y;
+}
+
+fun hull(a: Range, b: Range) Range {
+    ret Range{lo: smaller(a.lo, b.lo), hi: larger(a.hi, b.hi)};
+}
+
+# the values both ranges hold, or the first when they share none
+fun narrow(a: Range, b: Range) Range {
+    val lo: Wide = larger(a.lo, b.lo);
+    val hi: Wide = smaller(a.hi, b.hi);
+    if (word.compare(lo, hi) > 0) { ret a; }
+    ret Range{lo: lo, hi: hi};
+}
+
+fun relation(code: opcode.Opcode) Relation {
+    val c: u32 = code.index;
+    if (c == opcode.EQ.index)   { ret Relation{ok: true, rel: EQ, signed: false}; }
+    if (c == opcode.NE.index)   { ret Relation{ok: true, rel: NE, signed: false}; }
+    if (c == opcode.LT_U.index) { ret Relation{ok: true, rel: LT, signed: false}; }
+    if (c == opcode.LE_U.index) { ret Relation{ok: true, rel: LE, signed: false}; }
+    if (c == opcode.GT_U.index) { ret Relation{ok: true, rel: GT, signed: false}; }
+    if (c == opcode.GE_U.index) { ret Relation{ok: true, rel: GE, signed: false}; }
+    if (c == opcode.LT_S.index) { ret Relation{ok: true, rel: LT, signed: true}; }
+    if (c == opcode.LE_S.index) { ret Relation{ok: true, rel: LE, signed: true}; }
+    if (c == opcode.GT_S.index) { ret Relation{ok: true, rel: GT, signed: true}; }
+    if (c == opcode.GE_S.index) { ret Relation{ok: true, rel: GE, signed: true}; }
+    ret Relation{ok: false, rel: EQ, signed: false};
+}
+
+# the relation that holds when this one does not
+fun negate(rel: u32) u32 {
+    if (rel == LT) { ret GE; }
+    if (rel == LE) { ret GT; }
+    if (rel == GT) { ret LE; }
+    if (rel == GE) { ret LT; }
+    if (rel == EQ) { ret NE; }
+    ret EQ;
+}
+
+# the relation of the operands in the other order
+fun flip(rel: u32) u32 {
+    if (rel == LT) { ret GT; }
+    if (rel == LE) { ret GE; }
+    if (rel == GT) { ret LT; }
+    if (rel == GE) { ret LE; }
+    ret rel;
+}
+
+fun konst(w: *Walk, v: Value) Konst {
+    val got: res[Konst, module.Error] = read.konst(w.r.m, w.body, v);
+    if (sel got.err) {
+        fault(w, got.err);
+        var none: Konst;
+        ret none;
+    }
+    ret got.ok;
+}
+
+fun instruction(w: *Walk, v: Value) opt[*InstructionData] {
+    ret read.made(w.body, v);
+}
+
+fun operand(w: *Walk, ins: *InstructionData, k: usize, at: Block) Range {
+    if (k >= ins.operands.len) {
+        refuse(w, "an instruction has fewer operands than its row states");
+        ret full(1);
+    }
+    ret eval(w, ins.operands.data[k], at);
+}
+
+# the count a shift amount range gives, the width when it reaches it
+fun amount(x: Wide, width: u32) u32 {
+    if (word.compare(x, word.small(width::u64)) >= 0) { ret width; }
+    ret x[0]::u32;
+}
+
+fun sum(a: Range, b: Range, bits: u32) Range {
+    var lo: bool = false;
+    var hi: bool = false;
+    val l:  Wide = word.add_ov_u(a.lo, b.lo, bits, ?lo);
+    val h:  Wide = word.add_ov_u(a.hi, b.hi, bits, ?hi);
+    if (lo || hi) { ret full(bits); }
+    ret Range{lo: l, hi: h};
+}
+
+fun difference(a: Range, b: Range, bits: u32) Range {
+    if (word.compare(a.lo, b.hi) < 0) { ret full(bits); }
+    ret Range{lo: word.sub(a.lo, b.hi), hi: word.sub(a.hi, b.lo)};
+}
+
+fun product(a: Range, b: Range, bits: u32) Range {
+    var lo: bool = false;
+    var hi: bool = false;
+    val l:  Wide = word.mul_ov_u(a.lo, b.lo, bits, ?lo);
+    val h:  Wide = word.mul_ov_u(a.hi, b.hi, bits, ?hi);
+    if (lo || hi) { ret full(bits); }
+    ret Range{lo: l, hi: h};
+}
+
+# every bit below the highest one either bound can set
+fun covering(a: Range, b: Range, bits: u32) Range {
+    val top: Wide = larger(a.hi, b.hi);
+    ret Range{lo: word.zero(), hi: word.ones(word.length(top))};
+}
+
+fun shifted_left(a: Range, n: Range, bits: u32) Range {
+    if (!single(n) || word.compare(n.lo, word.small(bits::u64)) >= 0) { ret full(bits); }
+    val k:  u32  = n.lo[0]::u32;
+    val lo: Wide = word.shl_at(a.lo, k, bits);
+    val hi: Wide = word.shl_at(a.hi, k, bits);
+    if (word.compare(word.shr(hi, k), a.hi) != 0) { ret full(bits); }
+    ret Range{lo: lo, hi: hi};
+}
+
+fun shifted_right(a: Range, n: Range, bits: u32) Range {
+    val most:  u32  = amount(n.hi, bits);
+    val least: u32  = amount(n.lo, bits);
+    var lo:    Wide = word.zero();
+    var hi:    Wide = word.zero();
+    if (most < bits)  { lo = word.shr_u(a.lo, most, bits); }
+    if (least < bits) { hi = word.shr_u(a.hi, least, bits); }
+    ret Range{lo: lo, hi: hi};
+}
+
+fun quotient(a: Range, b: Range, bits: u32) Range {
+    if (word.is_zero(b.hi)) { ret full(bits); }
+    var least: Wide = b.lo;
+    if (word.is_zero(least)) { least = word.small(1); }
+    ret Range{lo: word.div_u(a.lo, b.hi, bits), hi: word.div_u(a.hi, least, bits)};
+}
+
+fun remainder(a: Range, b: Range, bits: u32) Range {
+    if (word.is_zero(b.hi)) { ret full(bits); }
+    ret Range{lo: word.zero(), hi: smaller(a.hi, word.sub(b.hi, word.small(1)))};
+}
+
+# the range an operation's first result takes from its operands' ranges
+fun transfer(w: *Walk, ins: *InstructionData, bits: u32, at: Block) Range {
+    val c: u32 = ins.opcode.index;
+    if (c == opcode.ADD.index) { ret sum(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.SUB.index) { ret difference(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.MUL.index) { ret product(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.AND.index) {
+        val a: Range = operand(w, ins, 0, at);
+        val b: Range = operand(w, ins, 1, at);
+        ret Range{lo: word.zero(), hi: smaller(a.hi, b.hi)};
+    }
+    if (c == opcode.OR.index) {
+        val a: Range = operand(w, ins, 0, at);
+        val b: Range = operand(w, ins, 1, at);
+        val r: Range = covering(a, b, bits);
+        ret Range{lo: larger(a.lo, b.lo), hi: r.hi};
+    }
+    if (c == opcode.XOR.index)   { ret covering(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.SHL.index)   { ret shifted_left(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.SHR_U.index) { ret shifted_right(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.DIV_U.index) { ret quotient(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.REM_U.index) { ret remainder(operand(w, ins, 0, at), operand(w, ins, 1, at), bits); }
+    if (c == opcode.EXT_U.index) { ret operand(w, ins, 0, at); }
+    if (c == opcode.TRUNC.index) {
+        val a: Range = operand(w, ins, 0, at);
+        if (word.compare(a.hi, word.ones(bits)) > 0) { ret full(bits); }
+        ret a;
+    }
+    if (c == opcode.SELECT.index) {
+        val a: Range = operand(w, ins, 1, at);
+        val b: Range = operand(w, ins, 2, at);
+        ret hull(a, b);
+    }
+    if (c == opcode.POPCNT.index || c == opcode.CLZ.index || c == opcode.CTZ.index) {
+        ret Range{lo: word.zero(), hi: word.small(bits::u64)};
+    }
+    ret full(bits);
+}
+
+fun seen(w: *Walk, v: Value) bool {
+    var i: u32 = 0;
+    for (i < w.held) {
+        if (w.seen[i] == v.index) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the range of a block parameter over the arguments the predecessors pass it
+fun merged(w: *Walk, blk: Block, index: u32, bits: u32) Range {
+    val bd:  *BlockData = ?w.body.blocks.data[blk.index];
+    var out: Range      = full(bits);
+    var any: bool       = false;
+    var i:   usize      = 0;
+    for (i < bd.predecessors.len) {
+        val ins: *InstructionData = ?w.body.instructions.data[bd.predecessors.data[i].index];
+        if (sel ins.place.placed) {
+            val from: Block = ins.place.placed;
+            var e:    usize = 0;
+            for (e < ins.edges.len) {
+                if (ins.edges.data[e].block.index == blk.index && dominance.reachable(w.r.d, from.index)) {
+                    val r: Range = eval(w, ins.edges.data[e].arguments.data[index], from);
+                    if (any) { out = hull(out, r); }
+                    or       { out = r; }
+                    any = true;
+                }
+                e = e + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (!any) { ret full(bits); }
+    ret out;
+}
+
+# the range of the parameter of a loop header whose loop is counted, or full
+fun counted(w: *Walk, blk: Block, index: u32, v: Value, lp: u32, bits: u32) Range {
+    val bd:    *BlockData = ?w.body.blocks.data[blk.index];
+    var entry: Range      = full(bits);
+    var any:   bool       = false;
+    var step:  Wide       = word.zero();
+    var i:     usize      = 0;
+    for (i < bd.predecessors.len) {
+        val ins: *InstructionData = ?w.body.instructions.data[bd.predecessors.data[i].index];
+        if (sel ins.place.placed) {
+            val from: Block = ins.place.placed;
+            var e:    usize = 0;
+            for (e < ins.edges.len) {
+                if (ins.edges.data[e].block.index == blk.index && dominance.reachable(w.r.d, from.index)) {
+                    val arg: Value = ins.edges.data[e].arguments.data[index];
+                    if (loops.contains(w.r.l, lp, from.index)) {
+                        val k: Wide = stepped(w, arg, v);
+                        if (word.is_zero(k)) { ret full(bits); }
+                        step = larger(step, k);
+                    }
+                    or {
+                        val r: Range = eval(w, arg, from);
+                        if (any) { entry = hull(entry, r); }
+                        or       { entry = r; }
+                        any = true;
+                    }
+                }
+                e = e + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (!any || word.is_zero(step)) { ret full(bits); }
+    val bound: Range = bounded(w, blk, v, lp, step, bits);
+    if (word.compare(bound.hi, word.ones(bits)) == 0 && word.is_zero(bound.lo)) { ret full(bits); }
+    ret Range{lo: entry.lo, hi: larger(entry.hi, bound.hi)};
+}
+
+# the constant a back edge adds to the parameter, zero when it is anything else
+fun stepped(w: *Walk, arg: Value, param: Value) Wide {
+    val made: opt[*InstructionData] = instruction(w, arg);
+    if (sel made.none) { ret word.zero(); }
+    val ins: *InstructionData = made.some;
+    if (ins.opcode.index != opcode.ADD.index || ins.operands.len != 2) { ret word.zero(); }
+    if (ins.operands.data[0].index == param.index) {
+        val k: Konst = konst(w, ins.operands.data[1]);
+        if (k.ok) { ret k.value; }
+    }
+    if (ins.operands.data[1].index == param.index) {
+        val k: Konst = konst(w, ins.operands.data[0]);
+        if (k.ok) { ret k.value; }
+    }
+    ret word.zero();
+}
+
+# the greatest value the parameter can reach at its header, as a range whose
+# hi is that value, or the full range when the header does not bound it
+fun bounded(w: *Walk, blk: Block, v: Value, lp: u32, step: Wide, bits: u32) Range {
+    val bd: *BlockData = ?w.body.blocks.data[blk.index];
+    if (bd.instructions.len == 0) { ret full(bits); }
+    val last: *InstructionData = ?w.body.instructions.data[bd.instructions.data[bd.instructions.len - 1].index];
+    if (last.opcode.index != opcode.CBR.index || last.edges.len != 2) { ret full(bits); }
+    val made: opt[*InstructionData] = instruction(w, last.operands.data[0]);
+    if (sel made.none) { ret full(bits); }
+    val test: *InstructionData = made.some;
+    val rel:  Relation         = relation(test.opcode);
+    if (!rel.ok || rel.signed || test.operands.len != 2 || test.operands.data[0].index != v.index) { ret full(bits); }
+    val stay0: bool = loops.contains(w.r.l, lp, last.edges.data[0].block.index);
+    val stay1: bool = loops.contains(w.r.l, lp, last.edges.data[1].block.index);
+    if (stay0 == stay1) { ret full(bits); }
+    var kind: u32 = rel.rel;
+    if (stay1)                    { kind = negate(kind); }
+    if (kind != LT && kind != LE) { ret full(bits); }
+    val limit: Range = eval(w, test.operands.data[1], blk);
+    var top:   Wide  = limit.hi;
+    if (kind == LT) {
+        if (word.is_zero(top)) { ret full(bits); }
+        top = word.sub(top, word.small(1));
+    }
+    var over:  bool = false;
+    val reach: Wide = word.add_ov_u(top, step, bits, ?over);
+    if (over) { ret full(bits); }
+    ret Range{lo: word.zero(), hi: reach};
+}
+
+fun parameter(w: *Walk, v: Value, blk: Block, index: u32, bits: u32) Range {
+    if (blk.index == 0 || seen(w, v) || w.held >= DEPTH) { ret full(bits); }
+    w.seen[w.held] = v.index;
+    w.held         = w.held + 1;
+    var out:    Range    = full(bits);
+    val inner:  opt[u32] = loops.innermost(w.r.l, blk.index);
+    var header: bool     = false;
+    if (sel inner.some) { header = loops.loop(w.r.l, inner.some).header == blk.index; }
+    if (header) {
+        if (sel inner.some) { out = counted(w, blk, index, v, inner.some, bits); }
+    }
+    or {
+        out = merged(w, blk, index, bits);
+    }
+    w.held = w.held - 1;
+    ret out;
+}
+
+fun definition(w: *Walk, v: Value, bits: u32, at: Block) Range {
+    val vd: *ValueData = ?w.body.values.data[v.index];
+    if (sel vd.def.constant) {
+        val k: Konst = konst(w, v);
+        if (k.ok) { ret exactly(k.value); }
+        ret full(bits);
+    }
+    if (sel vd.def.parameter) { ret parameter(w, v, vd.def.parameter.block, vd.def.parameter.index, bits); }
+    if (sel vd.def.result && vd.def.result.index == 0) {
+        val made: opt[*InstructionData] = instruction(w, v);
+        if (sel made.some) { ret transfer(w, made.some, bits, at); }
+    }
+    ret full(bits);
+}
+
+# narrow a range of v by what a relation to another range states
+fun restrict(w: *Walk, cur: Range, rel: u32, signed: bool, other: Range, bits: u32) Range {
+    if (signed && rel != EQ && rel != NE) {
+        val half: Wide = word.least(bits);
+        if (word.compare(cur.hi, half) >= 0 || word.compare(other.hi, half) >= 0) { ret cur; }
+    }
+    if (rel == LT) {
+        if (word.is_zero(other.hi)) { ret cur; }
+        ret narrow(cur, Range{lo: word.zero(), hi: word.sub(other.hi, word.small(1))});
+    }
+    if (rel == LE) { ret narrow(cur, Range{lo: word.zero(), hi: other.hi}); }
+    if (rel == GT) {
+        if (word.compare(other.lo, word.ones(bits)) == 0) { ret cur; }
+        ret narrow(cur, Range{lo: word.add(other.lo, word.small(1)), hi: word.ones(bits)});
+    }
+    if (rel == GE) { ret narrow(cur, Range{lo: other.lo, hi: word.ones(bits)}); }
+    if (rel == EQ) { ret narrow(cur, other); }
+    if (single(other)) {
+        if (word.compare(cur.lo, other.lo) == 0 && word.compare(cur.hi, other.lo) != 0) {
+            ret Range{lo: word.add(cur.lo, word.small(1)), hi: cur.hi};
+        }
+        if (word.compare(cur.hi, other.lo) == 0 && word.compare(cur.lo, other.lo) != 0) {
+            ret Range{lo: cur.lo, hi: word.sub(cur.hi, word.small(1))};
+        }
+    }
+    ret cur;
+}
+
+# narrow a range of v by the branch that takes the edge from p to n
+fun by_edge(w: *Walk, v: Value, bits: u32, p: u32, n: u32, cur: Range) Range {
+    val pd: *BlockData = ?w.body.blocks.data[p];
+    if (pd.instructions.len == 0) { ret cur; }
+    val last: *InstructionData = ?w.body.instructions.data[pd.instructions.data[pd.instructions.len - 1].index];
+    if (last.opcode.index != opcode.CBR.index || last.edges.len != 2) { ret cur; }
+    val first:  bool = last.edges.data[0].block.index == n;
+    val second: bool = last.edges.data[1].block.index == n;
+    if (first == second) { ret cur; }
+    val cond: Value = last.operands.data[0];
+    if (cond.index == v.index) {
+        var one: Wide = word.zero();
+        if (first) { one = word.small(1); }
+        ret narrow(cur, exactly(one));
+    }
+    val made: opt[*InstructionData] = instruction(w, cond);
+    if (sel made.none) { ret cur; }
+    val test: *InstructionData = made.some;
+    val rel:  Relation         = relation(test.opcode);
+    if (!rel.ok || test.operands.len != 2) { ret cur; }
+    var kind: u32 = rel.rel;
+    if (second) { kind = negate(kind); }
+    val a: Value = test.operands.data[0];
+    val b: Value = test.operands.data[1];
+    if (a.index == b.index) { ret cur; }
+    if (a.index == v.index) { ret restrict(w, cur, kind, rel.signed, eval(w, b, Block{index: p}), bits); }
+    if (b.index == v.index) { ret restrict(w, cur, flip(kind), rel.signed, eval(w, a, Block{index: p}), bits); }
+    ret cur;
+}
+
+# narrow a range by every comparison whose branch edge dominates the reader
+fun guarded(w: *Walk, v: Value, bits: u32, at: Block, cur: Range) Range {
+    var out:  Range = cur;
+    var n:    u32   = at.index;
+    var hops: u32   = 0;
+    for (hops < GUARDS && !w.failed) {
+        val preds: Slice[u32] = graph.predecessors(w.r.g, n);
+        if (preds.size == 1 && dominance.reachable(w.r.d, n)) { out = by_edge(w, v, bits, preds.data[0], n, out); }
+        val up: opt[u32] = dominance.idom(w.r.d, n);
+        if (sel up.none) { brk; }
+        n    = up.some;
+        hops = hops + 1;
+    }
+    ret out;
+}
+
+fun eval(w: *Walk, v: Value, at: Block) Range {
+    val bits: u32 = width_of(w, v);
+    if (w.failed || w.steps >= STEPS || w.depth >= DEPTH) { ret full(bits); }
+    w.steps = w.steps + 1;
+    w.depth = w.depth + 1;
+    var out: Range = definition(w, v, bits, at);
+    if (!w.failed) { out = guarded(w, v, bits, at, out); }
+    w.depth = w.depth - 1;
+    ret out;
+}
+
+# the unsigned range of an integer value where a block reads it
+# ---
+# r:   the ranges of the function
+# v:   the value
+# at:  the block that reads it
+# ret: its range, or why the query was refused: a value or block the function
+#      does not have, or a value that is not an integer
+pub fun range_at(r: *Ranges, v: Value, at: Block) res[Range, Why] {
+    val got: res[*Body, module.Error] = module.body(r.m, r.f);
+    if (sel got.err)                          { ret res[Range, Why].err{Why.ir{got.err}}; }
+    if (at.index::usize >= got.ok.blocks.len) { ret res[Range, Why].err{Why.ir{module.Error.block{at}}}; }
+    var w: Walk;
+    w.r    = r;
+    w.body = got.ok;
+    val out: Range = eval(?w, v, at);
+    if (w.failed) { ret res[Range, Why].err{w.why}; }
+    ret res[Range, Why].ok{out};
+}
