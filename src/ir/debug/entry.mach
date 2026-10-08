@@ -1,0 +1,699 @@
+# the debug types of a module: declaring, defining, linking pointees and reading
+#
+# an entry is declared under its key before its members are walked, so a walk
+# that reaches the entry again finds it and stops. a pointer names its pointee
+# by key, and pointees are linked once at the end, each to the one entry
+# described under that key.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.debug.record.Array;
+use mirl.ir.debug.record.Base;
+use mirl.ir.debug.record.Case;
+use mirl.ir.debug.record.Declared;
+use mirl.ir.debug.record.Encoding;
+use mirl.ir.debug.record.Entry;
+use mirl.ir.debug.record.Enumeration;
+use mirl.ir.debug.record.Enumerator;
+use mirl.ir.debug.record.Function;
+use mirl.ir.debug.record.Head;
+use mirl.ir.debug.record.Kind;
+use mirl.ir.debug.record.Member;
+use mirl.ir.debug.record.Pointer;
+use mirl.ir.debug.record.Shape;
+use mirl.ir.debug.record.Tagged;
+use mirl.ir.debug.record.Type;
+use mirl.ir.debug.table;
+use mirl.ir.debug.table.Error;
+use mirl.ir.debug.table.Node;
+use mirl.ir.debug.table.Table;
+use ir_type: mirl.ir.type;
+use mirl.slice;
+
+# whether two ids are the same debug type
+pub fun same(a: Type, b: Type) bool {
+    ret a.index == b.index;
+}
+
+# the entry described under a key, or none
+pub fun find(t: *Table, key: View) opt[Type] {
+    val found: opt[*Type] = map.get_by[View, Type](?t.keys, ?key);
+    if (sel found.none) { ret opt[Type].none{}; }
+    ret opt[Type].some{@found.some};
+}
+
+# the entry for a key, inserting it open when the table has not seen the key
+#
+# the caller walks the members of a fresh entry and then defines it. a base or
+# pointer entry is complete once declared.
+# ---
+# t:     the table
+# types: the module's ir type table, which an aggregate's layout is read from
+# e:     the entry, whose names are copied
+# ret:   the fresh or known entry, or why it was refused
+pub fun declare(t: *Table, types: *ir_type.Table, e: Entry) res[Declared, Error] {
+    if (e.key.len == 0) { ret res[Declared, Error].err{Error.empty{}}; }
+    val checked: err[Error] = check_head(types, ?e.head);
+    if (sel checked.err) { ret res[Declared, Error].err{checked.err}; }
+
+    val found: opt[Type] = find(t, e.key);
+    if (sel found.some) {
+        if (!matches(?t.nodes.data[found.some.index], ?e.head)) { ret res[Declared, Error].err{Error.conflict{found.some}}; }
+        ret res[Declared, Error].ok{Declared.known{found.some}};
+    }
+
+    val made: res[Node, allocator.Error] = open(t.a, ?e);
+    if (sel made.err) { ret res[Declared, Error].err{Error.alloc{made.err}}; }
+    var n: Node = made.ok;
+
+    val id:     Type                        = Type{index: t.nodes.len::u32};
+    val pushed: res[usize, allocator.Error] = vector.push[Node](?t.nodes, n);
+    if (sel pushed.err) {
+        drop(t.a, ?n);
+        ret res[Declared, Error].err{Error.alloc{pushed.err}};
+    }
+    val keyed: res[bool, allocator.Error] = map.insert_by[View, Type](?t.keys, n.key, id);
+    if (sel keyed.err) {
+        vector.pop[Node](?t.nodes);
+        drop(t.a, ?n);
+        ret res[Declared, Error].err{Error.alloc{keyed.err}};
+    }
+    if (sel n.shape.pointer) {
+        val queued: res[usize, allocator.Error] = vector.push[Type](?t.pointers, id);
+        if (sel queued.err) {
+            map.remove_by[View, Type](?t.keys, ?n.key);
+            vector.pop[Node](?t.nodes);
+            drop(t.a, ?n);
+            ret res[Declared, Error].err{Error.alloc{queued.err}};
+        }
+    }
+    ret res[Declared, Error].ok{Declared.fresh{id}};
+}
+
+# give an open entry its members
+# ---
+# t:     the table
+# types: the module's ir type table, which each member's field is read from
+# ty:    the open entry
+# shape: its description, of the kind it was declared as, whose lists are copied
+# ret:   ok, or why it was refused
+pub fun define(t: *Table, types: *ir_type.Table, ty: Type, shape: Shape) err[Error] {
+    val got: res[*Node, Error] = node(t, ty);
+    if (sel got.err) { ret err[Error].err{got.err}; }
+    val n: *Node = got.ok;
+    if (n.defined)                                        { ret err[Error].err{Error.defined{ty}}; }
+    if (rank(kind_of(?n.shape)) != rank(kind_of(?shape))) { ret err[Error].err{Error.kind{kind_of(?n.shape)}}; }
+
+    val checked: err[Error] = check_shape(t, types, n.layout, ?shape);
+    if (sel checked.err) { ret checked; }
+
+    val owned: res[Shape, allocator.Error] = own(t.a, ?shape);
+    if (sel owned.err) { ret err[Error].err{Error.alloc{owned.err}}; }
+    n.shape   = owned.ok;
+    n.defined = true;
+    ret err[Error].ok{};
+}
+
+# the key of the first pointee no entry is described under yet, or none
+#
+# every pointer up to it is linked on the way. the caller describes the key it
+# is given and asks again, until none is left.
+pub fun pending(t: *Table) opt[View] {
+    for (t.linked < t.pointers.len) {
+        val n: *Node = ?t.nodes.data[t.pointers.data[t.linked].index];
+        if (sel n.shape.pointer) {
+            val target: opt[Type] = find(t, n.shape.pointer.pointee);
+            if (sel target.none) { ret opt[View].some{n.shape.pointer.pointee}; }
+            n.shape.pointer.target = target;
+        }
+        t.linked = t.linked + 1;
+    }
+    ret opt[View].none{};
+}
+
+# link every pointee and confirm every entry is defined, before a producer reads
+# ---
+# t:   the table
+# ret: ok, or the first pointee or open entry left
+pub fun finish(t: *Table) err[Error] {
+    val left: opt[View] = pending(t);
+    if (sel left.some) { ret err[Error].err{Error.pointee{left.some}}; }
+    var i: usize = 0;
+    for (i < t.nodes.len) {
+        if (!t.nodes.data[i].defined) { ret err[Error].err{Error.open{Type{index: i::u32}}}; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the key of an entry, its identity across modules
+pub fun key(t: *Table, ty: Type) res[View, Error] {
+    val n: res[*Node, Error] = node(t, ty);
+    if (sel n.err) { ret res[View, Error].err{n.err}; }
+    ret res[View, Error].ok{n.ok.key};
+}
+
+# the source name of an entry, empty for an anonymous type
+pub fun name(t: *Table, ty: Type) res[View, Error] {
+    val n: res[*Node, Error] = node(t, ty);
+    if (sel n.err) { ret res[View, Error].err{n.err}; }
+    ret res[View, Error].ok{n.ok.name};
+}
+
+# the kind of an entry
+pub fun kind(t: *Table, ty: Type) res[Kind, Error] {
+    val n: res[*Node, Error] = node(t, ty);
+    if (sel n.err) { ret res[Kind, Error].err{n.err}; }
+    ret res[Kind, Error].ok{kind_of(?n.ok.shape)};
+}
+
+# the full description of a defined entry
+pub fun shape(t: *Table, ty: Type) res[Shape, Error] {
+    val n: res[*Node, Error] = node(t, ty);
+    if (sel n.err)     { ret res[Shape, Error].err{n.err}; }
+    if (!n.ok.defined) { ret res[Shape, Error].err{Error.open{ty}}; }
+    ret res[Shape, Error].ok{n.ok.shape};
+}
+
+# the ir type a structure, union or tagged union is laid out as
+pub fun layout(t: *Table, ty: Type) res[ir_type.Type, Error] {
+    val n: res[*Node, Error] = node(t, ty);
+    if (sel n.err) { ret res[ir_type.Type, Error].err{n.err}; }
+    val l: opt[ir_type.Type] = n.ok.layout;
+    if (sel l.none) { ret res[ir_type.Type, Error].err{Error.kind{kind_of(?n.ok.shape)}}; }
+    ret res[ir_type.Type, Error].ok{l.some};
+}
+
+# the entry a pointer's pointee is linked to
+pub fun pointee(t: *Table, ty: Type) res[Type, Error] {
+    val n: res[*Node, Error] = node(t, ty);
+    if (sel n.err)                 { ret res[Type, Error].err{n.err}; }
+    if (!(sel n.ok.shape.pointer)) { ret res[Type, Error].err{Error.kind{kind_of(?n.ok.shape)}}; }
+    val target: opt[Type] = n.ok.shape.pointer.target;
+    if (sel target.none) { ret res[Type, Error].err{Error.pending{ty}}; }
+    ret res[Type, Error].ok{target.some};
+}
+
+fun node(t: *Table, ty: Type) res[*Node, Error] {
+    if (ty.index::usize >= t.nodes.len) { ret res[*Node, Error].err{Error.unknown{ty}}; }
+    ret res[*Node, Error].ok{?t.nodes.data[ty.index]};
+}
+
+fun known(t: *Table, ty: Type) err[Error] {
+    if (ty.index::usize >= t.nodes.len) { ret err[Error].err{Error.unknown{ty}}; }
+    ret err[Error].ok{};
+}
+
+fun known_all(t: *Table, list: Slice[Type]) err[Error] {
+    var i: usize = 0;
+    for (i < list.size) {
+        val k: err[Error] = known(t, list.data[i]);
+        if (sel k.err) { ret k; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun kind_of(s: *Shape) Kind {
+    if (sel s.base)        { ret Kind.base{}; }
+    if (sel s.structure)   { ret Kind.structure{}; }
+    if (sel s.union)       { ret Kind.union{}; }
+    if (sel s.tagged)      { ret Kind.tagged{}; }
+    if (sel s.enumeration) { ret Kind.enumeration{}; }
+    if (sel s.array)       { ret Kind.array{}; }
+    if (sel s.pointer)     { ret Kind.pointer{}; }
+    ret Kind.function{};
+}
+
+fun rank(k: Kind) u8 {
+    if (sel k.base)        { ret 0; }
+    if (sel k.structure)   { ret 1; }
+    if (sel k.union)       { ret 2; }
+    if (sel k.tagged)      { ret 3; }
+    if (sel k.enumeration) { ret 4; }
+    if (sel k.array)       { ret 5; }
+    if (sel k.pointer)     { ret 6; }
+    ret 7;
+}
+
+fun encoding_rank(e: Encoding) u8 {
+    if (sel e.signed)    { ret 0; }
+    if (sel e.unsigned)  { ret 1; }
+    if (sel e.float)     { ret 2; }
+    if (sel e.boolean)   { ret 3; }
+    if (sel e.character) { ret 4; }
+    ret 5;
+}
+
+# whether a layout is of the ir kind a head needs
+fun check_head(types: *ir_type.Table, h: *Head) err[Error] {
+    if (sel h.base) {
+        if (h.base.width == 0) { ret err[Error].err{Error.width{}}; }
+        ret err[Error].ok{};
+    }
+    if (sel h.pointer) {
+        if (h.pointer.len == 0) { ret err[Error].err{Error.empty{}}; }
+        ret err[Error].ok{};
+    }
+    if (sel h.structure) { ret layout_is(types, h.structure, false); }
+    if (sel h.tagged)    { ret layout_is(types, h.tagged, false); }
+    if (sel h.union)     { ret layout_is(types, h.union, true); }
+    ret err[Error].ok{};
+}
+
+fun layout_is(types: *ir_type.Table, l: ir_type.Type, union: bool) err[Error] {
+    val k: res[ir_type.Kind, ir_type.Error] = ir_type.kind(types, l);
+    if (sel k.err)                    { ret err[Error].err{Error.types{k.err}}; }
+    if (union && sel k.ok.union)      { ret err[Error].ok{}; }
+    if (!union && sel k.ok.structure) { ret err[Error].ok{}; }
+    ret err[Error].err{Error.layout{k.ok}};
+}
+
+# whether a known entry is what a later declaration under its key says it is
+fun matches(n: *Node, h: *Head) bool {
+    if (sel h.base) {
+        if (!(sel n.shape.base)) { ret false; }
+        ret encoding_rank(n.shape.base.encoding) == encoding_rank(h.base.encoding) && n.shape.base.width == h.base.width;
+    }
+    if (sel h.pointer) {
+        if (!(sel n.shape.pointer)) { ret false; }
+        ret slice.same_view(n.shape.pointer.pointee, h.pointer);
+    }
+    if (sel h.structure)   { ret sel n.shape.structure && same_layout(n.layout, h.structure); }
+    if (sel h.union)       { ret sel n.shape.union && same_layout(n.layout, h.union); }
+    if (sel h.tagged)      { ret sel n.shape.tagged && same_layout(n.layout, h.tagged); }
+    if (sel h.enumeration) { ret sel n.shape.enumeration; }
+    if (sel h.array)       { ret sel n.shape.array; }
+    ret sel n.shape.function;
+}
+
+fun same_layout(have: opt[ir_type.Type], want: ir_type.Type) bool {
+    if (sel have.none) { ret false; }
+    ret ir_type.same(have.some, want);
+}
+
+# an open node for an entry, owning copies of its names
+fun open(a: *allocator.Allocator, e: *Entry) res[Node, allocator.Error] {
+    var n: Node;
+    n.layout  = opt[ir_type.Type].none{};
+    n.defined = false;
+    val h: *Head = ?e.head;
+    if (sel h.base) {
+        n.shape   = Shape.base{h.base};
+        n.defined = true;
+    }
+    or (sel h.structure) {
+        n.shape  = Shape.structure{Slice[Member]{data: nil, size: 0}};
+        n.layout = opt[ir_type.Type].some{h.structure};
+    }
+    or (sel h.union) {
+        n.shape  = Shape.union{Slice[Member]{data: nil, size: 0}};
+        n.layout = opt[ir_type.Type].some{h.union};
+    }
+    or (sel h.tagged) {
+        var tg: Tagged;
+        n.shape  = Shape.tagged{tg};
+        n.layout = opt[ir_type.Type].some{h.tagged};
+    }
+    or (sel h.enumeration) {
+        var en: Enumeration;
+        n.shape = Shape.enumeration{en};
+    }
+    or (sel h.array) {
+        var ar: Array;
+        n.shape = Shape.array{ar};
+    }
+    or (sel h.pointer) {
+        val p: res[View, allocator.Error] = slice.copy_view(a, h.pointer);
+        if (sel p.err) { ret res[Node, allocator.Error].err{p.err}; }
+        n.shape   = Shape.pointer{Pointer{pointee: p.ok, target: opt[Type].none{}}};
+        n.defined = true;
+    }
+    or {
+        var fu: Function;
+        n.shape = Shape.function{fu};
+    }
+
+    val k: res[View, allocator.Error] = slice.copy_view(a, e.key);
+    if (sel k.err) {
+        table.release_shape(a, ?n.shape);
+        ret res[Node, allocator.Error].err{k.err};
+    }
+    n.key = k.ok;
+    val nm: res[View, allocator.Error] = slice.copy_view(a, e.name);
+    if (sel nm.err) {
+        table.release_shape(a, ?n.shape);
+        slice.release_view(a, n.key);
+        ret res[Node, allocator.Error].err{nm.err};
+    }
+    n.name = nm.ok;
+    ret res[Node, allocator.Error].ok{n};
+}
+
+fun drop(a: *allocator.Allocator, n: *Node) {
+    table.release_shape(a, ?n.shape);
+    slice.release_view(a, n.key);
+    slice.release_view(a, n.name);
+}
+
+fun check_shape(t: *Table, types: *ir_type.Table, l: opt[ir_type.Type], s: *Shape) err[Error] {
+    if (sel s.structure) {
+        if (sel l.none) { ret err[Error].err{Error.kind{Kind.structure{}}}; }
+        ret check_members(t, types, l.some, s.structure);
+    }
+    if (sel s.union) {
+        if (sel l.none) { ret err[Error].err{Error.kind{Kind.union{}}}; }
+        ret check_members(t, types, l.some, s.union);
+    }
+    if (sel s.tagged) {
+        if (sel l.none) { ret err[Error].err{Error.kind{Kind.tagged{}}}; }
+        ret check_tagged(t, types, l.some, ?s.tagged);
+    }
+    if (sel s.enumeration) {
+        val b: res[Kind, Error] = kind(t, s.enumeration.base);
+        if (sel b.err)        { ret err[Error].err{b.err}; }
+        if (!(sel b.ok.base)) { ret err[Error].err{Error.kind{b.ok}}; }
+        ret err[Error].ok{};
+    }
+    if (sel s.array) { ret known(t, s.array.element); }
+    if (sel s.function) {
+        val p: err[Error] = known_all(t, s.function.params);
+        if (sel p.err) { ret p; }
+        ret known_all(t, s.function.results);
+    }
+    ret err[Error].ok{};
+}
+
+fun fields(types: *ir_type.Table, l: ir_type.Type) res[Slice[ir_type.Type], Error] {
+    val m: res[Slice[ir_type.Type], ir_type.Error] = ir_type.members(types, l);
+    if (sel m.err) { ret res[Slice[ir_type.Type], Error].err{Error.types{m.err}}; }
+    ret res[Slice[ir_type.Type], Error].ok{m.ok};
+}
+
+fun check_members(t: *Table, types: *ir_type.Table, l: ir_type.Type, members: Slice[Member]) err[Error] {
+    val f: res[Slice[ir_type.Type], Error] = fields(types, l);
+    if (sel f.err) { ret err[Error].err{f.err}; }
+    var i: usize = 0;
+    for (i < members.size) {
+        val c: err[Error] = check_member(t, types, f.ok, ?members.data[i]);
+        if (sel c.err) { ret c; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun check_member(t: *Table, types: *ir_type.Table, f: Slice[ir_type.Type], m: *Member) err[Error] {
+    val k: err[Error] = known(t, m.type);
+    if (sel k.err)                { ret k; }
+    if (m.field::usize >= f.size) { ret err[Error].err{Error.field{m.field}}; }
+    ret agree(t, types, m.type, f.data[m.field], m.field);
+}
+
+fun check_tagged(t: *Table, types: *ir_type.Table, l: ir_type.Type, tg: *Tagged) err[Error] {
+    val f: res[Slice[ir_type.Type], Error] = fields(types, l);
+    if (sel f.err) { ret err[Error].err{f.err}; }
+    val d: err[Error] = check_member(t, types, f.ok, ?tg.discriminant);
+    if (sel d.err)                      { ret d; }
+    if (tg.payload::usize >= f.ok.size) { ret err[Error].err{Error.field{tg.payload}}; }
+    val u:  ir_type.Type = f.ok.data[tg.payload];
+    val is: err[Error]   = layout_is(types, u, true);
+    if (sel is.err) { ret is; }
+    val cases: res[Slice[ir_type.Type], Error] = fields(types, u);
+    if (sel cases.err) { ret err[Error].err{cases.err}; }
+    var i: usize = 0;
+    for (i < tg.cases.size) {
+        val p: opt[Member] = tg.cases.data[i].payload;
+        if (sel p.some) {
+            var m: Member     = p.some;
+            val c: err[Error] = check_member(t, types, cases.ok, ?m);
+            if (sel c.err) { ret c; }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether a by-value member is described as laid out at its owner's field
+fun agree(t: *Table, types: *ir_type.Table, d: Type, field: ir_type.Type, at: u32) err[Error] {
+    val n: *Node             = ?t.nodes.data[d.index];
+    val l: opt[ir_type.Type] = n.layout;
+    if (sel l.some) {
+        if (!ir_type.same(l.some, field)) { ret err[Error].err{Error.agree{at}}; }
+        ret err[Error].ok{};
+    }
+    if (sel n.shape.array) {
+        if (!n.defined) { ret err[Error].err{Error.open{d}}; }
+        val c: res[u64, ir_type.Error] = ir_type.count(types, field);
+        if (sel c.err)                   { ret err[Error].err{Error.agree{at}}; }
+        if (c.ok != n.shape.array.count) { ret err[Error].err{Error.agree{at}}; }
+        val e: res[ir_type.Type, ir_type.Error] = ir_type.element(types, field);
+        if (sel e.err) { ret err[Error].err{Error.types{e.err}}; }
+        ret agree(t, types, n.shape.array.element, e.ok, at);
+    }
+    ret err[Error].ok{};
+}
+
+# a copy of the shape whose lists and names the table owns
+fun own(a: *allocator.Allocator, s: *Shape) res[Shape, allocator.Error] {
+    if (sel s.structure) {
+        val m: res[Slice[Member], allocator.Error] = table.copy_members(a, s.structure);
+        if (sel m.err) { ret res[Shape, allocator.Error].err{m.err}; }
+        ret res[Shape, allocator.Error].ok{Shape.structure{m.ok}};
+    }
+    if (sel s.union) {
+        val m: res[Slice[Member], allocator.Error] = table.copy_members(a, s.union);
+        if (sel m.err) { ret res[Shape, allocator.Error].err{m.err}; }
+        ret res[Shape, allocator.Error].ok{Shape.union{m.ok}};
+    }
+    if (sel s.tagged) {
+        val d: res[View, allocator.Error] = slice.copy_view(a, s.tagged.discriminant.name);
+        if (sel d.err) { ret res[Shape, allocator.Error].err{d.err}; }
+        val c: res[Slice[Case], allocator.Error] = table.copy_cases(a, s.tagged.cases);
+        if (sel c.err) {
+            slice.release_view(a, d.ok);
+            ret res[Shape, allocator.Error].err{c.err};
+        }
+        var tg: Tagged = s.tagged;
+        tg.discriminant.name = d.ok;
+        tg.cases             = c.ok;
+        ret res[Shape, allocator.Error].ok{Shape.tagged{tg}};
+    }
+    if (sel s.enumeration) {
+        val e: res[Slice[Enumerator], allocator.Error] = table.copy_enumerators(a, s.enumeration.enumerators);
+        if (sel e.err) { ret res[Shape, allocator.Error].err{e.err}; }
+        ret res[Shape, allocator.Error].ok{Shape.enumeration{Enumeration{base: s.enumeration.base, enumerators: e.ok}}};
+    }
+    if (sel s.function) {
+        val p: res[Slice[Type], allocator.Error] = slice.copy[Type](a, s.function.params);
+        if (sel p.err) { ret res[Shape, allocator.Error].err{p.err}; }
+        val r: res[Slice[Type], allocator.Error] = slice.copy[Type](a, s.function.results);
+        if (sel r.err) {
+            slice.release[Type](a, p.ok);
+            ret res[Shape, allocator.Error].err{r.err};
+        }
+        ret res[Shape, allocator.Error].ok{Shape.function{Function{params: p.ok, results: r.ok}}};
+    }
+    ret res[Shape, allocator.Error].ok{@s};
+}
+
+fun text(s: str) View {
+    ret View{data: s, len: str_len(s)};
+}
+
+fun ir(r: res[ir_type.Type, ir_type.Error], out: *ir_type.Type) bool {
+    if (sel r.err) { ret false; }
+    @out = r.ok;
+    ret true;
+}
+
+fun fresh(r: res[Declared, Error], out: *Type) bool {
+    if (sel r.err)      { ret false; }
+    if (sel r.ok.known) { ret false; }
+    @out = r.ok.fresh;
+    ret true;
+}
+
+fun known_as(r: res[Declared, Error], want: Type) bool {
+    if (sel r.err)      { ret false; }
+    if (sel r.ok.fresh) { ret false; }
+    ret same(r.ok.known, want);
+}
+
+fun base(key: str, width: u32) Entry {
+    ret Entry{key: text(key), name: text(key), head: Head.base{Base{encoding: Encoding.signed{}, width: width}}};
+}
+
+fun pointer(key: str, pointee: str) Entry {
+    ret Entry{key: text(key), name: text(""), head: Head.pointer{text(pointee)}};
+}
+
+fun structure(key: str, l: ir_type.Type) Entry {
+    ret Entry{key: text(key), name: text(key), head: Head.structure{l}};
+}
+
+# the ir structure of two members
+fun record(types: *ir_type.Table, member: ir_type.Type, second: ir_type.Type, out: *ir_type.Type) bool {
+    var m: [2]ir_type.Type = [2]ir_type.Type{member, second};
+    val s: ir_type.Shape   = ir_type.Shape.structure{ir_type.Structure{members: Slice[ir_type.Type]{data: ?m[0], size: 2}, offsets: opt[Slice[u64]].none{}}};
+    ret ir(ir_type.intern(types, s), out);
+}
+
+# describe `point.Point { x: i64; y: i64; }` in a module
+fun point(t: *Table, types: *ir_type.Table, out: *Type) bool {
+    var i64t: ir_type.Type;
+    var l:    ir_type.Type;
+    if (!ir(ir_type.intern(types, ir_type.Shape.integer{ir_type.Integer{width: 64}}), ?i64t)) { ret false; }
+    if (!record(types, i64t, i64t, ?l))                                                       { ret false; }
+    if (!fresh(declare(t, types, structure("point.Point", l)), out))                          { ret false; }
+    var i64d: Type;
+    if (!fresh(declare(t, types, base("i64", 64)), ?i64d)) { ret false; }
+    var m: [2]Member  = [2]Member{Member{name: text("x"), type: i64d, field: 0}, Member{name: text("y"), type: i64d, field: 1}};
+    val d: err[Error] = define(t, types, @out, Shape.structure{Slice[Member]{data: ?m[0], size: 2}});
+    if (sel d.err) { ret false; }
+    val f: err[Error] = finish(t);
+    ret sel f.ok;
+}
+
+test key__one_identity_across_modules {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var types1: ir_type.Table = ir_type.init(?a);
+    var types2: ir_type.Table = ir_type.init(?a);
+    var one:    Table         = table.init(?a);
+    var two:    Table         = table.init(?a);
+    fin {
+        table.dnit(?two);
+        table.dnit(?one);
+        ir_type.dnit(?types2);
+        ir_type.dnit(?types1);
+    }
+
+    # the second module describes another type first, so the two ids differ
+    var other: Type;
+    if (!fresh(declare(?two, ?types2, base("u8", 8)), ?other)) { ret 1; }
+    var p1: Type;
+    var p2: Type;
+    if (!point(?one, ?types1, ?p1)) { ret 1; }
+    if (!point(?two, ?types2, ?p2)) { ret 1; }
+    if (p1.index == p2.index)       { ret 2; }
+
+    val k1: res[View, Error] = key(?one, p1);
+    val k2: res[View, Error] = key(?two, p2);
+    if (sel k1.err)                     { ret 3; }
+    if (sel k2.err)                     { ret 3; }
+    if (!slice.same_view(k1.ok, k2.ok)) { ret 3; }
+
+    # a body inlined from the first module names the type by its key and lands on the second's entry
+    val found: opt[Type] = find(?two, k1.ok);
+    if (sel found.none)        { ret 4; }
+    if (!same(found.some, p2)) { ret 4; }
+    val before: usize                    = two.nodes.len;
+    var l:      ir_type.Type;
+    val lr:     res[ir_type.Type, Error] = layout(?two, p2);
+    if (sel lr.err) { ret 5; }
+    l = lr.ok;
+    if (!known_as(declare(?two, ?types2, structure("point.Point", l)), p2)) { ret 5; }
+    if (two.nodes.len != before)                                            { ret 6; }
+    ret 0;
+}
+
+test declare__self_reference_closes_on_open_entry {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var types: ir_type.Table = ir_type.init(?a);
+    var t:     Table         = table.init(?a);
+    fin {
+        table.dnit(?t);
+        ir_type.dnit(?types);
+    }
+
+    # list.Node { value: i64; next: *list.Node; }
+    var i64t: ir_type.Type;
+    var ptr:  ir_type.Type;
+    var l:    ir_type.Type;
+    if (!ir(ir_type.intern(?types, ir_type.Shape.integer{ir_type.Integer{width: 64}}), ?i64t)) { ret 1; }
+    if (!ir(ir_type.intern(?types, ir_type.Shape.pointer{ir_type.Pointer{space: 0}}), ?ptr))   { ret 1; }
+    if (!record(?types, i64t, ptr, ?l))                                                        { ret 1; }
+
+    var nd: Type;
+    if (!fresh(declare(?t, ?types, structure("list.Node", l)), ?nd)) { ret 2; }
+    var value: Type;
+    var next:  Type;
+    if (!fresh(declare(?t, ?types, base("i64", 64)), ?value))                   { ret 3; }
+    if (!fresh(declare(?t, ?types, pointer("*list.Node", "list.Node")), ?next)) { ret 3; }
+
+    # the walk reaches the node again while its members are still being walked, and stops on it
+    if (!known_as(declare(?t, ?types, structure("list.Node", l)), nd)) { ret 4; }
+
+    var m: [2]Member  = [2]Member{Member{name: text("value"), type: value, field: 0}, Member{name: text("next"), type: next, field: 1}};
+    val d: err[Error] = define(?t, ?types, nd, Shape.structure{Slice[Member]{data: ?m[0], size: 2}});
+    if (sel d.err) { ret 5; }
+    val f: err[Error] = finish(?t);
+    if (sel f.err)        { ret 6; }
+    if (t.nodes.len != 3) { ret 7; }
+    val to: res[Type, Error] = pointee(?t, next);
+    if (sel to.err)       { ret 8; }
+    if (!same(to.ok, nd)) { ret 8; }
+    ret 0;
+}
+
+test pending__late_pointee_described_once {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var types: ir_type.Table = ir_type.init(?a);
+    var t:     Table         = table.init(?a);
+    fin {
+        table.dnit(?t);
+        ir_type.dnit(?types);
+    }
+
+    # two pointers to a leaf no value describes, then a pointer to a root a value describes later
+    var p1:   Type;
+    var p2:   Type;
+    var p3:   Type;
+    var root: Type;
+    if (!fresh(declare(?t, ?types, pointer("*Leaf", "Leaf")), ?p1))  { ret 1; }
+    if (!fresh(declare(?t, ?types, pointer("^*Leaf", "Leaf")), ?p2)) { ret 1; }
+    if (!fresh(declare(?t, ?types, pointer("*Root", "Root")), ?p3))  { ret 1; }
+    if (!fresh(declare(?t, ?types, base("Root", 32)), ?root))        { ret 1; }
+
+    var leaf:  Type;
+    var asked: u32 = 0;
+    for {
+        val p: opt[View] = pending(?t);
+        if (sel p.none)                             { brk; }
+        if (!slice.same_view(p.some, text("Leaf"))) { ret 2; }
+        asked = asked + 1;
+        if (asked > 1)                                           { ret 3; }
+        if (!fresh(declare(?t, ?types, base("Leaf", 8)), ?leaf)) { ret 3; }
+    }
+    if (asked != 1) { ret 4; }
+    val f: err[Error] = finish(?t);
+    if (sel f.err) { ret 5; }
+
+    val t1: res[Type, Error] = pointee(?t, p1);
+    val t2: res[Type, Error] = pointee(?t, p2);
+    val t3: res[Type, Error] = pointee(?t, p3);
+    if (sel t1.err)                                            { ret 6; }
+    if (sel t2.err)                                            { ret 6; }
+    if (sel t3.err)                                            { ret 6; }
+    if (!same(t1.ok, leaf) || !same(t2.ok, leaf))              { ret 7; }
+    if (!same(t3.ok, root))                                    { ret 8; }
+    if (!known_as(declare(?t, ?types, base("Leaf", 8)), leaf)) { ret 9; }
+    ret 0;
+}
