@@ -30,6 +30,9 @@
 #   target's byte order, each carrying the access's flags, so a kept store
 #   stays kept in every word. a block's parameter is one parameter per word,
 #   and every edge into it passes the words of its argument.
+# - a reinterpretation as a vector whose lanes fill words whole takes each
+#   lane from its bits, lane 0 from the low bits, and one back puts each lane
+#   in its place.
 # - a constant is its words.
 #
 # an i1 a store writes or a load reads is held in memory as the integer of its
@@ -172,6 +175,18 @@ fun wanted(t: *Target) bool {
     ret top.some < types.WIDTHS[$length_of(types.Widths) - 1];
 }
 
+# a reinterpretation between a wide integer and a vector whose lanes fill
+# words whole
+# ---
+# into:   the vector is the result, not the operand
+# vector: the vector's lanes
+# bits:   the bits of one lane
+pub rec Lanes {
+    into:   bool;
+    vector: types.Vector;
+    bits:   u32;
+}
+
 # how an instruction is split
 pub tag Form: u8 {
     none;
@@ -200,6 +215,8 @@ pub tag Form: u8 {
     offset;
     address;
     pointer;
+    recast;
+    lanes: Lanes;
     bit_load;
     bit_store;
 }
@@ -290,6 +307,46 @@ fun pointer_bits(v: *Visit, ty: Type) u32 {
     ret (size.ok * 8)::u32;
 }
 
+# the bits of an integer or float type, zero for any other type
+fun scalar_bits(v: *Visit, ty: Type) u32 {
+    val s: res[types.Shape, types.Error] = types.shape(?v.w.site.m.types, ty);
+    if (sel s.err)        { ret 0; }
+    if (sel s.ok.integer) { ret s.ok.integer.width; }
+    if (sel s.ok.float) {
+        val f: opt[types.Row] = types.row(s.ok.float.format);
+        if (sel f.some) { ret f.some.width; }
+    }
+    ret 0;
+}
+
+# a vector's lanes when they fill words whole, none for any other type
+fun word_lanes(v: *Visit, ty: Type, into: bool) opt[Lanes] {
+    val s: res[types.Shape, types.Error] = types.shape(?v.w.site.m.types, ty);
+    if (sel s.err)          { ret opt[Lanes].none{}; }
+    if (!(sel s.ok.vector)) { ret opt[Lanes].none{}; }
+    val bits: u32 = scalar_bits(v, s.ok.vector.element);
+    if (bits == 0 || bits > v.w.word || v.w.word % bits != 0) { ret opt[Lanes].none{}; }
+    ret opt[Lanes].some{Lanes{into: into, vector: s.ok.vector, bits: bits}};
+}
+
+# how a reinterpretation that reads or gives a wide integer is split: words
+# kept as they are between two wide integers, and lanes taken from or put into
+# the words for a vector whose lanes fill words whole
+fun recast_form(v: *Visit, from: Type, to: Type) Form {
+    val wide_from: bool = wide_of(v, from) != 0;
+    val wide_to:   bool = wide_of(v, to) != 0;
+    if (wide_from && wide_to) { ret Form.recast{}; }
+    if (wide_from) {
+        val lanes: opt[Lanes] = word_lanes(v, to, true);
+        if (sel lanes.some) { ret Form.lanes{lanes.some}; }
+    }
+    if (wide_to) {
+        val lanes: opt[Lanes] = word_lanes(v, from, false);
+        if (sel lanes.some) { ret Form.lanes{lanes.some}; }
+    }
+    ret Form.refused{UNSPLIT};
+}
+
 # how an instruction that reads or gives a wide integer is split
 fun wide_form(v: *Visit, d: *InstructionData, row: *Row) Form {
     if (sel row.tail.argument || sel row.tail.returned) { ret Form.refused{BOUNDARY}; }
@@ -332,6 +389,7 @@ fun wide_form(v: *Visit, d: *InstructionData, row: *Row) Form {
         if (d.opcode.index == opcode.LOAD.index) { ret Form.load{}; }
         ret Form.store{};
     }
+    if (d.opcode.index == opcode.BITCAST.index) { ret recast_form(v, type_of(v, d.operands.data[0]), type_of(v, d.results.data[0])); }
     var form:    Form = Form.refused{UNSPLIT};
     var pointer: Type = type_of(v, d.operands.data[0]);
     if (d.opcode.index == opcode.PTR_ADD.index)  { form = Form.offset{}; }
@@ -592,6 +650,56 @@ fun bit_memory(v: *Visit) Type {
     ret words.integer(?v.w, (size.ok * 8)::u32);
 }
 
+# a vector whose lanes fill words whole from the words of a wide integer,
+# lane 0 from the low bits
+fun to_lanes(v: *Visit, c: *Copied, l: Lanes) Value {
+    val w:     *Work        = ?v.w;
+    val to:    Type         = type_of(v, c.results[0]);
+    val lane:  Type         = l.vector.element;
+    val bits:  u32          = l.bits;
+    val held:  Type         = words.integer(w, bits);
+    val float: bool         = width_of(v, lane) == 0;
+    val parts: Slice[Value] = operand_words(v, c, 0);
+    val n:     usize        = l.vector.lanes::usize;
+    val out:   Slice[Value] = words.fresh(w, n);
+    var i:     usize        = 0;
+    for (i < n && sel w.failed.none) {
+        val at: u32   = i::u32 * bits;
+        var x:  Value = words.shift_by(w, opcode.SHR_U, parts.data[(at / w.word)::usize], at % w.word);
+        if (bits < w.word) { x = emit.convert(?w.site, opcode.TRUNC, x, held); }
+        if (float)         { x = emit.convert(?w.site, opcode.BITCAST, x, lane); }
+        out.data[i] = x;
+        i           = i + 1;
+    }
+    var imm:  [1]Immediate = [1]Immediate{Immediate.ty{to}};
+    val made: Instruction  = emit.make(?w.site, opcode.VBUILD, out, Slice[Immediate]{data: ?imm[0], size: 1});
+    ret emit.result(?w.site, made, 0);
+}
+
+# the words of a vector whose lanes fill words whole, lane 0 in the low bits
+fun from_lanes(v: *Visit, c: *Copied, l: Lanes) Slice[Value] {
+    val w:     *Work        = ?v.w;
+    val out:   Slice[Value] = words.zeros(w, count_of(v, type_of(v, c.results[0])));
+    val lane:  Type         = l.vector.element;
+    val bits:  u32          = l.bits;
+    val held:  Type         = words.integer(w, bits);
+    val float: bool         = width_of(v, lane) == 0;
+    var i:     u32          = 0;
+    for (i < l.vector.lanes && sel w.failed.none) {
+        var ops:  [1]Value     = [1]Value{c.operands[0]};
+        var imm:  [1]Immediate = [1]Immediate{Immediate.lane{i}};
+        val made: Instruction  = emit.make(?w.site, opcode.VEXTRACT, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+        var x:    Value        = emit.result(?w.site, made, 0);
+        if (float)         { x = emit.convert(?w.site, opcode.BITCAST, x, held); }
+        if (bits < w.word) { x = emit.convert(?w.site, opcode.EXT_U, x, w.wty); }
+        val at: u32   = i * bits;
+        val j:  usize = (at / w.word)::usize;
+        out.data[j] = words.or_(w, out.data[j], words.shift_by(w, opcode.SHL, x, at % w.word));
+        i           = i + 1;
+    }
+    ret out;
+}
+
 # split an instruction by its form
 fun split(v: *Visit, form: Form, c: *Copied, origin: Instruction) Split {
     val w: *Work = ?v.w;
@@ -664,6 +772,11 @@ fun split(v: *Visit, form: Form, c: *Copied, origin: Instruction) Split {
         ret only(arith.extend(w, Slice[Value]{data: ?one[0], size: 1}, count_of(v, type_of(v, c.results[0])), false));
     }
     if (sel form.pointer) { ret standing(emit.convert(?w.site, opcode.INTTOPTR, operand_words(v, c, 0).data[0], type_of(v, c.results[0]))); }
+    if (sel form.recast)  { ret only(operand_words(v, c, 0)); }
+    if (sel form.lanes) {
+        if (form.lanes.into) { ret standing(to_lanes(v, c, form.lanes)); }
+        ret only(from_lanes(v, c, form.lanes));
+    }
     if (sel form.bit_load) {
         val held: Type  = bit_memory(v);
         val x:    Value = load_of(v, c, c.operands[0], held, alignment_of(c));
