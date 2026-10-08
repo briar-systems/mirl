@@ -1,0 +1,263 @@
+# the locations an allocator assigns, numbered once per target, and the
+# storage they share
+#
+# a location is a register row of the target's register file or a cell of a
+# memory-backed class the target supplies. register rows come first, numbered
+# as the file orders them, then the cells of each memory class, the classes in
+# the order of their addresses. one register equals no unit of storage here:
+# two rows share storage when masc's overlap holds for them, which reads the
+# bank, offset, stride, piece count and width of each row at every multiplier
+# of its scale, so a sub-register shares with the registers it is part of, a
+# pair with each of its halves and a scalable register with the fixed width
+# registers it holds. a cell shares with nothing but itself, since a memory
+# class states no layout against another.
+
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.fail.keep;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Lists;
+use mirl.machine.class.Cell;
+use mirl.machine.class.Memory;
+use mirl.machine.class.Physical;
+use mirl.machine.registers;
+
+use rf: masc.core.register;
+
+# why the locations of a target were not numbered
+# ---
+# alloc: the allocator refused storage
+# size:  the locations do not fit the numbering
+pub tag Error: u8 {
+    alloc: allocator.Error;
+    size;
+}
+
+# the locations of a target
+# ---
+# file:     the register file, nil for a set with none
+# rows:     its rows by identity
+# memories: the memory-backed classes, sorted by address and each once
+# bases:    the first location of each memory class's cells
+# shares:   each location's locations sharing storage with it, itself first
+# count:    how many locations there are
+pub rec Locations {
+    file:     *rf.File;
+    rows:     registers.Rows;
+    memories: vector.Vector[*Memory];
+    bases:    vector.Vector[u32];
+    shares:   Lists[u32];
+    count:    u32;
+}
+
+# a register row and its bank, sorted by bank to group the rows that may share
+rec Banked {
+    bank: u16;
+    row:  u32;
+}
+
+fun by_bank(a: *Banked, b: *Banked) i64 {
+    if (a.bank != b.bank) {
+        if (a.bank < b.bank) { ret -1; }
+        ret 1;
+    }
+    if (a.row < b.row) { ret -1; }
+    if (a.row > b.row) { ret 1; }
+    ret 0;
+}
+
+fun by_address(a: **Memory, b: **Memory) i64 {
+    val x: u64 = (@a):~u64;
+    val y: u64 = (@b):~u64;
+    if (x < y) { ret -1; }
+    if (x > y) { ret 1; }
+    ret 0;
+}
+
+fun pair(keys: *vector.Vector[u32], items: *vector.Vector[u32], k: u32, n: u32) err[allocator.Error] {
+    val pk: res[usize, allocator.Error] = vector.push[u32](keys, k);
+    if (sel pk.err) { ret err[allocator.Error].err{pk.err}; }
+    val pi: res[usize, allocator.Error] = vector.push[u32](items, n);
+    if (sel pi.err) { ret err[allocator.Error].err{pi.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+# the pairs of rows sharing storage, each row's own pair first, found by
+# comparing only the rows of one bank, which is O(r log r) for the sort and
+# the sum over banks of the square of a bank's rows for the comparisons
+fun share_rows(a: *allocator.Allocator, file: *rf.File, keys: *vector.Vector[u32], items: *vector.Vector[u32]) err[allocator.Error] {
+    var banked: vector.Vector[Banked] = vector.init[Banked](a);
+    fin { vector.dnit[Banked](?banked); }
+    val room: res[usize, allocator.Error] = vector.reserve[Banked](?banked, file.register_count::usize);
+    if (sel room.err) { ret err[allocator.Error].err{room.err}; }
+    var i: u32 = 0;
+    for (i < file.register_count) {
+        vector.push[Banked](?banked, Banked{bank: file.registers[i].bank, row: i});
+        val own: err[allocator.Error] = pair(keys, items, i, i);
+        if (sel own.err) { ret own; }
+        i = i + 1;
+    }
+    sort.sort_by[Banked](banked.data, banked.len, by_bank);
+    var start: usize = 0;
+    for (start < banked.len) {
+        var end: usize = start + 1;
+        for (end < banked.len && banked.data[end].bank == banked.data[start].bank) { end = end + 1; }
+        var x: usize = start;
+        for (x < end) {
+            var y: usize = start;
+            for (y < end) {
+                val p: u32 = banked.data[x].row;
+                val q: u32 = banked.data[y].row;
+                if (p != q && rf.overlap(file, ?file.registers[p], ?file.registers[q])) {
+                    val both: err[allocator.Error] = pair(keys, items, p, q);
+                    if (sel both.err) { ret both; }
+                }
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        start = end;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+fun fill(a: *allocator.Allocator, l: *Locations, memories: Slice[*Memory]) err[Error] {
+    var total: u64 = 0;
+    if (l.file != nil) { total = l.file.register_count::u64; }
+    val held: res[usize, allocator.Error] = vector.reserve[*Memory](?l.memories, memories.size);
+    if (sel held.err) { ret err[Error].err{Error.alloc{held.err}}; }
+    var i: usize = 0;
+    for (i < memories.size) {
+        vector.push[*Memory](?l.memories, memories.data[i]);
+        i = i + 1;
+    }
+    sort.sort_by[*Memory](l.memories.data, l.memories.len, by_address);
+    var kept: usize = 0;
+    i = 0;
+    for (i < l.memories.len) {
+        if (kept == 0 || l.memories.data[kept - 1] != l.memories.data[i]) {
+            l.memories.data[kept] = l.memories.data[i];
+            kept                  = kept + 1;
+        }
+        i = i + 1;
+    }
+    l.memories.len = kept;
+    i              = 0;
+    for (i < l.memories.len) {
+        if (total + l.memories.data[i].count::u64 >= 0xffffffff) { ret err[Error].err{Error.size{}}; }
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?l.bases, total::u32);
+        if (sel pushed.err) { ret err[Error].err{Error.alloc{pushed.err}}; }
+        total = total + l.memories.data[i].count::u64;
+        i     = i + 1;
+    }
+    l.count = total::u32;
+
+    var keys:  vector.Vector[u32] = vector.init[u32](a);
+    var items: vector.Vector[u32] = vector.init[u32](a);
+    fin {
+        vector.dnit[u32](?keys);
+        vector.dnit[u32](?items);
+    }
+    if (l.file != nil) {
+        val shared: err[allocator.Error] = share_rows(a, l.file, ?keys, ?items);
+        if (sel shared.err) { ret err[Error].err{Error.alloc{shared.err}}; }
+    }
+    var at: u32 = 0;
+    if (l.file != nil) { at = l.file.register_count; }
+    for (at < l.count) {
+        val own: err[allocator.Error] = pair(?keys, ?items, at, at);
+        if (sel own.err) { ret err[Error].err{Error.alloc{own.err}}; }
+        at = at + 1;
+    }
+    val made: res[Lists[u32], allocator.Error] = graph.lists[u32](a, l.count, Slice[u32]{data: keys.data, size: keys.len}, Slice[u32]{data: items.data, size: items.len});
+    if (sel made.err) { ret err[Error].err{Error.alloc{made.err}}; }
+    l.shares = made.ok;
+    ret err[Error].ok{};
+}
+
+# the locations of a target
+# ---
+# a:        the allocator the locations take
+# file:     the target's register file, nil for a set with none
+# memories: the memory-backed classes the target supplies
+# ret:      the locations, or why they were not numbered
+pub fun init(a: *allocator.Allocator, file: *rf.File, memories: Slice[*Memory]) res[Locations, Error] {
+    var l: Locations = Locations{
+        file:     file,
+        rows:     registers.Rows{file: nil, spots: vector.init[registers.Spot](a)},
+        memories: vector.init[*Memory](a),
+        bases:    vector.init[u32](a),
+        shares:   Lists[u32]{first: vector.init[u32](a), items: vector.init[u32](a)},
+        count:    0,
+    };
+    val rows: res[registers.Rows, allocator.Error] = registers.init(a, file);
+    if (sel rows.err) { ret res[Locations, Error].err{Error.alloc{rows.err}}; }
+    l.rows = rows.ok;
+    val filled: err[Error] = fill(a, ?l, memories);
+    if (sel filled.err) {
+        dnit(?l);
+        ret res[Locations, Error].err{filled.err};
+    }
+    ret res[Locations, Error].ok{l};
+}
+
+# give back the locations' storage
+pub fun dnit(l: *Locations) err[allocator.Error] {
+    var failed: err[allocator.Error] = registers.dnit(?l.rows);
+    keep(?failed, vector.dnit[*Memory](?l.memories));
+    keep(?failed, vector.dnit[u32](?l.bases));
+    keep(?failed, graph.release[u32](?l.shares));
+    ret failed;
+}
+
+# how many locations there are
+pub fun count(l: *Locations) u32 {
+    ret l.count;
+}
+
+# the place of a memory class among the sorted classes, or their count
+fun memory_at(l: *Locations, c: *Memory) usize {
+    var lo: usize = 0;
+    var hi: usize = l.memories.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (l.memories.data[mid]:~u64 < c:~u64) { lo = mid + 1; }
+        or                                      { hi = mid; }
+    }
+    ret lo;
+}
+
+# the number of a location, none when the target has no such register or
+# supplies no such cell, in O(log n) of the rows or the memory classes
+pub fun locate(l: *Locations, p: Physical) opt[u32] {
+    if (sel p.register) { ret registers.row(?l.rows, p.register); }
+    val k: usize = memory_at(l, p.cell.class);
+    if (k >= l.memories.len || l.memories.data[k] != p.cell.class || p.cell.number >= p.cell.class.count) { ret opt[u32].none{}; }
+    ret opt[u32].some{l.bases.data[k] + p.cell.number};
+}
+
+# the location a number names, which must be below count
+pub fun physical(l: *Locations, at: u32) Physical {
+    if (l.file != nil && at < l.file.register_count) { ret Physical.register{rf.id_of(?l.file.registers[at])}; }
+    var lo: usize = 0;
+    var hi: usize = l.bases.len;
+    for (hi - lo > 1) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (l.bases.data[mid] <= at) { lo = mid; }
+        or                           { hi = mid; }
+    }
+    ret Physical.cell{Cell{class: l.memories.data[lo], number: at - l.bases.data[lo]}};
+}
+
+# the locations sharing storage with a location, itself first
+pub fun shares(l: *Locations, at: u32) Slice[u32] {
+    ret graph.list[u32](?l.shares, at);
+}
