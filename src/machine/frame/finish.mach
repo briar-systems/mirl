@@ -1,0 +1,468 @@
+# the writing of a laid out frame
+#
+# the framed function is made anew through the function's maker: the input's
+# virtual registers, slots and blocks, then a slot for each saved register.
+# the prologue opens the entry block, an epilogue comes before every exit,
+# each dynamic allocation, slot address, spill and reload is expanded through
+# the target's frame code, and every other instruction is copied. each move of
+# the stack or frame pointer and each save and restore states its call frame
+# rule beside the instruction that makes it true. the input is never changed.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.metadata.Metadata;
+use mirl.machine.class.Physical;
+use mirl.machine.frame.code.Code;
+use mirl.machine.frame.code.Emit;
+use mirl.machine.frame.code.Refusal;
+use mirl.machine.frame.lay;
+use mirl.machine.frame.lay.Plan;
+use mirl.machine.frame.lay.Spot;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Address;
+use mirl.machine.frame.record.Cfa;
+use mirl.machine.frame.record.Fact;
+use mirl.machine.frame.record.Framed;
+use mirl.machine.frame.record.Layout;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.frame.record.Place;
+use mirl.machine.frame.record.Rule;
+use mirl.machine.frame.record.Saved;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.function.SlotData;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Virtual;
+use mirl.machine.pseudo;
+
+use rf: masc.core.register;
+
+# why a frame was not written
+# ---
+# lay:     the layout was refused
+# code:    the target's frame code refused a move
+# made:    the function's maker refused a virtual register, slot or block
+# operand: a spill, reload, address or dynamic allocation whose register is
+#          not a register of the file, at this instruction
+# dropped: an instruction naming a slot the layout dropped
+pub tag Error: u8 {
+    lay:     lay.Error;
+    code:    Refusal;
+    made:    function.Error;
+    operand: Instruction;
+    dropped: Instruction;
+}
+
+# what the writing of one frame shares
+rec Writer {
+    src:  *Function;
+    p:    *Plan;
+    code: *Code;
+    out:  *Framed;
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.code{Refusal.made{function.Error.alloc{e}}}};
+}
+
+fun refused(r: err[Refusal]) err[Error] {
+    if (sel r.err) { ret err[Error].err{Error.code{r.err}}; }
+    ret err[Error].ok{};
+}
+
+# the origin of every instruction made since `from`
+fun origins(w: *Writer, from: usize, origin: u32) err[Error] {
+    var i: usize = from;
+    for (i < w.out.function.instructions.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?w.out.origins, origin);
+        if (sel pushed.err) { ret alloc_err(pushed.err); }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun last(w: *Writer) Instruction {
+    ret Instruction{index: (w.out.function.instructions.len - 1)::u32};
+}
+
+fun fact(w: *Writer, at: Instruction, after: bool, rule: Rule) err[Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[Fact](?w.out.facts, Fact{at: at, after: after, rule: rule});
+    if (sel pushed.err) { ret alloc_err(pushed.err); }
+    ret err[Error].ok{};
+}
+
+# a rule after the last instruction, when the move made one
+fun after(w: *Writer, from: usize, rule: Rule) err[Error] {
+    if (w.out.function.instructions.len == from) { ret err[Error].ok{}; }
+    ret fact(w, last(w), true, rule);
+}
+
+fun cfa(w: *Writer, from: usize, reg: rf.Id, o: Offset) err[Error] {
+    ret after(w, from, Rule.cfa{Cfa{register: reg, offset: o}});
+}
+
+fun nonzero(o: Offset) bool {
+    ret o.fixed != 0 || o.per != 0;
+}
+
+fun add(w: *Writer, e: *Emit, dest: rf.Id, src: rf.Id, o: Offset) err[Error] {
+    if (dest == src && !nonzero(o)) { ret err[Error].ok{}; }
+    ret refused(w.code.add(e, dest, src, o));
+}
+
+fun fixed(n: i64) Offset {
+    ret record.bytes(n);
+}
+
+fun base_register(l: *Layout, a: Address) rf.Id {
+    if (sel a.base.frame) { ret l.pointer; }
+    ret l.stack;
+}
+
+fun slot_size(s: SlotData) Offset {
+    ret Offset{fixed: s.size::i64, per: s.per::i64, scale: s.scale};
+}
+
+fun register_of(o: Operand) opt[rf.Id] {
+    if (!(sel o.physical)) { ret opt[rf.Id].none{}; }
+    val p: Physical = o.physical;
+    if (!(sel p.register)) { ret opt[rf.Id].none{}; }
+    ret opt[rf.Id].some{p.register};
+}
+
+# a saved register's slot from the stack pointer while the prologue or an
+# epilogue has it `above` bytes and `per` bytes per unit below the canonical
+# frame address
+fun at_depth(w: *Writer, s: Spot, above: i64, per: i64) Offset {
+    val d: i64 = s.depth::i64;
+    if (s.scaled) { ret Offset{fixed: above - w.p.top::i64, per: per - d, scale: w.p.scale}; }
+    ret Offset{fixed: above - d, per: per, scale: w.p.scale};
+}
+
+fun save(w: *Writer, e: *Emit, s: Spot, above: i64, per: i64, cfa_offset: Offset) err[Error] {
+    val from: usize      = w.out.function.instructions.len;
+    val size: Offset     = slot_size(w.p.added.data[s.slot]);
+    val done: err[Error] = refused(w.code.store(e, s.register, w.out.layout.stack, at_depth(w, s, above, per), size));
+    if (sel done.err) { ret done; }
+    ret after(w, from, Rule.saved{Saved{register: s.register, offset: cfa_offset}});
+}
+
+fun restore(w: *Writer, e: *Emit, s: Spot, base: rf.Id, o: Offset) err[Error] {
+    val from: usize      = w.out.function.instructions.len;
+    val size: Offset     = slot_size(w.p.added.data[s.slot]);
+    val done: err[Error] = refused(w.code.load(e, s.register, base, o, size));
+    if (sel done.err) { ret done; }
+    ret after(w, from, Rule.restored{s.register});
+}
+
+fun prologue(w: *Writer, e: *Emit) err[Error] {
+    val p:     *Plan   = w.p;
+    val l:     *Layout = ?w.out.layout;
+    val sp:    rf.Id   = l.stack;
+    val fp:    rf.Id   = l.pointer;
+    val entry: i64     = l.entry::i64;
+    val top:   i64     = p.top::i64;
+    val total: i64     = top + p.locals::i64;
+    val per:   i64     = p.per::i64;
+    if (p.empty) { ret err[Error].ok{}; }
+    if (l.red != 0) {
+        var k: usize = 0;
+        for (k < p.spots.len) {
+            val s:    Spot       = p.spots.data[k];
+            val done: err[Error] = save(w, e, s, entry, 0, l.saves.data[k].offset);
+            if (sel done.err) { ret done; }
+            k = k + 1;
+        }
+        ret err[Error].ok{};
+    }
+    # the first move takes the saves, and every fixed part too when nothing scales
+    var above: i64 = top;
+    if (per == 0) { above = total; }
+    val from:  usize      = w.out.function.instructions.len;
+    val moved: err[Error] = add(w, e, sp, sp, fixed(entry - above));
+    if (sel moved.err) { ret moved; }
+    val framed: err[Error] = cfa(w, from, sp, fixed(above));
+    if (sel framed.err) { ret framed; }
+    var k: usize = 0;
+    for (k < p.spots.len) {
+        val s: Spot = p.spots.data[k];
+        if (!s.scaled) {
+            val done: err[Error] = save(w, e, s, above, 0, l.saves.data[k].offset);
+            if (sel done.err) { ret done; }
+        }
+        k = k + 1;
+    }
+    if (fp != rf.NONE) {
+        val at:  usize      = w.out.function.instructions.len;
+        val set: err[Error] = add(w, e, fp, sp, fixed(above + l.at));
+        if (sel set.err) { ret set; }
+        val rule: err[Error] = cfa(w, at, fp, fixed(0 - l.at));
+        if (sel rule.err) { ret rule; }
+    }
+    if (per != 0) {
+        val at:    usize      = w.out.function.instructions.len;
+        val grown: err[Error] = add(w, e, sp, sp, Offset{fixed: 0, per: 0 - per, scale: p.scale});
+        if (sel grown.err) { ret grown; }
+        if (fp == rf.NONE) {
+            val rule: err[Error] = cfa(w, at, sp, Offset{fixed: top, per: per, scale: p.scale});
+            if (sel rule.err) { ret rule; }
+        }
+        k = 0;
+        for (k < p.spots.len) {
+            val s: Spot = p.spots.data[k];
+            if (s.scaled) {
+                val done: err[Error] = save(w, e, s, top, per, l.saves.data[k].offset);
+                if (sel done.err) { ret done; }
+            }
+            k = k + 1;
+        }
+        val below: usize      = w.out.function.instructions.len;
+        val rest:  err[Error] = add(w, e, sp, sp, fixed(0 - p.locals::i64));
+        if (sel rest.err) { ret rest; }
+        if (fp == rf.NONE) {
+            val rule: err[Error] = cfa(w, below, sp, Offset{fixed: total, per: per, scale: p.scale});
+            if (sel rule.err) { ret rule; }
+        }
+    }
+    if (l.realign != 0) { ret refused(w.code.mask(e, sp, sp, l.realign)); }
+    ret err[Error].ok{};
+}
+
+# the restores of the saves of one kind, last saved first
+fun restores(w: *Writer, e: *Emit, scaled: bool, base: rf.Id, above: i64, per: i64) err[Error] {
+    var k: usize = w.p.spots.len;
+    for (k > 0) {
+        k = k - 1;
+        val s: Spot = w.p.spots.data[k];
+        if (s.scaled == scaled) {
+            val done: err[Error] = restore(w, e, s, base, at_depth(w, s, above, per));
+            if (sel done.err) { ret done; }
+        }
+    }
+    ret err[Error].ok{};
+}
+
+fun epilogue(w: *Writer, e: *Emit) err[Error] {
+    val p:     *Plan   = w.p;
+    val l:     *Layout = ?w.out.layout;
+    val sp:    rf.Id   = l.stack;
+    val fp:    rf.Id   = l.pointer;
+    val entry: i64     = l.entry::i64;
+    val top:   i64     = p.top::i64;
+    val total: i64     = top + p.locals::i64;
+    val per:   i64     = p.per::i64;
+    if (p.empty) { ret err[Error].ok{}; }
+    val kept: err[Error] = fact(w, Instruction{index: w.out.function.instructions.len::u32}, false, Rule.remember{});
+    if (sel kept.err) { ret kept; }
+    if (l.red != 0) {
+        val done: err[Error] = restores(w, e, false, sp, entry, 0);
+        if (sel done.err) { ret done; }
+        ret restores(w, e, true, sp, entry, 0);
+    }
+    var above: i64 = total;
+    if (fp != rf.NONE) {
+        # scaled saves from the frame pointer, which is where the frame
+        # pointer is minus the bytes down to the saves
+        val scaled: err[Error] = restores(w, e, true, fp, 0 - l.at, 0);
+        if (sel scaled.err) { ret scaled; }
+        val at:    usize      = w.out.function.instructions.len;
+        val moved: err[Error] = add(w, e, sp, fp, fixed(0 - l.at - top));
+        if (sel moved.err) { ret moved; }
+        val rule: err[Error] = cfa(w, at, sp, fixed(top));
+        if (sel rule.err) { ret rule; }
+        above = top;
+    }
+    or (per != 0) {
+        val at:    usize      = w.out.function.instructions.len;
+        val moved: err[Error] = add(w, e, sp, sp, fixed(p.locals::i64));
+        if (sel moved.err) { ret moved; }
+        val rule: err[Error] = cfa(w, at, sp, Offset{fixed: top, per: per, scale: p.scale});
+        if (sel rule.err) { ret rule; }
+        val scaled: err[Error] = restores(w, e, true, sp, top, per);
+        if (sel scaled.err) { ret scaled; }
+        val past:   usize      = w.out.function.instructions.len;
+        val shrunk: err[Error] = add(w, e, sp, sp, Offset{fixed: 0, per: per, scale: p.scale});
+        if (sel shrunk.err) { ret shrunk; }
+        val again: err[Error] = cfa(w, past, sp, fixed(top));
+        if (sel again.err) { ret again; }
+        above = top;
+    }
+    val fixed_saves: err[Error] = restores(w, e, false, sp, above, 0);
+    if (sel fixed_saves.err) { ret fixed_saves; }
+    val from: usize      = w.out.function.instructions.len;
+    val back: err[Error] = add(w, e, sp, sp, fixed(above - entry));
+    if (sel back.err) { ret back; }
+    ret cfa(w, from, sp, fixed(entry));
+}
+
+# a dynamic allocation: the size rounded up to the stack's alignment taken
+# off the stack pointer, the block just above the outgoing area
+fun dynamic(w: *Writer, e: *Emit, dest: rf.Id, size: rf.Id, align: u64) err[Error] {
+    val sp:      rf.Id      = w.out.layout.stack;
+    val rounded: err[Error] = add(w, e, dest, size, fixed((align - 1)::i64));
+    if (sel rounded.err) { ret rounded; }
+    val masked: err[Error] = refused(w.code.mask(e, dest, dest, align));
+    if (sel masked.err) { ret masked; }
+    val taken: err[Error] = refused(w.code.sub(e, sp, sp, dest));
+    if (sel taken.err) { ret taken; }
+    ret refused(w.code.add(e, dest, sp, fixed(w.out.layout.outgoing::i64)));
+}
+
+fun slot_address(w: *Writer, at: Instruction, s: Slot) res[Address, Error] {
+    val pl: Place = w.out.layout.slots.data[s.index];
+    if (sel pl.dropped) { ret res[Address, Error].err{Error.dropped{at}}; }
+    ret res[Address, Error].ok{pl.at};
+}
+
+fun copy(w: *Writer, b: Block, d: *InstructionData) err[Error] {
+    val made: res[Instruction, function.Error] = function.append(?w.out.function, b, d.opcode, d.operands, d.metadata, d.declassifies);
+    if (sel made.err) { ret err[Error].err{Error.made{made.err}}; }
+    ret err[Error].ok{};
+}
+
+fun instruction(w: *Writer, b: Block, id: Instruction) err[Error] {
+    val d:  *InstructionData = function.data(w.src, id);
+    var e:  Emit             = Emit{f: ?w.out.function, block: b, metadata: d.metadata, stack: w.out.layout.stack, scratch: opt[rf.Id].none{}};
+    val op: Opcode           = d.opcode;
+    if (w.p.facts.exits.data[id.index]) {
+        var outer: Emit       = Emit{f: ?w.out.function, block: b, metadata: d.metadata, stack: w.out.layout.stack, scratch: w.p.scratch};
+        val from:  usize      = w.out.function.instructions.len;
+        val ended: err[Error] = epilogue(w, ?outer);
+        if (sel ended.err) { ret ended; }
+        val o: err[Error] = origins(w, from, record.NONE);
+        if (sel o.err) { ret o; }
+        val mid:    usize      = w.out.function.instructions.len;
+        val copied: err[Error] = copy(w, b, d);
+        if (sel copied.err) { ret copied; }
+        val oc: err[Error] = origins(w, mid, id.index);
+        if (sel oc.err) { ret oc; }
+        if (w.p.empty)  { ret err[Error].ok{}; }
+        ret fact(w, last(w), true, Rule.restore{});
+    }
+    val from:    usize         = w.out.function.instructions.len;
+    var done:    err[Error]    = err[Error].ok{};
+    var kind:    pseudo.Pseudo = pseudo.COPY;
+    var expands: bool          = false;
+    if (sel op.pseudo) {
+        kind    = op.pseudo;
+        expands = kind == pseudo.DYNAMIC || kind == pseudo.ADDRESS || kind == pseudo.SPILL || kind == pseudo.RELOAD;
+    }
+    if (expands) {
+        if (kind == pseudo.DYNAMIC) {
+            val dest: opt[rf.Id] = register_of(d.operands.data[0]);
+            val size: opt[rf.Id] = register_of(d.operands.data[1]);
+            if (sel dest.none) { ret err[Error].err{Error.operand{id}}; }
+            if (sel size.none) { ret err[Error].err{Error.operand{id}}; }
+            done = dynamic(w, ?e, dest.some, size.some, w.p.align);
+        }
+        or {
+            # the slot is operand 1 of an address or a reload and operand 0 of a spill
+            var reg_at:  usize = 0;
+            var slot_at: usize = 1;
+            if (kind == pseudo.SPILL) {
+                reg_at  = 1;
+                slot_at = 0;
+            }
+            val reg: opt[rf.Id] = register_of(d.operands.data[reg_at]);
+            if (sel reg.none) { ret err[Error].err{Error.operand{id}}; }
+            val so: Operand = d.operands.data[slot_at];
+            if (!(sel so.slot)) { ret err[Error].err{Error.operand{id}}; }
+            val s:  Slot                = so.slot;
+            val ad: res[Address, Error] = slot_address(w, id, s);
+            if (sel ad.err) { ret err[Error].err{ad.err}; }
+            val base: rf.Id  = base_register(?w.out.layout, ad.ok);
+            val size: Offset = slot_size(w.out.function.slots.data[s.index]);
+            if (kind == pseudo.ADDRESS) { done = refused(w.code.add(?e, reg.some, base, ad.ok.offset)); }
+            or (kind == pseudo.SPILL)   { done = refused(w.code.store(?e, reg.some, base, ad.ok.offset, size)); }
+            or                          { done = refused(w.code.load(?e, reg.some, base, ad.ok.offset, size)); }
+        }
+    }
+    or                { done = copy(w, b, d); }
+    if (sel done.err) { ret done; }
+    ret origins(w, from, id.index);
+}
+
+# write a laid out frame
+# ---
+# a:    the allocator the framed function takes
+# f:    the function the plan was laid out for, unchanged whatever the outcome
+# p:    the plan, whose layout moves into the result
+# code: the target's frame code
+# ret:  the framed function, or why it was refused
+pub fun finish(a: *allocator.Allocator, f: *Function, p: *Plan, code: *Code) res[Framed, Error] {
+    var out: Framed = Framed{function: function.init(a, f.set), layout: p.layout, facts: vector.init[Fact](a), origins: vector.init[u32](a)};
+    p.layout.slots = vector.init[Place](a);
+    p.layout.saves = vector.init[record.Save](a);
+    var w:    Writer     = Writer{src: f, p: p, code: code, out: ?out};
+    val done: err[Error] = write(?w);
+    if (sel done.err) {
+        record.release(?out);
+        ret res[Framed, Error].err{done.err};
+    }
+    ret res[Framed, Error].ok{out};
+}
+
+fun write(w: *Writer) err[Error] {
+    val f: *Function = w.src;
+    var i: usize     = 0;
+    for (i < f.virtuals.len) {
+        val made: res[Virtual, function.Error] = function.virtual(?w.out.function, f.virtuals.data[i]);
+        if (sel made.err) { ret err[Error].err{Error.made{made.err}}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.slots.len) {
+        val made: res[Slot, function.Error] = function.slot(?w.out.function, f.slots.data[i]);
+        if (sel made.err) { ret err[Error].err{Error.made{made.err}}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.p.added.len) {
+        val made: res[Slot, function.Error] = function.slot(?w.out.function, w.p.added.data[i]);
+        if (sel made.err) { ret err[Error].err{Error.made{made.err}}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        val made: res[Block, function.Error] = function.block(?w.out.function);
+        if (sel made.err) { ret err[Error].err{Error.made{made.err}}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        val b: Block = Block{index: i::u32};
+        if (i == 0) {
+            var md:   Metadata;
+            var e:    Emit       = Emit{f: ?w.out.function, block: b, metadata: md, stack: w.out.layout.stack, scratch: w.p.scratch};
+            val from: usize      = w.out.function.instructions.len;
+            val done: err[Error] = prologue(w, ?e);
+            if (sel done.err) { ret done; }
+            val o: err[Error] = origins(w, from, record.NONE);
+            if (sel o.err) { ret o; }
+        }
+        val list: Slice[Instruction] = function.instructions(f, b);
+        var k:    usize              = 0;
+        for (k < list.size) {
+            val done: err[Error] = instruction(w, b, list.data[k]);
+            if (sel done.err) { ret done; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}

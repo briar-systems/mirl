@@ -1,0 +1,407 @@
+# tests of frames, machine form text in and text out, on the risc-v rows
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.filesystem;
+use io: std.io.writer;
+
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use ir_reader: mirl.ir.text.parse;
+use mirl.ir.text.parse.refusal.Refusal;
+use mirl.ir.text.printer;
+use mirl.isa.riscv.frame.FRAME;
+use mirl.machine.alloc.allocate;
+use mirl.machine.alloc.allocate.Allocation;
+use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class.Memory;
+use mirl.machine.class.Physical;
+use mirl.machine.frame.finish;
+use mirl.machine.frame.lay;
+use mirl.machine.frame.lay.Plan;
+use mirl.machine.frame.lay.Request;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Fact;
+use mirl.machine.frame.record.Framed;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.frame.record.Place;
+use mirl.machine.frame.record.Rule;
+use mirl.machine.frame.record.Save;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.text.equal;
+use mirl.machine.text.item;
+use reader:   mirl.machine.text.parse;
+use printing: mirl.machine.text.print;
+use targets:  mirl.target;
+use mirl.target.Target;
+use mirl.target.abi.call;
+use mirl.target.abi.convention;
+use mirl.target.abi.convention.Convention;
+use mirl.target.abi.convention.Frame;
+use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.convention.Stack;
+use mirl.target.abi.convention.Unresolved;
+
+use masc.core.diagnostic;
+use masc.core.extension;
+use rf:        masc.core.register;
+use riscv_set: masc.isa.riscv.set;
+
+#[testing]
+val MODULE: str = "target \"riscv64-linux\"\nfunction @f: fun() -> () {\n^entry:\n    ret\n}\nfunction @g: fun() -> () {\n^entry:\n    ret\n}\n";
+
+#[testing]
+fun view_of(s: str) View {
+    ret View{data: s, len: str_len(s)};
+}
+
+# a test's module, selection, view, convention and locations
+#[testing]
+rec Fixture {
+    a:    allocator.Allocator;
+    m:    Module;
+    sel:  extension.Selection;
+    regs: rf.Available;
+    row:  Convention;
+    r:    Resolved;
+    at:   Locations;
+}
+
+# open a fixture over the module's target, its convention row changed by
+# `change` when it is not nil
+#[testing]
+fun open(x: *Fixture, spelling: str, change: fun(*Convention)) bool {
+    page.make(?x.a);
+    val made: res[Module, Refusal] = ir_reader.parse_body(?x.a, view_of(MODULE));
+    if (sel made.err) { ret false; }
+    x.m = made.ok;
+    val tg: opt[*Target] = targets.by_name(x.m.target);
+    if (sel tg.none) { ret false; }
+    val row: res[*Convention, call.Error] = call.of(tg.some);
+    if (sel row.err) { ret false; }
+    x.row = @row.ok;
+    if (change != nil) { change(?x.row); }
+    val chosen: res[extension.Selection, extension.Error] = extension.select(?x.a, riscv_set.SET.extensions, spelling, diagnostic.START);
+    if (sel chosen.err) { ret false; }
+    x.sel = chosen.ok;
+    val viewed: res[rf.Available, rf.Error] = rf.select(?x.a, x.row.file, ?x.sel);
+    if (sel viewed.err) { ret false; }
+    x.regs = viewed.ok;
+    val resolved: res[Resolved, Unresolved] = convention.resolve(?x.a, ?x.row, ?x.regs);
+    if (sel resolved.err) { ret false; }
+    x.r = resolved.ok;
+    val got: res[Locations, location.Error] = location.init(?x.a, x.row.file, Slice[*Memory]{data: nil, size: 0});
+    if (sel got.err) { ret false; }
+    x.at = got.ok;
+    ret true;
+}
+
+#[testing]
+fun close(x: *Fixture) {
+    location.dnit(?x.at);
+    convention.release(?x.r);
+    rf.release(?x.regs);
+    extension.release(?x.sel);
+    module.dnit(?x.m);
+}
+
+#[testing]
+fun read(x: *Fixture, text: str) opt[reader.Unit] {
+    val read: res[reader.Unit, Refusal] = reader.parse_body(?x.a, ?x.m, view_of(text));
+    if (sel read.err) { ret opt[reader.Unit].none{}; }
+    ret opt[reader.Unit].some{read.ok};
+}
+
+# print a function to standard error, so a failing comparison shows what came out
+#[testing]
+fun show(m: *Module, f: Function) {
+    var items: [1]item.Item;
+    items[0].function = f;
+    var out: io.Writer = filesystem.writer(filesystem.STDERR);
+    printing.print(?out, m, Slice[item.Item]{data: ?items[0], size: 1});
+}
+
+#[testing]
+fun request(x: *Fixture) Request {
+    ret Request{convention: ?x.r, at: ?x.at};
+}
+
+# frame the allocated @f of a text and compare it with the expected text
+# ---
+# x:    the fixture
+# text: the machine text of @f, every operand a location
+# want: the expected text of the framed @f
+# out:  the framed function, kept for further checks
+# ret:  0, or the step that failed
+#[testing]
+fun frames(x: *Fixture, text: str, want: str, out: *Framed) i32 {
+    val input: opt[reader.Unit] = read(x, text);
+    if (sel input.none) { ret 1; }
+    var u: reader.Unit = input.some;
+    fin { reader.dnit(?u); }
+    val expected: opt[reader.Unit] = read(x, want);
+    if (sel expected.none) { ret 2; }
+    var w: reader.Unit = expected.some;
+    fin { reader.dnit(?w); }
+    val f:    *Function            = ?u.items.data[0].function;
+    val laid: res[Plan, lay.Error] = lay.lay(?x.a, f, Slice[u32]{data: nil, size: 0}, request(x));
+    if (sel laid.err) { ret 3; }
+    var p: Plan = laid.ok;
+    fin { lay.release(?p); }
+    val done: res[Framed, finish.Error] = finish.finish(?x.a, f, ?p, ?FRAME);
+    if (sel done.err) { ret 4; }
+    @out = done.ok;
+    val same: res[bool, printer.Error] = equal.same_function(?x.m, ?out.function, ?x.m, ?w.items.data[0].function);
+    if (sel same.err) { ret 5; }
+    if (!same.ok) {
+        show(?x.m, out.function);
+        ret 6;
+    }
+    ret 0;
+}
+
+#[testing]
+fun named(x: *Fixture, name: str) rf.Id {
+    val found: res[rf.Id, rf.Absent] = rf.lookup(?x.regs, view_of(name));
+    if (sel found.err) { ret rf.NONE; }
+    ret found.ok;
+}
+
+#[testing]
+fun fixed_at(p: Place) opt[i64] {
+    if (sel p.dropped)        { ret opt[i64].none{}; }
+    if (p.at.offset.per != 0) { ret opt[i64].none{}; }
+    ret opt[i64].some{p.at.offset.fixed};
+}
+
+# a call with a local slot, an outgoing stack argument and a saved register:
+# the return address and s1 are saved, the outgoing area is at the stack
+# pointer, and the frame is a multiple of sixteen bytes so the call sees the
+# stack pointer aligned
+#[testing]
+val CALLS: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 24 align 8\n    slot [1]: size 8 align 8 outgoing 8\n^0:\n    addi x9, x0, 1\n    pseudo address x10, [0]\n    pseudo spill [1], x11\n    jal x1, @g : jal20\n    jalr x0, x1, 0\n}\n";
+
+#[testing]
+val CALLS_OUT: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 24 align 8\n    slot [1]: size 8 align 8 outgoing 8\n    slot [2]: size 8 align 8\n    slot [3]: size 8 align 8\n^0:\n    addi x2, x2, -64\n    sd x2, x1, 56\n    sd x2, x9, 48\n    addi x9, x0, 1\n    addi x10, x2, 16\n    sd x2, x11, 8\n    jal x1, @g : jal20\n    ld x9, x2, 48\n    ld x1, x2, 56\n    addi x2, x2, 64\n    jalr x0, x1, 0\n}\n";
+
+# two vector values live at once over one vector register: one is spilled to
+# a slot whose size follows the vector length, laid out in the scaled area
+#[testing]
+val SCALED: str = "target \"riscv64-linux\"\n\nfunction @f {\n    virtual %0: class v\n    virtual %1: class v\n^0:\n    pseudo copy %0, v8\n    pseudo copy %1, v9\n    pseudo copy v10, %1\n    pseudo copy v11, %0\n    jalr x0, x1, 0\n}\n";
+
+test frame__keeps_the_declared_stack_alignment_at_every_call {
+    var x: Fixture;
+    if (!open(?x, "rv64imafdc", nil)) { ret 1; }
+    fin { close(?x); }
+    var out:  Framed;
+    val same: i32 = frames(?x, CALLS, CALLS_OUT, ?out);
+    if (same != 0) { ret 10 + same; }
+    fin { record.release(?out); }
+    val st: Stack = x.row.stack;
+    if (!(sel st.memory)) { ret 2; }
+    val align: u64 = st.memory.align;
+    if (out.layout.size.per != 0 || out.layout.size.fixed::u64 % align != 0 || out.layout.outgoing != 16) { ret 2; }
+
+    # a scaled spill slot keeps the alignment at every multiplier
+    var v: Fixture;
+    if (!open(?v, "rv64imafdcv", nil)) { ret 3; }
+    fin { close(?v); }
+    val input: opt[reader.Unit] = read(?v, SCALED);
+    if (sel input.none) { ret 4; }
+    var u: reader.Unit = input.some;
+    fin { reader.dnit(?u); }
+    var one:  [1]Physical                     = [1]Physical{Physical.register{named(?v, "v2")}};
+    val done: res[Allocation, allocate.Error] = allocate.allocate(?v.a, ?u.items.data[0].function, allocate.Request{at: ?v.at, registers: ?v.regs, allowed: Slice[Physical]{data: ?one[0], size: 1}, clobbers: Slice[Clobber]{data: nil, size: 0}});
+    if (sel done.err) { ret 5; }
+    var al: Allocation = done.ok;
+    fin { allocate.release(?al); }
+    if (al.spills.len != 1) { ret 6; }
+    val spilled: function.SlotData = al.function.slots.data[al.spills.data[0].index];
+    if (spilled.per == 0 || spilled.size != 0) { ret 7; }
+    val laid: res[Plan, lay.Error] = lay.lay(?v.a, ?al.function, Slice[u32]{data: al.used.data, size: al.used.len}, request(?v));
+    if (sel laid.err) { ret 8; }
+    var p: Plan = laid.ok;
+    fin { lay.release(?p); }
+    val size: Offset = p.layout.size;
+    if (size.per == 0 || size.per::u64 % align != 0 || size.fixed::u64 % align != 0 || size.scale != spilled.scale) { ret 9; }
+    val at: Place = p.layout.slots.data[al.spills.data[0].index];
+    if (sel at.dropped)                                                      { ret 10; }
+    if (at.at.offset.per == 0 || at.at.offset.per::u64 % spilled.align != 0) { ret 10; }
+    ret 0;
+}
+
+#[testing]
+fun red_zone(c: *Convention) {
+    val st: Stack = c.stack;
+    if (!(sel st.memory)) { ret; }
+    val f: Frame = st.memory;
+    c.stack = Stack.memory{Frame{align: f.align, red: 64, shadow: 0, link: f.link, pointer: f.pointer}};
+}
+
+#[testing]
+fun shadow_space(c: *Convention) {
+    val st: Stack = c.stack;
+    if (!(sel st.memory)) { ret; }
+    val f: Frame = st.memory;
+    c.stack = Stack.memory{Frame{align: f.align, red: 0, shadow: 32, link: f.link, pointer: f.pointer}};
+}
+
+# a leaf in the red zone moves no stack pointer, its save and slot below it
+#[testing]
+val LEAF: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 8 align 8\n^0:\n    addi x9, x0, 1\n    pseudo address x10, [0]\n    jalr x0, x1, 0\n}\n";
+
+#[testing]
+val LEAF_OUT: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 8 align 8\n    slot [1]: size 8 align 8\n^0:\n    sd x2, x9, -8\n    addi x9, x0, 1\n    addi x10, x2, -32\n    ld x9, x2, -8\n    jalr x0, x1, 0\n}\n";
+
+# a call under a row with shadow space reserves it at the stack pointer
+#[testing]
+val CALL: str = "target \"riscv64-linux\"\n\nfunction @f {\n^0:\n    jal x1, @g : jal20\n    jalr x0, x1, 0\n}\n";
+
+#[testing]
+val CALL_OUT: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 8 align 8\n^0:\n    addi x2, x2, -48\n    sd x2, x1, 40\n    jal x1, @g : jal20\n    ld x1, x2, 40\n    addi x2, x2, 48\n    jalr x0, x1, 0\n}\n";
+
+test frame__uses_the_red_zone_and_shadow_space_as_the_row_declares {
+    var red: Fixture;
+    if (!open(?red, "rv64imafdc", red_zone)) { ret 1; }
+    fin { close(?red); }
+    var leaf: Framed;
+    val same: i32 = frames(?red, LEAF, LEAF_OUT, ?leaf);
+    if (same != 0) { ret 10 + same; }
+    fin { record.release(?leaf); }
+    if (leaf.layout.red != 32 || leaf.layout.size.fixed != 0) { ret 2; }
+    # without a red zone the same leaf moves its stack pointer
+    var none: Fixture;
+    if (!open(?none, "rv64imafdc", nil)) { ret 3; }
+    fin { close(?none); }
+    val input: opt[reader.Unit] = read(?none, LEAF);
+    if (sel input.none) { ret 4; }
+    var u: reader.Unit = input.some;
+    fin { reader.dnit(?u); }
+    val laid: res[Plan, lay.Error] = lay.lay(?none.a, ?u.items.data[0].function, Slice[u32]{data: nil, size: 0}, request(?none));
+    if (sel laid.err) { ret 5; }
+    var p: Plan = laid.ok;
+    fin { lay.release(?p); }
+    if (p.layout.red != 0 || p.layout.size.fixed != 32) { ret 6; }
+
+    var shadow: Fixture;
+    if (!open(?shadow, "rv64imafdc", shadow_space)) { ret 7; }
+    fin { close(?shadow); }
+    var called: Framed;
+    val again:  i32 = frames(?shadow, CALL, CALL_OUT, ?called);
+    if (again != 0) { ret 20 + again; }
+    fin { record.release(?called); }
+    if (called.layout.outgoing != 32) { ret 8; }
+    ret 0;
+}
+
+# a call that saves the return address and s1
+#[testing]
+val SAVES: str = "target \"riscv64-linux\"\n\nfunction @f {\n^0:\n    addi x9, x0, 1\n    jal x1, @g : jal20\n    jalr x0, x1, 0\n}\n";
+
+#[testing]
+val SAVES_OUT: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 8 align 8\n    slot [1]: size 8 align 8\n^0:\n    addi x2, x2, -16\n    sd x2, x1, 8\n    sd x2, x9, 0\n    addi x9, x0, 1\n    jal x1, @g : jal20\n    ld x9, x2, 0\n    ld x1, x2, 8\n    addi x2, x2, 16\n    jalr x0, x1, 0\n}\n";
+
+#[testing]
+fun is_cfa(f: Fact, at: u32, after: bool, reg: rf.Id, offset: i64) bool {
+    val r: Rule = f.rule;
+    ret f.at.index == at && f.after == after && (sel r.cfa && (r.cfa.register == reg && r.cfa.offset.fixed == offset && r.cfa.offset.per == 0));
+}
+
+#[testing]
+fun is_saved(f: Fact, at: u32, reg: rf.Id, offset: i64) bool {
+    val r: Rule = f.rule;
+    ret f.at.index == at && f.after && (sel r.saved && (r.saved.register == reg && r.saved.offset.fixed == offset && r.saved.offset.per == 0));
+}
+
+#[testing]
+fun is_restored(f: Fact, at: u32, reg: rf.Id) bool {
+    val r: Rule = f.rule;
+    ret f.at.index == at && f.after && (sel r.restored && r.restored == reg);
+}
+
+test frame__the_cfi_describes_every_saved_register_at_its_slot {
+    var x: Fixture;
+    if (!open(?x, "rv64imafdc", nil)) { ret 1; }
+    fin { close(?x); }
+    var out:  Framed;
+    val same: i32 = frames(?x, SAVES, SAVES_OUT, ?out);
+    if (same != 0) { ret 10 + same; }
+    fin { record.release(?out); }
+    val sp: rf.Id = named(?x, "sp");
+    val ra: rf.Id = named(?x, "ra");
+    val s1: rf.Id = named(?x, "s1");
+    if (out.layout.saves.len != 2) { ret 2; }
+    # every save is at its slot: the canonical frame address is the stack
+    # pointer plus the frame's size, so each slot's offset from the stack
+    # pointer less that size is the offset its rule states
+    var k: usize = 0;
+    for (k < out.layout.saves.len) {
+        val s:  Save     = out.layout.saves.data[k];
+        val at: opt[i64] = fixed_at(out.layout.slots.data[s.slot.index]);
+        if (sel at.none)                                       { ret 3; }
+        if (at.some - out.layout.size.fixed != s.offset.fixed) { ret 3; }
+        var found: bool  = false;
+        var n:     usize = 0;
+        for (n < out.facts.len) {
+            val r: Rule = out.facts.data[n].rule;
+            if (sel r.saved && (r.saved.register == s.register && r.saved.offset.fixed == s.offset.fixed)) { found = true; }
+            n = n + 1;
+        }
+        if (!found) { ret 4; }
+        k = k + 1;
+    }
+    # the prologue and the epilogue, rule by rule
+    if (out.facts.len != 8) { ret 5; }
+    val f:        *Fact = out.facts.data;
+    val remember: Rule  = f[3].rule;
+    val restore:  Rule  = f[7].rule;
+    if (!is_cfa(f[0], 0, true, sp, 16))                               { ret 6; }
+    if (!is_saved(f[1], 1, ra, -8) || !is_saved(f[2], 2, s1, -16))    { ret 7; }
+    if (f[3].at.index != 5 || f[3].after || !(sel remember.remember)) { ret 8; }
+    if (!is_restored(f[4], 5, s1) || !is_restored(f[5], 6, ra))       { ret 9; }
+    if (!is_cfa(f[6], 7, true, sp, 0))                                { ret 10; }
+    if (f[7].at.index != 8 || !f[7].after || !(sel restore.restore))  { ret 11; }
+    ret 0;
+}
+
+# a dynamic allocation moves the stack pointer below the frame, which keeps
+# its frame pointer and its frame record, and its slot from the frame pointer
+#[testing]
+val DYNAMIC: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 8 align 8\n^0:\n    pseudo dynamic x10, x11\n    pseudo address x12, [0]\n    jalr x0, x1, 0\n}\n";
+
+#[testing]
+val DYNAMIC_OUT: str = "target \"riscv64-linux\"\n\nfunction @f {\n    slot [0]: size 8 align 8\n    slot [1]: size 8 align 8\n    slot [2]: size 8 align 8\n^0:\n    addi x2, x2, -32\n    sd x2, x8, 16\n    sd x2, x1, 24\n    addi x8, x2, 32\n    addi x10, x11, 15\n    andi x10, x10, -16\n    sub x2, x2, x10\n    addi x10, x2, 0\n    addi x12, x8, -32\n    addi x2, x8, -16\n    ld x1, x2, 8\n    ld x8, x2, 0\n    addi x2, x2, 16\n    jalr x0, x1, 0\n}\n";
+
+test frame__a_dynamic_allocation_keeps_the_frame_addressable {
+    var x: Fixture;
+    if (!open(?x, "rv64imafdc", nil)) { ret 1; }
+    fin { close(?x); }
+    var out:  Framed;
+    val same: i32 = frames(?x, DYNAMIC, DYNAMIC_OUT, ?out);
+    if (same != 0) { ret 10 + same; }
+    fin { record.release(?out); }
+    if (out.layout.pointer != named(?x, "s0")) { ret 2; }
+    # every slot of the frame is addressed from the frame pointer
+    var k: usize = 0;
+    for (k < out.layout.slots.len) {
+        val p: Place = out.layout.slots.data[k];
+        if (sel p.dropped)          { ret 3; }
+        if (!(sel p.at.base.frame)) { ret 4; }
+        k = k + 1;
+    }
+    ret 0;
+}
