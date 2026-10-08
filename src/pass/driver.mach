@@ -1,0 +1,441 @@
+# the driver: one pass, one row or a whole schedule over a module
+#
+# a pass that refuses leaves every function as it was: the driver snapshots
+# each body before the pass may touch it, puts the snapshot back on a refusal
+# and gives it back otherwise, so no pass has to take back its own edits.
+# after a pass changes a function, every analysis it does not preserve is
+# dropped. a checked run verifies the module after every pass.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use io: std.io.writer;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.fail.keep;
+use mirl.ir.body;
+use mirl.ir.cfg.loops;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.text;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.cache.Cache;
+use mirl.pass.failure.Defect;
+use mirl.pass.failure.Error;
+use mirl.pass.failure.Refusal;
+use mirl.pass.failure.Unverified;
+use mirl.pass.failure.Why;
+use mirl.pass.pipeline;
+use mirl.pass.record;
+use mirl.pass.record.Context;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Unit;
+use mirl.pass.rows;
+use mirl.pass.schedule;
+use mirl.pass.schedule.Level;
+use mirl.pass.schedule.Row;
+use mirl.slice;
+use targets: mirl.target;
+use mirl.target.Target;
+use mirl.verify;
+
+# how a schedule is run
+# ---
+# level:   the optimisation level
+# checked: verify the module before the first pass and after every pass, as
+#          every build that tests does
+pub rec Options {
+    level:   Level;
+    checked: bool;
+}
+
+# a run in progress
+# ---
+# m:       the module
+# t:       the target
+# cache:   the analyses of the module's functions
+# options: how it runs
+pub rec Driver {
+    m:       *Module;
+    t:       *Target;
+    cache:   Cache;
+    options: Options;
+}
+
+# a run over a module with an empty cache over the analysis registry
+pub fun init(m: *Module, t: *Target, options: Options) Driver {
+    ret Driver{m: m, t: t, cache: cache.init(m, analysis.rows()), options: options};
+}
+
+# give back the run's analyses
+pub fun dnit(d: *Driver) err[allocator.Error] {
+    ret cache.dnit(?d.cache);
+}
+
+fun refused(p: *Pass, f: opt[Function], why: Why) res[bool, Error] {
+    ret res[bool, Error].err{Error.refused{Refusal{pass: p.name, function: f, why: why}}};
+}
+
+fun lost(e: allocator.Error) res[bool, Error] {
+    ret res[bool, Error].err{Error.alloc{e}};
+}
+
+# the allocator's refusal of a release, the only refusal a body the driver
+# took from the module can give
+fun released(r: err[module.Error]) err[allocator.Error] {
+    if (sel r.err) {
+        if (sel r.err.alloc) { ret err[allocator.Error].err{r.err.alloc}; }
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# verify the module, naming the pass that left it so
+fun verified(d: *Driver, p: *Pass) err[Error] {
+    val r: err[verify.Error] = verify.against(d.m, d.t);
+    if (sel r.err) {
+        var name: opt[str] = opt[str].none{};
+        if (p != nil) { name = opt[str].some{p.name}; }
+        ret err[Error].err{Error.unverified{Unverified{pass: name, error: r.err}}};
+    }
+    ret err[Error].ok{};
+}
+
+fun each_function(d: *Driver, c: *Context, visit: record.Visit) res[bool, Error] {
+    val p:       *Pass = c.pass;
+    val count:   usize = d.m.functions.len;
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < count) {
+        val f: Function = Function{index: i::u32};
+        if (record.touches(c, f)) {
+            val snap: res[Body, module.Error] = body.snapshot(d.m, f);
+            if (sel snap.err) { ret refused(p, opt[Function].some{f}, Why.ir{snap.err}); }
+            var kept: Body           = snap.ok;
+            var u:    Unit           = Unit{context: c, f: f};
+            val r:    res[bool, Why] = visit(?u);
+            if (sel r.err) {
+                body.restore(d.m, f, ?kept);
+                cache.forget(?d.cache, f);
+                ret refused(p, opt[Function].some{f}, r.err);
+            }
+            val given: err[allocator.Error] = released(body.discard(d.m, ?kept));
+            if (sel given.err) { ret lost(given.err); }
+            if (r.ok) {
+                changed = true;
+                val dropped: err[allocator.Error] = cache.drop(?d.cache, f, p.preserves);
+                if (sel dropped.err) { ret lost(dropped.err); }
+            }
+        }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{changed};
+}
+
+fun release_all(d: *Driver, snaps: *vector.Vector[Body], restore: bool) err[allocator.Error] {
+    var failed: err[allocator.Error] = err[allocator.Error].ok{};
+    var i:      usize                = 0;
+    for (i < snaps.len) {
+        if (restore) { keep(?failed, released(body.restore(d.m, Function{index: i::u32}, ?snaps.data[i]))); }
+        or           { keep(?failed, released(body.discard(d.m, ?snaps.data[i]))); }
+        i = i + 1;
+    }
+    keep(?failed, vector.dnit[Body](snaps));
+    ret failed;
+}
+
+fun whole_module(d: *Driver, c: *Context, run: record.Run) res[bool, Error] {
+    val p:     *Pass               = c.pass;
+    var snaps: vector.Vector[Body] = vector.init[Body](d.m.a);
+    val count: usize               = d.m.functions.len;
+    var i:     usize               = 0;
+    for (i < count) {
+        val snap: res[Body, module.Error] = body.snapshot(d.m, Function{index: i::u32});
+        if (sel snap.err) {
+            release_all(d, ?snaps, false);
+            ret refused(p, opt[Function].none{}, Why.ir{snap.err});
+        }
+        var kept:   Body                        = snap.ok;
+        val pushed: res[usize, allocator.Error] = vector.push[Body](?snaps, kept);
+        if (sel pushed.err) {
+            body.discard(d.m, ?kept);
+            release_all(d, ?snaps, false);
+            ret refused(p, opt[Function].none{}, Why.alloc{pushed.err});
+        }
+        i = i + 1;
+    }
+    val r: res[bool, Why] = run(c);
+    if (sel r.err) {
+        release_all(d, ?snaps, true);
+        cache.drop_all(?d.cache, cache.NONE);
+        ret refused(p, opt[Function].none{}, r.err);
+    }
+    val given: err[allocator.Error] = release_all(d, ?snaps, false);
+    if (sel given.err) { ret lost(given.err); }
+    if (r.ok) {
+        val dropped: err[allocator.Error] = cache.drop_all(?d.cache, p.preserves);
+        if (sel dropped.err) { ret lost(dropped.err); }
+    }
+    ret res[bool, Error].ok{r.ok};
+}
+
+# run one pass over the module, verifying it after when the run is checked
+# ---
+# d:   the run
+# p:   the pass
+# ret: whether it changed anything, or why the run fails, with every
+#      function as it was before the pass when the pass refused
+pub fun apply(d: *Driver, p: *Pass) res[bool, Error] {
+    var c:       Context = Context{m: d.m, t: d.t, cache: ?d.cache, pass: p};
+    var changed: res[bool, Error];
+    if (sel p.scope.function) { changed = each_function(d, ?c, p.scope.function); }
+    or (sel p.scope.module)   { changed = whole_module(d, ?c, p.scope.module); }
+    or                        { ret refused(p, opt[Function].none{}, Why.reason{"the pass states no scope"}); }
+    if (sel changed.err)      { ret changed; }
+    if (d.options.checked) {
+        val v: err[Error] = verified(d, p);
+        if (sel v.err) { ret res[bool, Error].err{v.err}; }
+    }
+    ret changed;
+}
+
+# run one row: its pass, its follow-ups when the pass changed something, and
+# its verification
+pub fun step(d: *Driver, row: *Row) err[Error] {
+    val changed: res[bool, Error] = apply(d, row.pass);
+    if (sel changed.err) { ret err[Error].err{changed.err}; }
+    if (changed.ok) {
+        var i: usize = 0;
+        for (i < row.after.size) {
+            if (pipeline.selected(?row.after.data[i], ?d.t.caps, d.options.level)) {
+                val r: err[Error] = step(d, ?row.after.data[i]);
+                if (sel r.err) { ret r; }
+            }
+            i = i + 1;
+        }
+    }
+    if (d.options.checked)                                               { ret err[Error].ok{}; }
+    if (sel row.verify.always || (changed.ok && sel row.verify.changed)) { ret verified(d, row.pass); }
+    ret err[Error].ok{};
+}
+
+# run a schedule over a module for a target
+# ---
+# m:       the module
+# t:       the target the module is built for
+# table:   the schedule, checked before anything runs
+# options: how it runs
+# ret:     ok, or why the run failed
+pub fun drive(m: *Module, t: *Target, table: Slice[Row], options: Options) err[Error] {
+    val whole: err[Defect] = schedule.check(table, analysis.rows());
+    if (sel whole.err) { ret err[Error].err{Error.schedule{whole.err}}; }
+    var d: Driver = init(m, t, options);
+    fin { dnit(?d); }
+    if (options.checked) {
+        val v: err[Error] = verified(?d, nil);
+        if (sel v.err) { ret v; }
+    }
+    val chosen: res[vector.Vector[*Row], allocator.Error] = pipeline.choose(m.a, table, ?t.caps, options.level);
+    if (sel chosen.err) { ret err[Error].err{Error.alloc{chosen.err}}; }
+    var plan: vector.Vector[*Row] = chosen.ok;
+    fin { vector.dnit[*Row](?plan); }
+    var i: usize = 0;
+    for (i < plan.len) {
+        val r: err[Error] = step(?d, plan.data[i]);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# run mirl's schedule over a module for a target, the entry `mirl opt` calls
+# ---
+# m:       the module
+# t:       the target the module is built for
+# options: the level, and whether every pass is verified
+# ret:     ok, or why the run failed
+pub fun run(m: *Module, t: *Target, options: Options) err[Error] {
+    ret drive(m, t, rows.schedule(), options);
+}
+
+# the module, its target and its one function f(x: i32) i32, which returns
+# x + x
+#[testing]
+rec Fixture {
+    m: Module;
+    t: Target;
+    f: Function;
+}
+
+#[testing]
+fun request(code: opcode.Opcode, operands: Slice[Value]) Request {
+    ret Request{opcode: code, operands: operands, immediates: Slice[opcode.Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: nil, size: 0}};
+}
+
+#[testing]
+fun fixture(a: *allocator.Allocator, x: *Fixture) bool {
+    val row: opt[*Target] = targets.row(0);
+    if (sel row.none) { ret false; }
+    x.t = @row.some;
+    val made: res[Module, module.Error] = module.init(a, View{data: "riscv64-linux", len: 13});
+    if (sel made.err) { ret false; }
+    x.m = made.ok;
+    val i32: res[Type, types.Error] = types.intern(?x.m.types, types.Shape.integer{types.Integer{width: 32}});
+    if (sel i32.err) { ret false; }
+    var one: [1]Type                = [1]Type{i32.ok};
+    val sig: res[Type, types.Error] = types.intern(?x.m.types, types.Shape.function{types.Function{params: Slice[Type]{data: ?one[0], size: 1}, results: Slice[Type]{data: ?one[0], size: 1}}});
+    if (sel sig.err) { ret false; }
+    var b: Builder = build.init(?x.m);
+    x.f = build.function(?b, FunctionData{name: View{data: "f", len: 1}, signature: sig.ok});
+    build.enter(?b, x.f);
+    var decl:  [1]Declaration = [1]Declaration{Declaration{type: i32.ok, secret: false}};
+    val entry: Block          = build.block(?b, Slice[Declaration]{data: ?decl[0], size: 1});
+    val v:     Value          = build.parameter(?b, entry, 0);
+    build.at_end(?b, entry);
+    var xx:  [2]Value    = [2]Value{v, v};
+    val sum: Instruction = build.emit(?b, request(opcode.ADD, Slice[Value]{data: ?xx[0], size: 2}));
+    var y:   [1]Value    = [1]Value{build.result(?b, sum, 0)};
+    build.emit(?b, request(opcode.RET, Slice[Value]{data: ?y[0], size: 1}));
+    val ended: err[build.Failure] = build.done(?b);
+    ret sel ended.ok;
+}
+
+#[testing]
+fun changes(u: *Unit) res[bool, Why] {
+    ret res[bool, Why].ok{true};
+}
+
+#[testing]
+fun leaves(u: *Unit) res[bool, Why] {
+    ret res[bool, Why].ok{false};
+}
+
+#[testing]
+val KEEPS_SHAPE:     Pass = Pass{name: "keeps-shape", scope: record.Scope.function{changes}, preserves: analysis.SHAPE};
+#[testing]
+val KEEPS_DOMINANCE: Pass = Pass{name: "keeps-dominance", scope: record.Scope.function{changes}, preserves: 0x2};
+#[testing]
+val CHANGES_NOTHING: Pass = Pass{name: "changes-nothing", scope: record.Scope.function{leaves}};
+
+#[testing]
+fun holding(d: *Driver, f: Function) u8 {
+    var bits: u8 = 0;
+    if (cache.held(?d.cache, f, analysis.GRAPH))     { bits = bits | 1; }
+    if (cache.held(?d.cache, f, analysis.DOMINANCE)) { bits = bits | 2; }
+    if (cache.held(?d.cache, f, analysis.LOOPS))     { bits = bits | 4; }
+    ret bits;
+}
+
+test pass__unpreserved_analysis_is_dropped {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var x: Fixture;
+    if (!fixture(?a, ?x)) { ret 1; }
+    fin { module.dnit(?x.m); }
+    var d: Driver = init(?x.m, ?x.t, Options{level: 2, checked: true});
+    fin { dnit(?d); }
+
+    val first: res[*loops.Loops, Why] = analysis.loops_of(?d.cache, x.f);
+    if (sel first.err)         { ret 2; }
+    if (holding(?d, x.f) != 7) { ret 2; }
+    val shaped: res[bool, Error] = apply(?d, ?KEEPS_SHAPE);
+    if (sel shaped.err || holding(?d, x.f) != 3) { ret 3; }
+    # dominance is kept but the graph it is computed from is not
+    val dominated: res[bool, Error] = apply(?d, ?KEEPS_DOMINANCE);
+    if (sel dominated.err || holding(?d, x.f) != 0) { ret 4; }
+    val again: res[*loops.Loops, Why] = analysis.loops_of(?d.cache, x.f);
+    if (sel again.err) { ret 5; }
+    val left: res[bool, Error] = apply(?d, ?CHANGES_NOTHING);
+    if (sel left.err || holding(?d, x.f) != 7) { ret 5; }
+    ret 0;
+}
+
+#[testing]
+var EDITED: bool = false;
+
+# put a new x + x in place of the old one, erase the old one, then refuse
+#[testing]
+fun breaks(u: *Unit) res[bool, Why] {
+    val m:   *Module                  = u.context.m;
+    val got: res[*Body, module.Error] = module.body(m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val sum: Instruction = got.ok.blocks.data[0].instructions.data[0];
+    val old: Value       = got.ok.instructions.data[sum.index].results.data[0];
+    var xx:  [2]Value    = [2]Value{got.ok.blocks.data[0].parameters.data[0], got.ok.blocks.data[0].parameters.data[0]};
+    var b:   Builder     = build.init(m);
+    build.enter(?b, u.f);
+    build.at(?b, Block{index: 0}, 1);
+    val more:  Instruction        = build.emit(?b, request(opcode.ADD, Slice[Value]{data: ?xx[0], size: 2}));
+    val new:   Value              = build.result(?b, more, 0);
+    val ended: err[build.Failure] = build.done(?b);
+    if (sel ended.err) { ret res[bool, Why].err{Why.build{ended.err}}; }
+    val replaced: err[module.Error] = body.replace(m, u.f, old, new);
+    if (sel replaced.err) { ret res[bool, Why].err{Why.ir{replaced.err}}; }
+    val erased: err[module.Error] = body.erase(m, u.f, sum);
+    if (sel erased.err) { ret res[bool, Why].err{Why.ir{erased.err}}; }
+    EDITED = true;
+    ret res[bool, Why].err{Why.reason{"refused after an edit"}};
+}
+
+#[testing]
+val BREAKS:   Pass   = Pass{name: "breaks", kind: record.Kind.legalise{}, scope: record.Scope.function{breaks}};
+#[testing]
+val BREAKING: [1]Row = [1]Row{Row{pass: ?BREAKS}};
+
+#[testing]
+fun printed(a: *allocator.Allocator, m: *Module, out: *text.Sink) bool {
+    @out = text.init(a);
+    var w: io.Writer       = text.writer(out);
+    val r: err[text.Error] = text.print(?w, m);
+    ret sel r.ok;
+}
+
+test pass__refusal_leaves_the_function_unchanged {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var x: Fixture;
+    if (!fixture(?a, ?x)) { ret 1; }
+    fin { module.dnit(?x.m); }
+    var before: text.Sink;
+    if (!printed(?a, ?x.m, ?before)) { ret 2; }
+    fin { text.dnit(?before); }
+
+    val r: err[Error] = drive(?x.m, ?x.t, Slice[Row]{data: ?BREAKING[0], size: 1}, Options{level: 0, checked: true});
+    if (!EDITED)                                   { ret 3; }
+    if (!(sel r.err))                              { ret 4; }
+    if (!(sel r.err.refused))                      { ret 4; }
+    if (!str_equals(r.err.refused.pass, "breaks")) { ret 4; }
+
+    var after: text.Sink;
+    if (!printed(?a, ?x.m, ?after)) { ret 5; }
+    fin { text.dnit(?after); }
+    if (!slice.same_view(text.view(?before), text.view(?after))) { ret 6; }
+    val v: err[verify.Error] = verify.against(?x.m, ?x.t);
+    if (sel v.err) { ret 7; }
+    ret 0;
+}
