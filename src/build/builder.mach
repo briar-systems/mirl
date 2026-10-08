@@ -1,0 +1,869 @@
+# the builder: the one maker of instructions
+#
+# it places each instruction at its cursor and fills its metadata record from
+# the sticky attributes. every call answers with a plain id, and the first
+# call refused is kept with what was being built, after which every call is
+# refused and answers a stand-in. a front end reads `done` once at the end.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.failure.Error;
+use mirl.build.failure.Failure;
+use mirl.build.failure.Work;
+use mirl.build.remap;
+use mirl.build.remap.Remap;
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.Binding;
+use mirl.ir.debug.Location;
+use mirl.ir.debug.Site;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.global.GlobalData;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Global;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.UNBOUND;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.ValueData;
+
+# an insertion position in a block
+# ---
+# block: the block
+# index: the position in its list the next instruction takes
+pub rec Position {
+    block: Block;
+    index: u32;
+}
+
+# where the next instruction goes
+# ---
+# detached:  made in the function and listed in no block, for the caller to
+#            place
+# end:       appended to this block, which must not end in a terminator yet
+# at:        inserted at this position, which then moves past it so a run of
+#            instructions lands in order
+# replacing: put in this placed instruction's slot, taking the uses of its
+#            results, after which the cursor inserts just past it
+pub tag Cursor: u8 {
+    detached;
+    end:       Block;
+    at:        Position;
+    replacing: Instruction;
+}
+
+# a builder over one module
+# ---
+# m:        the module
+# function: the function instructions are made in, none before one is entered
+# cursor:   where the next instruction goes
+# location: the source location each instruction is built for
+# site:     the inlining site each instruction is inlined through
+# flags:    the flags each instruction carries
+# secret:   each instruction is marked secret
+# failure:  the first call refused, none while every call has succeeded
+pub rec Builder {
+    m:        *Module;
+    function: opt[Function];
+    cursor:   Cursor;
+    location: opt[Location];
+    site:     opt[Site];
+    flags:    Flags;
+    secret:   bool;
+    failure:  opt[Failure];
+}
+
+val NO_VALUE:       Value       = Value{index: 0xffffffff};
+val NO_BLOCK:       Block       = Block{index: 0xffffffff};
+val NO_INSTRUCTION: Instruction = Instruction{index: 0xffffffff};
+val NO_CONSTANT:    Constant    = Constant{index: 0xffffffff};
+val NO_GLOBAL:      Global      = Global{index: 0xffffffff};
+val NO_FUNCTION:    Function    = Function{index: 0xffffffff};
+
+# a builder over a module, in no function and with no attributes
+pub fun init(m: *Module) Builder {
+    var b: Builder;
+    b.m        = m;
+    b.function = opt[Function].none{};
+    b.cursor   = Cursor.detached{};
+    b.failure  = opt[Failure].none{};
+    plain(?b);
+    ret b;
+}
+
+# make instructions in function f, detached and with no attributes
+pub fun enter(b: *Builder, f: Function) {
+    b.function = opt[Function].some{f};
+    b.cursor   = Cursor.detached{};
+    plain(b);
+}
+
+# build at the end of block k
+pub fun at_end(b: *Builder, k: Block) {
+    b.cursor = Cursor.end{k};
+}
+
+# insert into block k's list at index
+pub fun at(b: *Builder, k: Block, index: u32) {
+    b.cursor = Cursor.at{Position{block: k, index: index}};
+}
+
+# put the next instruction in old's slot
+pub fun replacing(b: *Builder, old: Instruction) {
+    b.cursor = Cursor.replacing{old};
+}
+
+# make instructions listed in no block
+pub fun detach(b: *Builder) {
+    b.cursor = Cursor.detached{};
+}
+
+# where the next instruction goes
+pub fun cursor(b: *Builder) Cursor {
+    ret b.cursor;
+}
+
+# the source location the next instructions are built for
+pub fun locate(b: *Builder, location: opt[Location]) {
+    b.location = location;
+}
+
+# the inlining site the next instructions are inlined through
+pub fun site(b: *Builder, s: opt[Site]) {
+    b.site = s;
+}
+
+# the flags the next instructions carry
+pub fun flags(b: *Builder, f: Flags) {
+    b.flags = f;
+}
+
+# whether the next instructions are marked secret
+pub fun secret(b: *Builder, s: bool) {
+    b.secret = s;
+}
+
+# the next instructions carry no location, site, flags or secrecy
+pub fun plain(b: *Builder) {
+    b.location = opt[Location].none{};
+    b.site     = opt[Site].none{};
+    b.flags    = Flags{volatile: false};
+    b.secret   = false;
+}
+
+# the next instructions read as origin, the instruction they rewrite: its
+# location, site and secrecy, and no flags
+pub fun derive(b: *Builder, origin: Instruction) {
+    if (failed(b)) { ret; }
+    val work: Work          = Work.derive{origin};
+    val f:    opt[Function] = current(b, work);
+    if (sel f.none) { ret; }
+    val d: res[InstructionData, module.Error] = body.instruction_data(b.m, f.some, origin);
+    if (sel d.err) {
+        fault(b, Error.ir{d.err}, work);
+        ret;
+    }
+    b.location = d.ok.metadata.location;
+    b.site     = d.ok.metadata.site;
+    b.flags    = Flags{volatile: false};
+    b.secret   = d.ok.metadata.secret;
+}
+
+# whether a call has been refused
+pub fun failed(b: *Builder) bool {
+    ret sel b.failure.some;
+}
+
+# the end of the work: ok, or the first call refused
+pub fun done(b: *Builder) err[Failure] {
+    if (sel b.failure.some) { ret err[Failure].err{b.failure.some}; }
+    ret err[Failure].ok{};
+}
+
+fun fault(b: *Builder, e: Error, work: Work) {
+    if (failed(b)) { ret; }
+    b.failure = opt[Failure].some{Failure{error: e, work: work, function: b.function}};
+}
+
+fun current(b: *Builder, work: Work) opt[Function] {
+    if (sel b.function.none) { fault(b, Error.function{}, work); }
+    ret b.function;
+}
+
+fun attributes(b: *Builder) Metadata {
+    ret Metadata{location: b.location, site: b.site, flags: b.flags, secret: b.secret, bindings: UNBOUND};
+}
+
+fun ends(m: *Module, f: Function, i: Instruction) bool {
+    val d: res[InstructionData, module.Error] = body.instruction_data(m, f, i);
+    if (sel d.err) { ret false; }
+    val r: opt[opcode.Row] = opcode.row(d.ok.opcode);
+    ret sel r.some && r.some.terminator;
+}
+
+fun terminated(m: *Module, f: Function, k: BlockData) bool {
+    if (k.instructions.len == 0) { ret false; }
+    ret ends(m, f, k.instructions.data[k.instructions.len - 1]);
+}
+
+# whether the cursor takes an instruction that does or does not end its block
+fun room(b: *Builder, f: Function, terminator: bool) err[Error] {
+    val c: Cursor = b.cursor;
+    if (sel c.detached) { ret err[Error].ok{}; }
+    if (sel c.end) {
+        val k: res[BlockData, module.Error] = body.block_data(b.m, f, c.end);
+        if (sel k.err)                { ret err[Error].err{Error.ir{k.err}}; }
+        if (terminated(b.m, f, k.ok)) { ret err[Error].err{Error.terminated{c.end}}; }
+        ret err[Error].ok{};
+    }
+    if (sel c.at) {
+        val k: res[BlockData, module.Error] = body.block_data(b.m, f, c.at.block);
+        if (sel k.err) { ret err[Error].err{Error.ir{k.err}}; }
+        val len:  usize = k.ok.instructions.len;
+        val last: bool  = c.at.index::usize == len;
+        if (c.at.index::usize > len) { ret err[Error].err{Error.position{c.at.index}}; }
+        if (terminated(b.m, f, k.ok)) {
+            if (terminator) { ret err[Error].err{Error.terminator{}}; }
+            if (last)       { ret err[Error].err{Error.position{c.at.index}}; }
+        }
+        or (terminator && !last) { ret err[Error].err{Error.terminator{}}; }
+        ret err[Error].ok{};
+    }
+    if (sel c.replacing) {
+        val old: Instruction                        = c.replacing;
+        val d:   res[InstructionData, module.Error] = body.instruction_data(b.m, f, old);
+        if (sel d.err)                       { ret err[Error].err{Error.ir{d.err}}; }
+        if (sel d.ok.place.erased)           { ret err[Error].err{Error.ir{module.Error.erased{old}}}; }
+        if (sel d.ok.place.detached)         { ret err[Error].err{Error.ir{module.Error.detached{old}}}; }
+        if (ends(b.m, f, old) != terminator) { ret err[Error].err{Error.terminator{}}; }
+    }
+    ret err[Error].ok{};
+}
+
+fun slot_of(m: *Module, f: Function, k: Block, i: Instruction) u32 {
+    val d: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel d.err) { ret 0; }
+    var p: usize = 0;
+    for (p < d.ok.instructions.len && d.ok.instructions.data[p].index != i.index) { p = p + 1; }
+    ret p::u32;
+}
+
+# place a detached instruction at the cursor and move the cursor past it
+fun put(b: *Builder, f: Function, i: Instruction) err[module.Error] {
+    val c: Cursor = b.cursor;
+    if (sel c.detached) { ret err[module.Error].ok{}; }
+    if (sel c.end)      { ret body.append(b.m, f, c.end, i); }
+    if (sel c.at) {
+        val k: res[BlockData, module.Error] = body.block_data(b.m, f, c.at.block);
+        if (sel k.err) { ret err[module.Error].err{k.err}; }
+        var placed: err[module.Error] = err[module.Error].ok{};
+        if (c.at.index::usize == k.ok.instructions.len) { placed = body.append(b.m, f, c.at.block, i); }
+        or                                              { placed = body.insert(b.m, f, k.ok.instructions.data[c.at.index], i); }
+        if (sel placed.err)                             { ret placed; }
+        b.cursor = Cursor.at{Position{block: c.at.block, index: c.at.index + 1}};
+        ret placed;
+    }
+    if (sel c.replacing) {
+        val old: Instruction                        = c.replacing;
+        val d:   res[InstructionData, module.Error] = body.instruction_data(b.m, f, old);
+        if (sel d.err)                { ret err[module.Error].err{d.err}; }
+        if (!(sel d.ok.place.placed)) { ret err[module.Error].err{module.Error.detached{old}}; }
+        val k:       Block             = d.ok.place.placed;
+        val swapped: err[module.Error] = body.supplant(b.m, f, old, i);
+        if (sel swapped.err) { ret swapped; }
+        b.cursor = Cursor.at{Position{block: k, index: slot_of(b.m, f, k, i) + 1}};
+    }
+    ret err[module.Error].ok{};
+}
+
+# make an instruction with a metadata record and place it at the cursor
+fun make(b: *Builder, req: Request, md: Metadata, work: Work) Instruction {
+    val f: opt[Function] = current(b, work);
+    if (sel f.none) { ret NO_INSTRUCTION; }
+    val r: opt[opcode.Row] = opcode.row(req.opcode);
+    if (sel r.none) {
+        fault(b, Error.ir{module.Error.typing{opcode.Error.opcode{req.opcode}}}, work);
+        ret NO_INSTRUCTION;
+    }
+    val fits: err[Error] = room(b, f.some, r.some.terminator);
+    if (sel fits.err) {
+        fault(b, fits.err, work);
+        ret NO_INSTRUCTION;
+    }
+    val made: res[Instruction, module.Error] = body.builder_make(b.m, f.some, req, md);
+    if (sel made.err) {
+        fault(b, Error.ir{made.err}, work);
+        ret NO_INSTRUCTION;
+    }
+    val placed: err[module.Error] = put(b, f.some, made.ok);
+    if (sel placed.err) {
+        body.erase(b.m, f.some, made.ok);
+        fault(b, Error.ir{placed.err}, work);
+        ret NO_INSTRUCTION;
+    }
+    ret made.ok;
+}
+
+# make an instruction at the cursor, its metadata from the sticky attributes
+# ---
+# b:   the builder
+# req: what it is made from, typed by its opcode's row
+# ret: the instruction, or a stand-in once a call is refused
+pub fun emit(b: *Builder, req: Request) Instruction {
+    if (failed(b)) { ret NO_INSTRUCTION; }
+    ret make(b, req, attributes(b), Work.instruction{req.opcode});
+}
+
+fun result_of(b: *Builder, i: Instruction, index: u32, work: Work) Value {
+    val f: opt[Function] = current(b, work);
+    if (sel f.none) { ret NO_VALUE; }
+    val d: res[InstructionData, module.Error] = body.instruction_data(b.m, f.some, i);
+    if (sel d.err) {
+        fault(b, Error.ir{d.err}, work);
+        ret NO_VALUE;
+    }
+    if (index::usize >= d.ok.results.len) {
+        fault(b, Error.result{index}, work);
+        ret NO_VALUE;
+    }
+    ret d.ok.results.data[index];
+}
+
+# the result of an instruction at a position
+pub fun result(b: *Builder, i: Instruction, index: u32) Value {
+    if (failed(b)) { ret NO_VALUE; }
+    ret result_of(b, i, index, Work.result{i});
+}
+
+# make an instruction of one result at the cursor, as `emit`
+# ---
+# b:   the builder
+# req: what it is made from, whose row gives it one result
+# ret: its result, or a stand-in once a call is refused
+pub fun value(b: *Builder, req: Request) Value {
+    if (failed(b)) { ret NO_VALUE; }
+    val work: Work        = Work.instruction{req.opcode};
+    val i:    Instruction = make(b, req, attributes(b), work);
+    if (failed(b)) { ret NO_VALUE; }
+    ret result_of(b, i, 0, work);
+}
+
+# the copy of a source value in the builder's function
+fun copied(b: *Builder, r: *Remap, from: Function, to: Function, v: Value) res[Value, module.Error] {
+    val bound: opt[Value] = remap.value(r, v);
+    if (sel bound.some)         { ret res[Value, module.Error].ok{bound.some}; }
+    if (from.index == to.index) { ret res[Value, module.Error].ok{v}; }
+    val d: res[ValueData, module.Error] = body.value_data(b.m, from, v);
+    if (sel d.err)             { ret res[Value, module.Error].err{d.err}; }
+    if (sel d.ok.def.constant) { ret body.constant(b.m, to, d.ok.def.constant); }
+    ret res[Value, module.Error].err{module.Error.value{v}};
+}
+
+fun copied_block(r: *Remap, from: Function, to: Function, k: Block) res[Block, module.Error] {
+    val bound: opt[Block] = remap.block(r, k);
+    if (sel bound.some)         { ret res[Block, module.Error].ok{bound.some}; }
+    if (from.index == to.index) { ret res[Block, module.Error].ok{k}; }
+    ret res[Block, module.Error].err{module.Error.block{k}};
+}
+
+fun alloc(e: allocator.Error) module.Error {
+    ret module.Error.alloc{e};
+}
+
+# the request a copy is made from, its lists in values and targets
+fun copy_request(b: *Builder, r: *Remap, from: Function, to: Function, d: *InstructionData, values: *vector.Vector[Value], targets: *vector.Vector[Branch]) res[Request, module.Error] {
+    var total: usize = d.operands.len;
+    var e:     usize = 0;
+    for (e < d.edges.len) {
+        total = total + d.edges.data[e].arguments.len;
+        e     = e + 1;
+    }
+    val room: res[usize, allocator.Error] = vector.reserve[Value](values, total);
+    if (sel room.err) { ret res[Request, module.Error].err{alloc(room.err)}; }
+    val edges: res[usize, allocator.Error] = vector.reserve[Branch](targets, d.edges.len);
+    if (sel edges.err) { ret res[Request, module.Error].err{alloc(edges.err)}; }
+
+    var i: usize = 0;
+    for (i < d.operands.len) {
+        val v: res[Value, module.Error] = copied(b, r, from, to, d.operands.data[i]);
+        if (sel v.err) { ret res[Request, module.Error].err{v.err}; }
+        vector.push[Value](values, v.ok);
+        i = i + 1;
+    }
+    e = 0;
+    for (e < d.edges.len) {
+        val k: res[Block, module.Error] = copied_block(r, from, to, d.edges.data[e].block);
+        if (sel k.err) { ret res[Request, module.Error].err{k.err}; }
+        val first: usize = values.len;
+        var j:     usize = 0;
+        for (j < d.edges.data[e].arguments.len) {
+            val v: res[Value, module.Error] = copied(b, r, from, to, d.edges.data[e].arguments.data[j]);
+            if (sel v.err) { ret res[Request, module.Error].err{v.err}; }
+            vector.push[Value](values, v.ok);
+            j = j + 1;
+        }
+        vector.push[Branch](targets, Branch{block: k.ok, arguments: Slice[Value]{data: ?values.data[first], size: values.len - first}});
+        e = e + 1;
+    }
+    ret res[Request, module.Error].ok{Request{
+        opcode:     d.opcode,
+        operands:   Slice[Value]{data: values.data, size: d.operands.len},
+        immediates: Slice[opcode.Immediate]{data: d.immediates.data, size: d.immediates.len},
+        targets:    Slice[Branch]{data: targets.data, size: targets.len},
+    }};
+}
+
+# copy an instruction of the module to the cursor, with its whole metadata
+# record and results of its own
+#
+# each value and block it names is read through r, and one r does not bind
+# stands for itself when the copy is made in the source's function. a
+# constant's value is the copy's function's value of the same constant.
+# each source result is bound in r to the copy's result.
+# ---
+# b:    the builder
+# from: the function the source is in
+# i:    the source
+# r:    the values and blocks the copy stands for
+# ret:  the copy, or a stand-in once a call is refused
+pub fun copy(b: *Builder, from: Function, i: Instruction, r: *Remap) Instruction {
+    if (failed(b)) { ret NO_INSTRUCTION; }
+    val work: Work          = Work.copy{i};
+    val f:    opt[Function] = current(b, work);
+    if (sel f.none) { ret NO_INSTRUCTION; }
+    val src: res[InstructionData, module.Error] = body.instruction_data(b.m, from, i);
+    if (sel src.err) {
+        fault(b, Error.ir{src.err}, work);
+        ret NO_INSTRUCTION;
+    }
+    var d: InstructionData = src.ok;
+    if (sel d.place.erased) {
+        fault(b, Error.ir{module.Error.erased{i}}, work);
+        ret NO_INSTRUCTION;
+    }
+
+    var values:  vector.Vector[Value]  = vector.init[Value](b.m.a);
+    var targets: vector.Vector[Branch] = vector.init[Branch](b.m.a);
+    fin {
+        vector.dnit[Value](?values);
+        vector.dnit[Branch](?targets);
+    }
+    val req: res[Request, module.Error] = copy_request(b, r, from, f.some, ?d, ?values, ?targets);
+    if (sel req.err) {
+        fault(b, Error.ir{req.err}, work);
+        ret NO_INSTRUCTION;
+    }
+    val made: Instruction = make(b, req.ok, d.metadata, work);
+    if (failed(b)) { ret NO_INSTRUCTION; }
+    val got: res[InstructionData, module.Error] = body.instruction_data(b.m, f.some, made);
+    if (sel got.err) {
+        fault(b, Error.ir{got.err}, work);
+        ret NO_INSTRUCTION;
+    }
+    var k: usize = 0;
+    for (k < d.results.len) {
+        val bound: err[allocator.Error] = remap.bind_value(r, d.results.data[k], got.ok.results.data[k]);
+        if (sel bound.err) {
+            fault(b, Error.ir{alloc(bound.err)}, work);
+            ret NO_INSTRUCTION;
+        }
+        k = k + 1;
+    }
+    ret made;
+}
+
+# make a block in the function
+# ---
+# b:          the builder
+# parameters: its parameters, in order
+# ret:        the block, or a stand-in once a call is refused
+pub fun block(b: *Builder, parameters: Slice[Declaration]) Block {
+    if (failed(b)) { ret NO_BLOCK; }
+    val work: Work          = Work.block{};
+    val f:    opt[Function] = current(b, work);
+    if (sel f.none) { ret NO_BLOCK; }
+    val k: res[Block, module.Error] = body.block(b.m, f.some, parameters);
+    if (sel k.err) {
+        fault(b, Error.ir{k.err}, work);
+        ret NO_BLOCK;
+    }
+    ret k.ok;
+}
+
+# the parameter of a block at a position
+pub fun parameter(b: *Builder, k: Block, index: u32) Value {
+    if (failed(b)) { ret NO_VALUE; }
+    val work: Work          = Work.parameter{k};
+    val f:    opt[Function] = current(b, work);
+    if (sel f.none) { ret NO_VALUE; }
+    val d: res[BlockData, module.Error] = body.block_data(b.m, f.some, k);
+    if (sel d.err) {
+        fault(b, Error.ir{d.err}, work);
+        ret NO_VALUE;
+    }
+    if (index::usize >= d.ok.parameters.len) {
+        fault(b, Error.ir{module.Error.parameter{index}}, work);
+        ret NO_VALUE;
+    }
+    ret d.ok.parameters.data[index];
+}
+
+# add a constant to the module
+pub fun constant(b: *Builder, data: ConstantData) Constant {
+    if (failed(b)) { ret NO_CONSTANT; }
+    val c: res[Constant, module.Error] = module.add_constant(b.m, data);
+    if (sel c.err) {
+        fault(b, Error.ir{c.err}, Work.constant{});
+        ret NO_CONSTANT;
+    }
+    ret c.ok;
+}
+
+# the value that stands for a constant in the function
+pub fun use_constant(b: *Builder, c: Constant) Value {
+    if (failed(b)) { ret NO_VALUE; }
+    val work: Work          = Work.constant{};
+    val f:    opt[Function] = current(b, work);
+    if (sel f.none) { ret NO_VALUE; }
+    val v: res[Value, module.Error] = body.constant(b.m, f.some, c);
+    if (sel v.err) {
+        fault(b, Error.ir{v.err}, work);
+        ret NO_VALUE;
+    }
+    ret v.ok;
+}
+
+# add a global to the module
+pub fun global(b: *Builder, data: GlobalData) Global {
+    if (failed(b)) { ret NO_GLOBAL; }
+    val g: res[Global, module.Error] = module.add_global(b.m, data);
+    if (sel g.err) {
+        fault(b, Error.ir{g.err}, Work.global{});
+        ret NO_GLOBAL;
+    }
+    ret g.ok;
+}
+
+# declare a function in the module, with an empty body
+pub fun function(b: *Builder, data: FunctionData) Function {
+    if (failed(b)) { ret NO_FUNCTION; }
+    val f: res[Function, module.Error] = module.add_function(b.m, data);
+    if (sel f.err) {
+        fault(b, Error.ir{f.err}, Work.function{});
+        ret NO_FUNCTION;
+    }
+    ret f.ok;
+}
+
+fun bare(code: opcode.Opcode, operands: Slice[Value], targets: Slice[Branch]) Request {
+    ret Request{opcode: code, operands: operands, immediates: Slice[opcode.Immediate]{data: nil, size: 0}, targets: targets};
+}
+
+fun values(data: *Value, size: usize) Slice[Value] {
+    ret Slice[Value]{data: data, size: size};
+}
+
+fun no_targets() Slice[Branch] {
+    ret Slice[Branch]{data: nil, size: 0};
+}
+
+fun int(m: *Module, width: u32) Type {
+    val r: res[Type, types.Error] = types.intern(?m.types, types.Shape.integer{types.Integer{width: width}});
+    if (sel r.err) { ret Type{index: 0xffffffff}; }
+    ret r.ok;
+}
+
+# a module holding f, taking integers of the given widths and giving nothing,
+# with an entry block whose parameters are its parameters
+fun fixture(a: *allocator.Allocator, m: *Module, widths: Slice[u32], f: *Function, entry: *Block) bool {
+    val made: res[Module, module.Error] = module.init(a, View{data: "riscv64", len: 7});
+    if (sel made.err) { ret false; }
+    @m = made.ok;
+    var params: [4]Type;
+    var decls:  [4]Declaration;
+    var i:      usize = 0;
+    for (i < widths.size) {
+        params[i] = int(m, widths.data[i]);
+        decls[i]  = Declaration{type: params[i], secret: false};
+        i         = i + 1;
+    }
+    val sig: res[Type, types.Error] = types.intern(?m.types, types.Shape.function{types.Function{params: Slice[Type]{data: ?params[0], size: widths.size}, results: Slice[Type]{data: nil, size: 0}}});
+    if (sel sig.err) { ret false; }
+    var b: Builder = init(m);
+    @f = function(?b, FunctionData{name: View{data: "f", len: 1}, signature: sig.ok});
+    enter(?b, @f);
+    @entry = block(?b, Slice[Declaration]{data: ?decls[0], size: widths.size});
+    ret !failed(?b);
+}
+
+fun record(m: *Module, f: Function, i: Instruction) InstructionData {
+    var none: InstructionData;
+    none.place = Place.erased{};
+    val d: res[InstructionData, module.Error] = body.instruction_data(m, f, i);
+    if (sel d.err) { ret none; }
+    ret d.ok;
+}
+
+fun maker(m: *Module, f: Function, v: Value) Instruction {
+    val d: res[ValueData, module.Error] = body.value_data(m, f, v);
+    if (sel d.err)           { ret NO_INSTRUCTION; }
+    if (sel d.ok.def.result) { ret d.ok.def.result.instruction; }
+    ret NO_INSTRUCTION;
+}
+
+test build__failure_is_sticky {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var m:      Module;
+    var f:      Function;
+    var entry:  Block;
+    var widths: [2]u32 = [2]u32{32, 8};
+    if (!fixture(?a, ?m, Slice[u32]{data: ?widths[0], size: 2}, ?f, ?entry)) { ret 1; }
+    fin { module.dnit(?m); }
+
+    var b: Builder = init(?m);
+    enter(?b, f);
+    var mixed: [2]Value = [2]Value{parameter(?b, entry, 0), parameter(?b, entry, 1)};
+    at_end(?b, entry);
+    if (failed(?b)) { ret 2; }
+    val bad: Instruction = emit(?b, bare(opcode.ADD, values(?mixed[0], 2), no_targets()));
+    if (bad.index != NO_INSTRUCTION.index || !failed(?b)) { ret 3; }
+
+    val held: res[*Body, module.Error] = module.body(?m, f);
+    if (sel held.err) { ret 4; }
+    val count:  usize    = held.ok.instructions.len;
+    val blocks: usize    = held.ok.blocks.len;
+    val consts: usize    = m.constants.len;
+    var same:   [2]Value = [2]Value{mixed[0], mixed[0]};
+    val sum:    Value    = value(?b, bare(opcode.ADD, values(?same[0], 2), no_targets()));
+    val more:   Block    = block(?b, Slice[Declaration]{data: nil, size: 0});
+    var zero:   [1]u64   = [1]u64{0};
+    val c:      Constant = constant(?b, ConstantData.integer{Bits{type: int(?m, 32), words: Slice[u64]{data: ?zero[0], size: 1}}});
+    if (sum.index != NO_VALUE.index || more.index != NO_BLOCK.index || c.index != NO_CONSTANT.index)    { ret 5; }
+    if (held.ok.instructions.len != count || held.ok.blocks.len != blocks || m.constants.len != consts) { ret 6; }
+
+    val got: err[Failure] = done(?b);
+    if (sel got.ok) { ret 7; }
+    val first: Failure = got.err;
+    if (!(sel first.work.instruction && first.work.instruction.index == opcode.ADD.index)) { ret 8; }
+    if (!(sel first.function.some && first.function.some.index == f.index))                { ret 8; }
+    if (!(sel first.error.ir && sel first.error.ir.typing))                                { ret 9; }
+    ret 0;
+}
+
+# one placement: the cursor, how many instructions are made at it, and the
+# position the first lands at, none when it is listed in no block
+rec Placement {
+    cursor: Cursor;
+    run:    u32;
+    lands:  opt[u32];
+}
+
+test build__each_mode_places_where_it_says {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var m:      Module;
+    var f:      Function;
+    var entry:  Block;
+    var widths: [2]u32 = [2]u32{32, 32};
+    if (!fixture(?a, ?m, Slice[u32]{data: ?widths[0], size: 2}, ?f, ?entry)) { ret 1; }
+    fin { module.dnit(?m); }
+
+    var b: Builder = init(?m);
+    enter(?b, f);
+    var xy: [2]Value = [2]Value{parameter(?b, entry, 0), parameter(?b, entry, 1)};
+    at_end(?b, entry);
+    val first: Value    = value(?b, bare(opcode.ADD, values(?xy[0], 2), no_targets()));
+    var uses:  [2]Value = [2]Value{first, xy[1]};
+    val later: Value    = value(?b, bare(opcode.ADD, values(?uses[0], 2), no_targets()));
+    if (failed(?b)) { ret 2; }
+    val old: Instruction = maker(?m, f, first);
+
+    var rows: [4]Placement = [4]Placement{
+        Placement{cursor: Cursor.end{entry}, run: 1, lands: opt[u32].some{2}},
+        Placement{cursor: Cursor.at{Position{block: entry, index: 0}}, run: 2, lands: opt[u32].some{0}},
+        Placement{cursor: Cursor.replacing{old}, run: 1, lands: opt[u32].some{2}},
+        Placement{cursor: Cursor.detached{}, run: 1, lands: opt[u32].none{}},
+    };
+    var replacement: Instruction = NO_INSTRUCTION;
+    var r:           usize       = 0;
+    for (r < 4) {
+        val row: Placement = rows[r];
+        b.cursor = row.cursor;
+        var k: u32 = 0;
+        for (k < row.run) {
+            val made: Instruction     = emit(?b, bare(opcode.ADD, values(?xy[0], 2), no_targets()));
+            val d:    InstructionData = record(?m, f, made);
+            if (failed(?b)) { ret 3; }
+            if (sel row.lands.none) {
+                if (!(sel d.place.detached)) { ret 4; }
+            }
+            or (sel row.lands.some) {
+                if (!(sel d.place.placed && d.place.placed.index == entry.index)) { ret 5; }
+                if (slot_of(?m, f, entry, made) != row.lands.some + k)            { ret 6; }
+            }
+            if (sel row.cursor.replacing) { replacement = made; }
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+
+    val gone: InstructionData = record(?m, f, old);
+    if (!(sel gone.place.erased)) { ret 7; }
+    val now: InstructionData = record(?m, f, maker(?m, f, later));
+    val by:  InstructionData = record(?m, f, replacement);
+    if (now.operands.data[0].index != by.results.data[0].index) { ret 8; }
+    ret 0;
+}
+
+fun same_record(md: Metadata, location: opt[Location], s: opt[Site], volatile: bool, secret: bool) bool {
+    if (sel md.location.some != sel location.some) { ret false; }
+    if (sel md.location.some) {
+        if (sel location.some && md.location.some.index != location.some.index) { ret false; }
+    }
+    if (sel md.site.some != sel s.some) { ret false; }
+    if (sel md.site.some) {
+        if (sel s.some && md.site.some.index != s.some.index) { ret false; }
+    }
+    ret md.flags.volatile == volatile && md.secret == secret;
+}
+
+test build__sticky_attributes_reach_each_instruction {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var m:      Module;
+    var f:      Function;
+    var entry:  Block;
+    var widths: [2]u32 = [2]u32{32, 32};
+    if (!fixture(?a, ?m, Slice[u32]{data: ?widths[0], size: 2}, ?f, ?entry)) { ret 1; }
+    fin { module.dnit(?m); }
+
+    var b: Builder = init(?m);
+    enter(?b, f);
+    var xy: [2]Value = [2]Value{parameter(?b, entry, 0), parameter(?b, entry, 1)};
+    at_end(?b, entry);
+    val here:  opt[Location] = opt[Location].some{Location{index: 3}};
+    val there: opt[Location] = opt[Location].some{Location{index: 4}};
+    val from:  opt[Site]     = opt[Site].some{Site{index: 5}};
+    locate(?b, here);
+    site(?b, from);
+    flags(?b, Flags{volatile: true});
+    secret(?b, true);
+    var made: [4]Instruction;
+    made[0] = emit(?b, bare(opcode.ADD, values(?xy[0], 2), no_targets()));
+    made[1] = emit(?b, bare(opcode.ADD, values(?xy[0], 2), no_targets()));
+    locate(?b, there);
+    secret(?b, false);
+    made[2] = emit(?b, bare(opcode.ADD, values(?xy[0], 2), no_targets()));
+    plain(?b);
+    made[3] = emit(?b, bare(opcode.ADD, values(?xy[0], 2), no_targets()));
+    if (failed(?b)) { ret 2; }
+
+    if (!same_record(record(?m, f, made[0]).metadata, here, from, true, true))                               { ret 3; }
+    if (!same_record(record(?m, f, made[1]).metadata, here, from, true, true))                               { ret 3; }
+    if (!same_record(record(?m, f, made[2]).metadata, there, from, true, false))                             { ret 4; }
+    if (!same_record(record(?m, f, made[3]).metadata, opt[Location].none{}, opt[Site].none{}, false, false)) { ret 5; }
+
+    var bound: [1]Binding                  = [1]Binding{Binding{index: 9}};
+    val list:  res[Bindings, module.Error] = module.bindings(?m, Slice[Binding]{data: ?bound[0], size: 1});
+    if (sel list.err) { ret 6; }
+    var md: Metadata = record(?m, f, made[0]).metadata;
+    md.bindings = list.ok;
+    val set: err[module.Error] = body.set_metadata(?m, f, made[0], md);
+    if (sel set.err) { ret 6; }
+    var r: Remap = remap.init(?a);
+    fin { remap.dnit(?r); }
+    val twin: Instruction     = copy(?b, f, made[0], ?r);
+    val td:   InstructionData = record(?m, f, twin);
+    if (failed(?b))                                        { ret 7; }
+    if (!same_record(td.metadata, here, from, true, true)) { ret 8; }
+    if (td.metadata.bindings.index != list.ok.index)       { ret 8; }
+    val mapped: opt[Value] = remap.value(?r, record(?m, f, made[0]).results.data[0]);
+    if (!(sel mapped.some && mapped.some.index == td.results.data[0].index)) { ret 9; }
+    ret 0;
+}
+
+# the arguments one branch passes
+rec Passing {
+    arguments: [2]Value;
+    count:     usize;
+}
+
+test build__branch_arguments_match_parameters {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var m:      Module;
+    var f:      Function;
+    var entry:  Block;
+    var widths: [2]u32 = [2]u32{32, 8};
+    if (!fixture(?a, ?m, Slice[u32]{data: ?widths[0], size: 2}, ?f, ?entry)) { ret 1; }
+    fin { module.dnit(?m); }
+
+    var b: Builder = init(?m);
+    enter(?b, f);
+    val x:    Value          = parameter(?b, entry, 0);
+    val n:    Value          = parameter(?b, entry, 1);
+    var decl: [1]Declaration = [1]Declaration{Declaration{type: int(?m, 32), secret: false}};
+    val join: Block          = block(?b, Slice[Declaration]{data: ?decl[0], size: 1});
+    if (failed(?b)) { ret 2; }
+
+    var cases: [4]Passing = [4]Passing{
+        Passing{arguments: [2]Value{x, x}, count: 0},
+        Passing{arguments: [2]Value{n, n}, count: 1},
+        Passing{arguments: [2]Value{x, x}, count: 2},
+        Passing{arguments: [2]Value{x, x}, count: 1},
+    };
+    var i: usize = 0;
+    for (i < 4) {
+        var c: Builder = init(?m);
+        enter(?c, f);
+        at_end(?c, entry);
+        var edge: [1]Branch = [1]Branch{Branch{block: join, arguments: values(?cases[i].arguments[0], cases[i].count)}};
+        emit(?c, bare(opcode.BR, values(nil, 0), Slice[Branch]{data: ?edge[0], size: 1}));
+        val got: err[Failure] = done(?c);
+        if (i < 3) {
+            if (sel got.ok) { ret 3; }
+            val e: Error = got.err.error;
+            if (!(sel e.ir)) { ret 4; }
+            val ir: module.Error = e.ir;
+            if (!(sel ir.typing)) { ret 4; }
+            val t: opcode.Error = ir.typing;
+            if (!(sel t.arguments)) { ret 4; }
+        }
+        or (sel got.err) { ret 5; }
+        i = i + 1;
+    }
+    val j: res[BlockData, module.Error] = body.block_data(?m, f, join);
+    if (sel j.err)                  { ret 6; }
+    if (j.ok.predecessors.len != 1) { ret 6; }
+    ret 0;
+}
