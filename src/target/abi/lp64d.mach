@@ -1,0 +1,412 @@
+# lp64d, the risc-v calling convention of rv64 with hardware double precision
+#
+# implemented to the risc-v elf psabi, calling convention chapter, version 1.0
+# as ratified (riscv-elf-psabi-doc tag v1.0, riscv-cc.adoc). the one classifier
+# reads the word, the widest float and the registers from the row it is called
+# through, so the other risc-v variants are rows of the same routine.
+#
+# a value is placed by the first rule that takes it:
+# - a value the call passes by reference, a scalar or aggregate wider than two
+#   words, takes one word for its copy's address
+# - a named float no wider than the widest float takes a float register
+# - a named structure or array that flattens to one float, two floats, or one
+#   float and one integer no wider than a word takes those registers, when all
+#   of them are free, each leaf at its own offset
+# - anything else takes one or two integer registers by its size, the second
+#   word going to the stack when one register is left. an unnamed value of
+#   two-word alignment starts at an even register
+# - with no register left it goes on the stack, at the greater of its
+#   alignment and a word but never past the stack's alignment
+# results are placed as a first named argument would be, in the result
+# registers, and a result that would travel by reference makes its address an
+# implicit first argument.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.collections.slice.Slice;
+
+use rf:    masc.core.register;
+use riscv: masc.isa.riscv.register;
+
+use mirl.target.abi.convention.Call;
+use mirl.target.abi.convention.Carrier;
+use mirl.target.abi.convention.Convention;
+use mirl.target.abi.convention.Count;
+use mirl.target.abi.convention.Floats;
+use mirl.target.abi.convention.Frame;
+use mirl.target.abi.convention.Half;
+use mirl.target.abi.convention.Indirect;
+use mirl.target.abi.convention.List;
+use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.convention.Returned;
+use mirl.target.abi.convention.Stack;
+use mirl.target.abi.convention.Unnamed;
+use mirl.target.abi.convention.Value;
+use mirl.target.abi.convention.Variadic;
+use mirl.target.abi.convention.bank;
+use mirl.target.abi.piece;
+use mirl.target.abi.piece.Assignment;
+use mirl.target.abi.piece.Copy;
+use mirl.target.abi.piece.Fill;
+use mirl.target.abi.piece.Passing;
+use mirl.target.abi.piece.Piece;
+use mirl.target.abi.piece.Place;
+use mirl.target.abi.piece.Refusal;
+use mirl.target.abi.piece.Scale;
+use mirl.target.abi.view;
+use mirl.target.abi.view.Node;
+use mirl.target.abi.view.View;
+use mirl.target.capability.Bits;
+
+# the registers one placement draws from, and how far it has drawn
+# ---
+# integers: the integer registers in order
+# floats:   the float registers in order
+# integer:  the next integer register
+# float:    the next float register
+# stack:    the next free byte of the stack area
+# spill:    whether anything may go on the stack, which no result may
+# word:     the bytes of a word
+# widest:   the bits of the widest float passed in a float register, 0 for none
+# align:    the stack's alignment at a call
+# half:     how a 16-bit float travels
+rec State {
+    integers: Slice[rf.Id];
+    floats:   Slice[rf.Id];
+    integer:  usize;
+    float:    usize;
+    stack:    u64;
+    spill:    bool;
+    word:     u64;
+    widest:   u64;
+    align:    u64;
+    half:     Half;
+}
+
+# a scalar leaf a structure flattens to
+# ---
+# node:   its node
+# offset: its offset in the flattened value
+# float:  whether it takes a float register
+rec Leaf {
+    node:   u32;
+    offset: u64;
+    float:  bool;
+}
+
+fun state(r: *Resolved, results: bool) State {
+    var s: State;
+    s.integer = 0;
+    s.float   = 0;
+    s.stack   = 0;
+    s.word    = 0;
+    if (sel r.row.word.bits) { s.word = r.row.word.bits::u64 / 8; }
+    s.widest = 0;
+    if (sel r.row.floats.widest) { s.widest = r.row.floats.widest::u64; }
+    s.align = 0;
+    if (sel r.row.stack.memory) { s.align = r.row.stack.memory.align; }
+    s.half = r.row.half;
+    if (results) {
+        s.integers = bank(?r.returning, rf.GENERAL);
+        s.floats   = bank(?r.returning, rf.FLOAT);
+        s.spill    = false;
+    }
+    or {
+        s.integers = bank(?r.passing, rf.GENERAL);
+        s.floats   = bank(?r.passing, rf.FLOAT);
+        s.spill    = true;
+    }
+    ret s;
+}
+
+fun round(v: u64, to: u64) u64 {
+    ret (v + to - 1) / to * to;
+}
+
+fun laid(n: *Node) u64 {
+    if (sel n.room.laid) { ret n.room.laid.size; }
+    ret 0;
+}
+
+fun alignment(n: *Node) u64 {
+    if (sel n.room.laid) { ret n.room.laid.align; }
+    ret 1;
+}
+
+# whether a float node travels as a float under the half rule
+fun real(s: *State, n: *Node) bool {
+    if (!(sel n.shape.float))      { ret false; }
+    if (n.shape.float.width == 16) { ret sel s.half.float; }
+    ret true;
+}
+
+# whether a float node fits a float register
+fun fits(s: *State, n: *Node) bool {
+    if (sel n.shape.float) { ret real(s, n) && n.shape.float.width::u64 <= s.widest; }
+    ret false;
+}
+
+fun fill_float(s: *State, n: *Node) Fill {
+    if (sel n.shape.float && n.shape.float.width::u64 < s.widest) { ret Fill.boxed{}; }
+    ret Fill.exact{};
+}
+
+# the fill of a scalar's word in an integer register or a stack slot
+fun fill_integer(s: *State, n: *Node, size: u64) Fill {
+    if (sel n.shape.integer) {
+        val w: u32 = n.shape.integer;
+        if (w == 1)                     { ret Fill.zero{1}; }
+        if (w < 32)                     { ret Fill.declared{w}; }
+        if (w == 32 && s.word * 8 > 32) { ret Fill.sign{32}; }
+    }
+    if (size >= s.word) { ret Fill.exact{}; }
+    ret Fill.undefined{};
+}
+
+fun at(place: Place, offset: u64, size: u64, fill: Fill) Piece {
+    ret Piece{place: place, offset: offset, size: size, scale: Scale.fixed{}, fill: fill};
+}
+
+# a slot on the stack for `size` bytes at `align`, taking it from the state
+fun slot(s: *State, size: u64, align: u64) u64 {
+    var to: u64 = align;
+    if (to < s.word)  { to = s.word; }
+    if (to > s.align) { to = s.align; }
+    val off: u64 = round(s.stack, to);
+    s.stack = off + round(size, s.word);
+    ret off;
+}
+
+# place a value of `size` bytes by the integer rule
+fun integer(s: *State, asg: *Assignment, v: *View, at_node: u32, named: bool) err[Refusal] {
+    val n:     *Node = view.node(v, at_node);
+    val size:  u64   = laid(n);
+    val align: u64   = alignment(n);
+    if (size <= s.word) {
+        val fill: Fill = fill_integer(s, n, size);
+        if (s.integer < s.integers.size) {
+            s.integer = s.integer + 1;
+            ret piece.add(asg, at(Place.register{s.integers.data[s.integer - 1]}, 0, size, fill));
+        }
+        if (!s.spill) { ret err[Refusal].err{Refusal.room{at_node}}; }
+        ret piece.add(asg, at(Place.stack{slot(s, size, align)}, 0, size, fill));
+    }
+    if (!named && align == 2 * s.word && s.integer % 2 == 1) { s.integer = s.integer + 1; }
+    val high: u64  = size - s.word;
+    val fill: Fill = fill_integer(s, n, high);
+    if (s.integer + 2 <= s.integers.size) {
+        val low: err[Refusal] = piece.add(asg, at(Place.register{s.integers.data[s.integer]}, 0, s.word, Fill.exact{}));
+        if (sel low.err) { ret low; }
+        s.integer = s.integer + 2;
+        ret piece.add(asg, at(Place.register{s.integers.data[s.integer - 1]}, s.word, high, fill));
+    }
+    if (!s.spill) { ret err[Refusal].err{Refusal.room{at_node}}; }
+    if (s.integer + 1 == s.integers.size) {
+        val low: err[Refusal] = piece.add(asg, at(Place.register{s.integers.data[s.integer]}, 0, s.word, Fill.exact{}));
+        if (sel low.err) { ret low; }
+        s.integer = s.integers.size;
+        ret piece.add(asg, at(Place.stack{slot(s, high, s.word)}, s.word, high, fill));
+    }
+    s.integer = s.integers.size;
+    val off: u64          = slot(s, size, align);
+    val low: err[Refusal] = piece.add(asg, at(Place.stack{off}, 0, s.word, Fill.exact{}));
+    if (sel low.err) { ret low; }
+    ret piece.add(asg, at(Place.stack{off + s.word}, s.word, high, fill));
+}
+
+# the piece the address of a copy travels in, an integer word
+fun address(s: *State) Piece {
+    if (s.integer < s.integers.size) {
+        s.integer = s.integer + 1;
+        ret at(Place.register{s.integers.data[s.integer - 1]}, 0, s.word, Fill.exact{});
+    }
+    ret at(Place.stack{slot(s, s.word, s.word)}, 0, s.word, Fill.exact{});
+}
+
+# flatten a node into at most two leaves, false when it cannot be flattened:
+# a union, a vector, a handle, a pointer, an integer wider than a word or a
+# float that no float register takes. empty structures and arrays add nothing
+fun flatten(s: *State, v: *View, at_node: u32, base: u64, out: *Leaf, count: *u32) bool {
+    val n: *Node = view.node(v, at_node);
+    if (sel n.shape.structure) {
+        var k: u32 = 0;
+        for (k < n.count) {
+            val c: u32 = view.child(v, at_node, k);
+            if (!flatten(s, v, c, base + view.node(v, c).offset, out, count)) { ret false; }
+            k = k + 1;
+        }
+        ret true;
+    }
+    if (sel n.shape.array) {
+        if (n.shape.array == 0) { ret true; }
+        val e:      u32 = view.child(v, at_node, 0);
+        var inside: [2]Leaf;
+        var leaves: u32 = 0;
+        if (!flatten(s, v, e, 0, ?inside[0], ?leaves)) { ret false; }
+        if (leaves == 0)                               { ret true; }
+        if (n.shape.array > 2)                         { ret false; }
+        val stride: u64 = laid(view.node(v, e));
+        var i:      u64 = 0;
+        for (i < n.shape.array) {
+            if (!flatten(s, v, e, base + i * stride, out, count)) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    if (sel n.shape.union) { ret laid(n) == 0; }
+    var float: bool = false;
+    if (sel n.shape.integer) {
+        if (laid(n) > s.word) { ret false; }
+    }
+    or (fits(s, n)) {
+        float = true;
+    }
+    or {
+        ret false;
+    }
+    if (@count == 2) { ret false; }
+    out[@count] = Leaf{node: at_node, offset: base, float: float};
+    @count      = @count + 1;
+    ret true;
+}
+
+# place a named structure or array in float registers when it flattens to
+# leaves they take and enough are free, true when it was placed
+fun flattened(s: *State, asg: *Assignment, v: *View, at_node: u32, out: *bool) err[Refusal] {
+    @out = false;
+    var leaves: [2]Leaf;
+    var count:  u32 = 0;
+    if (!flatten(s, v, at_node, 0, ?leaves[0], ?count)) { ret err[Refusal].ok{}; }
+    var floats: usize = 0;
+    var ints:   usize = 0;
+    var i:      u32   = 0;
+    for (i < count) {
+        if (leaves[i].float) { floats = floats + 1; }
+        or                   { ints = ints + 1; }
+        i = i + 1;
+    }
+    if (floats == 0)                        { ret err[Refusal].ok{}; }
+    if (s.float + floats > s.floats.size)   { ret err[Refusal].ok{}; }
+    if (s.integer + ints > s.integers.size) { ret err[Refusal].ok{}; }
+    i = 0;
+    for (i < count) {
+        val leaf: *Node = view.node(v, leaves[i].node);
+        var p:    Piece;
+        if (leaves[i].float) {
+            p       = at(Place.register{s.floats.data[s.float]}, leaves[i].offset, laid(leaf), fill_float(s, leaf));
+            s.float = s.float + 1;
+        }
+        or {
+            p         = at(Place.register{s.integers.data[s.integer]}, leaves[i].offset, laid(leaf), Fill.undefined{});
+            s.integer = s.integer + 1;
+        }
+        val added: err[Refusal] = piece.add(asg, p);
+        if (sel added.err) { ret added; }
+        i = i + 1;
+    }
+    @out = true;
+    ret err[Refusal].ok{};
+}
+
+# place one value, as an argument or a result, and say how it travels
+fun place(s: *State, asg: *Assignment, v: *View, value: Value, passing: *Passing) err[Refusal] {
+    val n: *Node = view.node(v, value.node);
+    if (sel n.room.unsized) { ret err[Refusal].err{Refusal.unsized{value.node}}; }
+    val size: u64 = laid(n);
+    @passing = Passing.value{};
+    if (sel value.by.reference || size > 2 * s.word) {
+        @passing = Passing.reference{Copy{size: size, align: alignment(n)}};
+        if (!s.spill) { ret err[Refusal].ok{}; }
+        ret piece.add(asg, address(s));
+    }
+    if (size == 0) { ret err[Refusal].ok{}; }
+    if (value.named && fits(s, n) && s.float < s.floats.size) {
+        s.float = s.float + 1;
+        ret piece.add(asg, at(Place.register{s.floats.data[s.float - 1]}, 0, size, fill_float(s, n)));
+    }
+    if (value.named && (sel n.shape.structure || sel n.shape.array)) {
+        var done: bool         = false;
+        val flat: err[Refusal] = flattened(s, asg, v, value.node, ?done);
+        if (sel flat.err) { ret flat; }
+        if (done)         { ret flat; }
+    }
+    ret integer(s, asg, v, value.node, value.named);
+}
+
+# the lp64d result classifier
+fun results(r: *Resolved, call: *Call, asg: *Assignment) err[Refusal] {
+    if (call.results.size > 1) { ret err[Refusal].err{Refusal.results{call.results.size::u32}}; }
+    var s: State = state(r, true);
+    var i: usize = 0;
+    for (i < call.results.size) {
+        val first:   u32          = piece.open(asg);
+        var passing: Passing;
+        val placed:  err[Refusal] = place(?s, asg, call.view, call.results.data[i], ?passing);
+        if (sel placed.err) { ret placed; }
+        val closed: err[Refusal] = piece.close(asg, true, passing, first);
+        if (sel closed.err) { ret closed; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the lp64d argument classifier
+fun arguments(r: *Resolved, call: *Call, asg: *Assignment) err[Refusal] {
+    var s: State = state(r, false);
+    var i: usize = 0;
+    for (i < asg.results.len) {
+        if (sel asg.results.data[i].passing.reference) { asg.address = opt[Piece].some{address(?s)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < call.arguments.size) {
+        val first:   u32          = piece.open(asg);
+        var passing: Passing;
+        val placed:  err[Refusal] = place(?s, asg, call.view, call.arguments.data[i], ?passing);
+        if (sel placed.err) { ret placed; }
+        val closed: err[Refusal] = piece.close(asg, false, passing, first);
+        if (sel closed.err) { ret closed; }
+        i = i + 1;
+    }
+    asg.stack = s.stack;
+    ret err[Refusal].ok{};
+}
+
+val PASSING: [16]str = [16]str{
+    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+    "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
+};
+
+val RETURNING: [4]str = [4]str{"a0", "a1", "fa0", "fa1"};
+
+val PRESERVED: [25]str = [25]str{
+    "sp", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+    "fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11",
+};
+
+# the global and thread pointers, which no code a call reaches may change
+val RESERVED: [2]str = [2]str{"gp", "tp"};
+
+# lp64d
+pub val LP64D: Convention = Convention{
+    name:      "lp64d",
+    file:      ?riscv.FILE,
+    results:   results,
+    arguments: arguments,
+    word:      Bits.bits{64},
+    floats:    Floats.widest{64},
+    passing:   Slice[str]{data: ?PASSING[0], size: 16},
+    returning: Slice[str]{data: ?RETURNING[0], size: 4},
+    preserved: Slice[str]{data: ?PRESERVED[0], size: 25},
+    reserved:  Slice[str]{data: ?RESERVED[0], size: 2},
+    stack:     Stack.memory{Frame{align: 16, red: 0, shadow: 0}},
+    indirect:  Indirect{carrier: Carrier.first{}, returned: Returned.none{}},
+    variadic:  Variadic{unnamed: Unnamed.integer{}, count: Count.none{}, list: List.pointer{}},
+    half:      Half.float{},
+};
