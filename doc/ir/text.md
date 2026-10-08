@@ -181,13 +181,16 @@ functions
   step        = word ( constant | type ) ;
   instruction = [ local { "," local } "=" ] ( operation | assembly ) ;
   operation   = word [ entry { "," entry } ] [ "loc" dref ] [ "site" dref ]
-                [ "volatile" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
+                [ "volatile" ] [ "kept" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
   entry       = operand | immediate | target ;
   operand     = local | constant ;
   immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]" ) ;
   ordering    = "relaxed" | "acquire" | "release" | "acq_rel" | "seq_cst" ;
   target      = label [ "(" operand { "," operand } ")" ] ;
   assembly    = "asm" ... ;
+
+  `kept` marks a store or a fill whose write no pass may take away (see
+  the specification's memory section).
 
   `constant_time` marks a function that must run in time independent of its
   secret values.
