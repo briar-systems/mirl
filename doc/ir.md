@@ -287,7 +287,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 5 | `attribute` | every attribute on a function or global is of a family the target accepts |
 | 6 | `reference` | every id a block or instruction names is one its body holds and has not removed, every instruction is listed in exactly one block and placed in it, every operand and branch argument is defined, every result and parameter is defined by the instruction or block that lists it, and every opcode names a row |
 | 7 | `terminator` | every block ends in exactly one terminator, with none before it |
-| 8 | `edge` | every edge passes its target's parameters in count and type, and the entry block takes the signature's parameters |
+| 8 | `edge` | every edge passes its target's parameters in count and type, and the entry block takes the signature's parameters, or one parameter per place once the abi legalisation has placed them |
 | 9 | `typing` | every instruction is an instance its opcode's row types, and its results are the number and types the row derives |
 | 10 | `secrecy` | every result is secret exactly as its row's secrecy rule gives, and no edge passes a secret value to a public parameter |
 | 11 | `dominance` | every use in a reached block is dominated by its definition, and so is every branch argument at its edge |
