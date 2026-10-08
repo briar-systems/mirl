@@ -130,12 +130,17 @@ types
   structure   = "struct" ( "{" [ types ] "}" | "at" "{" [ placed { "," placed } ] "}" ) ;
   placed      = uint ":" type ;           ; a member at its stated byte offset
   union       = "union" "{" [ types ] "}" ;
-  signature   = "fun" "(" [ types ] ")" "->" "(" [ types ] ")" ;
+  signature   = "fun" "(" [ extended ] ")" "->" "(" [ extended ] ")" ;
+  extended    = type [ "sext" | "zext" ] { "," type [ "sext" | "zext" ] } ;
   handle      = "handle" "<" name ">" ;   ; the target's kind name
   types       = type { "," type } ;
 
   `struct at` states every member's offset, and a plain `struct` leaves
   them to the data layout. the printer spells space 0 as a bare `ptr`.
+
+  a parameter or result of a signature may state how an integer is extended,
+  `sext` or `zext`, and states none by leaving the word out. it is part of
+  the type: `fun(i8 sext) -> ()` and `fun(i8) -> ()` are different types.
 
 constants
 

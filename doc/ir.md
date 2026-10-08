@@ -64,6 +64,8 @@ A union is a list of member types that overlap in storage. Every member is at of
 
 A function type has a list of parameter types and a list of result types. A function may have any number of results. A pointer to a function is an ordinary pointer, and a call states the signature it calls through.
 
+The integers are signless, but a convention extends a narrow integer by the signedness of the source type. Each parameter and each result of a function type may therefore state an **extension**: `sext` for sign extended, `zext` for zero extended, or none. Only an integer may state one. The extensions are part of the type, so `fun(i8 sext) -> ()` and `fun(i8 zext) -> ()` are different types, and a function and the call that states a signature carry them as data of that one type. The debug information keeps the signedness of its own types and is not derived from the extension.
+
 ### 2.7 Target handles
 
 A handle is an opaque value that a target declares, named by a family-qualified kind such as `spirv.image`. The kind is a non-empty name compared by its bytes.
@@ -296,6 +298,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 12 | `debug` | every location, inlining site and binding that an instruction's metadata names is an entry of the debug table |
 | 13 | `binding` | every value binding record stands before an instruction of its block, in the order of their points, names a variable of the debug table and reads a defined value through an expression that applies to its type, and in a reached block the value dominates the record's point |
 | 14 | `structured` | past legalisation on a target that declares structured control, every function with a body is the tree of regions its structure analysis holds, and the tree keeps the rules of structured control: every selection and loop header strictly dominates its merge, no block is the merge or the continue target of two constructs, every block the entry reaches is in exactly one region, a selection's arms start at its header's edges in order, a loop's body starts at its header and its continue sequence at its continue target, a loop is entered back by exactly one edge from that target, and every edge goes on to the next region of its sequence, to the merge of the construct around it, to the innermost loop's merge or to its continue target, so a construct is entered only at its header. A refusal names the construct's header and the rule broken |
+| 15 | `call` | every call through the address of a function of the module states the extension of each parameter and result that the function's signature states |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
