@@ -1,0 +1,404 @@
+# threading values to the uses a rewrite of the graph left them not dominating
+#
+# a rewrite that moves edges through a new block keeps where every path goes,
+# but a value may stop dominating a use it reached along every path before,
+# since the new block joins paths it was defined along with paths it was not.
+# such a value is passed to each of those uses through block parameters on
+# the iterated dominance frontier of its definition, as ssa construction
+# places them, and a path it is not defined along passes a zero, which no run
+# carries to the use. a parameter whose every argument is one value, or itself,
+# is replaced by that value and taken out.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.ValueData;
+use mirl.pass.failure.Why;
+
+fun alloc[T](e: allocator.Error) res[T, Why] {
+    ret res[T, Why].err{Why.alloc{e}};
+}
+
+fun ir[T](e: module.Error) res[T, Why] {
+    ret res[T, Why].err{Why.ir{e}};
+}
+
+# an edge into a block, as its instruction and its position among its edges
+rec Into {
+    instruction: Instruction;
+    edge:        u32;
+}
+
+# one value being threaded
+# ---
+# at:       the block that defines it
+# frontier: per block, whether a parameter for it may go there
+# reach:    per block, the value it has on entry, NONE until found
+# zero:     the zero of its type, NONE until made
+# made:     the parameters made for it
+rec Thread {
+    m:        *Module;
+    f:        Function;
+    d:        *Dominance;
+    v:        Value;
+    type:     Type;
+    secret:   bool;
+    at:       u32;
+    frontier: vector.Vector[u32];
+    reach:    vector.Vector[u32];
+    zero:     u32;
+    made:     vector.Vector[Value];
+}
+
+fun place(b: *Body, i: Instruction) u32 {
+    val at: Place = b.instructions.data[i.index].place;
+    if (sel at.placed) { ret at.placed.index; }
+    ret NONE;
+}
+
+# the block that defines a value, NONE for a constant or a removed value
+fun home(b: *Body, v: u32) u32 {
+    val vd: *ValueData = ?b.values.data[v];
+    if (sel vd.def.parameter) { ret vd.def.parameter.block.index; }
+    if (sel vd.def.result)    { ret place(b, vd.def.result.instruction); }
+    ret NONE;
+}
+
+# the reached instructions using a value that its block does not dominate,
+# each once
+fun stranded(a: *allocator.Allocator, b: *Body, d: *Dominance, v: u32, at: u32, out: *vector.Vector[Instruction]) err[allocator.Error] {
+    out.len = 0;
+    val uses: *vector.Vector[Instruction] = ?b.values.data[v].uses;
+    var i:    usize                       = 0;
+    for (i < uses.len) {
+        val u:  Instruction = uses.data[i];
+        val ub: u32         = place(b, u);
+        if (ub != NONE && dominance.reachable(d, ub) && !dominance.dominates(d, at, ub)) {
+            var seen: bool  = false;
+            var k:    usize = 0;
+            for (k < out.len) {
+                if (out.data[k].index == u.index) { seen = true; }
+                k = k + 1;
+            }
+            if (!seen) {
+                val pushed: res[usize, allocator.Error] = vector.push[Instruction](out, u);
+                if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+fun zero(t: *Thread) res[Value, Why] {
+    if (t.zero != NONE) { ret res[Value, Why].ok{Value{index: t.zero}}; }
+    val c: res[Constant, module.Error] = module.add_constant(t.m, ConstantData.zero{t.type});
+    if (sel c.err) { ret ir[Value](c.err); }
+    val v: res[Value, module.Error] = body.constant(t.m, t.f, c.ok);
+    if (sel v.err) { ret ir[Value](v.err); }
+    t.zero = v.ok.index;
+    ret res[Value, Why].ok{v.ok};
+}
+
+# every edge into a block, read before any of them moves
+fun into(m: *Module, f: Function, k: u32, out: *vector.Vector[Into]) err[Why] {
+    out.len = 0;
+    val got: res[*Body, module.Error] = module.body(m, f);
+    if (sel got.err) { ret err[Why].err{Why.ir{got.err}}; }
+    val preds: *vector.Vector[Instruction] = ?got.ok.blocks.data[k].predecessors;
+    var i:     usize                       = 0;
+    for (i < preds.len) {
+        val p:     Instruction = preds.data[i];
+        var first: bool        = true;
+        var j:     usize       = 0;
+        for (j < i) {
+            if (preds.data[j].index == p.index) { first = false; }
+            j = j + 1;
+        }
+        if (first) {
+            val d: *InstructionData = ?got.ok.instructions.data[p.index];
+            var e: usize            = 0;
+            for (e < d.edges.len) {
+                if (d.edges.data[e].block.index == k) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Into](out, Into{instruction: p, edge: e::u32});
+                    if (sel pushed.err) { ret err[Why].err{Why.alloc{pushed.err}}; }
+                }
+                e = e + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# pass a value as one argument of an edge, its others as they were
+fun pass(m: *Module, f: Function, edge: Into, slot: usize, v: Value) err[Why] {
+    val d: res[InstructionData, module.Error] = body.instruction_data(m, f, edge.instruction);
+    if (sel d.err) { ret err[Why].err{Why.ir{d.err}}; }
+    val old:  *vector.Vector[Value] = ?d.ok.edges.data[edge.edge].arguments;
+    val to:   Block                 = d.ok.edges.data[edge.edge].block;
+    var args: vector.Vector[Value]  = vector.init[Value](m.a);
+    fin { vector.dnit[Value](?args); }
+    var i: usize = 0;
+    for (i < old.len) {
+        var a: Value = old.data[i];
+        if (i == slot) { a = v; }
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?args, a);
+        if (sel pushed.err) { ret err[Why].err{Why.alloc{pushed.err}}; }
+        i = i + 1;
+    }
+    val moved: err[module.Error] = body.retarget(m, f, edge.instruction, edge.edge, to, Slice[Value]{data: args.data, size: args.len});
+    if (sel moved.err) { ret err[Why].err{Why.ir{moved.err}}; }
+    ret err[Why].ok{};
+}
+
+fun leaving(t: *Thread, k: u32) res[Value, Why] {
+    if (k == t.at) { ret res[Value, Why].ok{t.v}; }
+    ret entering(t, k);
+}
+
+# the value a block has on entry: a parameter where paths join on the
+# frontier, and otherwise the one its immediate dominator leaves with
+fun entering(t: *Thread, k: u32) res[Value, Why] {
+    if (t.reach.data[k] != NONE)      { ret res[Value, Why].ok{Value{index: t.reach.data[k]}}; }
+    if (!dominance.reachable(t.d, k)) { ret zero(t); }
+    if (t.frontier.data[k] != 0) {
+        val kd: res[BlockData, module.Error] = body.block_data(t.m, t.f, Block{index: k});
+        if (sel kd.err) { ret ir[Value](kd.err); }
+        val z: res[Value, Why] = zero(t);
+        if (sel z.err) { ret z; }
+        var incoming: vector.Vector[Value] = vector.init[Value](t.m.a);
+        var edges:    vector.Vector[Into]  = vector.init[Into](t.m.a);
+        fin {
+            vector.dnit[Value](?incoming);
+            vector.dnit[Into](?edges);
+        }
+        var i: usize = 0;
+        for (i < kd.ok.predecessors.len) {
+            val pushed: res[usize, allocator.Error] = vector.push[Value](?incoming, z.ok);
+            if (sel pushed.err) { ret alloc[Value](pushed.err); }
+            i = i + 1;
+        }
+        val slot: usize                    = kd.ok.parameters.len;
+        val p:    res[Value, module.Error] = body.add_parameter(t.m, t.f, Block{index: k}, Declaration{type: t.type, secret: t.secret}, Slice[Value]{data: incoming.data, size: incoming.len});
+        if (sel p.err) { ret ir[Value](p.err); }
+        t.reach.data[k] = p.ok.index;
+        val kept: res[usize, allocator.Error] = vector.push[Value](?t.made, p.ok);
+        if (sel kept.err) { ret alloc[Value](kept.err); }
+        val read: err[Why] = into(t.m, t.f, k, ?edges);
+        if (sel read.err) { ret res[Value, Why].err{read.err}; }
+        i = 0;
+        for (i < edges.len) {
+            val got: res[*Body, module.Error] = module.body(t.m, t.f);
+            if (sel got.err) { ret ir[Value](got.err); }
+            val from: u32             = place(got.ok, edges.data[i].instruction);
+            val out:  res[Value, Why] = leaving(t, from);
+            if (sel out.err) { ret out; }
+            val passed: err[Why] = pass(t.m, t.f, edges.data[i], slot, out.ok);
+            if (sel passed.err) { ret res[Value, Why].err{passed.err}; }
+            i = i + 1;
+        }
+        ret res[Value, Why].ok{p.ok};
+    }
+    val up: opt[u32] = dominance.idom(t.d, k);
+    if (sel up.none) { ret zero(t); }
+    val r: res[Value, Why] = leaving(t, up.some);
+    if (sel r.err) { ret r; }
+    t.reach.data[k] = r.ok.index;
+    ret r;
+}
+
+fun mark(t: *Thread) err[allocator.Error] {
+    var work: vector.Vector[u32] = vector.init[u32](t.m.a);
+    fin { vector.dnit[u32](?work); }
+    val first: res[usize, allocator.Error] = vector.push[u32](?work, t.at);
+    if (sel first.err) { ret err[allocator.Error].err{first.err}; }
+    for (work.len > 0) {
+        val n: u32 = work.data[work.len - 1];
+        work.len = work.len - 1;
+        val df: Slice[u32] = dominance.frontier(t.d, n);
+        var i:  usize      = 0;
+        for (i < df.size) {
+            val y: u32 = df.data[i];
+            if (t.frontier.data[y] == 0) {
+                t.frontier.data[y] = 1;
+                val pushed: res[usize, allocator.Error] = vector.push[u32](?work, y);
+                if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+            }
+            i = i + 1;
+        }
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the one value every edge passes a parameter besides itself, or the
+# parameter when they pass more than one
+fun sole(m: *Module, f: Function, p: Value) res[Value, Why] {
+    val pd: res[ValueData, module.Error] = body.value_data(m, f, p);
+    if (sel pd.err)                 { ret ir[Value](pd.err); }
+    if (!(sel pd.ok.def.parameter)) { ret res[Value, Why].ok{p}; }
+    val k:     Block                    = pd.ok.def.parameter.block;
+    val index: u32                      = pd.ok.def.parameter.index;
+    val got:   res[*Body, module.Error] = module.body(m, f);
+    if (sel got.err) { ret ir[Value](got.err); }
+    val b:     *Body                       = got.ok;
+    val preds: *vector.Vector[Instruction] = ?b.blocks.data[k.index].predecessors;
+    var one:   u32                         = NONE;
+    var i:     usize                       = 0;
+    for (i < preds.len) {
+        val d: *InstructionData = ?b.instructions.data[preds.data[i].index];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            if (d.edges.data[e].block.index == k.index) {
+                val a: u32 = d.edges.data[e].arguments.data[index].index;
+                if (a != p.index) {
+                    if (one == NONE) { one = a; }
+                    or (one != a)    { ret res[Value, Why].ok{p}; }
+                }
+            }
+            e = e + 1;
+        }
+        i = i + 1;
+    }
+    if (one == NONE) { ret res[Value, Why].ok{p}; }
+    ret res[Value, Why].ok{Value{index: one}};
+}
+
+# take out every parameter made that passes on one value alone
+fun prune(t: *Thread) err[Why] {
+    var gone: vector.Vector[u32] = vector.init[u32](t.m.a);
+    fin { vector.dnit[u32](?gone); }
+    var i: usize = 0;
+    for (i < t.made.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?gone, 0);
+        if (sel pushed.err) { ret err[Why].err{Why.alloc{pushed.err}}; }
+        i = i + 1;
+    }
+    var again: bool = true;
+    for (again) {
+        again = false;
+        i     = 0;
+        for (i < t.made.len) {
+            if (gone.data[i] == 0) {
+                val p: Value           = t.made.data[i];
+                val w: res[Value, Why] = sole(t.m, t.f, p);
+                if (sel w.err) { ret err[Why].err{w.err}; }
+                if (w.ok.index != p.index) {
+                    val moved: err[module.Error] = body.replace(t.m, t.f, p, w.ok, body.Records.follow{});
+                    if (sel moved.err) { ret err[Why].err{Why.ir{moved.err}}; }
+                    val pd: res[ValueData, module.Error] = body.value_data(t.m, t.f, p);
+                    if (sel pd.err)                 { ret err[Why].err{Why.ir{pd.err}}; }
+                    if (!(sel pd.ok.def.parameter)) { ret err[Why].err{Why.reason{"a parameter made for a value is no parameter"}}; }
+                    val out: err[module.Error] = body.remove_parameter(t.m, t.f, pd.ok.def.parameter.block, pd.ok.def.parameter.index);
+                    if (sel out.err) { ret err[Why].err{Why.ir{out.err}}; }
+                    gone.data[i] = 1;
+                    again        = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    ret err[Why].ok{};
+}
+
+fun fill(v: *vector.Vector[u32], n: usize, x: u32) err[allocator.Error] {
+    val room: res[usize, allocator.Error] = vector.reserve[u32](v, n);
+    if (sel room.err) { ret err[allocator.Error].err{room.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        vector.push[u32](v, x);
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# thread one value to the uses its block does not dominate
+fun thread(m: *Module, f: Function, d: *Dominance, v: Value, at: u32, uses: *vector.Vector[Instruction]) err[Why] {
+    val vd: res[ValueData, module.Error] = body.value_data(m, f, v);
+    if (sel vd.err) { ret err[Why].err{Why.ir{vd.err}}; }
+    val got: res[*Body, module.Error] = module.body(m, f);
+    if (sel got.err) { ret err[Why].err{Why.ir{got.err}}; }
+    val blocks: usize  = got.ok.blocks.len;
+    var t:      Thread = Thread{m: m, f: f, d: d, v: v, type: vd.ok.type, secret: vd.ok.secret, at: at, frontier: vector.init[u32](m.a), reach: vector.init[u32](m.a), zero: NONE, made: vector.init[Value](m.a)};
+    fin {
+        vector.dnit[u32](?t.frontier);
+        vector.dnit[u32](?t.reach);
+        vector.dnit[Value](?t.made);
+    }
+    val framed: err[allocator.Error] = fill(?t.frontier, blocks, 0);
+    if (sel framed.err) { ret err[Why].err{Why.alloc{framed.err}}; }
+    val reached: err[allocator.Error] = fill(?t.reach, blocks, NONE);
+    if (sel reached.err) { ret err[Why].err{Why.alloc{reached.err}}; }
+    val marked: err[allocator.Error] = mark(?t);
+    if (sel marked.err) { ret err[Why].err{Why.alloc{marked.err}}; }
+    var i: usize = 0;
+    for (i < uses.len) {
+        val now: res[*Body, module.Error] = module.body(m, f);
+        if (sel now.err) { ret err[Why].err{Why.ir{now.err}}; }
+        val r: res[Value, Why] = entering(?t, place(now.ok, uses.data[i]));
+        if (sel r.err) { ret err[Why].err{r.err}; }
+        val put: err[module.Error] = body.substitute(m, f, uses.data[i], v, r.ok);
+        if (sel put.err) { ret err[Why].err{Why.ir{put.err}}; }
+        i = i + 1;
+    }
+    ret prune(?t);
+}
+
+# thread every value of a function to the reached uses it does not dominate
+# ---
+# m:   the module
+# f:   the function
+# d:   the dominance of its graph as it is, which parameters do not change
+# ret: whether a value was threaded, or why it was refused
+pub fun repair(m: *Module, f: Function, d: *Dominance) res[bool, Why] {
+    val got: res[*Body, module.Error] = module.body(m, f);
+    if (sel got.err) { ret ir[bool](got.err); }
+    val count:   usize                      = got.ok.values.len;
+    var uses:    vector.Vector[Instruction] = vector.init[Instruction](m.a);
+    var changed: bool                       = false;
+    fin { vector.dnit[Instruction](?uses); }
+    var v: usize = 0;
+    for (v < count) {
+        val now: res[*Body, module.Error] = module.body(m, f);
+        if (sel now.err) { ret ir[bool](now.err); }
+        val at: u32 = home(now.ok, v::u32);
+        if (at != NONE && dominance.reachable(d, at)) {
+            val found: err[allocator.Error] = stranded(m.a, now.ok, d, v::u32, at, ?uses);
+            if (sel found.err) { ret alloc[bool](found.err); }
+            if (uses.len > 0) {
+                val threaded: err[Why] = thread(m, f, d, Value{index: v::u32}, at, ?uses);
+                if (sel threaded.err) { ret res[bool, Why].err{threaded.err}; }
+                changed = true;
+            }
+        }
+        v = v + 1;
+    }
+    ret res[bool, Why].ok{changed};
+}

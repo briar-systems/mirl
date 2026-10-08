@@ -1,0 +1,985 @@
+# memory dependence and alias: where an access lands, whether two accesses may
+# touch the same bytes, how far apart loop iterations touch them, and which
+# accumulators a loop carries
+#
+# an access lands at a base and an offset from it. a base is a stack slot or a
+# global, the allocation an address is built from through `ptr.add`, and
+# anything else is unknown. two accesses through distinct allocations never
+# alias, two through one base alias when their byte ranges overlap, and every
+# other pair may alias: an unknown base, an offset no rule follows or a size
+# the operation does not state. a pointer offset is a signed byte count, and it is followed at the width of
+# the pointer in the address's space, the target's, never a fixed one.
+#
+# an offset is a sum of one value, scaled, and a constant. `alias` compares two
+# accesses within one iteration, the same value meaning the same number on both
+# sides, and `carried` compares them across the iterations of one loop, where a
+# value defined in the loop is known only when it steps by a constant each trip.
+#
+# what an instruction does to memory is read from its opcode row alone: the row
+# says whether it reads or writes, its operands' roles say which addresses it
+# goes through and how many bytes, and an operation that touches memory through
+# no address, such as a call or a fence, touches all of it. an ordering
+# immediate other than relaxed, or a volatile flag, orders the access against
+# every other. an inline assembly item will state the same record as an
+# `Effect`, from the effects it reports, and `conflicts` orders it as it does
+# any other instruction without change.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.vector;
+
+use mirl.fold.algebra;
+use mirl.fold.algebra.Algebra;
+use mirl.fold.algebra.Op;
+use mirl.fold.word;
+use mirl.ir.block.BlockData;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Opcode;
+use mirl.ir.opcode.Row;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.ValueData;
+use mirl.pass.analysis.range;
+use mirl.pass.analysis.range.Range;
+use mirl.pass.analysis.range.Ranges;
+use mirl.pass.analysis.read;
+use mirl.pass.analysis.read.Konst;
+use mirl.pass.failure.Why;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use TargetError: mirl.target.record.Error;
+use mirl.target.record.Target;
+
+# the allocation an address is built from
+# ---
+# unknown: no allocation is known
+# slot:    the stack slot an `alloca` made
+# symbol:  a function or global
+pub tag Base: u8 {
+    unknown;
+    slot:   Instruction;
+    symbol: Symbol;
+}
+
+# an offset in bytes: scale times a value, plus a constant
+# ---
+# has:      a value takes part
+# value:    that value
+# scale:    what the value is multiplied by
+# constant: the constant added
+# bits:     the width of the address space's pointer, which the sum is taken to
+#           stay within as a signed number
+# unsigned: the value is read as an unsigned number of its own width, which a
+#           value narrower than the pointer is when a zero extension widened it
+pub rec Offset {
+    has:      bool;
+    value:    Value;
+    scale:    i64;
+    constant: i64;
+    bits:     u32;
+    unsigned: bool;
+}
+
+# where an access lands
+# ---
+# base:   the allocation
+# offset: the byte offset from it
+# sized:  the access states how many bytes it covers
+# size:   that many bytes
+pub rec Place {
+    base:   Base;
+    offset: Offset;
+    sized:  bool;
+    size:   u64;
+}
+
+# whether two accesses may touch the same bytes
+# ---
+# no:   they never do
+# may:  they may
+# must: they touch exactly the same bytes
+pub tag Alias: u8 {
+    no;
+    may;
+    must;
+}
+
+# what an instruction does to memory
+# ---
+# reads:    it may read
+# writes:   it may write
+# anywhere: it may touch any byte, since it goes through no address
+# ordered:  it is ordered against every other access
+# places:   where it reads or writes, one for each address operand it has,
+#           with no limit on how many. the caller gives them back with
+#           `release`
+pub rec Effect {
+    reads:    bool;
+    writes:   bool;
+    anywhere: bool;
+    ordered:  bool;
+    places:   vector.Vector[Place];
+}
+
+# how far apart iterations touch the same bytes
+# ---
+# none:     no two iterations of the loop do
+# distance: the least number of iterations, at least one, from the first
+#           access to the second
+# unknown:  they may, at no distance known
+pub tag Carried: u8 {
+    none;
+    distance: u64;
+    unknown;
+}
+
+# an accumulator a loop updates each trip
+# ---
+# op:    how it combines, a sum, product, and, or or exclusive or
+# float: it is a float accumulator
+# exact: its result is the same in any order, which the algebra table states
+#        of the operation and which no float accumulator has, so a float sum
+#        needs the reader's permission to reassociate
+pub rec Reduction {
+    op:    Op;
+    float: bool;
+    exact: bool;
+}
+
+# the memory analysis of one function
+# ---
+# m:      the module
+# f:      the function
+# l:      its loops, valid as long as the cache holds this
+# r:      its value ranges, which prove an operation narrower than the pointer
+#         does not wrap, valid as long as the cache holds this
+# layout: the module's types laid out for the target
+pub rec Memory {
+    m:      *Module;
+    f:      Function;
+    l:      *Loops;
+    r:      *Ranges;
+    layout: Layout;
+}
+
+# how a value steps from trip to trip of a loop
+# ---
+# invariant: it is the same every trip
+# stepped:   it adds `step` every trip
+# varies:    it changes in a way no rule follows
+tag Motion: u8 {
+    invariant;
+    stepped: i64;
+    varies;
+}
+
+# the bounds a value takes, both inclusive
+rec Span {
+    lo: i128;
+    hi: i128;
+}
+
+# a query in progress
+rec Walk {
+    mem:    *Memory;
+    body:   *Body;
+    failed: bool;
+    why:    Why;
+    bits:   u32;
+    placed: bool;
+    at:     Block;
+}
+
+val HOPS:  u32 = 64;
+val TERMS: u32 = 8;
+
+# the memory analysis of a function
+pub fun init(m: *Module, t: *Target, f: Function, l: *Loops, r: *Ranges) Memory {
+    ret Memory{m: m, f: f, l: l, r: r, layout: layout.of(t, ?m.types)};
+}
+
+fun fault(w: *Walk, e: module.Error) {
+    if (!w.failed) {
+        w.failed = true;
+        w.why    = Why.ir{e};
+    }
+}
+
+fun refuse(w: *Walk, reason: *u8) {
+    if (!w.failed) {
+        w.failed = true;
+        w.why    = Why.reason{reason};
+    }
+}
+
+fun checked(w: *Walk, v: Value) bool {
+    if (v.index::usize >= w.body.values.len) {
+        fault(w, module.Error.value{v});
+        ret false;
+    }
+    ret true;
+}
+
+fun width_of(w: *Walk, v: Value) u32 {
+    if (!checked(w, v)) { ret 0; }
+    val got: res[u32, types.Error] = types.width(?w.mem.m.types, w.body.values.data[v.index].type);
+    if (sel got.err) { ret 0; }
+    ret got.ok;
+}
+
+fun constant(c: i64, bits: u32) Offset {
+    var o: Offset;
+    o.constant = c;
+    o.bits     = bits;
+    ret o;
+}
+
+fun opaque(v: Value, bits: u32, unsigned: bool) Offset {
+    var o: Offset;
+    o.has      = true;
+    o.value    = v;
+    o.scale    = 1;
+    o.bits     = bits;
+    o.unsigned = unsigned;
+    ret o;
+}
+
+# whether two offsets name one value read one way
+fun same_term(a: Offset, b: Offset) bool {
+    ret a.value.index == b.value.index && a.unsigned == b.unsigned;
+}
+
+# an i128 as an i64, none when it does not fit a signed number of the width. an
+# offset is held in an i64, so a width past 64 bits follows nothing
+fun narrowed(x: i128, bits: u32) opt[i64] {
+    if (bits == 0 || bits > 64) { ret opt[i64].none{}; }
+    val bound: i128 = 1::i128 << (bits - 1);
+    if (x >= bound || x < -bound) { ret opt[i64].none{}; }
+    ret opt[i64].some{x::i64};
+}
+
+# the number a constant of a width narrower than 64 bits holds as an unsigned
+# byte count
+fun unsigned_of(k: Konst, bits: u32) opt[i64] {
+    if (bits == 0 || bits >= 64) { ret opt[i64].none{}; }
+    val low: u64 = k.value[0] & ((1::u64 << bits) - 1);
+    ret opt[i64].some{low::i64};
+}
+
+# the number a constant holds as a signed byte count, none when it does not fit
+# a signed number of the offset's width
+fun signed(k: Konst, bits: u32, limit: u32) opt[i64] {
+    val x:        word.Wide = word.sext(k.value, bits);
+    val negative: bool      = word.bit(x, bits - 1);
+    var low:      u64       = x[0];
+    var i:        u32       = 1;
+    for (i < word.words()) {
+        val expect: u64 = 0;
+        if (negative) {
+            if (x[i] != ~expect) { ret opt[i64].none{}; }
+        }
+        or {
+            if (x[i] != expect) { ret opt[i64].none{}; }
+        }
+        i = i + 1;
+    }
+    val s: i64 = low::i64;
+    if (negative != (s < 0)) { ret opt[i64].none{}; }
+    ret narrowed(s::i128, limit);
+}
+
+# the sum of two offsets, scaling the second by sign, none when they name
+# different values or a number overflows
+fun combine(a: Offset, b: Offset, sign: i64) opt[Offset] {
+    var out: Offset   = a;
+    val c:   opt[i64] = narrowed(a.constant::i128 + sign::i128 * b.constant::i128, a.bits);
+    if (sel c.none) { ret opt[Offset].none{}; }
+    out.constant = c.some;
+    if (b.has) {
+        val s: opt[i64] = narrowed(sign::i128 * b.scale::i128, a.bits);
+        if (sel s.none) { ret opt[Offset].none{}; }
+        if (!a.has) {
+            out.has      = true;
+            out.value    = b.value;
+            out.scale    = s.some;
+            out.unsigned = b.unsigned;
+        }
+        or {
+            if (!same_term(a, b)) { ret opt[Offset].none{}; }
+            val t: opt[i64] = narrowed(a.scale::i128 + s.some::i128, a.bits);
+            if (sel t.none) { ret opt[Offset].none{}; }
+            out.scale = t.some;
+            if (t.some == 0) { out.has = false; }
+        }
+    }
+    ret opt[Offset].some{out};
+}
+
+fun scaled(a: Offset, k: i64) opt[Offset] {
+    var out: Offset   = a;
+    val c:   opt[i64] = narrowed(a.constant::i128 * k::i128, a.bits);
+    val s:   opt[i64] = narrowed(a.scale::i128 * k::i128, a.bits);
+    if (sel c.none) { ret opt[Offset].none{}; }
+    if (sel s.none) { ret opt[Offset].none{}; }
+    out.constant = c.some;
+    out.scale    = s.some;
+    if (k == 0) { out.has = false; }
+    ret opt[Offset].some{out};
+}
+
+fun fixed(a: Offset) bool {
+    ret !a.has;
+}
+
+# the signed or unsigned bounds a value takes where the access reads it, none
+# when the access is not placed or the value is wider than a number can hold
+fun span_of(w: *Walk, v: Value, bits: u32, unsigned: bool) opt[Span] {
+    if (!w.placed || bits == 0 || bits >= 64) { ret opt[Span].none{}; }
+    val got: res[Range, Why] = range.range_at(w.mem.r, v, w.at);
+    if (sel got.err) {
+        if (!w.failed) {
+            w.failed = true;
+            w.why    = got.err;
+        }
+        ret opt[Span].none{};
+    }
+    val lo:   i128 = got.ok.lo[0]::i128;
+    val hi:   i128 = got.ok.hi[0]::i128;
+    val half: i128 = 1::i128 << (bits - 1);
+    val full: i128 = 1::i128 << bits;
+    if (unsigned || hi < half) { ret opt[Span].some{Span{lo: lo, hi: hi}}; }
+    if (lo >= half)            { ret opt[Span].some{Span{lo: lo - full, hi: hi - full}}; }
+    ret opt[Span].some{Span{lo: -half, hi: half - 1}};
+}
+
+# whether an operation narrower than the pointer provably stays within its own
+# width, read as signed or unsigned numbers, from the ranges of its operands
+fun stays(w: *Walk, ins: *InstructionData, op: Op, bits: u32, unsigned: bool) bool {
+    if (ins.operands.len != 2) { ret false; }
+    val x: opt[Span] = span_of(w, ins.operands.data[0], bits, unsigned);
+    val y: opt[Span] = span_of(w, ins.operands.data[1], bits, unsigned);
+    if (sel x.none) { ret false; }
+    if (sel y.none) { ret false; }
+    var lo: i128 = 0;
+    var hi: i128 = 0;
+    if (sel op.sum) {
+        lo = x.some.lo + y.some.lo;
+        hi = x.some.hi + y.some.hi;
+    }
+    or (sel op.difference) {
+        lo = x.some.lo - y.some.hi;
+        hi = x.some.hi - y.some.lo;
+    }
+    or (sel op.product) {
+        val a: i128 = x.some.lo * y.some.lo;
+        val b: i128 = x.some.lo * y.some.hi;
+        val c: i128 = x.some.hi * y.some.lo;
+        val d: i128 = x.some.hi * y.some.hi;
+        lo = least(least(a, b), least(c, d));
+        hi = most(most(a, b), most(c, d));
+    }
+    or (sel op.shift_left) {
+        val k: opt[Span] = span_of(w, ins.operands.data[1], bits, true);
+        if (sel k.none)              { ret false; }
+        if (k.some.hi >= bits::i128) { ret false; }
+        val a: i128 = x.some.lo << k.some.lo::u64;
+        val b: i128 = x.some.lo << k.some.hi::u64;
+        val c: i128 = x.some.hi << k.some.lo::u64;
+        val d: i128 = x.some.hi << k.some.hi::u64;
+        lo = least(least(a, b), least(c, d));
+        hi = most(most(a, b), most(c, d));
+    }
+    or {
+        ret false;
+    }
+    if (unsigned) { ret lo >= 0 && hi < (1::i128 << bits); }
+    ret lo >= -(1::i128 << (bits - 1)) && hi < (1::i128 << (bits - 1));
+}
+
+fun least(a: i128, b: i128) i128 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun most(a: i128, b: i128) i128 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# an integer value as an offset, the value itself standing for what no rule
+# follows. arithmetic at the pointer's width or wider is followed, an offset
+# that fits a signed number of the pointer's width not wrapping, since a wrap
+# leaves the address space. a value narrower than the pointer can wrap while
+# staying in bounds, so its arithmetic is followed only where the ranges of its
+# operands prove the result within its own width, and an extension is followed
+# to the value it extends, a sign extension reading it as signed and a zero
+# extension as unsigned. the ranges are read where the access is
+fun offset_of(w: *Walk, v: Value, terms: u32, unsigned: bool) Offset {
+    if (!checked(w, v)) { ret opaque(v, w.bits, false); }
+    val bits:   u32                      = width_of(w, v);
+    val narrow: bool                     = bits < w.bits;
+    val reads:  bool                     = unsigned && narrow;
+    val k:      res[Konst, module.Error] = read.konst(w.mem.m, w.body, v);
+    if (sel k.err) {
+        fault(w, k.err);
+        ret opaque(v, w.bits, reads);
+    }
+    var limit: u32 = w.bits;
+    if (narrow) { limit = bits; }
+    if (k.ok.ok) {
+        if (reads) {
+            val u: opt[i64] = unsigned_of(k.ok, bits);
+            if (sel u.some) { ret constant(u.some, w.bits); }
+            ret opaque(v, w.bits, reads);
+        }
+        val n: opt[i64] = signed(k.ok, bits, limit);
+        if (sel n.some) { ret constant(n.some, w.bits); }
+        ret opaque(v, w.bits, reads);
+    }
+    if (terms >= TERMS) { ret opaque(v, w.bits, reads); }
+    val made: opt[*InstructionData] = read.made(w.body, v);
+    if (sel made.none) { ret opaque(v, w.bits, reads); }
+    val ins: *InstructionData = made.some;
+    val op:  Op               = algebra.algebra(ins.opcode).op;
+    if (ins.operands.len == 1 && sel op.extend_u) { ret offset_of(w, ins.operands.data[0], terms + 1, true); }
+    if (ins.operands.len == 1 && sel op.extend_s) {
+        if (reads) { ret opaque(v, w.bits, reads); }
+        ret offset_of(w, ins.operands.data[0], terms + 1, false);
+    }
+    if (ins.operands.len != 2)                     { ret opaque(v, w.bits, reads); }
+    if (narrow && !stays(w, ins, op, bits, reads)) { ret opaque(v, w.bits, reads); }
+    if (w.failed)                                  { ret opaque(v, w.bits, reads); }
+    val x: Offset = offset_of(w, ins.operands.data[0], terms + 1, reads);
+    val y: Offset = offset_of(w, ins.operands.data[1], terms + 1, reads);
+    if (sel op.sum) {
+        val r: opt[Offset] = combine(x, y, 1);
+        if (sel r.some) { ret r.some; }
+    }
+    if (sel op.difference) {
+        val r: opt[Offset] = combine(x, y, -1);
+        if (sel r.some) { ret r.some; }
+    }
+    if (sel op.product) {
+        if (fixed(y)) {
+            val r: opt[Offset] = scaled(x, y.constant);
+            if (sel r.some) { ret r.some; }
+        }
+        if (fixed(x)) {
+            val r: opt[Offset] = scaled(y, x.constant);
+            if (sel r.some) { ret r.some; }
+        }
+    }
+    if (sel op.shift_left && fixed(y) && y.constant >= 0 && y.constant < 62) {
+        val r: opt[Offset] = scaled(x, 1::i64 << y.constant::u64);
+        if (sel r.some) { ret r.some; }
+    }
+    ret opaque(v, w.bits, reads);
+}
+
+# the width in bits of the pointer an address value is, none when its space
+# states no byte width
+fun pointer_bits(w: *Walk, address: Value) opt[u32] {
+    val got: res[u64, TargetError] = layout.size(?w.mem.layout, w.body.values.data[address.index].type);
+    if (sel got.err) { ret opt[u32].none{}; }
+    if (got.ok == 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{(got.ok * 8)::u32};
+}
+
+# the place an address value lands
+fun locate(w: *Walk, address: Value) Place {
+    var p: Place;
+    p.base = Base.unknown{};
+    if (!checked(w, address)) { ret p; }
+    val bits: opt[u32] = pointer_bits(w, address);
+    if (sel bits.none) {
+        p.offset = constant(0, 0);
+        ret p;
+    }
+    w.bits   = bits.some;
+    p.offset = constant(0, w.bits);
+    var cur:  Value = address;
+    var hops: u32   = 0;
+    for (hops < HOPS && !w.failed) {
+        if (!checked(w, cur)) { ret p; }
+        val vd: *ValueData = ?w.body.values.data[cur.index];
+        if (sel vd.def.constant) {
+            val got: res[ConstantData, module.Error] = module.constant_data(w.mem.m, vd.def.constant);
+            if (sel got.err) {
+                fault(w, got.err);
+                ret p;
+            }
+            if (sel got.ok.address) {
+                val sum: opt[Offset] = combine(p.offset, constant(got.ok.address.offset, w.bits), 1);
+                if (sel sum.none) { ret p; }
+                p.offset = sum.some;
+                p.base   = Base.symbol{got.ok.address.symbol};
+            }
+            ret p;
+        }
+        val made: opt[*InstructionData] = read.made(w.body, cur);
+        if (sel made.none) { ret p; }
+        val ins: *InstructionData = made.some;
+        if (ins.opcode.index == opcode.ALLOCA.index) {
+            if (sel vd.def.result) { p.base = Base.slot{vd.def.result.instruction}; }
+            ret p;
+        }
+        if (ins.opcode.index != opcode.PTR_ADD.index || ins.operands.len != 2) { ret p; }
+        val sum: opt[Offset] = combine(p.offset, offset_of(w, ins.operands.data[1], 0, false), 1);
+        if (sel sum.none) {
+            p.offset = opaque(ins.operands.data[1], w.bits, false);
+            ret p;
+        }
+        p.offset = sum.some;
+        cur      = ins.operands.data[0];
+        hops     = hops + 1;
+    }
+    ret p;
+}
+
+# where an address lands, with no size stated
+# ---
+# mem:     the analysis
+# address: the address
+# at:      the block that reads it, where the ranges of narrow offsets are read
+# ret:     its place, or why the query was refused
+pub fun place_of(mem: *Memory, address: Value, at: Block) res[Place, Why] {
+    val got: res[*Body, module.Error] = module.body(mem.m, mem.f);
+    if (sel got.err) { ret res[Place, Why].err{Why.ir{got.err}}; }
+    var w: Walk;
+    w.mem    = mem;
+    w.body   = got.ok;
+    w.placed = true;
+    w.at     = at;
+    val p: Place = locate(?w, address);
+    if (w.failed) { ret res[Place, Why].err{w.why}; }
+    ret res[Place, Why].ok{p};
+}
+
+fun same_base(a: Base, b: Base) bool {
+    if (sel a.slot) {
+        if (sel b.slot) { ret a.slot.index == b.slot.index; }
+        ret false;
+    }
+    if (sel a.symbol) {
+        if (sel b.symbol) {
+            if (sel a.symbol.function) {
+                if (sel b.symbol.function) { ret a.symbol.function.index == b.symbol.function.index; }
+                ret false;
+            }
+            if (sel a.symbol.global) {
+                if (sel b.symbol.global) { ret a.symbol.global.index == b.symbol.global.index; }
+            }
+        }
+    }
+    ret false;
+}
+
+fun known(b: Base) bool {
+    ret sel b.slot || sel b.symbol;
+}
+
+# whether two accesses may touch the same bytes within one iteration
+pub fun alias(a: Place, b: Place) Alias {
+    if (!known(a.base) || !known(b.base)) { ret Alias.may{}; }
+    if (!same_base(a.base, b.base))       { ret Alias.no{}; }
+    if (a.offset.has != b.offset.has)     { ret Alias.may{}; }
+    if (a.offset.has) {
+        if (!same_term(a.offset, b.offset) || a.offset.scale != b.offset.scale) { ret Alias.may{}; }
+    }
+    val ca:   i128 = a.offset.constant::i128;
+    val cb:   i128 = b.offset.constant::i128;
+    var near: bool = true;
+    var far:  bool = true;
+    if (a.sized)                                            { near = cb < ca + a.size::i128; }
+    if (b.sized)                                            { far = ca < cb + b.size::i128; }
+    if (!near || !far)                                      { ret Alias.no{}; }
+    if (a.sized && b.sized && ca == cb && a.size == b.size) { ret Alias.must{}; }
+    ret Alias.may{};
+}
+
+fun ordering_of(ins: *InstructionData) bool {
+    var i: usize = 0;
+    for (i < ins.immediates.len) {
+        val imm: opcode.Immediate = ins.immediates.data[i];
+        if (sel imm.ordering && !(sel imm.ordering.relaxed)) { ret true; }
+        i = i + 1;
+    }
+    ret ins.metadata.flags.volatile;
+}
+
+fun bytes_of(w: *Walk, ty: Type) opt[u64] {
+    val got: res[u64, TargetError] = layout.size(?w.mem.layout, ty);
+    if (sel got.err) {
+        refuse(w, "the target lays out no type of an access");
+        ret opt[u64].none{};
+    }
+    ret opt[u64].some{got.ok};
+}
+
+# how many bytes an instruction's addresses cover, none when it does not say
+fun extent(w: *Walk, ins: *InstructionData, r: *Row) opt[u64] {
+    val n: u32 = opcode.fixed(r);
+    var k: u32 = 0;
+    for (k < n && k::usize < ins.operands.len) {
+        if (sel r.operands[k].role.length) {
+            val c: res[Konst, module.Error] = read.konst(w.mem.m, w.body, ins.operands.data[k]);
+            if (sel c.err) {
+                fault(w, c.err);
+                ret opt[u64].none{};
+            }
+            if (c.ok.ok && word.length(c.ok.value) <= 64) { ret opt[u64].some{c.ok.value[0]}; }
+            ret opt[u64].none{};
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < n && k::usize < ins.operands.len) {
+        if (sel r.operands[k].role.stored) {
+            if (!checked(w, ins.operands.data[k])) { ret opt[u64].none{}; }
+            ret bytes_of(w, w.body.values.data[ins.operands.data[k].index].type);
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < opcode.slots(r) && k::usize < ins.immediates.len) {
+        if (sel r.immediates[k].holds.ty) {
+            if (sel ins.immediates.data[k].ty) { ret bytes_of(w, ins.immediates.data[k].ty); }
+        }
+        k = k + 1;
+    }
+    ret opt[u64].none{};
+}
+
+# what an instruction does to memory
+# ---
+# mem: the analysis
+# i:   the instruction
+# ret: its effect, or why the query was refused
+pub fun effect_of(mem: *Memory, i: Instruction) res[Effect, Why] {
+    var e: Effect;
+    e.places = vector.init[Place](mem.m.a);
+    val got: res[*Body, module.Error] = module.body(mem.m, mem.f);
+    if (sel got.err) { ret res[Effect, Why].err{Why.ir{got.err}}; }
+    var w: Walk;
+    w.mem  = mem;
+    w.body = got.ok;
+    if (i.index::usize >= w.body.instructions.len) { ret res[Effect, Why].err{Why.ir{module.Error.instruction{i}}}; }
+    val ins: *InstructionData = ?w.body.instructions.data[i.index];
+    if (sel ins.place.placed) {
+        w.placed = true;
+        w.at     = ins.place.placed;
+    }
+    val row: opt[Row] = opcode.row(ins.opcode);
+    if (sel row.none) { ret res[Effect, Why].err{Why.reason{"an instruction has no opcode row"}}; }
+    var r: Row = row.some;
+    e.reads  = r.effects.reads;
+    e.writes = r.effects.writes;
+    if (!e.reads && !e.writes) { ret res[Effect, Why].ok{e}; }
+    e.ordered = ordering_of(ins);
+    val size: opt[u64] = extent(?w, ins, ?r);
+    val n:    u32      = opcode.fixed(?r);
+    var k:    u32      = 0;
+    for (k < n && k::usize < ins.operands.len && !w.failed) {
+        if (sel r.operands[k].role.address) {
+            var p: Place = locate(?w, ins.operands.data[k]);
+            if (sel size.some) {
+                p.sized = true;
+                p.size  = size.some;
+            }
+            val pushed: res[usize, allocator.Error] = vector.push[Place](?e.places, p);
+            if (sel pushed.err) {
+                vector.dnit[Place](?e.places);
+                ret res[Effect, Why].err{Why.alloc{pushed.err}};
+            }
+        }
+        k = k + 1;
+    }
+    if (w.failed) {
+        vector.dnit[Place](?e.places);
+        ret res[Effect, Why].err{w.why};
+    }
+    if (e.places.len == 0) { e.anywhere = true; }
+    ret res[Effect, Why].ok{e};
+}
+
+# give back the storage of an effect
+pub fun release(e: *Effect) err[allocator.Error] {
+    ret vector.dnit[Place](?e.places);
+}
+
+# whether two instructions' effects must keep their order
+pub fun conflicts(a: Effect, b: Effect) bool {
+    val touches: bool = (a.reads || a.writes) && (b.reads || b.writes);
+    if (!touches)                 { ret false; }
+    if (a.ordered || b.ordered)   { ret true; }
+    if (!a.writes && !b.writes)   { ret false; }
+    if (a.anywhere || b.anywhere) { ret true; }
+    var i: usize = 0;
+    for (i < a.places.len) {
+        var j: usize = 0;
+        for (j < b.places.len) {
+            val al: Alias = alias(a.places.data[i], b.places.data[j]);
+            if (!(sel al.no)) { ret true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun defined_in(w: *Walk, lp: u32, v: Value) opt[bool] {
+    val vd: *ValueData = ?w.body.values.data[v.index];
+    if (sel vd.def.constant)  { ret opt[bool].some{false}; }
+    if (sel vd.def.parameter) { ret opt[bool].some{loops.contains(w.mem.l, lp, vd.def.parameter.block.index)}; }
+    if (sel vd.def.result) {
+        val ins: *InstructionData = ?w.body.instructions.data[vd.def.result.instruction.index];
+        if (sel ins.place.placed) { ret opt[bool].some{loops.contains(w.mem.l, lp, ins.place.placed.index)}; }
+    }
+    ret opt[bool].none{};
+}
+
+# how a value moves from trip to trip of a loop
+fun motion(w: *Walk, lp: u32, o: Offset) Motion {
+    val v: Value = o.value;
+    if (!checked(w, v)) { ret Motion.varies{}; }
+    val inside: opt[bool] = defined_in(w, lp, v);
+    if (sel inside.none) { ret Motion.varies{}; }
+    if (!inside.some)    { ret Motion.invariant{}; }
+    val vd: *ValueData = ?w.body.values.data[v.index];
+    if (!(sel vd.def.parameter)) { ret Motion.varies{}; }
+    val blk: Block = vd.def.parameter.block;
+    if (loops.loop(w.mem.l, lp).header != blk.index) { ret Motion.varies{}; }
+    val bd:   *BlockData = ?w.body.blocks.data[blk.index];
+    var step: i64        = 0;
+    var seen: bool       = false;
+    var i:    usize      = 0;
+    for (i < bd.predecessors.len) {
+        val ins: *InstructionData = ?w.body.instructions.data[bd.predecessors.data[i].index];
+        if (sel ins.place.placed && loops.contains(w.mem.l, lp, ins.place.placed.index)) {
+            var e: usize = 0;
+            for (e < ins.edges.len) {
+                if (ins.edges.data[e].block.index == blk.index) {
+                    val s: opt[i64] = stepped(w, ins.edges.data[e].arguments.data[vd.def.parameter.index], v);
+                    if (sel s.none)             { ret Motion.varies{}; }
+                    if (seen && s.some != step) { ret Motion.varies{}; }
+                    step = s.some;
+                    seen = true;
+                }
+                e = e + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (!seen) { ret Motion.varies{}; }
+    val bits: u32 = width_of(w, v);
+    if (bits < o.bits) {
+        # a narrow value steps only where its range at the header keeps every trip within its width
+        w.placed = true;
+        w.at     = blk;
+        val span: opt[Span] = span_of(w, v, bits, o.unsigned);
+        if (sel span.none) { ret Motion.varies{}; }
+        var least_v: i128 = -(1::i128 << (bits - 1));
+        var most_v:  i128 = (1::i128 << (bits - 1)) - 1;
+        if (o.unsigned) {
+            least_v = 0;
+            most_v  = (1::i128 << bits) - 1;
+        }
+        if (span.some.lo + step::i128 < least_v || span.some.hi + step::i128 > most_v) { ret Motion.varies{}; }
+    }
+    ret Motion.stepped{step};
+}
+
+# the constant a value adds to a parameter, none when it is anything else
+fun stepped(w: *Walk, arg: Value, param: Value) opt[i64] {
+    if (!checked(w, arg)) { ret opt[i64].none{}; }
+    val made: opt[*InstructionData] = read.made(w.body, arg);
+    if (sel made.none) { ret opt[i64].none{}; }
+    val ins:  *InstructionData = made.some;
+    val form: Algebra          = algebra.algebra(ins.opcode);
+    if (!(sel form.op.sum) || !form.commutative || ins.operands.len != 2) { ret opt[i64].none{}; }
+    var other: Value = ins.operands.data[1];
+    if (ins.operands.data[1].index == param.index) { other = ins.operands.data[0]; }
+    or (ins.operands.data[0].index != param.index) { ret opt[i64].none{}; }
+    val k: res[Konst, module.Error] = read.konst(w.mem.m, w.body, other);
+    if (sel k.err) {
+        fault(w, k.err);
+        ret opt[i64].none{};
+    }
+    if (!k.ok.ok) { ret opt[i64].none{}; }
+    ret signed(k.ok, width_of(w, param), width_of(w, param));
+}
+
+fun floor_div(a: i128, b: i128) i128 {
+    var q: i128 = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) { q = q - 1; }
+    ret q;
+}
+
+fun ceil_div(a: i128, b: i128) i128 {
+    ret -floor_div(-a, b);
+}
+
+# how far apart iterations of a loop touch the same bytes
+#
+# the second access is read `d` iterations after the first, and the least
+# `d` of one or more at which their bytes overlap is the distance. the trip
+# count is taken to be unbounded.
+# ---
+# mem:   the analysis
+# lp:    the loop, an index of its loops
+# first: the access made first
+# then:  the access made later
+# ret:   how they depend, or why the query was refused
+pub fun carried(mem: *Memory, lp: u32, first: Place, then: Place) res[Carried, Why] {
+    if (lp >= loops.count(mem.l)) { ret res[Carried, Why].err{Why.reason{"no such loop"}}; }
+    val got: res[*Body, module.Error] = module.body(mem.m, mem.f);
+    if (sel got.err) { ret res[Carried, Why].err{Why.ir{got.err}}; }
+    var w: Walk;
+    w.mem  = mem;
+    w.body = got.ok;
+    if (known(first.base) && known(then.base) && !same_base(first.base, then.base)) { ret res[Carried, Why].ok{Carried.none{}}; }
+    if (!known(first.base) || !known(then.base) || !first.sized || !then.sized)     { ret res[Carried, Why].ok{Carried.unknown{}}; }
+    if (first.offset.has != then.offset.has)                                        { ret res[Carried, Why].ok{Carried.unknown{}}; }
+    var stride: i64 = 0;
+    if (first.offset.has) {
+        if (!same_term(first.offset, then.offset) || first.offset.scale != then.offset.scale) { ret res[Carried, Why].ok{Carried.unknown{}}; }
+        val m: Motion = motion(?w, lp, first.offset);
+        if (w.failed)     { ret res[Carried, Why].err{w.why}; }
+        if (sel m.varies) { ret res[Carried, Why].ok{Carried.unknown{}}; }
+        if (sel m.stepped) {
+            val s: opt[i64] = narrowed(first.offset.scale::i128 * m.stepped::i128, first.offset.bits);
+            if (sel s.none) { ret res[Carried, Why].ok{Carried.unknown{}}; }
+            stride = s.some;
+        }
+    }
+    val ca: i128 = first.offset.constant::i128;
+    val cb: i128 = then.offset.constant::i128;
+    val lo: i128 = ca - cb - then.size::i128 + 1;
+    val hi: i128 = ca - cb + first.size::i128 - 1;
+    if (stride == 0) {
+        if (lo <= 0 && 0 <= hi) { ret res[Carried, Why].ok{Carried.distance{1}}; }
+        ret res[Carried, Why].ok{Carried.none{}};
+    }
+    var least: i128 = 0;
+    var most:  i128 = 0;
+    if (stride > 0) {
+        least = ceil_div(lo, stride::i128);
+        most  = floor_div(hi, stride::i128);
+    }
+    or {
+        least = ceil_div(-hi, -stride::i128);
+        most  = floor_div(-lo, -stride::i128);
+    }
+    if (least < 1)                          { least = 1; }
+    if (least > most)                       { ret res[Carried, Why].ok{Carried.none{}}; }
+    if (least > 18446744073709551615::i128) { ret res[Carried, Why].ok{Carried.unknown{}}; }
+    ret res[Carried, Why].ok{Carried.distance{least::u64}};
+}
+
+# whether an operation can fold an accumulator in any operand order
+fun reducing(a: Algebra) bool {
+    if (!a.commutative) { ret false; }
+    ret sel a.op.sum || sel a.op.product || sel a.op.both || sel a.op.either || sel a.op.differ;
+}
+
+fun inside(w: *Walk, lp: u32, i: Instruction) bool {
+    val ins: *InstructionData = ?w.body.instructions.data[i.index];
+    if (sel ins.place.placed) { ret loops.contains(w.mem.l, lp, ins.place.placed.index); }
+    ret true;
+}
+
+# whether every use of a value inside a loop is a branch passing it on
+fun sealed(w: *Walk, lp: u32, v: Value) bool {
+    val vd: *ValueData = ?w.body.values.data[v.index];
+    var u:  usize      = 0;
+    for (u < vd.uses.len) {
+        val user: *InstructionData = ?w.body.instructions.data[vd.uses.data[u].index];
+        val row:  opt[Row]         = opcode.row(user.opcode);
+        if (sel row.none)                                           { ret false; }
+        if (!row.some.terminator && inside(w, lp, vd.uses.data[u])) { ret false; }
+        u = u + 1;
+    }
+    ret true;
+}
+
+# whether a parameter of a loop's header is an accumulator the loop updates
+# each trip with one operation, and used nowhere else in the loop
+# ---
+# mem:   the analysis
+# lp:    the loop, an index of its loops
+# param: a parameter of the loop's header
+# ret:   its reduction, none when it is not one, or why the query was refused
+pub fun reduction(mem: *Memory, lp: u32, param: Value) res[opt[Reduction], Why] {
+    val none: res[opt[Reduction], Why] = res[opt[Reduction], Why].ok{opt[Reduction].none{}};
+    if (lp >= loops.count(mem.l)) { ret res[opt[Reduction], Why].err{Why.reason{"no such loop"}}; }
+    val got: res[*Body, module.Error] = module.body(mem.m, mem.f);
+    if (sel got.err) { ret res[opt[Reduction], Why].err{Why.ir{got.err}}; }
+    var w: Walk;
+    w.mem  = mem;
+    w.body = got.ok;
+    if (!checked(?w, param)) { ret res[opt[Reduction], Why].err{w.why}; }
+    val vd: *ValueData = ?w.body.values.data[param.index];
+    if (!(sel vd.def.parameter)) { ret none; }
+    val blk: Block = vd.def.parameter.block;
+    if (loops.loop(mem.l, lp).header != blk.index) { ret none; }
+    val bd:   *BlockData = ?w.body.blocks.data[blk.index];
+    var code: u32        = 0;
+    var seen: bool       = false;
+    var i:    usize      = 0;
+    for (i < bd.predecessors.len) {
+        val ins: *InstructionData = ?w.body.instructions.data[bd.predecessors.data[i].index];
+        if (sel ins.place.placed && loops.contains(mem.l, lp, ins.place.placed.index)) {
+            var e: usize = 0;
+            for (e < ins.edges.len) {
+                if (ins.edges.data[e].block.index == blk.index) {
+                    val arg:  Value                 = ins.edges.data[e].arguments.data[vd.def.parameter.index];
+                    val made: opt[*InstructionData] = read.made(w.body, arg);
+                    if (sel made.none) { ret none; }
+                    val op:   *InstructionData = made.some;
+                    val c:    u32              = op.opcode.index;
+                    val form: Algebra          = algebra.algebra(op.opcode);
+                    if (!reducing(form) || op.operands.len != 2)                                              { ret none; }
+                    if (op.operands.data[0].index == op.operands.data[1].index)                               { ret none; }
+                    if (op.operands.data[0].index != param.index && op.operands.data[1].index != param.index) { ret none; }
+                    if (seen && c != code)                                                                    { ret none; }
+                    code = c;
+                    seen = true;
+                }
+                e = e + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (!seen) { ret none; }
+    var u: usize = 0;
+    for (u < vd.uses.len) {
+        val user: *InstructionData = ?w.body.instructions.data[vd.uses.data[u].index];
+        if (inside(?w, lp, vd.uses.data[u])) {
+            if (user.opcode.index != code || user.results.len == 0 || !sealed(?w, lp, user.results.data[0])) { ret none; }
+        }
+        u = u + 1;
+    }
+    val form: Algebra                      = algebra.algebra(Opcode{index: code});
+    val ty:   res[types.Kind, types.Error] = types.kind(?mem.m.types, w.body.values.data[param.index].type);
+    if (sel ty.err) { ret res[opt[Reduction], Why].err{Why.ir{module.Error.types{ty.err}}}; }
+    ret res[opt[Reduction], Why].ok{opt[Reduction].some{Reduction{op: form.op, float: sel ty.ok.float, exact: form.associative}}};
+}

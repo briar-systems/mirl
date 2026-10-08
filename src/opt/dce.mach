@@ -1,0 +1,381 @@
+# dead code removal: blocks the entry cannot reach, then every instruction and
+# block parameter nothing live reads
+#
+# an instruction may go when its opcode row states no effect on it: it is not a
+# terminator, writes no memory, traps never and is not volatile. liveness grows
+# from every instruction that stays, and a branch argument is read only when
+# the parameter it is passed for is, so parameters that only feed each other go
+# together. a value binding record never keeps code alive, since reading a
+# value is no use of it. a record reading a result that goes is salvaged as a
+# step over the instruction's operand when a step row names its opcode, and
+# otherwise becomes unavailable at its point, never dropped. the pass adds no
+# branch and never reads a secret, so it keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.row.Traps;
+use mirl.ir.opcode.rule.Trap;
+use mirl.ir.opcode.table;
+use mirl.ir.point.Reads;
+use mirl.ir.value.Def;
+use mirl.pass.cache;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+
+# the pass: it can remove blocks and values, so no analysis outlives it
+pub val DCE: Pass = Pass{name: "dce", kind: Kind.optimise{}, scope: Scope.function{visit}, preserves: cache.NONE, time: Time.keeps{}};
+
+# one run over a function
+# ---
+# m:     the module
+# f:     the function
+# b:     its body
+# block: per block, whether the entry reaches it
+# value: per value, whether something live reads it
+# inst:  per instruction, whether it stays
+# work:  the values whose readers are not yet marked
+rec Sweep {
+    m:     *Module;
+    f:     Function;
+    b:     *Body;
+    block: vector.Vector[u8];
+    value: vector.Vector[u8];
+    inst:  vector.Vector[u8];
+    work:  vector.Vector[Value];
+}
+
+fun lost(e: allocator.Error) err[Why] {
+    ret err[Why].err{Why.alloc{e}};
+}
+
+fun edit(r: err[module.Error]) err[Why] {
+    if (sel r.err) { ret err[Why].err{Why.ir{r.err}}; }
+    ret err[Why].ok{};
+}
+
+fun zeros(v: *vector.Vector[u8], n: usize) err[Why] {
+    var i: usize = 0;
+    for (i < n) {
+        val pushed: res[usize, allocator.Error] = vector.push[u8](v, 0);
+        if (sel pushed.err) { ret lost(pushed.err); }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# the row of a placed instruction, which always has one
+fun row_of(d: *InstructionData) res[Row, Why] {
+    val found: opt[Row] = table.row(d.opcode);
+    if (!(sel found.some)) { ret res[Row, Why].err{Why.reason{"an instruction whose opcode has no row"}}; }
+    ret res[Row, Why].ok{found.some};
+}
+
+# whether an instruction may go when nothing reads it, from its row alone
+fun removable(d: *InstructionData) res[bool, Why] {
+    if (d.metadata.flags.volatile) { ret res[bool, Why].ok{false}; }
+    val got: res[Row, Why] = row_of(d);
+    if (sel got.err) { ret res[bool, Why].err{got.err}; }
+    val row: Row = got.ok;
+    if (row.terminator || row.effects.writes) { ret res[bool, Why].ok{false}; }
+    var t: usize = 0;
+    for (t < $length_of(Traps)) {
+        val trap: Trap = row.effects.traps[t];
+        if (!(sel trap.unstated)) { ret res[bool, Why].ok{false}; }
+        t = t + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
+
+fun mark_block(s: *Sweep, k: Block) bool {
+    if (s.block.data[k.index] != 0) { ret false; }
+    s.block.data[k.index] = 1;
+    ret true;
+}
+
+# mark the blocks the entry reaches
+fun reach(s: *Sweep) err[Why] {
+    var todo: vector.Vector[Block] = vector.init[Block](s.m.a);
+    fin { vector.dnit[Block](?todo); }
+    mark_block(s, Block{index: 0});
+    val first: res[usize, allocator.Error] = vector.push[Block](?todo, Block{index: 0});
+    if (sel first.err) { ret lost(first.err); }
+    for (todo.len != 0) {
+        val k: Block = todo.data[todo.len - 1];
+        todo.len = todo.len - 1;
+        val list: *vector.Vector[Instruction] = ?s.b.blocks.data[k.index].instructions;
+        var i:    usize                       = 0;
+        for (i < list.len) {
+            val d: *InstructionData = ?s.b.instructions.data[list.data[i].index];
+            var e: usize            = 0;
+            for (e < d.edges.len) {
+                val to: Block = d.edges.data[e].block;
+                if (mark_block(s, to)) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Block](?todo, to);
+                    if (sel pushed.err) { ret lost(pushed.err); }
+                }
+                e = e + 1;
+            }
+            i = i + 1;
+        }
+    }
+    ret err[Why].ok{};
+}
+
+# remove the blocks the entry does not reach, with their instructions
+fun prune(s: *Sweep) res[bool, Why] {
+    var gone: vector.Vector[Instruction] = vector.init[Instruction](s.m.a);
+    fin { vector.dnit[Instruction](?gone); }
+    var k:   usize = 0;
+    var any: bool  = false;
+    for (k < s.b.blocks.len) {
+        if (s.block.data[k] == 0 && !s.b.blocks.data[k].erased) {
+            any = true;
+            val list: *vector.Vector[Instruction] = ?s.b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                val pushed: res[usize, allocator.Error] = vector.push[Instruction](?gone, list.data[i]);
+                if (sel pushed.err) { ret res[bool, Why].err{Why.alloc{pushed.err}}; }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    if (!any) { ret res[bool, Why].ok{false}; }
+    val taken: err[Why] = edit(body.remove_dead(s.m, s.f, Slice[Instruction]{data: gone.data, size: gone.len}, Slice[Value]{data: nil, size: 0}));
+    if (sel taken.err) { ret res[bool, Why].err{taken.err}; }
+    k = 0;
+    for (k < s.b.blocks.len) {
+        if (s.block.data[k] == 0 && !s.b.blocks.data[k].erased) {
+            val erased: err[Why] = edit(body.erase_block(s.m, s.f, Block{index: k::u32}));
+            if (sel erased.err) { ret res[bool, Why].err{erased.err}; }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
+
+fun want(s: *Sweep, v: Value) err[Why] {
+    if (s.value.data[v.index] != 0) { ret err[Why].ok{}; }
+    s.value.data[v.index] = 1;
+    val pushed: res[usize, allocator.Error] = vector.push[Value](?s.work, v);
+    if (sel pushed.err) { ret lost(pushed.err); }
+    ret err[Why].ok{};
+}
+
+# keep an instruction and want what it reads
+fun keep(s: *Sweep, i: Instruction) err[Why] {
+    if (s.inst.data[i.index] != 0) { ret err[Why].ok{}; }
+    s.inst.data[i.index] = 1;
+    val d: *InstructionData = ?s.b.instructions.data[i.index];
+    var k: usize            = 0;
+    for (k < d.operands.len) {
+        val r: err[Why] = want(s, d.operands.data[k]);
+        if (sel r.err) { ret r; }
+        k = k + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# a wanted parameter wants the argument every edge into its block passes for it
+fun feed(s: *Sweep, v: Value) err[Why] {
+    val at: Def = s.b.values.data[v.index].def;
+    if (sel at.result)       { ret keep(s, at.result.instruction); }
+    if (!(sel at.parameter)) { ret err[Why].ok{}; }
+    val preds: *vector.Vector[Instruction] = ?s.b.blocks.data[at.parameter.block.index].predecessors;
+    var p:     usize                       = 0;
+    for (p < preds.len) {
+        val d: *InstructionData = ?s.b.instructions.data[preds.data[p].index];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            if (d.edges.data[e].block.index == at.parameter.block.index) {
+                val r: err[Why] = want(s, d.edges.data[e].arguments.data[at.parameter.index]);
+                if (sel r.err) { ret r; }
+            }
+            e = e + 1;
+        }
+        p = p + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# grow liveness from every instruction that stays and the entry's parameters
+fun live(s: *Sweep) err[Why] {
+    var k: usize = 0;
+    for (k < s.b.blocks.len) {
+        if (!s.b.blocks.data[k].erased) {
+            val list: *vector.Vector[Instruction] = ?s.b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                val may: res[bool, Why] = removable(?s.b.instructions.data[list.data[i].index]);
+                if (sel may.err) { ret err[Why].err{may.err}; }
+                if (!may.ok) {
+                    val r: err[Why] = keep(s, list.data[i]);
+                    if (sel r.err) { ret r; }
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    val entry: *vector.Vector[Value] = ?s.b.blocks.data[0].parameters;
+    k = 0;
+    for (k < entry.len) {
+        val r: err[Why] = want(s, entry.data[k]);
+        if (sel r.err) { ret r; }
+        k = k + 1;
+    }
+    for (s.work.len != 0) {
+        val v: Value = s.work.data[s.work.len - 1];
+        s.work.len = s.work.len - 1;
+        val r: err[Why] = feed(s, v);
+        if (sel r.err) { ret r; }
+    }
+    ret err[Why].ok{};
+}
+
+# whether a value goes with this sweep: the result of an instruction that
+# goes, or a parameter nothing live reads
+fun going(s: *Sweep, v: Value) bool {
+    val def: Def = s.b.values.data[v.index].def;
+    if (sel def.result)    { ret s.inst.data[def.result.instruction.index] == 0; }
+    if (sel def.parameter) { ret def.parameter.block.index != 0 && s.value.data[v.index] == 0; }
+    ret false;
+}
+
+# whether a record reads a value that goes
+fun dies(s: *Sweep, r: Reads) bool {
+    if (sel r.operand) { ret going(s, r.operand.value); }
+    ret false;
+}
+
+# salvage every record that reads a result that goes: a step over the
+# instruction's operand by the step row naming its opcode, again while that
+# operand goes too, and unavailable when no row applies
+fun salvage(s: *Sweep, v: Value) err[Why] {
+    var ids: vector.Vector[u32] = vector.init[u32](s.m.a);
+    fin { vector.dnit[u32](?ids); }
+    val bound: *vector.Vector[u32] = ?s.b.values.data[v.index].bound;
+    var n:     usize               = 0;
+    for (n < bound.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?ids, bound.data[n]);
+        if (sel pushed.err) { ret lost(pushed.err); }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < ids.len) {
+        var reads: Reads = s.b.points.data[ids.data[n]].reads;
+        for (dies(s, reads)) {
+            val next: res[Reads, module.Error] = body.salvage(s.m, s.f, reads);
+            if (sel next.err) { ret err[Why].err{Why.ir{next.err}}; }
+            reads = next.ok;
+        }
+        val set: err[Why] = edit(body.rebind(s.m, s.f, ids.data[n], reads));
+        if (sel set.err) { ret set; }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# remove what nothing live reads
+fun sweep(s: *Sweep) res[bool, Why] {
+    var gone: vector.Vector[Instruction] = vector.init[Instruction](s.m.a);
+    var dead: vector.Vector[Value]       = vector.init[Value](s.m.a);
+    fin {
+        vector.dnit[Instruction](?gone);
+        vector.dnit[Value](?dead);
+    }
+    var k: usize = 0;
+    for (k < s.b.blocks.len) {
+        if (!s.b.blocks.data[k].erased) {
+            val list: *vector.Vector[Instruction] = ?s.b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                if (s.inst.data[list.data[i].index] == 0) {
+                    val results: *vector.Vector[Value] = ?s.b.instructions.data[list.data[i].index].results;
+                    var r:       usize                 = 0;
+                    for (r < results.len) {
+                        val saved: err[Why] = salvage(s, results.data[r]);
+                        if (sel saved.err) { ret res[bool, Why].err{saved.err}; }
+                        r = r + 1;
+                    }
+                    val pushed: res[usize, allocator.Error] = vector.push[Instruction](?gone, list.data[i]);
+                    if (sel pushed.err) { ret res[bool, Why].err{Why.alloc{pushed.err}}; }
+                }
+                i = i + 1;
+            }
+            if (k != 0) {
+                val params: *vector.Vector[Value] = ?s.b.blocks.data[k].parameters;
+                i = 0;
+                for (i < params.len) {
+                    if (s.value.data[params.data[i].index] == 0) {
+                        val pushed: res[usize, allocator.Error] = vector.push[Value](?dead, params.data[i]);
+                        if (sel pushed.err) { ret res[bool, Why].err{Why.alloc{pushed.err}}; }
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    if (gone.len == 0 && dead.len == 0) { ret res[bool, Why].ok{false}; }
+    val taken: err[Why] = edit(body.remove_dead(s.m, s.f, Slice[Instruction]{data: gone.data, size: gone.len}, Slice[Value]{data: dead.data, size: dead.len}));
+    if (sel taken.err) { ret res[bool, Why].err{taken.err}; }
+    ret res[bool, Why].ok{true};
+}
+
+fun run(s: *Sweep) res[bool, Why] {
+    val shape: err[Why] = zeros(?s.block, s.b.blocks.len);
+    if (sel shape.err) { ret res[bool, Why].err{shape.err}; }
+    val reached: err[Why] = reach(s);
+    if (sel reached.err) { ret res[bool, Why].err{reached.err}; }
+    val cut: res[bool, Why] = prune(s);
+    if (sel cut.err) { ret cut; }
+    val sized: err[Why] = zeros(?s.value, s.b.values.len);
+    if (sel sized.err) { ret res[bool, Why].err{sized.err}; }
+    val counted: err[Why] = zeros(?s.inst, s.b.instructions.len);
+    if (sel counted.err) { ret res[bool, Why].err{counted.err}; }
+    val grown: err[Why] = live(s);
+    if (sel grown.err) { ret res[bool, Why].err{grown.err}; }
+    val swept: res[bool, Why] = sweep(s);
+    if (sel swept.err) { ret swept; }
+    ret res[bool, Why].ok{cut.ok || swept.ok};
+}
+
+# remove the dead code of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val m:   *Module                  = u.context.m;
+    val got: res[*Body, module.Error] = module.body(m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    var s: Sweep = Sweep{m: m, f: u.f, b: got.ok, block: vector.init[u8](m.a), value: vector.init[u8](m.a), inst: vector.init[u8](m.a), work: vector.init[Value](m.a)};
+    fin {
+        vector.dnit[u8](?s.block);
+        vector.dnit[u8](?s.value);
+        vector.dnit[u8](?s.inst);
+        vector.dnit[Value](?s.work);
+    }
+    ret run(?s);
+}
