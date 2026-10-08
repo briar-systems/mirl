@@ -29,7 +29,7 @@ Equality is **insensitive** to
 
 Equality is **sensitive** to
 
-- the instructions of a block, in order,
+- the instructions of a block, in order, and its value binding records, in order and each at the same position among the instructions,
 - the entry block, and every other block as the same edge reaches it from the entry,
 - a block's parameters, an instruction's operands, immediates, edges, edge arguments and results, aggregate elements, structure members and signature lists, each in order.
 
@@ -176,7 +176,9 @@ functions
                 [ "{" newline { block } "}" ] newline ;
   block       = label [ "(" param { "," param } ")" ] ":" newline { line } ;
   param       = local ":" [ "secret" ] type ;
-  line        = newline | instruction newline ;
+  line        = newline | binding newline | instruction newline ;
+  binding     = "bind" dref ( "=" operand { "," step } | "unavailable" ) ;
+  step        = word ( constant | type ) ;
   instruction = [ local { "," local } "=" ] ( operation | assembly ) ;
   operation   = word [ entry { "," entry } ] [ "loc" dref ] [ "site" dref ]
                 [ "volatile" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
@@ -202,9 +204,21 @@ functions
   name and spelled by what it holds, then each target in order with its
   arguments. results are not typed, since the row derives their types.
   after the entries comes the metadata record: its location, its inlining
-  site, its flags, its secrecy and its debug bindings, each left out when
-  empty. no slot name is a type word or a metadata keyword, so one token
-  tells an operand from an immediate, a target or the record.
+  site, its flags, its secrecy and the debug bindings whose storage its
+  result addresses, each left out when empty. no slot name is a type word
+  or a metadata keyword, so one token tells an operand from an immediate, a
+  target or the record.
+
+  a binding line is a value binding record: from its point on, the
+  variable is the operand, read through each step in order. a step is a
+  salvage step row's name, then a constant of the type it reads when the
+  row takes one, or the type it gives otherwise: `add` and `sub` a
+  constant, `ext.u`, `ext.s` and `trunc` a type. `unavailable` gives the
+  variable no value from the point on. a record stands just before the
+  instruction line after it, or at its block's end when none follows, so
+  the records after a block's label stand at its entry, and records print
+  in the order they stand. no opcode is named `bind`, so the first word
+  tells a record from an instruction.
 
   `asm` is reserved for inline assembly items, whose block is spelled
   through masc's text form.
@@ -216,8 +230,7 @@ debug table
               | "location" dref uint ":" uint
               | "site" dref string [ "parent" dref ]
               | "type" string string shape
-              | "variable" string dref "declared" dref [ "parameter" uint ] holds ;
-  holds       = "value" | "storage" ;
+              | "variable" string dref "declared" dref [ "parameter" uint ] ;
   shape       = "base" encoding uint
               | "structure" type members
               | "union" type members
@@ -243,8 +256,8 @@ debug table
   its base type and values, an array its element and count, a pointer the
   key of its pointee and a function its parameters and results. `open` is an
   entry declared and not yet defined. a variable is its source name, debug
-  type, declaring location, its position among the parameters when it is
-  one, and what an instruction binding it gives it. every file is printed,
-  then every location, site, type and variable, each in order, so a
-  reference names an entry printed before it, except a type naming a type.
+  type, declaring location and its position among the parameters when it
+  is one. every file is printed, then every location, site, type and
+  variable, each in order, so a reference names an entry printed before
+  it, except a type naming a type.
 ```
