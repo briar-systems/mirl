@@ -1,0 +1,1014 @@
+# liveness and the live intervals a register allocator reads
+#
+# instructions are numbered in one linear order: the blocks in reverse
+# postorder of the graph view, then every block the entry does not reach in
+# its own order. instruction n has two positions, its use slot 2n, where it
+# reads, and its def slot 2n + 1, where it writes, so a value one instruction
+# reads and a value it writes never overlap and may share a location. a
+# segment is the positions from `from` up to, not including, `to`, and a block
+# spans from the use slot of its first instruction to the use slot after its
+# last.
+#
+# liveness is the backward dataflow over the graph view, one bit for each
+# virtual register and each location. the machine form has no block
+# parameters: an edge's parallel copy reads every source at its use slot and
+# writes every destination at its def slot, so the copies on edges are the
+# uses and a destination is defined where its copy stands.
+#
+# a virtual register's interval is its segments, sorted and disjoint, with a
+# hole wherever its value is dead inside its range, and its uses in position
+# order, each weighted by the loop depth of its block. a location's holds are
+# where it is not free: where it holds a value of its own, written or read by
+# a physical operand, an implicit register or flag of masc's effect or a
+# clobber the caller states, and the slot a virtual register is pinned to it
+# at, by its row's fixed register or the physical half of a tie. holds of one
+# location never overlap, and a function holding two values in one location
+# at one position is refused.
+#
+# a physical write ends the value of the location it names and no other, since
+# masc states which rows overlap but not which covers another. the value of a
+# register a narrower write overlaps stays live, which holds the allocator off
+# it longer than needed and never too briefly.
+#
+# with b blocks, n instructions, e operand and effect events, v virtual
+# registers and l locations, liveness takes O(b) passes of O(b (v + l) / 64)
+# each, intervals O(e + b (v + l) / 64), and the holds O(h log h). a cover
+# query is O(log s) in an interval's segments, the next use O(log u) in its
+# uses, overlap O(s + t) in two intervals' segments, and blocked the sum over
+# the locations sharing storage of O(s + h) in their holds.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.fail.keep;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.graph.Lists;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class.Physical;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.operand.Tied;
+use mirl.machine.operand.Virtual;
+use mirl.slice;
+
+use masc.core.effect;
+use mo:   masc.core.operand;
+use rf:   masc.core.register;
+use rows: masc.core.row;
+
+# no position, virtual register, location or operand
+pub val NONE: u32 = 0xffffffff;
+
+# how many times one loop level weighs the level outside it, as a shift
+pub val LEVEL_SHIFT: u32 = 3;
+
+# the deepest loop level a weight tells apart, which keeps a sum of weights far from overflow
+pub val DEPTH_CAP: u32 = 8;
+
+# positions from `from` up to, not including, `to`
+pub rec Segment {
+    from: u32;
+    to:   u32;
+}
+
+# positions a location is not free over
+# ---
+# from:  the first position
+# to:    one past the last
+# owner: the virtual register pinned to it there, NONE when the location
+#        holds a value of its own
+pub rec Hold {
+    from:  u32;
+    to:    u32;
+    owner: u32;
+}
+
+# one read or write of a virtual register
+# ---
+# position:    the use slot of a read, the def slot of a write
+# weight:      eight to the power of its block's loop depth, capped at DEPTH_CAP levels
+# write:       whether it writes the register
+# instruction: the instruction
+# operand:     the operand position
+# fixed:       the location it must be in there, NONE when it may be in any of its class
+# tied:        the virtual register tied to it there, NONE when none is
+pub rec Use {
+    position:    u32;
+    weight:      u64;
+    write:       bool;
+    instruction: Instruction;
+    operand:     u32;
+    fixed:       u32;
+    tied:        u32;
+}
+
+# a location an instruction leaves undefined beyond what its row states, as a
+# calling convention's clobbers at a call
+# ---
+# instruction: the instruction
+# location:    the location
+pub rec Clobber {
+    instruction: Instruction;
+    location:    u32;
+}
+
+# an operand, or an instruction as a whole when operand is NONE
+pub rec Site {
+    instruction: Instruction;
+    operand:     u32;
+}
+
+# two values held in one location at one position
+pub rec Conflict {
+    location: u32;
+    position: u32;
+}
+
+# why liveness was refused
+# ---
+# alloc:     the allocator refused storage
+# foreign:   the locations are of another register file than the function's
+# unlocated: a register, cell or clobber the locations do not number
+# conflict:  two values held in one location at one position
+# size:      the positions do not fit
+pub tag Error: u8 {
+    alloc: allocator.Error;
+    foreign;
+    unlocated: Site;
+    conflict:  Conflict;
+    size;
+}
+
+# the liveness of a function
+# ---
+# virtuals: how many virtual registers there are
+# order:    the blocks in linear order
+# starts:   each block's first position
+# ends:     each block's position past its last
+# numbers:  each instruction's place in linear order, NONE when no block holds it
+# segments: each virtual register's segments, sorted and disjoint
+# uses:     each virtual register's uses, in position order
+# weights:  each virtual register's uses' weights summed
+# holds:    each location's holds, sorted and disjoint
+pub rec Live {
+    virtuals: u32;
+    order:    vector.Vector[u32];
+    starts:   vector.Vector[u32];
+    ends:     vector.Vector[u32];
+    numbers:  vector.Vector[u32];
+    segments: Lists[Segment];
+    uses:     Lists[Use];
+    weights:  vector.Vector[u64];
+    holds:    Lists[Hold];
+}
+
+# one read or write an instruction makes
+# ---
+# value:   a virtual register's index, or the virtual count plus a location
+# write:   whether it writes
+# operand: the operand position, NONE for an effect or a clobber
+# fixed:   the location a virtual register is pinned to, NONE
+# tied:    the virtual register tied to it, NONE
+rec Event {
+    value:   u32;
+    write:   bool;
+    operand: u32;
+    fixed:   u32;
+    tied:    u32;
+}
+
+# what one computation works with
+rec Build {
+    a:         *allocator.Allocator;
+    f:         *Function;
+    at:        *Locations;
+    g:         *Graph;
+    values:    u32;
+    words:     u32;
+    linear:    vector.Vector[Instruction];
+    depths:    vector.Vector[u32];
+    events:    vector.Vector[Event];
+    first:     vector.Vector[u32];
+    clobbers:  Lists[u32];
+    gen:       vector.Vector[u64];
+    kill:      vector.Vector[u64];
+    live_in:   vector.Vector[u64];
+    live_out:  vector.Vector[u64];
+    seg_keys:  vector.Vector[u32];
+    seg_items: vector.Vector[Segment];
+    use_keys:  vector.Vector[u32];
+    use_items: vector.Vector[Use];
+    hold_keys: vector.Vector[u32];
+    holds:     vector.Vector[Hold];
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun unlocated(i: Instruction, operand: u32) err[Error] {
+    ret err[Error].err{Error.unlocated{Site{instruction: i, operand: operand}}};
+}
+
+fun bit(v: *vector.Vector[u64], base: usize, w: u32) bool {
+    ret ((v.data[base + (w / 64)::usize] >> (w % 64)::u64) & 1) != 0;
+}
+
+fun set(v: *vector.Vector[u64], base: usize, w: u32) {
+    val k: usize = base + (w / 64)::usize;
+    v.data[k] = v.data[k] | ((1::u64) << (w % 64)::u64);
+}
+
+fun clear(v: *vector.Vector[u64], base: usize, w: u32) {
+    val k: usize = base + (w / 64)::usize;
+    v.data[k] = v.data[k] & ~((1::u64) << (w % 64)::u64);
+}
+
+# the weight of a use at a loop depth
+pub fun weight(depth: u32) u64 {
+    var d: u32 = depth;
+    if (d > DEPTH_CAP) { d = DEPTH_CAP; }
+    ret (1::u64) << (d * LEVEL_SHIFT)::u64;
+}
+
+fun push_event(b: *Build, e: Event) err[Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[Event](?b.events, e);
+    if (sel pushed.err) { ret alloc_err(pushed.err); }
+    ret err[Error].ok{};
+}
+
+# the value a register names, or NONE when the locations do not number it
+fun value_of(b: *Build, r: Register) u32 {
+    if (sel r.virtual) { ret r.virtual.index; }
+    val at: opt[u32] = location.locate(b.at, r.physical);
+    if (sel at.none) { ret NONE; }
+    ret b.f.virtuals.len::u32 + at.some;
+}
+
+fun is_virtual(b: *Build, value: u32) bool {
+    ret value::usize < b.f.virtuals.len;
+}
+
+# the location a value is, NONE for a virtual register
+fun location_of(b: *Build, value: u32) u32 {
+    if (is_virtual(b, value)) { ret NONE; }
+    ret value - b.f.virtuals.len::u32;
+}
+
+# every register of an effect set as reads or writes of their locations
+fun effect_set(b: *Build, id: Instruction, s: effect.Set, write: bool) err[Error] {
+    var w: u32 = 0;
+    for (w < s.len) {
+        val word: u64 = s.words[w];
+        var k:    u32 = 0;
+        for (word != 0 && k < 64) {
+            if (((word >> k::u64) & 1) != 0) {
+                val row: u32 = w * 64 + k;
+                if (b.at.file == nil || row >= b.at.file.register_count) { ret unlocated(id, NONE); }
+                val pushed: err[Error] = push_event(b, Event{value: b.f.virtuals.len::u32 + row, write: write, operand: NONE, fixed: NONE, tied: NONE});
+                if (sel pushed.err) { ret pushed; }
+            }
+            k = k + 1;
+        }
+        w = w + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun tied_operand(b: *Build, id: Instruction, k: u32, t: Tied, pin: u32) err[Error] {
+    val dest:   Register = t.dest;
+    val source: Register = t.source;
+    val d:      u32      = value_of(b, dest);
+    val s:      u32      = value_of(b, source);
+    if (d == NONE || s == NONE) { ret unlocated(id, k); }
+    var dpin:  u32 = pin;
+    var spin:  u32 = pin;
+    var dtied: u32 = NONE;
+    var stied: u32 = NONE;
+    if (is_virtual(b, d) && is_virtual(b, s)) {
+        dtied = s;
+        stied = d;
+    }
+    if (pin == NONE && is_virtual(b, d) && !is_virtual(b, s)) { dpin = location_of(b, s); }
+    if (pin == NONE && is_virtual(b, s) && !is_virtual(b, d)) { spin = location_of(b, d); }
+    if (!is_virtual(b, s))                                    { spin = NONE; }
+    if (!is_virtual(b, d))                                    { dpin = NONE; }
+    val read: err[Error] = push_event(b, Event{value: s, write: false, operand: k, fixed: spin, tied: stied});
+    if (sel read.err) { ret read; }
+    ret push_event(b, Event{value: d, write: true, operand: k, fixed: dpin, tied: dtied});
+}
+
+# the reads and writes of one instruction: its operands by their roles, its
+# row's implicit registers and flags, and the clobbers the caller states
+fun gather(b: *Build, id: Instruction) err[Error] {
+    val d:     *InstructionData = function.data(b.f, id);
+    val count: u32              = d.operands.size::u32;
+    var k:     u32              = 0;
+    for (k < count) {
+        val o:      Operand    = d.operands.data[k];
+        val role:   mo.Role    = instruction.role(d.opcode, count, k);
+        val reads:  bool       = (role & mo.READ) != 0;
+        val writes: bool       = (role & mo.WRITE) != 0;
+        var pin:    u32        = NONE;
+        val fixed:  opt[rf.Id] = instruction.fixed(function.file(b.f), d.opcode, k);
+        if (sel fixed.some) {
+            val at: opt[u32] = location.locate(b.at, Physical.register{fixed.some});
+            if (sel at.none) { ret unlocated(id, k); }
+            pin = at.some;
+        }
+        var value: u32 = NONE;
+        if (sel o.virtual) { value = o.virtual.index; }
+        or (sel o.physical) {
+            value = value_of(b, Register.physical{o.physical});
+            if (value == NONE) { ret unlocated(id, k); }
+            pin = NONE;
+        }
+        or (sel o.tied) {
+            val tied: err[Error] = tied_operand(b, id, k, o.tied, pin);
+            if (sel tied.err) { ret tied; }
+        }
+        if (value != NONE && reads) {
+            val r: err[Error] = push_event(b, Event{value: value, write: false, operand: k, fixed: pin, tied: NONE});
+            if (sel r.err) { ret r; }
+        }
+        if (value != NONE && writes) {
+            val w: err[Error] = push_event(b, Event{value: value, write: true, operand: k, fixed: pin, tied: NONE});
+            if (sel w.err) { ret w; }
+        }
+        k = k + 1;
+    }
+    val op: Opcode = d.opcode;
+    if (sel op.row) {
+        val r: *rows.Row = op.row;
+        if (r.effect != nil) {
+            val e:  *effect.Effect = r.effect;
+            val ir: err[Error]     = effect_set(b, id, e.implicit.read, false);
+            if (sel ir.err) { ret ir; }
+            val fr: err[Error] = effect_set(b, id, e.flags.read, false);
+            if (sel fr.err) { ret fr; }
+            val fk: err[Error] = effect_set(b, id, e.flags.kept, false);
+            if (sel fk.err) { ret fk; }
+            val iw: err[Error] = effect_set(b, id, e.implicit.written, true);
+            if (sel iw.err) { ret iw; }
+            val fw: err[Error] = effect_set(b, id, e.flags.written, true);
+            if (sel fw.err) { ret fw; }
+            val fu: err[Error] = effect_set(b, id, e.flags.undefined, true);
+            if (sel fu.err) { ret fu; }
+        }
+    }
+    val extra: Slice[u32] = graph.list[u32](?b.clobbers, id.index);
+    var c:     usize      = 0;
+    for (c < extra.size) {
+        val pushed: err[Error] = push_event(b, Event{value: b.f.virtuals.len::u32 + extra.data[c], write: true, operand: NONE, fixed: NONE, tied: NONE});
+        if (sel pushed.err) { ret pushed; }
+        c = c + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun events_of(b: *Build, n: u32) Slice[Event] {
+    val start: u32 = b.first.data[n];
+    ret Slice[Event]{data: ?b.events.data[start], size: (b.first.data[n + 1] - start)::usize};
+}
+
+fun reserve_room[T](v: *vector.Vector[T], n: usize) err[allocator.Error] {
+    val room: res[usize, allocator.Error] = vector.reserve[T](v, n);
+    if (sel room.err) { ret err[allocator.Error].err{room.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+fun place(b: *Build, l: *Live, k: u32, nest: *Loops) err[Error] {
+    vector.push[u32](?l.order, k);
+    val list:  Slice[Instruction] = function.instructions(b.f, Block{index: k});
+    val depth: u32                = loops.depth(nest, k);
+    l.starts.data[k] = 2 * b.linear.len::u32;
+    var i: usize = 0;
+    for (i < list.size) {
+        if (b.linear.len >= 0x7ffffffe) { ret err[Error].err{Error.size{}}; }
+        l.numbers.data[list.data[i].index] = b.linear.len::u32;
+        val pushed: res[usize, allocator.Error] = vector.push[Instruction](?b.linear, list.data[i]);
+        if (sel pushed.err) { ret alloc_err(pushed.err); }
+        val deep: res[usize, allocator.Error] = vector.push[u32](?b.depths, depth);
+        if (sel deep.err) { ret alloc_err(deep.err); }
+        i = i + 1;
+    }
+    l.ends.data[k] = 2 * b.linear.len::u32;
+    ret err[Error].ok{};
+}
+
+# the blocks in linear order and every instruction's number and positions
+fun number(b: *Build, l: *Live, d: *Dominance, nest: *Loops) err[Error] {
+    val blocks: u32                  = b.f.blocks.len::u32;
+    var failed: err[allocator.Error] = slice.fill[u32](?l.starts, blocks::usize, 0);
+    keep(?failed, slice.fill[u32](?l.ends, blocks::usize, 0));
+    keep(?failed, slice.fill[u32](?l.numbers, b.f.instructions.len, NONE));
+    keep(?failed, reserve_room[u32](?l.order, blocks::usize));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    val rpo: Slice[u32] = dominance.order(d);
+    var i:   usize      = 0;
+    for (i < rpo.size) {
+        val placed: err[Error] = place(b, l, rpo.data[i], nest);
+        if (sel placed.err) { ret placed; }
+        i = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < blocks) {
+        if (!dominance.reachable(d, k)) {
+            val placed: err[Error] = place(b, l, k, nest);
+            if (sel placed.err) { ret placed; }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the clobbers grouped by instruction, each checked against the function and the locations
+fun group_clobbers(b: *Build, clobbers: Slice[Clobber]) err[Error] {
+    var keys:  vector.Vector[u32] = vector.init[u32](b.a);
+    var items: vector.Vector[u32] = vector.init[u32](b.a);
+    fin {
+        vector.dnit[u32](?keys);
+        vector.dnit[u32](?items);
+    }
+    var failed: err[allocator.Error] = reserve_room[u32](?keys, clobbers.size);
+    keep(?failed, reserve_room[u32](?items, clobbers.size));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    var i: usize = 0;
+    for (i < clobbers.size) {
+        val c: Clobber = clobbers.data[i];
+        if (c.instruction.index::usize >= b.f.instructions.len || c.location >= location.count(b.at)) { ret unlocated(c.instruction, NONE); }
+        vector.push[u32](?keys, c.instruction.index);
+        vector.push[u32](?items, c.location);
+        i = i + 1;
+    }
+    val made: res[Lists[u32], allocator.Error] = graph.lists[u32](b.a, b.f.instructions.len::u32, Slice[u32]{data: keys.data, size: keys.len}, Slice[u32]{data: items.data, size: items.len});
+    if (sel made.err) { ret alloc_err(made.err); }
+    b.clobbers = made.ok;
+    ret err[Error].ok{};
+}
+
+# every instruction's reads and writes, in linear order
+fun gather_all(b: *Build) err[Error] {
+    var n: usize = 0;
+    for (n < b.linear.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?b.first, b.events.len::u32);
+        if (sel pushed.err) { ret alloc_err(pushed.err); }
+        val got: err[Error] = gather(b, b.linear.data[n]);
+        if (sel got.err)                { ret got; }
+        if (b.events.len >= 0xffffffff) { ret err[Error].err{Error.size{}}; }
+        n = n + 1;
+    }
+    val last: res[usize, allocator.Error] = vector.push[u32](?b.first, b.events.len::u32);
+    if (sel last.err) { ret alloc_err(last.err); }
+    ret err[Error].ok{};
+}
+
+# the first linear number of a block's instructions and one past its last
+fun span(l: *Live, k: u32) Segment {
+    ret Segment{from: l.starts.data[k] / 2, to: l.ends.data[k] / 2};
+}
+
+# each block's values read before written in it, and its values written
+fun local(b: *Build, l: *Live) err[Error] {
+    val size:   usize                = b.f.blocks.len * b.words::usize;
+    var failed: err[allocator.Error] = slice.fill[u64](?b.gen, size, 0);
+    keep(?failed, slice.fill[u64](?b.kill, size, 0));
+    keep(?failed, slice.fill[u64](?b.live_in, size, 0));
+    keep(?failed, slice.fill[u64](?b.live_out, size, 0));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    var k: u32 = 0;
+    for (k::usize < b.f.blocks.len) {
+        val base: usize   = k::usize * b.words::usize;
+        val s:    Segment = span(l, k);
+        var n:    u32     = s.from;
+        for (n < s.to) {
+            val ev: Slice[Event] = events_of(b, n);
+            var i:  usize        = 0;
+            for (i < ev.size) {
+                if (!ev.data[i].write && !bit(?b.kill, base, ev.data[i].value)) { set(?b.gen, base, ev.data[i].value); }
+                i = i + 1;
+            }
+            i = 0;
+            for (i < ev.size) {
+                if (ev.data[i].write) { set(?b.kill, base, ev.data[i].value); }
+                i = i + 1;
+            }
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the values live into and out of each block, iterated to a fixed point in
+# reverse linear order
+fun flow(b: *Build, l: *Live) {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var i: usize = l.order.len;
+        for (i > 0) {
+            i = i - 1;
+            val k:    u32        = l.order.data[i];
+            val base: usize      = k::usize * b.words::usize;
+            val succ: Slice[u32] = graph.successors(b.g, k);
+            var w:    usize      = 0;
+            for (w < b.words::usize) {
+                var out: u64   = 0;
+                var j:   usize = 0;
+                for (j < succ.size) {
+                    out = out | b.live_in.data[succ.data[j]::usize * b.words::usize + w];
+                    j   = j + 1;
+                }
+                b.live_out.data[base + w] = out;
+                val into: u64 = b.gen.data[base + w] | (out & ~b.kill.data[base + w]);
+                if (into != b.live_in.data[base + w]) {
+                    b.live_in.data[base + w] = into;
+                    changed                  = true;
+                }
+                w = w + 1;
+            }
+        }
+    }
+}
+
+fun emit(b: *Build, value: u32, from: u32, to: u32) err[Error] {
+    if (from == to) { ret err[Error].ok{}; }
+    if (is_virtual(b, value)) {
+        val key: res[usize, allocator.Error] = vector.push[u32](?b.seg_keys, value);
+        if (sel key.err) { ret alloc_err(key.err); }
+        val item: res[usize, allocator.Error] = vector.push[Segment](?b.seg_items, Segment{from: from, to: to});
+        if (sel item.err) { ret alloc_err(item.err); }
+        ret err[Error].ok{};
+    }
+    ret hold(b, location_of(b, value), Hold{from: from, to: to, owner: NONE});
+}
+
+fun hold(b: *Build, at: u32, h: Hold) err[Error] {
+    val key: res[usize, allocator.Error] = vector.push[u32](?b.hold_keys, at);
+    if (sel key.err) { ret alloc_err(key.err); }
+    val item: res[usize, allocator.Error] = vector.push[Hold](?b.holds, h);
+    if (sel item.err) { ret alloc_err(item.err); }
+    ret err[Error].ok{};
+}
+
+# close every value still open at a block's start
+fun close_all(b: *Build, cur: *vector.Vector[u64], open: *vector.Vector[u32], start: u32) err[Error] {
+    var w: u32 = 0;
+    for (w < b.words) {
+        var word: u64 = cur.data[w];
+        var k:    u32 = 0;
+        for (word != 0) {
+            if ((word & 1) != 0) {
+                val value: u32        = w * 64 + k;
+                val done:  err[Error] = emit(b, value, start, open.data[value]);
+                if (sel done.err) { ret done; }
+                open.data[value] = NONE;
+            }
+            word = word >> 1;
+            k    = k + 1;
+        }
+        cur.data[w] = 0;
+        w           = w + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# every value's segments, walking each block backward from its live out set,
+# so they come out last first
+fun walk(b: *Build, l: *Live) err[Error] {
+    var open: vector.Vector[u32] = vector.init[u32](b.a);
+    var cur:  vector.Vector[u64] = vector.init[u64](b.a);
+    fin {
+        vector.dnit[u32](?open);
+        vector.dnit[u64](?cur);
+    }
+    var failed: err[allocator.Error] = slice.fill[u32](?open, b.values::usize, NONE);
+    keep(?failed, slice.fill[u64](?cur, b.words::usize, 0));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    var i: usize = l.order.len;
+    for (i > 0) {
+        i = i - 1;
+        val k:    u32     = l.order.data[i];
+        val base: usize   = k::usize * b.words::usize;
+        val s:    Segment = span(l, k);
+        var w:    u32     = 0;
+        for (w < b.words) {
+            var word: u64 = b.live_out.data[base + w::usize];
+            cur.data[w] = word;
+            var bitat: u32 = 0;
+            for (word != 0) {
+                if ((word & 1) != 0) { open.data[w * 64 + bitat] = l.ends.data[k]; }
+                word  = word >> 1;
+                bitat = bitat + 1;
+            }
+            w = w + 1;
+        }
+        var n: u32 = s.to;
+        for (n > s.from) {
+            n = n - 1;
+            val ev: Slice[Event] = events_of(b, n);
+            var j:  usize        = 0;
+            for (j < ev.size) {
+                val e: Event = ev.data[j];
+                if (e.write) {
+                    var to: u32 = 2 * n + 2;
+                    if (open.data[e.value] != NONE) {
+                        to                 = open.data[e.value];
+                        open.data[e.value] = NONE;
+                        clear(?cur, 0, e.value);
+                    }
+                    val done: err[Error] = emit(b, e.value, 2 * n + 1, to);
+                    if (sel done.err) { ret done; }
+                }
+                j = j + 1;
+            }
+            j = 0;
+            for (j < ev.size) {
+                val e: Event = ev.data[j];
+                if (!e.write && open.data[e.value] == NONE) {
+                    open.data[e.value] = 2 * n + 1;
+                    set(?cur, 0, e.value);
+                }
+                j = j + 1;
+            }
+        }
+        val closed: err[Error] = close_all(b, ?cur, ?open, l.starts.data[k]);
+        if (sel closed.err) { ret closed; }
+    }
+    ret err[Error].ok{};
+}
+
+# every virtual register's uses in position order, and the slot each pinned
+# one holds its location
+fun record_uses(b: *Build, l: *Live) err[Error] {
+    val filled: err[allocator.Error] = slice.fill[u64](?l.weights, b.f.virtuals.len, 0);
+    if (sel filled.err) { ret alloc_err(filled.err); }
+    var n: u32 = 0;
+    for (n::usize < b.linear.len) {
+        val w:  u64          = weight(b.depths.data[n]);
+        val ev: Slice[Event] = events_of(b, n);
+        var j:  usize        = 0;
+        for (j < ev.size) {
+            val e: Event = ev.data[j];
+            if (is_virtual(b, e.value)) {
+                var at: u32 = 2 * n;
+                if (e.write) { at = 2 * n + 1; }
+                val key: res[usize, allocator.Error] = vector.push[u32](?b.use_keys, e.value);
+                if (sel key.err) { ret alloc_err(key.err); }
+                val item: res[usize, allocator.Error] = vector.push[Use](?b.use_items, Use{position: at, weight: w, write: e.write, instruction: b.linear.data[n], operand: e.operand, fixed: e.fixed, tied: e.tied});
+                if (sel item.err) { ret alloc_err(item.err); }
+                l.weights.data[e.value] = l.weights.data[e.value] + w;
+                if (e.fixed != NONE) {
+                    val held: err[Error] = hold(b, e.fixed, Hold{from: at, to: at + 1, owner: e.value});
+                    if (sel held.err) { ret held; }
+                }
+            }
+            j = j + 1;
+        }
+        n = n + 1;
+    }
+    val made: res[Lists[Use], allocator.Error] = graph.lists[Use](b.a, b.f.virtuals.len::u32, Slice[u32]{data: b.use_keys.data, size: b.use_keys.len}, Slice[Use]{data: b.use_items.data, size: b.use_items.len});
+    if (sel made.err) { ret alloc_err(made.err); }
+    l.uses = made.ok;
+    ret err[Error].ok{};
+}
+
+# each virtual register's segments in position order, the touching ones merged
+fun settle_segments(b: *Build, l: *Live) err[Error] {
+    val made: res[Lists[Segment], allocator.Error] = graph.lists[Segment](b.a, b.f.virtuals.len::u32, Slice[u32]{data: b.seg_keys.data, size: b.seg_keys.len}, Slice[Segment]{data: b.seg_items.data, size: b.seg_items.len});
+    if (sel made.err) { ret alloc_err(made.err); }
+    var grouped: Lists[Segment] = made.ok;
+    fin { graph.release[Segment](?grouped); }
+    var failed: err[allocator.Error] = reserve_room[u32](?l.segments.first, b.f.virtuals.len + 1);
+    keep(?failed, reserve_room[Segment](?l.segments.items, b.seg_items.len));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    vector.push[u32](?l.segments.first, 0);
+    var v: u32 = 0;
+    for (v::usize < b.f.virtuals.len) {
+        val s:    Slice[Segment] = graph.list[Segment](?grouped, v);
+        val base: usize          = l.segments.items.len;
+        var k:    usize          = s.size;
+        for (k > 0) {
+            k = k - 1;
+            val seg: Segment = s.data[k];
+            val len: usize   = l.segments.items.len;
+            if (len > base && l.segments.items.data[len - 1].to >= seg.from) {
+                if (seg.to > l.segments.items.data[len - 1].to) { l.segments.items.data[len - 1].to = seg.to; }
+            }
+            or { vector.push[Segment](?l.segments.items, seg); }
+        }
+        vector.push[u32](?l.segments.first, l.segments.items.len::u32);
+        v = v + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun by_from(a: *Hold, b: *Hold) i64 {
+    if (a.from < b.from)   { ret -1; }
+    if (a.from > b.from)   { ret 1; }
+    if (a.owner < b.owner) { ret -1; }
+    if (a.owner > b.owner) { ret 1; }
+    ret 0;
+}
+
+# each location's holds sorted, those of one owner that touch merged, and a
+# refusal where two owners overlap
+fun settle_holds(b: *Build, l: *Live) err[Error] {
+    val count: u32                               = location.count(b.at);
+    val made:  res[Lists[Hold], allocator.Error] = graph.lists[Hold](b.a, count, Slice[u32]{data: b.hold_keys.data, size: b.hold_keys.len}, Slice[Hold]{data: b.holds.data, size: b.holds.len});
+    if (sel made.err) { ret alloc_err(made.err); }
+    var grouped: Lists[Hold] = made.ok;
+    fin { graph.release[Hold](?grouped); }
+    var failed: err[allocator.Error] = reserve_room[u32](?l.holds.first, count::usize + 1);
+    keep(?failed, reserve_room[Hold](?l.holds.items, b.holds.len));
+    if (sel failed.err) { ret alloc_err(failed.err); }
+    vector.push[u32](?l.holds.first, 0);
+    var at: u32 = 0;
+    for (at < count) {
+        val s: Slice[Hold] = graph.list[Hold](?grouped, at);
+        if (s.size > 1) { sort.sort_by[Hold](s.data, s.size, by_from); }
+        val base: usize = l.holds.items.len;
+        var k:    usize = 0;
+        for (k < s.size) {
+            val h:   Hold  = s.data[k];
+            val len: usize = l.holds.items.len;
+            if (len > base && l.holds.items.data[len - 1].to > h.from && l.holds.items.data[len - 1].owner != h.owner) { ret err[Error].err{Error.conflict{Conflict{location: at, position: h.from}}}; }
+            if (len > base && l.holds.items.data[len - 1].to >= h.from && l.holds.items.data[len - 1].owner == h.owner) {
+                if (h.to > l.holds.items.data[len - 1].to) { l.holds.items.data[len - 1].to = h.to; }
+            }
+            or { vector.push[Hold](?l.holds.items, h); }
+            k = k + 1;
+        }
+        vector.push[u32](?l.holds.first, l.holds.items.len::u32);
+        at = at + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun build_dnit(b: *Build) {
+    vector.dnit[Instruction](?b.linear);
+    vector.dnit[u32](?b.depths);
+    vector.dnit[Event](?b.events);
+    vector.dnit[u32](?b.first);
+    graph.release[u32](?b.clobbers);
+    vector.dnit[u64](?b.gen);
+    vector.dnit[u64](?b.kill);
+    vector.dnit[u64](?b.live_in);
+    vector.dnit[u64](?b.live_out);
+    vector.dnit[u32](?b.seg_keys);
+    vector.dnit[Segment](?b.seg_items);
+    vector.dnit[u32](?b.use_keys);
+    vector.dnit[Use](?b.use_items);
+    vector.dnit[u32](?b.hold_keys);
+    vector.dnit[Hold](?b.holds);
+}
+
+fun empty(a: *allocator.Allocator) Live {
+    ret Live{
+        virtuals: 0,
+        order:    vector.init[u32](a),
+        starts:   vector.init[u32](a),
+        ends:     vector.init[u32](a),
+        numbers:  vector.init[u32](a),
+        segments: Lists[Segment]{first: vector.init[u32](a), items: vector.init[Segment](a)},
+        uses:     Lists[Use]{first: vector.init[u32](a), items: vector.init[Use](a)},
+        weights:  vector.init[u64](a),
+        holds:    Lists[Hold]{first: vector.init[u32](a), items: vector.init[Hold](a)},
+    };
+}
+
+fun run(b: *Build, l: *Live, clobbers: Slice[Clobber]) err[Error] {
+    val dom: res[Dominance, allocator.Error] = dominance.compute(b.a, b.g);
+    if (sel dom.err) { ret alloc_err(dom.err); }
+    var d: Dominance = dom.ok;
+    fin { dominance.dnit(?d); }
+    val nest: res[Loops, allocator.Error] = loops.compute(b.a, b.g, ?d);
+    if (sel nest.err) { ret alloc_err(nest.err); }
+    var lp: Loops = nest.ok;
+    fin { loops.dnit(?lp); }
+    val numbered: err[Error] = number(b, l, ?d, ?lp);
+    if (sel numbered.err) { ret numbered; }
+    val grouped: err[Error] = group_clobbers(b, clobbers);
+    if (sel grouped.err) { ret grouped; }
+    val gathered: err[Error] = gather_all(b);
+    if (sel gathered.err) { ret gathered; }
+    val sets: err[Error] = local(b, l);
+    if (sel sets.err) { ret sets; }
+    flow(b, l);
+    val walked: err[Error] = walk(b, l);
+    if (sel walked.err) { ret walked; }
+    val used: err[Error] = record_uses(b, l);
+    if (sel used.err) { ret used; }
+    val settled: err[Error] = settle_segments(b, l);
+    if (sel settled.err) { ret settled; }
+    ret settle_holds(b, l);
+}
+
+# the liveness and live intervals of a function
+# ---
+# a:        the allocator the result takes
+# f:        the function
+# at:       the locations of its target, of its register file
+# clobbers: locations instructions leave undefined beyond their rows, as a
+#           calling convention states them at its calls
+# ret:      the liveness, or why it was refused
+pub fun compute(a: *allocator.Allocator, f: *Function, at: *Locations, clobbers: Slice[Clobber]) res[Live, Error] {
+    if (at.file != function.file(f)) { ret res[Live, Error].err{Error.foreign{}}; }
+    val total: u64 = f.virtuals.len::u64 + location.count(at)::u64;
+    if (total >= 0xffffffff) { ret res[Live, Error].err{Error.size{}}; }
+    val got: res[Graph, allocator.Error] = function.graph_of(f);
+    if (sel got.err) { ret res[Live, Error].err{Error.alloc{got.err}}; }
+    var g: Graph = got.ok;
+    fin { graph.dnit(?g); }
+    var b: Build = Build{
+        a:         a,
+        f:         f,
+        at:        at,
+        g:         ?g,
+        values:    total::u32,
+        words:     ((total + 63) / 64)::u32,
+        linear:    vector.init[Instruction](a),
+        depths:    vector.init[u32](a),
+        events:    vector.init[Event](a),
+        first:     vector.init[u32](a),
+        clobbers:  Lists[u32]{first: vector.init[u32](a), items: vector.init[u32](a)},
+        gen:       vector.init[u64](a),
+        kill:      vector.init[u64](a),
+        live_in:   vector.init[u64](a),
+        live_out:  vector.init[u64](a),
+        seg_keys:  vector.init[u32](a),
+        seg_items: vector.init[Segment](a),
+        use_keys:  vector.init[u32](a),
+        use_items: vector.init[Use](a),
+        hold_keys: vector.init[u32](a),
+        holds:     vector.init[Hold](a),
+    };
+    fin { build_dnit(?b); }
+    var l: Live = empty(a);
+    l.virtuals = f.virtuals.len::u32;
+    val done: err[Error] = run(?b, ?l, clobbers);
+    if (sel done.err) {
+        dnit(?l);
+        ret res[Live, Error].err{done.err};
+    }
+    ret res[Live, Error].ok{l};
+}
+
+# give back the storage of a function's liveness
+pub fun dnit(l: *Live) err[allocator.Error] {
+    var failed: err[allocator.Error] = vector.dnit[u32](?l.order);
+    keep(?failed, vector.dnit[u32](?l.starts));
+    keep(?failed, vector.dnit[u32](?l.ends));
+    keep(?failed, vector.dnit[u32](?l.numbers));
+    keep(?failed, graph.release[Segment](?l.segments));
+    keep(?failed, graph.release[Use](?l.uses));
+    keep(?failed, vector.dnit[u64](?l.weights));
+    keep(?failed, graph.release[Hold](?l.holds));
+    ret failed;
+}
+
+# the blocks in linear order
+pub fun order(l: *Live) Slice[u32] {
+    ret Slice[u32]{data: l.order.data, size: l.order.len};
+}
+
+# a block's first position
+pub fun start(l: *Live, b: Block) u32 {
+    ret l.starts.data[b.index];
+}
+
+# the position past a block's last
+pub fun end(l: *Live, b: Block) u32 {
+    ret l.ends.data[b.index];
+}
+
+# an instruction's use slot, none when no block holds it
+pub fun use_slot(l: *Live, i: Instruction) opt[u32] {
+    val n: u32 = l.numbers.data[i.index];
+    if (n == NONE) { ret opt[u32].none{}; }
+    ret opt[u32].some{2 * n};
+}
+
+# an instruction's def slot, none when no block holds it
+pub fun def_slot(l: *Live, i: Instruction) opt[u32] {
+    val n: u32 = l.numbers.data[i.index];
+    if (n == NONE) { ret opt[u32].none{}; }
+    ret opt[u32].some{2 * n + 1};
+}
+
+# a virtual register's segments, sorted and disjoint
+pub fun segments(l: *Live, v: Virtual) Slice[Segment] {
+    ret graph.list[Segment](?l.segments, v.index);
+}
+
+# a virtual register's uses, in position order
+pub fun uses(l: *Live, v: Virtual) Slice[Use] {
+    ret graph.list[Use](?l.uses, v.index);
+}
+
+# a virtual register's uses' weights summed
+pub fun weight_of(l: *Live, v: Virtual) u64 {
+    ret l.weights.data[v.index];
+}
+
+# a location's holds, sorted and disjoint
+pub fun holds(l: *Live, at: u32) Slice[Hold] {
+    ret graph.list[Hold](?l.holds, at);
+}
+
+# whether a virtual register is live at a position
+pub fun covers(l: *Live, v: Virtual, p: u32) bool {
+    val s:  Slice[Segment] = segments(l, v);
+    var lo: usize          = 0;
+    var hi: usize          = s.size;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (s.data[mid].to <= p) { lo = mid + 1; }
+        or                       { hi = mid; }
+    }
+    ret lo < s.size && s.data[lo].from <= p;
+}
+
+# a virtual register's first use at or after a position, none when there is none
+pub fun next_use(l: *Live, v: Virtual, p: u32) opt[Use] {
+    val s:  Slice[Use] = uses(l, v);
+    var lo: usize      = 0;
+    var hi: usize      = s.size;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (s.data[mid].position < p) { lo = mid + 1; }
+        or                            { hi = mid; }
+    }
+    if (lo >= s.size) { ret opt[Use].none{}; }
+    ret opt[Use].some{s.data[lo]};
+}
+
+# the first position two virtual registers are both live at, none when their
+# intervals are disjoint
+pub fun overlap(l: *Live, v: Virtual, w: Virtual) opt[u32] {
+    val a: Slice[Segment] = segments(l, v);
+    val b: Slice[Segment] = segments(l, w);
+    var i: usize          = 0;
+    var j: usize          = 0;
+    for (i < a.size && j < b.size) {
+        if (a.data[i].to <= b.data[j].from) { i = i + 1; }
+        or (b.data[j].to <= a.data[i].from) { j = j + 1; }
+        or {
+            if (a.data[i].from > b.data[j].from) { ret opt[u32].some{a.data[i].from}; }
+            ret opt[u32].some{b.data[j].from};
+        }
+    }
+    ret opt[u32].none{};
+}
+
+# the first position a virtual register is live at while storage of a
+# location is held by any other value, none when the location is free for it
+# over its whole interval
+pub fun blocked(l: *Live, at: *Locations, loc: u32, v: Virtual) opt[u32] {
+    val a:     Slice[Segment] = segments(l, v);
+    val alias: Slice[u32]     = location.shares(at, loc);
+    var first: u32            = NONE;
+    var k:     usize          = 0;
+    for (k < alias.size) {
+        val h: Slice[Hold] = holds(l, alias.data[k]);
+        var i: usize       = 0;
+        var j: usize       = 0;
+        for (i < a.size && j < h.size) {
+            if (h.data[j].owner == v.index || h.data[j].to <= a.data[i].from) { j = j + 1; }
+            or (a.data[i].to <= h.data[j].from)                               { i = i + 1; }
+            or {
+                var p: u32 = h.data[j].from;
+                if (a.data[i].from > p) { p = a.data[i].from; }
+                if (p < first)          { first = p; }
+                brk;
+            }
+        }
+        k = k + 1;
+    }
+    if (first == NONE) { ret opt[u32].none{}; }
+    ret opt[u32].some{first};
+}
