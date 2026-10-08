@@ -47,6 +47,16 @@ wasm-validate, llvm-dwarfdump and the timing-leak harness, run locally and
 never in CI. CI builds every target and runs the unit tests.
 
 
+IR text test inputs live in `test/ir/` as `*.mirl` files. One test reads every
+file there, prints the module it parses, parses that text and compares the two
+modules, so a file added for any job is part of the round trip. A file starts with its
+`target` line and has no version line,
+since the reader puts the library's own before it and no release touches the
+files. `mach test` runs in the directory it was started from and not at the
+project root, so the walk finds `test/ir` only when `mach test .` is run from
+the root, as above.
+
+
 ## Branching
 
 - `main` holds tagged releases only. It takes integration merges from `dev`.
