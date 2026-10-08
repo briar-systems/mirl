@@ -206,6 +206,8 @@ The ordered comparisons (`feq.o`, `fne.o`, `flt.o`, `fle.o`, `fgt.o`, `fge.o`) a
 
 `load` reads a value of the stated type from an address, `store` writes one, and each states the alignment the access may assume as an immediate. An alignment is a power of two. `alloca` gives the address of a stack slot of the stated type and alignment. `ptr.add` adds an integer byte count to an address.
 
+The memory of a stack slot holds no defined value until it is stored to, and it is not zero. A `load` that no store reaches gives an unspecified value of the stated type: any bit pattern, the same one on every read until the next store, and never poison, so nothing after it is undefined. The verifier does not refuse it, since whether a store reaches it depends on the path taken. A front end that wants a zero stores one. A pass may choose any value for it, and the promotion of stack slots chooses a zero of the type.
+
 `mem.copy` copies a byte count between two addresses, and the ranges may overlap. `mem.fill` sets a byte count at an address to one byte value.
 
 A `volatile` flag on an instruction makes its memory access observable. It is never merged, moved or removed.
