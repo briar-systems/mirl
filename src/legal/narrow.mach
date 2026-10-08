@@ -1,0 +1,357 @@
+# narrow integer arithmetic widened to the widths a target computes at
+#
+# a target declares the integer widths its arithmetic runs at, and an
+# operation at any other width is rewritten to run at the narrowest declared
+# width above it: its operands are extended, the same opcode runs at the wide
+# width, and the result is truncated back. a comparison has no result to
+# truncate, since its result is a condition.
+#
+# how an operand is extended is a fact of the operation, read from the algebra
+# table and the folder's comparison table: an operation that reads its operands
+# as signed extends them with their sign, one that reads them as unsigned
+# extends with zeros, and one whose low bits do not depend on the bits above
+# them (a sum, a product, a shift left) takes either, which here is the sign.
+# a shift count is always read as unsigned. the result at the narrow width is
+# then exact, and so are the rules that hold at it:
+#
+# - a shift by the narrow width or more gives zero or the sign fill at the wide
+#   width too, since the count is not truncated, so the truncated result is the
+#   same.
+# - a division by zero traps at the wide width exactly when it does at the
+#   narrow one. the least value divided by minus one does not trap at the wide
+#   width, so an opcode whose row states that trap has its dividend replaced,
+#   when the narrow dividend is the least value and the divisor minus one, by
+#   the least value of the wide width, which traps there. the row states the
+#   operand positions, and the replacement is a select, so the pass adds no
+#   branch.
+#
+# the pass adds no branch and reads no value to decide anything, so it keeps
+# constant time, and every instruction it makes reads as the one it replaces,
+# which carries the secrecy over: a result is secret exactly when it was.
+#
+# what it leaves for another pass: a vector of narrow integers, a width above
+# the widest the target computes at, and the operations of LEFT, whose algebra
+# the table does not state.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.build.Failure;
+use folder: mirl.fold;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Division;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use mirl.ir.opcode.Row;
+use mirl.ir.opcode.Trap;
+use mirl.ir.opcode.Traps;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.pass.analysis;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use targets: mirl.target;
+use mirl.target.Capabilities;
+
+# the pass: it adds and removes instructions and never touches the graph
+pub val NARROW: Pass = Pass{name: "narrow", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: widens_something};
+
+# the width of a condition, which is held whole and never computed at another
+val CONDITION: u32 = 1;
+
+# an integer operation the pass leaves, and what keeps it
+# ---
+# opcode: the opcode
+# why:    what the algebra table does not state of it
+# owner:  the issue of the job that closes it, zero when no job does yet
+pub rec Left {
+    opcode: Opcode;
+    why:    str;
+    owner:  u32;
+}
+
+val COUNTED:  str = "the table states a count of bits without saying which count";
+val SWAPPED:  str = "the table states nothing of the operation";
+val OVERFLOW: str = "the table states neither the operation nor whether it reads its operands as signed";
+
+# the integer operations no widening here covers
+pub val LEFT: [10]Left = [10]Left{
+    Left{opcode: opcode.POPCNT, why: COUNTED, owner: 0},
+    Left{opcode: opcode.CLZ, why: COUNTED, owner: 0},
+    Left{opcode: opcode.CTZ, why: COUNTED, owner: 0},
+    Left{opcode: opcode.BSWAP, why: SWAPPED, owner: 0},
+    Left{opcode: opcode.ADD_OV_S, why: OVERFLOW, owner: 0},
+    Left{opcode: opcode.ADD_OV_U, why: OVERFLOW, owner: 0},
+    Left{opcode: opcode.SUB_OV_S, why: OVERFLOW, owner: 0},
+    Left{opcode: opcode.SUB_OV_U, why: OVERFLOW, owner: 0},
+    Left{opcode: opcode.MUL_OV_S, why: OVERFLOW, owner: 0},
+    Left{opcode: opcode.MUL_OV_U, why: OVERFLOW, owner: 0},
+};
+
+# how an operand is extended to the wide width
+# ---
+# zero: with zeros, the operand read as unsigned
+# sign: with copies of its sign bit, the operand read as signed or any
+tag Extend: u8 {
+    zero;
+    sign;
+}
+
+# how an opcode extends the operand at a position, none when it is not widened
+fun extension(code: Opcode, position: u32) opt[Extend] {
+    val a: folder.Algebra = folder.algebra_of(code);
+    if (sel a.op.shift_left || sel a.op.shift_right_s) {
+        if (position == 0) { ret opt[Extend].some{Extend.sign{}}; }
+        ret opt[Extend].some{Extend.zero{}};
+    }
+    if (sel a.op.shift_right_u || sel a.op.quotient_u || sel a.op.remainder_u)                                          { ret opt[Extend].some{Extend.zero{}}; }
+    if (sel a.op.sum || sel a.op.difference || sel a.op.product || sel a.op.both || sel a.op.either || sel a.op.differ) { ret opt[Extend].some{Extend.sign{}}; }
+    if (sel a.op.negate || sel a.op.complement || sel a.op.quotient_s || sel a.op.remainder_s)                          { ret opt[Extend].some{Extend.sign{}}; }
+    if (sel a.op.compare) {
+        val c: opt[folder.Comparison] = folder.comparison(code);
+        if (sel c.none)    { ret opt[Extend].none{}; }
+        if (c.some.signed) { ret opt[Extend].some{Extend.sign{}}; }
+        ret opt[Extend].some{Extend.zero{}};
+    }
+    ret opt[Extend].none{};
+}
+
+# whether the pass rewrites an opcode when its integer operands are narrow
+pub fun widens(code: Opcode) bool {
+    val how: opt[Extend] = extension(code, 0);
+    ret sel how.some;
+}
+
+# the width arithmetic at a width is done at instead, none where the target
+# computes at the width itself or at no wider one
+fun promoted(caps: *Capabilities, width: u32) opt[u32] {
+    if (width == CONDITION || targets.computes(caps, width)) { ret opt[u32].none{}; }
+    ret targets.wider(caps, width);
+}
+
+# whether a target has an integer width its arithmetic is widened from
+fun widens_something(caps: *Capabilities) bool {
+    var i: usize = 0;
+    for (i < $length_of(types.Widths)) {
+        val to: opt[u32] = promoted(caps, types.WIDTHS[i]);
+        if (sel to.some) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# one visit
+# ---
+# m:       the module
+# caps:    the target's declarations
+# f:       the function
+# b:       its body
+# scratch: storage for one instruction at a time, reset between them
+rec Work {
+    m:       *Module;
+    caps:    *Capabilities;
+    f:       Function;
+    b:       *Body;
+    scratch: *allocator.Allocator;
+}
+
+# a constant of an integer type in the function
+fun constant(w: *Work, ty: Type, width: u32, x: Wide) res[Value, Why] {
+    val n:    usize                      = word.words_for(width)::usize;
+    val room: res[*u64, allocator.Error] = allocator.zallocate[u64](w.scratch, n);
+    if (sel room.err) { ret res[Value, Why].err{Why.alloc{room.err}}; }
+    var k: usize = 0;
+    for (k < n) {
+        room.ok[k] = x[k];
+        k          = k + 1;
+    }
+    val made: res[Constant, module.Error] = module.add_constant(w.m, ConstantData.integer{Bits{type: ty, words: Slice[u64]{data: room.ok, size: n}}});
+    if (sel made.err) { ret res[Value, Why].err{Why.ir{made.err}}; }
+    val at: res[Value, module.Error] = body.constant(w.m, w.f, made.ok);
+    if (sel at.err) { ret res[Value, Why].err{Why.ir{at.err}}; }
+    ret res[Value, Why].ok{at.ok};
+}
+
+fun make(bld: *Builder, code: Opcode, operands: Slice[Value], immediates: Slice[Immediate]) Value {
+    ret build.value(bld, Request{opcode: code, operands: operands, immediates: immediates, targets: Slice[Branch]{data: nil, size: 0}});
+}
+
+fun make_plain(bld: *Builder, code: Opcode, operands: Slice[Value]) Value {
+    ret make(bld, code, operands, Slice[Immediate]{data: nil, size: 0});
+}
+
+fun resize(bld: *Builder, code: Opcode, v: Value, to: Type) Value {
+    var ops: [1]Value     = [1]Value{v};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{to}};
+    ret make(bld, code, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+fun extend(bld: *Builder, how: Extend, v: Value, to: Type) Value {
+    if (sel how.zero) { ret resize(bld, opcode.EXT_U, v, to); }
+    ret resize(bld, opcode.EXT_S, v, to);
+}
+
+fun compare(bld: *Builder, a: Value, b: Value) Value {
+    var ops: [2]Value = [2]Value{a, b};
+    ret make_plain(bld, opcode.EQ, Slice[Value]{data: ?ops[0], size: 2});
+}
+
+# the dividend a wide division reads in place of the extended one, which is the
+# least value of the wide width when the narrow division would overflow, so the
+# division traps at the wide width exactly when it would at the narrow one
+fun dividend(w: *Work, bld: *Builder, wide: [2]Value, at: Division, to: Type, narrow: u32, width: u32) res[Value, Why] {
+    val least: Wide            = word.mask(word.sext(word.least(narrow), narrow), width);
+    val above: res[Value, Why] = constant(w, to, width, least);
+    if (sel above.err) { ret above; }
+    val ones: res[Value, Why] = constant(w, to, width, word.ones(width));
+    if (sel ones.err) { ret ones; }
+    val floor: res[Value, Why] = constant(w, to, width, word.least(width));
+    if (sel floor.err) { ret floor; }
+    val x:    Value    = wide[at.dividend];
+    val y:    Value    = wide[at.divisor];
+    var both: [2]Value = [2]Value{compare(bld, x, above.ok), compare(bld, y, ones.ok)};
+    var pick: [3]Value = [3]Value{make_plain(bld, opcode.AND, Slice[Value]{data: ?both[0], size: 2}), floor.ok, x};
+    ret res[Value, Why].ok{make_plain(bld, opcode.SELECT, Slice[Value]{data: ?pick[0], size: 3})};
+}
+
+# widen one instruction, which stands in block k at a position, to a type of
+# the width the target computes at, and take it out
+fun widen(w: *Work, k: Block, at: u32, i: Instruction, narrow: u32, width: u32, to: Type) err[Why] {
+    val d:     *InstructionData = ?w.b.instructions.data[i.index];
+    val code:  Opcode           = d.opcode;
+    val count: usize            = d.operands.len;
+    val old:   Value            = d.results.data[0];
+    val ty:    Type             = w.b.values.data[old.index].type;
+    var given: [2]Value;
+    var n:     usize            = 0;
+    for (n < count) {
+        given[n] = d.operands.data[n];
+        n        = n + 1;
+    }
+    val got: opt[Row] = opcode.row(code);
+    if (sel got.none) { ret err[Why].err{Why.reason{"an instruction whose opcode has no row"}}; }
+    var row: Row = got.some;
+
+    var bld: Builder = build.init(w.m);
+    build.enter(?bld, w.f);
+    build.derive(?bld, i);
+    build.at(?bld, k, at);
+    var wide: [2]Value;
+    n = 0;
+    for (n < count) {
+        val how: opt[Extend] = extension(code, n::u32);
+        if (!(sel how.some)) { ret err[Why].err{Why.reason{"an operand of a widened operation that has no extension"}}; }
+        wide[n] = extend(?bld, how.some, given[n], to);
+        n       = n + 1;
+    }
+    n = 0;
+    for (n < $length_of(Traps)) {
+        val t: Trap = row.effects.traps[n];
+        if (sel t.overflow) {
+            val read: res[Value, Why] = dividend(w, ?bld, wide, t.overflow, to, narrow, width);
+            if (sel read.err) { ret err[Why].err{read.err}; }
+            wide[t.overflow.dividend] = read.ok;
+        }
+        n = n + 1;
+    }
+    var result: Value = make_plain(?bld, code, Slice[Value]{data: ?wide[0], size: count});
+    if (!build.failed(?bld)) {
+        if (!types.same(w.b.values.data[result.index].type, ty)) { result = resize(?bld, opcode.TRUNC, result, ty); }
+    }
+    val built: err[Failure] = build.done(?bld);
+    if (sel built.err) { ret err[Why].err{Why.build{built.err}}; }
+
+    val r: err[Why] = failure.edit(body.replace(w.m, w.f, old, result, Records.follow{}));
+    if (sel r.err) { ret r; }
+    ret failure.edit(body.erase(w.m, w.f, i));
+}
+
+# widen the instruction at a position of block k if it is narrow arithmetic
+fun consider(w: *Work, k: Block, at: u32, i: Instruction) res[bool, Why] {
+    val d: *InstructionData = ?w.b.instructions.data[i.index];
+    if (!(sel d.place.placed) || d.results.len != 1 || d.operands.len == 0) { ret res[bool, Why].ok{false}; }
+    if (!widens(d.opcode))                                                  { ret res[bool, Why].ok{false}; }
+    val shape: res[types.Shape, types.Error] = types.shape(?w.m.types, w.b.values.data[d.operands.data[0].index].type);
+    if (sel shape.err)           { ret res[bool, Why].err{Why.ir{module.Error.types{shape.err}}}; }
+    if (!(sel shape.ok.integer)) { ret res[bool, Why].ok{false}; }
+    val narrow: u32      = shape.ok.integer.width;
+    val to:     opt[u32] = promoted(w.caps, narrow);
+    if (sel to.none) { ret res[bool, Why].ok{false}; }
+    val ty: res[Type, types.Error] = types.intern(?w.m.types, types.Shape.integer{types.Integer{width: to.some}});
+    if (sel ty.err) { ret res[bool, Why].err{Why.ir{module.Error.types{ty.err}}}; }
+    val r: err[Why] = widen(w, k, at, i, narrow, to.some, ty.ok);
+    if (sel r.err) { ret res[bool, Why].err{r.err}; }
+    ret res[bool, Why].ok{true};
+}
+
+# widen every narrow operation of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var w:       Work  = Work{m: c.m, caps: ?c.t.caps, f: u.f, b: got.ok, scratch: ?scratch};
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < w.b.blocks.len) {
+        if (!w.b.blocks.data[k].erased) {
+            var p: usize = 0;
+            for (p < w.b.blocks.data[k].instructions.len) {
+                arena.reset(?ar);
+                val before: usize          = w.b.blocks.data[k].instructions.len;
+                val i:      Instruction    = w.b.blocks.data[k].instructions.data[p];
+                val done:   res[bool, Why] = consider(?w, Block{index: k::u32}, p::u32, i);
+                if (sel done.err) { ret res[bool, Why].err{done.err}; }
+                if (done.ok) {
+                    changed = true;
+                    p       = p + (w.b.blocks.data[k].instructions.len - before) + 1;
+                }
+                or { p = p + 1; }
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{changed};
+}

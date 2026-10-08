@@ -45,6 +45,6 @@ Some operations select only for the operands a base form covers.
 - A shift selects for a constant count. RISC-V takes a variable count modulo the width and the ir gives 0 or the sign fill, so a variable shift waits for the shift bounding that marks a count it has bounded (#55).
 - Division and remainder select to the instruction, which does not trap. The zero and overflow checks are inserted before selection (#54).
 - A multiply of two registers needs M, and without it names `mul`. A narrower multiply form waits for #55.
-- Arithmetic at 8 and 16 bits, and a signed comparison of conditions, has no rule. The target's ALU widths are 32 and 64, so narrower arithmetic is promoted before selection.
+- A signed comparison of conditions has no rule. Arithmetic at 8 and 16 bits is widened to the target's ALU widths before selection (see [target](../ir/target.md)), except the counts, the byte swap and the overflow forms, which `mirl.legal.LEFT` lists.
 - `fmin`, `fmax`, `ffloor`, `fceil`, `fint` and `fnearest` select to Zfa rows and have no base form. A select of floats has no rule. A 64 bit float constant needs RV64.
 - Half precision selects with Zfh and is otherwise legalised away (#53), and so are integers wider than the register (#51).
