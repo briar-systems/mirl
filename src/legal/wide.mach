@@ -1,0 +1,1124 @@
+# wide integers split into words of the widest width the target computes at
+#
+# every integer width is legal in the ir on every target. one wider than the
+# widest width the target's arithmetic runs at is held as words of that width,
+# low word first, and every operation on it is rewritten over the words by one
+# algorithm for every width and every word width: a 512 bit integer over 32 bit
+# words takes the path a 128 bit integer over 64 bit words takes. the width is
+# read from the target's declarations alone.
+#
+# - a sum carries and a difference borrows from word to word, and a negation
+#   is a difference from zero.
+# - and, or, xor and not apply to each word.
+# - a shift by a constant moves whole words and then bits across them, and one
+#   by a value does the same through selects on the bits of its count. a count
+#   of the width or more gives zero or the sign fill, as the ir states.
+# - a comparison decides on the top word, read as its opcode reads it, and
+#   falls to the words below, read as unsigned, only where those are equal.
+#   equality and inequality read whether every word is equal.
+# - a product sums the low and high words of the product of every pair of
+#   words, the high word written as the ir's high multiply at twice the word,
+#   which the target's multiply forms select or the multiply forms legalisation
+#   builds. a high multiply already written over words is the multiply forms'
+#   and is left as it stands.
+# - the counts count word by word, and a byte swap swaps the words and the
+#   bytes of each. the overflow forms read the carry, the borrow, the signs or
+#   the high half of the whole product.
+# - an extension adds zero words or words of the sign fill, a truncation keeps
+#   the low words, and a select chooses each word.
+# - a load or store is one access per word, at the word's offset by the
+#   target's byte order, each carrying the access's flags, so a kept store
+#   stays kept in every word. a block's parameter is one parameter per word,
+#   and every edge into it passes the words of its argument.
+# - a constant is its words.
+#
+# an i1 a store writes or a load reads is held in memory as the integer of its
+# size in the data layout, 0 or 1, through an address that can be reinterpreted.
+#
+# the words are made by the builder in front of the instruction they split, so
+# they read as it does: its location, its site and its secrecy, and every word
+# of a secret value is secret. nothing made branches or reads a value to decide
+# anything, so the pass keeps constant time. a variable bound to a split value
+# is bound to its words.
+#
+# what it refuses, naming what does: a wide value at a function's entry, a call
+# or a return, which the abi legalisation places in register pieces before this
+# pass runs; a wide division, remainder or conversion to or from a float, which
+# LEFT names; a vector of wide lanes; a wide access through a logical address;
+# and any other operation on a wide integer.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use arches: mink.lib.catalog.arch;
+use mink.lib.reader;
+use folder: mirl.fold;
+use mirl.fold.algebra;
+use mirl.fold.algebra.Op;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use mirl.ir.opcode.Row;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.legal.multiply;
+use mirl.legal.wide.arith;
+use mirl.legal.wide.arith.Compare;
+use mirl.legal.wide.arith.Logic;
+use mirl.legal.wide.shift;
+use mirl.legal.wide.shift.Way;
+use mirl.legal.wide.words;
+use mirl.legal.wide.words.Work;
+use mirl.opt.number;
+use mirl.pass.analysis;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use targets: mirl.target;
+use mirl.target.Capabilities;
+use mirl.target.Layout;
+use mirl.target.Target;
+
+# the pass: it adds and removes instructions and block parameters and never
+# touches an edge's target or a block
+pub val WIDE: Pass = Pass{name: "wide", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
+
+# an operation on a wide integer the pass does not split, and what does
+# ---
+# what:  the operation
+# owner: the issue of the job that provides it
+pub rec Left {
+    what:  str;
+    owner: u32;
+}
+
+# a wide division or remainder
+pub val DIVISION: str = "a wide division or remainder, which the shared wide division helpers provide";
+
+# a wide conversion to or from a float
+pub val CONVERSION: str = "a wide conversion to or from a float, which the shared wide conversion helpers provide";
+
+# what the pass leaves to the shared helpers of the wide division and conversion job
+pub val LEFT: [2]Left = [2]Left{
+    Left{what: DIVISION, owner: 54},
+    Left{what: CONVERSION, owner: 54},
+};
+
+# why the pass leaves an opcode at a wide width to the shared helpers, none
+# for one it splits or that is not arithmetic
+pub fun leaves(code: Opcode) opt[str] {
+    val a: Op = algebra.algebra(code).op;
+    if (sel a.quotient_s || sel a.quotient_u || sel a.remainder_s || sel a.remainder_u) { ret opt[str].some{DIVISION}; }
+    val e: folder.Entry = folder.entry(code);
+    if (sel e.to_float || sel e.to_integer) { ret opt[str].some{CONVERSION}; }
+    ret opt[str].none{};
+}
+
+val BOUNDARY: str = "a wide value at a function's entry, a call or a return, which the abi legalisation places in register pieces first";
+val VECTOR:   str = "a vector of integers wider than the target computes at, which is scalarised first";
+val LOGICAL:  str = "a wide access through a pointer that cannot be reinterpreted";
+val UNSPLIT:  str = "an operation the splitting has no rule for reads or gives a wide integer";
+val POINTER:  str = "a wide integer meets a pointer wider than a word";
+val CYCLE:    str = "wide values that define each other in code no path reaches";
+val NARROW:   str = "a target whose widest arithmetic is narrower than a byte";
+
+# the condition type's width
+val CONDITION: u32 = 1;
+
+# whether the pass rewrites something on a target: an integer width wider
+# than its arithmetic, or memory a condition can be stored to
+fun wanted(caps: *Capabilities) bool {
+    if (sel caps.addressing.physical) { ret true; }
+    val top: opt[u32] = targets.widest(caps);
+    if (sel top.none) { ret false; }
+    ret top.some < types.WIDTHS[$length_of(types.Widths) - 1];
+}
+
+# how an instruction is split
+pub tag Form: u8 {
+    none;
+    refused: str;
+    sum;
+    difference;
+    product;
+    negate;
+    complement;
+    logic:   Logic;
+    shift:   Way;
+    compare: Compare;
+    select;
+    extend: bool;
+    truncate;
+    population;
+    leading;
+    trailing;
+    swap;
+    checked_sum:        bool;
+    checked_difference: bool;
+    checked_product:    bool;
+    declassify;
+    load;
+    store;
+    offset;
+    address;
+    pointer;
+    bit_load;
+    bit_store;
+}
+
+# one visit
+# ---
+# w:        the words and where they are made
+# t:        the target
+# layout:   its data layout
+# little:   its byte order puts the low byte first
+# physical: memory can be reinterpreted
+# low:      the unsigned comparison of each relation, by its bits
+# have:     whether a relation has one
+rec Visit {
+    w:        Work;
+    t:        *Target;
+    layout:   Layout;
+    little:   bool;
+    physical: bool;
+    low:      [8]Opcode;
+    have:     [8]bool;
+}
+
+fun relation_bits(r: folder.Relation) usize {
+    var n: usize = 0;
+    if (r.less)    { n = n + 4; }
+    if (r.equal)   { n = n + 2; }
+    if (r.greater) { n = n + 1; }
+    ret n;
+}
+
+# index the unsigned comparison of each relation, once
+fun index_comparisons(v: *Visit) {
+    var i: u32 = 0;
+    for (i < opcode.rows()) {
+        val c: opt[folder.Comparison] = folder.comparison(Opcode{index: i});
+        if (sel c.some) {
+            if (!c.some.signed) {
+                val at: usize = relation_bits(c.some.relation);
+                v.low[at]  = Opcode{index: i};
+                v.have[at] = true;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun body_of(v: *Visit) *Body {
+    ret v.w.site.b;
+}
+
+fun type_of(v: *Visit, x: Value) Type {
+    ret body_of(v).values.data[x.index].type;
+}
+
+# the width of an integer type, zero for any other type
+fun width_of(v: *Visit, ty: Type) u32 {
+    val s: res[types.Shape, types.Error] = types.shape(?v.w.site.m.types, ty);
+    if (sel s.err)        { ret 0; }
+    if (sel s.ok.integer) { ret s.ok.integer.width; }
+    ret 0;
+}
+
+# the width of a wide integer type, zero for any other type
+fun wide_of(v: *Visit, ty: Type) u32 {
+    val bits: u32 = width_of(v, ty);
+    if (bits > v.w.word) { ret bits; }
+    ret 0;
+}
+
+# whether a type is a vector whose lanes are wide
+fun wide_lanes(v: *Visit, ty: Type) bool {
+    val s: res[types.Shape, types.Error] = types.shape(?v.w.site.m.types, ty);
+    if (sel s.err)       { ret false; }
+    if (sel s.ok.vector) { ret wide_of(v, s.ok.vector.element) != 0; }
+    ret false;
+}
+
+# the words a wide type is split into
+fun count_of(v: *Visit, ty: Type) usize {
+    ret (wide_of(v, ty) / v.w.word)::usize;
+}
+
+# the bits of a pointer type
+fun pointer_bits(v: *Visit, ty: Type) u32 {
+    val size: res[u64, targets.Error] = targets.size(?v.layout, ty);
+    if (sel size.err) { ret 0; }
+    ret (size.ok * 8)::u32;
+}
+
+# how an instruction that reads or gives a wide integer is split
+fun wide_form(v: *Visit, d: *InstructionData, row: *Row) Form {
+    if (sel row.tail.argument || sel row.tail.returned) { ret Form.refused{BOUNDARY}; }
+    val a: Op = algebra.algebra(d.opcode).op;
+    if (sel a.sum)                { ret Form.sum{}; }
+    if (sel a.difference)         { ret Form.difference{}; }
+    if (sel a.product)            { ret Form.product{}; }
+    if (sel a.negate)             { ret Form.negate{}; }
+    if (sel a.complement)         { ret Form.complement{}; }
+    if (sel a.both)               { ret Form.logic{Logic.both{}}; }
+    if (sel a.either)             { ret Form.logic{Logic.either{}}; }
+    if (sel a.differ)             { ret Form.logic{Logic.differ{}}; }
+    if (sel a.shift_left)         { ret Form.shift{Way.left{}}; }
+    if (sel a.shift_right_u)      { ret Form.shift{Way.zero{}}; }
+    if (sel a.shift_right_s)      { ret Form.shift{Way.sign{}}; }
+    if (sel a.select)             { ret Form.select{}; }
+    if (sel a.extend_u)           { ret Form.extend{false}; }
+    if (sel a.extend_s)           { ret Form.extend{true}; }
+    if (sel a.truncate)           { ret Form.truncate{}; }
+    if (sel a.population)         { ret Form.population{}; }
+    if (sel a.leading_zeros)      { ret Form.leading{}; }
+    if (sel a.trailing_zeros)     { ret Form.trailing{}; }
+    if (sel a.swap)               { ret Form.swap{}; }
+    if (sel a.checked_sum)        { ret Form.checked_sum{a.checked_sum}; }
+    if (sel a.checked_difference) { ret Form.checked_difference{a.checked_difference}; }
+    if (sel a.checked_product)    { ret Form.checked_product{a.checked_product}; }
+    val left: opt[str] = leaves(d.opcode);
+    if (sel left.some) { ret Form.refused{left.some}; }
+    if (sel a.compare) {
+        val c: opt[folder.Comparison] = folder.comparison(d.opcode);
+        if (sel c.none) { ret Form.refused{UNSPLIT}; }
+        val r:  folder.Relation = c.some.relation;
+        val at: usize           = relation_bits(r);
+        if (!v.have[at]) { ret Form.refused{UNSPLIT}; }
+        ret Form.compare{Compare{code: d.opcode, low: v.low[at], symmetric: r.less == r.greater}};
+    }
+    if (sel row.secrecy.declassifies && d.operands.len == 1 && d.results.len == 1) { ret Form.declassify{}; }
+    if (d.opcode.index == opcode.LOAD.index || d.opcode.index == opcode.STORE.index) {
+        if (!v.physical)                         { ret Form.refused{LOGICAL}; }
+        if (d.opcode.index == opcode.LOAD.index) { ret Form.load{}; }
+        ret Form.store{};
+    }
+    var form:    Form = Form.refused{UNSPLIT};
+    var pointer: Type = type_of(v, d.operands.data[0]);
+    if (d.opcode.index == opcode.PTR_ADD.index)  { form = Form.offset{}; }
+    if (d.opcode.index == opcode.PTRTOINT.index) { form = Form.address{}; }
+    if (d.opcode.index == opcode.INTTOPTR.index) {
+        form    = Form.pointer{};
+        pointer = type_of(v, d.results.data[0]);
+    }
+    if (sel form.refused)                    { ret form; }
+    if (pointer_bits(v, pointer) > v.w.word) { ret Form.refused{POINTER}; }
+    ret form;
+}
+
+# how an instruction is split, none when it reads and gives no wide integer
+# and holds no condition in memory
+fun form_of(v: *Visit, d: *InstructionData) Form {
+    var wide:  bool  = false;
+    var lanes: bool  = false;
+    var k:     usize = 0;
+    for (k < d.operands.len) {
+        val ty: Type = type_of(v, d.operands.data[k]);
+        if (wide_of(v, ty) != 0) { wide = true; }
+        if (wide_lanes(v, ty))   { lanes = true; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < d.results.len) {
+        val ty: Type = type_of(v, d.results.data[k]);
+        if (wide_of(v, ty) != 0) { wide = true; }
+        if (wide_lanes(v, ty))   { lanes = true; }
+        k = k + 1;
+    }
+    if (lanes) { ret Form.refused{VECTOR}; }
+    val got: opt[Row] = opcode.row(d.opcode);
+    if (sel got.none) { ret Form.refused{UNSPLIT}; }
+    var row: Row = got.some;
+    if (wide)                                                                                             { ret wide_form(v, d, ?row); }
+    if (!v.physical)                                                                                      { ret Form.none{}; }
+    if (d.opcode.index == opcode.LOAD.index && width_of(v, type_of(v, d.results.data[0])) == CONDITION)   { ret Form.bit_load{}; }
+    if (d.opcode.index == opcode.STORE.index && width_of(v, type_of(v, d.operands.data[1])) == CONDITION) { ret Form.bit_store{}; }
+    ret Form.none{};
+}
+
+# the position of a placed instruction in its block
+fun position(b: *Body, k: Block, i: Instruction) u32 {
+    val list: Slice[Instruction] = Slice[Instruction]{data: b.blocks.data[k.index].instructions.data, size: b.blocks.data[k.index].instructions.len};
+    var p:    usize              = 0;
+    for (p < list.size && list.data[p].index != i.index) { p = p + 1; }
+    ret p::u32;
+}
+
+# what one instruction is, copied before the body grows under it
+# ---
+# code:      its opcode
+# operands:  its fixed operands
+# count:     how many
+# results:   its results
+# results_n: how many
+# flags:     its flags
+# immediate: its first immediate, which a load's type or an access's alignment is
+# second:    its second
+pub rec Copied {
+    code:      Opcode;
+    operands:  [4]Value;
+    count:     usize;
+    results:   [2]Value;
+    results_n: usize;
+    flags:     Flags;
+    immediate: opt[Immediate];
+    second:    opt[Immediate];
+}
+
+fun copy_of(d: *InstructionData) Copied {
+    var c: Copied;
+    c.code  = d.opcode;
+    c.count = d.operands.len;
+    if (c.count > 4) { c.count = 4; }
+    var k: usize = 0;
+    for (k < c.count) {
+        c.operands[k] = d.operands.data[k];
+        k             = k + 1;
+    }
+    c.results_n = d.results.len;
+    if (c.results_n > 2) { c.results_n = 2; }
+    k = 0;
+    for (k < c.results_n) {
+        c.results[k] = d.results.data[k];
+        k            = k + 1;
+    }
+    c.flags     = d.metadata.flags;
+    c.immediate = opt[Immediate].none{};
+    c.second    = opt[Immediate].none{};
+    if (d.immediates.len > 0) { c.immediate = opt[Immediate].some{d.immediates.data[0]}; }
+    if (d.immediates.len > 1) { c.second = opt[Immediate].some{d.immediates.data[1]}; }
+    ret c;
+}
+
+# the alignment an access states
+fun alignment_of(c: *Copied) u64 {
+    if (sel c.immediate.some) {
+        val i: Immediate = c.immediate.some;
+        if (sel i.alignment) { ret i.alignment; }
+    }
+    if (sel c.second.some) {
+        val i: Immediate = c.second.some;
+        if (sel i.alignment) { ret i.alignment; }
+    }
+    ret 1;
+}
+
+# the alignment an access at a byte offset from an aligned address may assume
+fun aligned_at(align: u64, offset: u64) u64 {
+    if (offset == 0) { ret align; }
+    val low: u64 = offset & (0 - offset);
+    if (low < align) { ret low; }
+    ret align;
+}
+
+# the address of the word at a byte offset from an address
+fun at_offset(v: *Visit, address: Value, offset: u64) Value {
+    if (offset == 0) { ret address; }
+    val bits: u32   = pointer_bits(v, type_of(v, address));
+    val by:   Value = words.constant(?v.w, words.integer(?v.w, bits), word.small(offset));
+    ret emit.binary(?v.w.site, opcode.PTR_ADD, address, by);
+}
+
+# the byte offset of word i of n by the target's byte order
+fun word_offset(v: *Visit, i: usize, n: usize) u64 {
+    val bytes: u64 = (v.w.word / 8)::u64;
+    if (v.little) { ret i::u64 * bytes; }
+    ret (n - 1 - i)::u64 * bytes;
+}
+
+fun access_flags(c: *Copied) Flags {
+    ret Flags{volatile: c.flags.volatile, kept: c.flags.kept, bounded: false};
+}
+
+fun load_of(v: *Visit, c: *Copied, address: Value, ty: Type, align: u64) Value {
+    var ops: [1]Value     = [1]Value{address};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{align}};
+    emit.flags(?v.w.site, access_flags(c));
+    val i: Instruction = emit.make(?v.w.site, opcode.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+    emit.flags(?v.w.site, NO_FLAGS);
+    ret emit.result(?v.w.site, i, 0);
+}
+
+fun store_of(v: *Visit, c: *Copied, address: Value, value: Value, align: u64) {
+    var ops: [2]Value     = [2]Value{address, value};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+    emit.flags(?v.w.site, access_flags(c));
+    emit.make(?v.w.site, opcode.STORE, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 1});
+    emit.flags(?v.w.site, NO_FLAGS);
+}
+
+# the condition 0
+fun no(v: *Visit) Value {
+    ret words.constant(?v.w, v.w.bit, word.zero());
+}
+
+# what a split leaves: the words of its wide result, and what stands for the
+# result that is not wide
+# ---
+# words: the words of the first result, empty when it is not wide
+# value: the value that takes the place of the result that is not wide, if any
+rec Split {
+    words: Slice[Value];
+    value: opt[Value];
+}
+
+fun only(words: Slice[Value]) Split {
+    ret Split{words: words, value: opt[Value].none{}};
+}
+
+fun standing(x: Value) Split {
+    ret Split{words: Slice[Value]{data: nil, size: 0}, value: opt[Value].some{x}};
+}
+
+fun nothing() Split {
+    ret Split{words: Slice[Value]{data: nil, size: 0}, value: opt[Value].none{}};
+}
+
+# the words of an operand of a wide type
+fun operand_words(v: *Visit, c: *Copied, k: usize) Slice[Value] {
+    val x: Value = c.operands[k];
+    ret words.words_of(?v.w, x, count_of(v, type_of(v, x)));
+}
+
+# a shift of a value's words by its count
+fun shifted(v: *Visit, way: Way, c: *Copied) Split {
+    val a:     Slice[Value]                = operand_words(v, c, 0);
+    val width: u32                         = (a.size * v.w.word::usize)::u32;
+    val read:  res[opt[folder.Value], Why] = number.read(v.w.site.m, body_of(v), v.w.site.scratch, c.operands[1]);
+    if (sel read.err) {
+        words.fail(?v.w, read.err);
+        ret only(a);
+    }
+    var constant: bool = false;
+    var k:        Wide = word.zero();
+    if (sel read.ok.some) {
+        if (read.ok.some.lanes.size == 1) {
+            constant = true;
+            k        = word.of(read.ok.some.lanes.data[0].words);
+        }
+    }
+    if (constant) {
+        if (word.compare(k, word.small(width::u64)) >= 0) {
+            var fill: Value = words.zero(?v.w);
+            if (sel way.sign) { fill = words.fill(?v.w, a.data[a.size - 1]); }
+            val out: Slice[Value] = words.fresh(?v.w, a.size);
+            var i:   usize        = 0;
+            for (i < out.size) {
+                out.data[i] = fill;
+                i           = i + 1;
+            }
+            ret only(out);
+        }
+        ret only(shift.by_constant(?v.w, way, a, k[0]::u32));
+    }
+    ret only(shift.by_value(?v.w, way, a, operand_words(v, c, 1)));
+}
+
+# the words of a load, one access per word at its offset
+fun loaded(v: *Visit, c: *Copied) Split {
+    val n:     usize        = count_of(v, type_of(v, c.results[0]));
+    val align: u64          = alignment_of(c);
+    val out:   Slice[Value] = words.fresh(?v.w, n);
+    var i:     usize        = 0;
+    for (i < out.size) {
+        val off: u64 = word_offset(v, i, n);
+        out.data[i] = load_of(v, c, at_offset(v, c.operands[0], off), v.w.wty, aligned_at(align, off));
+        i           = i + 1;
+    }
+    ret only(out);
+}
+
+# the words of a store, one access per word at its offset, the last in the
+# store's place so a kept store is replaced only by a kept one
+fun stored(v: *Visit, c: *Copied, origin: Instruction) {
+    val a:     Slice[Value] = operand_words(v, c, 1);
+    val align: u64          = alignment_of(c);
+    var i:     usize        = 0;
+    for (i < a.size) {
+        val off:     u64   = word_offset(v, i, a.size);
+        val address: Value = at_offset(v, c.operands[0], off);
+        if (i + 1 == a.size) { emit.close(?v.w.site, origin); }
+        store_of(v, c, address, a.data[i], aligned_at(align, off));
+        i = i + 1;
+    }
+}
+
+# the integer type a condition is held in memory as, by its size in the layout
+fun bit_memory(v: *Visit) Type {
+    val size: res[u64, targets.Error] = targets.size(?v.layout, v.w.bit);
+    if (sel size.err) {
+        words.fail(?v.w, Why.reason{"the data layout states no size of a condition"});
+        ret v.w.wty;
+    }
+    ret words.integer(?v.w, (size.ok * 8)::u32);
+}
+
+# split an instruction by its form
+fun split(v: *Visit, form: Form, c: *Copied, origin: Instruction) Split {
+    val w: *Work = ?v.w;
+    if (sel form.sum)        { ret only(arith.sum(w, operand_words(v, c, 0), operand_words(v, c, 1), nil)); }
+    if (sel form.difference) { ret only(arith.difference(w, operand_words(v, c, 0), operand_words(v, c, 1), nil)); }
+    if (sel form.product) {
+        val a: Slice[Value] = operand_words(v, c, 0);
+        ret only(arith.product(w, a, operand_words(v, c, 1), a.size));
+    }
+    if (sel form.negate)     { ret only(arith.negate(w, operand_words(v, c, 0))); }
+    if (sel form.complement) { ret only(arith.each(w, opcode.NOT, operand_words(v, c, 0))); }
+    if (sel form.declassify) { ret only(arith.each(w, c.code, operand_words(v, c, 0))); }
+    if (sel form.logic)      { ret only(arith.bitwise(w, form.logic, operand_words(v, c, 0), operand_words(v, c, 1))); }
+    if (sel form.shift)      { ret shifted(v, form.shift, c); }
+    if (sel form.compare)    { ret standing(arith.compare(w, form.compare, operand_words(v, c, 0), operand_words(v, c, 1))); }
+    if (sel form.select)     { ret only(arith.select(w, c.operands[0], operand_words(v, c, 1), operand_words(v, c, 2))); }
+    if (sel form.extend) {
+        val n:    usize = count_of(v, type_of(v, c.results[0]));
+        val from: Type  = type_of(v, c.operands[0]);
+        if (wide_of(v, from) != 0) { ret only(arith.extend(w, operand_words(v, c, 0), n, form.extend)); }
+        ret only(arith.extend_narrow(w, c.operands[0], width_of(v, from), n, form.extend));
+    }
+    if (sel form.truncate) {
+        val to: Type         = type_of(v, c.results[0]);
+        val a:  Slice[Value] = operand_words(v, c, 0);
+        if (wide_of(v, to) != 0) { ret only(arith.low(w, a, count_of(v, to))); }
+        ret standing(arith.truncate(w, a, to, width_of(v, to)));
+    }
+    if (sel form.population) { ret only(arith.population(w, operand_words(v, c, 0))); }
+    if (sel form.leading)    { ret only(arith.leading(w, operand_words(v, c, 0))); }
+    if (sel form.trailing)   { ret only(arith.trailing(w, operand_words(v, c, 0))); }
+    if (sel form.swap)       { ret only(arith.swap(w, operand_words(v, c, 0))); }
+    if (sel form.checked_sum || sel form.checked_difference) {
+        val a:    Slice[Value] = operand_words(v, c, 0);
+        val b:    Slice[Value] = operand_words(v, c, 1);
+        val diff: bool         = sel form.checked_difference;
+        var sign: bool         = false;
+        if (sel form.checked_sum)        { sign = form.checked_sum; }
+        if (sel form.checked_difference) { sign = form.checked_difference; }
+        var flag: opt[Value]   = opt[Value].none{};
+        var out:  Slice[Value] = Slice[Value]{data: nil, size: 0};
+        if (sign) {
+            if (diff) { out = arith.difference(w, a, b, nil); }
+            or        { out = arith.sum(w, a, b, nil); }
+            val top: usize = a.size - 1;
+            flag = opt[Value].some{arith.signed_overflow(w, a.data[top], b.data[top], out.data[top], diff)};
+        }
+        or {
+            if (diff) { out = arith.difference(w, a, b, ?flag); }
+            or        { out = arith.sum(w, a, b, ?flag); }
+        }
+        var set: Value = no(v);
+        if (sel flag.some) { set = flag.some; }
+        ret Split{words: out, value: opt[Value].some{set}};
+    }
+    if (sel form.checked_product) {
+        var set: Value        = no(v);
+        val out: Slice[Value] = arith.checked_product(w, operand_words(v, c, 0), operand_words(v, c, 1), form.checked_product, ?set);
+        ret Split{words: out, value: opt[Value].some{set}};
+    }
+    if (sel form.load) { ret loaded(v, c); }
+    if (sel form.store) {
+        stored(v, c, origin);
+        ret nothing();
+    }
+    if (sel form.offset) { ret standing(emit.binary(?w.site, opcode.PTR_ADD, c.operands[0], operand_words(v, c, 1).data[0])); }
+    if (sel form.address) {
+        val low: Value    = emit.convert(?w.site, opcode.PTRTOINT, c.operands[0], w.wty);
+        var one: [1]Value = [1]Value{low};
+        ret only(arith.extend(w, Slice[Value]{data: ?one[0], size: 1}, count_of(v, type_of(v, c.results[0])), false));
+    }
+    if (sel form.pointer) { ret standing(emit.convert(?w.site, opcode.INTTOPTR, operand_words(v, c, 0).data[0], type_of(v, c.results[0]))); }
+    if (sel form.bit_load) {
+        val held: Type  = bit_memory(v);
+        val x:    Value = load_of(v, c, c.operands[0], held, alignment_of(c));
+        ret standing(emit.convert(?w.site, opcode.TRUNC, x, w.bit));
+    }
+    if (sel form.bit_store) {
+        val held: Type  = bit_memory(v);
+        val x:    Value = emit.convert(?w.site, opcode.EXT_U, c.operands[1], held);
+        emit.close(?w.site, origin);
+        store_of(v, c, c.operands[0], x, alignment_of(c));
+        ret nothing();
+    }
+    words.fail(w, Why.reason{UNSPLIT});
+    ret nothing();
+}
+
+# what the visit knows of each instruction of the function, by its index
+# ---
+# form:  how it is split, none for one that is not
+# kept:  part of a high multiply written over words, left as it stands
+# root:  the truncation such a pattern ends in
+# split: split in the walk
+# state: where the walk of definitions is: 0 unseen, 1 open, 2 done
+rec Mark {
+    form:  Form;
+    kept:  bool;
+    root:  bool;
+    split: bool;
+    state: u8;
+}
+
+# a block parameter split into words
+# ---
+# block: its block
+# old:   the parameter
+rec Parameter {
+    block: Block;
+    old:   Value;
+}
+
+# the walk of one function
+# ---
+# v:      the visit
+# marks:  one per instruction the function had when the walk began
+# order:  the instructions to split, each after those defining what it reads
+# gone:   the instructions split whose place nothing takes, removed at the end
+# params: the parameters split
+# before: for each block, how many parameters it had before its own were
+#         split, UNSPLIT_BLOCK for a block none of whose were
+rec Walk {
+    v:      *Visit;
+    marks:  vector.Vector[Mark];
+    order:  vector.Vector[Instruction];
+    gone:   vector.Vector[Instruction];
+    params: vector.Vector[Parameter];
+    before: vector.Vector[u32];
+}
+
+val UNSPLIT_BLOCK: u32 = 0xffffffff;
+
+fun lost(e: allocator.Error) Why {
+    ret Why.alloc{e};
+}
+
+# the mark of each instruction and whether any is split or refused
+fun scan(wk: *Walk) res[bool, Why] {
+    val b:    *Body                       = body_of(wk.v);
+    var none: Mark                        = Mark{form: Form.none{}, kept: false, root: false, split: false, state: 0};
+    val room: res[usize, allocator.Error] = vector.reserve[Mark](?wk.marks, b.instructions.len);
+    if (sel room.err) { ret res[bool, Why].err{lost(room.err)}; }
+    var i: usize = 0;
+    for (i < b.instructions.len) {
+        vector.push[Mark](?wk.marks, none);
+        i = i + 1;
+    }
+    var any: bool  = false;
+    var k:   usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var p: usize = 0;
+            for (p < b.blocks.data[k].parameters.len) {
+                val ty: Type = type_of(wk.v, b.blocks.data[k].parameters.data[p]);
+                if (wide_lanes(wk.v, ty)) { ret res[bool, Why].err{Why.reason{VECTOR}}; }
+                if (wide_of(wk.v, ty) != 0) {
+                    if (k == 0) { ret res[bool, Why].err{Why.reason{BOUNDARY}}; }
+                    any = true;
+                }
+                p = p + 1;
+            }
+            var n: usize = 0;
+            for (n < b.blocks.data[k].instructions.len) {
+                val at:   Instruction      = b.blocks.data[k].instructions.data[n];
+                val d:    *InstructionData = ?b.instructions.data[at.index];
+                val form: Form             = form_of(wk.v, d);
+                if (sel form.refused) { ret res[bool, Why].err{Why.reason{form.refused}}; }
+                if (!(sel form.none)) {
+                    wk.marks.data[at.index].form = form;
+                    any                          = true;
+                }
+                n = n + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{any};
+}
+
+# mark every high multiply written over words, which the multiply forms own
+fun mark_patterns(wk: *Walk) err[Why] {
+    val b: *Body = body_of(wk.v);
+    var i: usize = 0;
+    for (i < wk.marks.len) {
+        val f: Form = wk.marks.data[i].form;
+        if (sel f.truncate) {
+            val got: res[opt[multiply.Found], Why] = multiply.high(?wk.v.w.site, ?b.instructions.data[i]);
+            if (sel got.err) { ret err[Why].err{got.err}; }
+            if (sel got.ok.some) {
+                if (got.ok.some.lane.bits == wk.v.w.word) {
+                    val parts: multiply.Parts = got.ok.some.parts;
+                    wk.marks.data[i].kept                   = true;
+                    wk.marks.data[i].root                   = true;
+                    wk.marks.data[parts.shift.index].kept   = true;
+                    wk.marks.data[parts.product.index].kept = true;
+                    wk.marks.data[parts.left.index].kept    = true;
+                    wk.marks.data[parts.right.index].kept   = true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# whether an instruction is one to split, by its mark
+fun marked(wk: *Walk, i: Instruction) bool {
+    if (i.index::usize >= wk.marks.len) { ret false; }
+    val f: Form = wk.marks.data[i.index].form;
+    ret !(sel f.none);
+}
+
+# the instruction defining an operand, when it is one to split
+fun feeder(wk: *Walk, x: Value) opt[Instruction] {
+    val def: Def = body_of(wk.v).values.data[x.index].def;
+    if (!(sel def.result))                   { ret opt[Instruction].none{}; }
+    if (!marked(wk, def.result.instruction)) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{def.result.instruction};
+}
+
+# a frame of the walk of definitions
+# ---
+# at:   the instruction
+# next: the next operand to follow
+rec Frame {
+    at:   Instruction;
+    next: usize;
+}
+
+# order the instructions to split so each follows those defining what it
+# reads, whatever block holds it
+fun order(wk: *Walk) err[Why] {
+    val b:     *Body                = body_of(wk.v);
+    var stack: vector.Vector[Frame] = vector.init[Frame](wk.v.w.keep);
+    var k:     usize                = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var n: usize = 0;
+            for (n < b.blocks.data[k].instructions.len) {
+                val start: Instruction = b.blocks.data[k].instructions.data[n];
+                if (marked(wk, start) && wk.marks.data[start.index].state == 0) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Frame](?stack, Frame{at: start, next: 0});
+                    if (sel pushed.err) { ret err[Why].err{lost(pushed.err)}; }
+                    wk.marks.data[start.index].state = 1;
+                    for (stack.len > 0) {
+                        val top: *Frame           = ?stack.data[stack.len - 1];
+                        val d:   *InstructionData = ?b.instructions.data[top.at.index];
+                        if (top.next < d.operands.len) {
+                            val x: Value = d.operands.data[top.next];
+                            top.next = top.next + 1;
+                            val f: opt[Instruction] = feeder(wk, x);
+                            if (sel f.some) {
+                                val s: u8 = wk.marks.data[f.some.index].state;
+                                if (s == 1) { ret err[Why].err{Why.reason{CYCLE}}; }
+                                if (s == 0) {
+                                    wk.marks.data[f.some.index].state = 1;
+                                    val more: res[usize, allocator.Error] = vector.push[Frame](?stack, Frame{at: f.some, next: 0});
+                                    if (sel more.err) { ret err[Why].err{lost(more.err)}; }
+                                }
+                            }
+                        }
+                        or {
+                            wk.marks.data[top.at.index].state = 2;
+                            val listed: res[usize, allocator.Error] = vector.push[Instruction](?wk.order, top.at);
+                            if (sel listed.err) { ret err[Why].err{lost(listed.err)}; }
+                            stack.len = stack.len - 1;
+                        }
+                    }
+                }
+                n = n + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# which instructions are split: all but the parts of a high multiply over
+# words, and of those the ones whose result something split reads
+fun choose(wk: *Walk) {
+    val b: *Body = body_of(wk.v);
+    var n: usize = wk.order.len;
+    for (n > 0) {
+        n = n - 1;
+        val i: Instruction = wk.order.data[n];
+        val m: *Mark       = ?wk.marks.data[i.index];
+        if (!m.kept) { m.split = true; }
+        or (!m.root) {
+            val d: *InstructionData = ?b.instructions.data[i.index];
+            var r: usize            = 0;
+            for (r < d.results.len && !m.split) {
+                val uses: *vector.Vector[Instruction] = ?b.values.data[d.results.data[r].index].uses;
+                var u:    usize                       = 0;
+                for (u < uses.len && !m.split) {
+                    val user: Instruction = uses.data[u];
+                    if (user.index::usize >= wk.marks.len || !wk.marks.data[user.index].kept || wk.marks.data[user.index].split) { m.split = true; }
+                    u = u + 1;
+                }
+                r = r + 1;
+            }
+        }
+    }
+}
+
+# split every wide parameter of a block other than the entry into one
+# parameter per word, each edge passing zero words until its arguments are split
+fun split_parameters(wk: *Walk) err[Why] {
+    val v:    *Visit                      = wk.v;
+    val b:    *Body                       = body_of(v);
+    val room: res[usize, allocator.Error] = vector.reserve[u32](?wk.before, b.blocks.len);
+    if (sel room.err) { ret err[Why].err{lost(room.err)}; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        vector.push[u32](?wk.before, UNSPLIT_BLOCK);
+        k = k + 1;
+    }
+    k = 1;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            val count: usize = b.blocks.data[k].parameters.len;
+            var p:     usize = 0;
+            for (p < count) {
+                val old: Value = b.blocks.data[k].parameters.data[p];
+                val n:   usize = count_of(v, type_of(v, old));
+                if (n != 0) {
+                    wk.before.data[k] = count::u32;
+                    val preds:    usize        = b.blocks.data[k].predecessors.len;
+                    val incoming: Slice[Value] = words.zeros(?v.w, preds);
+                    val made:     Slice[Value] = words.fresh(?v.w, n);
+                    if (sel v.w.failed.some) { ret err[Why].err{v.w.failed.some}; }
+                    val secret: bool  = b.values.data[old.index].secret;
+                    var j:      usize = 0;
+                    for (j < n) {
+                        val added: res[Value, module.Error] = body.add_parameter(v.w.site.m, v.w.site.f, Block{index: k::u32}, Declaration{type: v.w.wty, secret: secret, name: opt[View].none{}}, incoming);
+                        if (sel added.err) { ret err[Why].err{Why.ir{added.err}}; }
+                        made.data[j] = added.ok;
+                        j            = j + 1;
+                    }
+                    words.hold(?v.w, old, made);
+                    val listed: res[usize, allocator.Error] = vector.push[Parameter](?wk.params, Parameter{block: Block{index: k::u32}, old: old});
+                    if (sel listed.err) { ret err[Why].err{lost(listed.err)}; }
+                }
+                p = p + 1;
+            }
+        }
+        k = k + 1;
+    }
+    if (sel v.w.failed.some) { ret err[Why].err{v.w.failed.some}; }
+    ret err[Why].ok{};
+}
+
+# split one instruction in its place
+fun rewrite(wk: *Walk, i: Instruction) err[Why] {
+    val v:    *Visit           = wk.v;
+    val b:    *Body            = body_of(v);
+    val d:    *InstructionData = ?b.instructions.data[i.index];
+    var c:    Copied           = copy_of(d);
+    val form: Form             = wk.marks.data[i.index].form;
+    val kept: bool             = wk.marks.data[i.index].kept;
+    if (!(sel d.place.placed)) { ret err[Why].err{Why.reason{"an instruction to split that stands in no block"}}; }
+    val k: Block = d.place.placed;
+    emit.open(?v.w.site, i, k, position(b, k, i));
+    val made: Split    = split(v, form, ?c, i);
+    val done: err[Why] = words.finished(?v.w);
+    if (sel done.err)         { ret done; }
+    if (made.words.size != 0) { words.hold(?v.w, c.results[0], made.words); }
+    if (sel made.value.some) {
+        var at: usize = 0;
+        if (made.words.size != 0) { at = 1; }
+        val moved: err[Why] = failure.edit(body.replace(v.w.site.m, v.w.site.f, c.results[at], made.value.some, Records.follow{}));
+        if (sel moved.err) { ret moved; }
+    }
+    if (sel v.w.failed.some) { ret err[Why].err{v.w.failed.some}; }
+    if (!kept && !(sel form.store) && !(sel form.bit_store)) {
+        val listed: res[usize, allocator.Error] = vector.push[Instruction](?wk.gone, i);
+        if (sel listed.err) { ret err[Why].err{lost(listed.err)}; }
+    }
+    ret err[Why].ok{};
+}
+
+# pass every edge into a block whose parameters were split the words of its
+# arguments, after the arguments it passed before
+fun split_edges(wk: *Walk) err[Why] {
+    val v: *Visit = wk.v;
+    val b: *Body  = body_of(v);
+    var k: usize  = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased && b.blocks.data[k].instructions.len != 0) {
+            val last:  Instruction = b.blocks.data[k].instructions.data[b.blocks.data[k].instructions.len - 1];
+            val edges: usize       = b.instructions.data[last.index].edges.len;
+            var e:     usize       = 0;
+            for (e < edges) {
+                val to:     Block = b.instructions.data[last.index].edges.data[e].block;
+                val before: u32   = wk.before.data[to.index];
+                if (before != UNSPLIT_BLOCK) {
+                    val wanted: usize                       = b.blocks.data[to.index].parameters.len;
+                    var list:   vector.Vector[Value]        = vector.init[Value](v.w.keep);
+                    val room:   res[usize, allocator.Error] = vector.reserve[Value](?list, wanted);
+                    if (sel room.err) { ret err[Why].err{lost(room.err)}; }
+                    var a: usize = 0;
+                    for (a < before::usize) {
+                        vector.push[Value](?list, b.instructions.data[last.index].edges.data[e].arguments.data[a]);
+                        a = a + 1;
+                    }
+                    a = 0;
+                    for (a < before::usize) {
+                        val x: Value = b.instructions.data[last.index].edges.data[e].arguments.data[a];
+                        val n: usize = count_of(v, type_of(v, b.blocks.data[to.index].parameters.data[a]));
+                        if (n != 0) {
+                            val parts: Slice[Value] = words.words_of(?v.w, x, n);
+                            var j:     usize        = 0;
+                            for (j < parts.size) {
+                                vector.push[Value](?list, parts.data[j]);
+                                j = j + 1;
+                            }
+                        }
+                        a = a + 1;
+                    }
+                    if (sel v.w.failed.some) { ret err[Why].err{v.w.failed.some}; }
+                    val moved: err[Why] = failure.edit(body.retarget(v.w.site.m, v.w.site.f, last, e::u32, to, Slice[Value]{data: list.data, size: list.len}));
+                    if (sel moved.err) { ret moved; }
+                }
+                e = e + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# take out the instructions split and the parameters split, which only each
+# other and the edges into the split blocks still read
+fun remove(wk: *Walk) err[Why] {
+    var dead: vector.Vector[Value]        = vector.init[Value](wk.v.w.keep);
+    val room: res[usize, allocator.Error] = vector.reserve[Value](?dead, wk.params.len);
+    if (sel room.err) { ret err[Why].err{lost(room.err)}; }
+    var p: usize = 0;
+    for (p < wk.params.len) {
+        vector.push[Value](?dead, wk.params.data[p].old);
+        p = p + 1;
+    }
+    ret failure.edit(body.remove_dead(wk.v.w.site.m, wk.v.w.site.f, Slice[Instruction]{data: wk.gone.data, size: wk.gone.len}, Slice[Value]{data: dead.data, size: dead.len}));
+}
+
+# split every wide integer of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+
+    var held: arena.Arena;
+    val kept: err[allocator.Error] = arena.init(?held, c.m.a, 0);
+    if (sel kept.err) { ret res[bool, Why].err{Why.alloc{kept.err}}; }
+    fin { arena.dnit(?held); }
+    var keep: allocator.Allocator;
+    arena.make(?keep, ?held);
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    val top:  opt[u32] = targets.widest(?c.t.caps);
+    var unit: u32      = types.WIDTHS[$length_of(types.Widths) - 1];
+    if (sel top.some) { unit = top.some; }
+    if (unit < 8)     { ret res[bool, Why].err{Why.reason{NARROW}}; }
+
+    var v: Visit;
+    v.w.site   = emit.init(c.m, u.f, got.ok, ?scratch);
+    v.w.word   = unit;
+    v.w.keep   = ?keep;
+    v.w.words  = vector.init[Slice[Value]](?keep);
+    v.w.zero   = opt[Value].none{};
+    v.w.failed = opt[Why].none{};
+    v.t        = c.t;
+    v.layout   = targets.of(c.t, ?c.m.types);
+    v.physical = sel c.t.caps.addressing.physical;
+    val arch: res[*arches.Arch, targets.Error] = targets.arch(c.t);
+    if (sel arch.err) { ret res[bool, Why].err{Why.reason{"a target whose architecture names no row of the catalog"}}; }
+    v.little = arch.ok.order == reader.LITTLE;
+    index_comparisons(?v);
+    v.w.wty    = words.integer(?v.w, unit);
+    v.w.bit    = words.integer(?v.w, CONDITION);
+    v.w.double = v.w.wty;
+    if (unit < types.WIDTHS[$length_of(types.Widths) - 1]) { v.w.double = words.integer(?v.w, unit * 2); }
+    if (sel v.w.failed.some)                               { ret res[bool, Why].err{v.w.failed.some}; }
+
+    var wk:  Walk           = Walk{v: ?v, marks: vector.init[Mark](?keep), order: vector.init[Instruction](?keep), gone: vector.init[Instruction](?keep), params: vector.init[Parameter](?keep), before: vector.init[u32](?keep)};
+    val any: res[bool, Why] = scan(?wk);
+    if (sel any.err) { ret any; }
+    if (!any.ok)     { ret res[bool, Why].ok{false}; }
+    val marking: err[Why] = mark_patterns(?wk);
+    if (sel marking.err) { ret res[bool, Why].err{marking.err}; }
+    val ordered: err[Why] = order(?wk);
+    if (sel ordered.err) { ret res[bool, Why].err{ordered.err}; }
+    choose(?wk);
+
+    var changed: bool  = false;
+    var n:       usize = 0;
+    for (n < wk.order.len) {
+        if (wk.marks.data[wk.order.data[n].index].split) { changed = true; }
+        n = n + 1;
+    }
+    var p: usize = 1;
+    for (p < got.ok.blocks.len) {
+        if (!got.ok.blocks.data[p].erased) {
+            var q: usize = 0;
+            for (q < got.ok.blocks.data[p].parameters.len) {
+                if (count_of(?v, type_of(?v, got.ok.blocks.data[p].parameters.data[q])) != 0) { changed = true; }
+                q = q + 1;
+            }
+        }
+        p = p + 1;
+    }
+    if (!changed) { ret res[bool, Why].ok{false}; }
+
+    val params: err[Why] = split_parameters(?wk);
+    if (sel params.err) { ret res[bool, Why].err{params.err}; }
+    n = 0;
+    for (n < wk.order.len) {
+        arena.reset(?ar);
+        val i: Instruction = wk.order.data[n];
+        if (wk.marks.data[i.index].split) {
+            val r: err[Why] = rewrite(?wk, i);
+            if (sel r.err) { ret res[bool, Why].err{r.err}; }
+        }
+        n = n + 1;
+    }
+    arena.reset(?ar);
+    val edges: err[Why] = split_edges(?wk);
+    if (sel edges.err) { ret res[bool, Why].err{edges.err}; }
+    val removed: err[Why] = remove(?wk);
+    if (sel removed.err) { ret res[bool, Why].err{removed.err}; }
+    ret res[bool, Why].ok{true};
+}

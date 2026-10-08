@@ -1,0 +1,361 @@
+# the words of a wide integer and the word operations its splitting is made of
+#
+# an integer wider than the widest width the target's arithmetic runs at is
+# held as words of that width, low word first. a word that is the constant zero
+# is known as one, and an operation on it makes nothing it can answer without,
+# so an extension's words or a constant's cost nothing where they are read.
+#
+# a carry or a borrow is the flag of the overflow form of the word operation,
+# which is the ir's own carry: selection gives it the target's add or subtract
+# with carry where it has one and a comparison where it has none. the high half
+# of the product of two words is the ir's high multiply, which the target's
+# multiply forms select and the multiply forms legalisation builds where it has
+# none. nothing here branches or reads a value to decide anything.
+#
+# a failure is kept, the first one, and every call after it answers a stand-in,
+# as the builder does, so a rewrite reads it once at its end.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use folder: mirl.fold;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.opt.number;
+use mirl.pass.failure.Why;
+
+# the most words a value is split into, a product's full width included: a
+# 512 bit integer's product over words of 8 bits
+pub val MOST: usize = 128;
+
+# a function being split
+# ---
+# site:   where its instructions are made, the scratch storage one rewrite's
+#         constants are read in
+# word:   the bits of one word
+# wty:    the integer type of one word
+# double: the integer type of two words, the high product's
+# bit:    the condition type
+# keep:   storage the words of every value live in until the visit ends
+# words:  the words of each value split so far, by its index, empty for one
+#         not split
+# zero:   the constant zero word, once made
+# failed: the first failure
+# stand:  the words a failed call answers
+pub rec Work {
+    site:   Site;
+    word:   u32;
+    wty:    Type;
+    double: Type;
+    bit:    Type;
+    keep:   *allocator.Allocator;
+    words:  vector.Vector[Slice[Value]];
+    zero:   opt[Value];
+    failed: opt[Why];
+    stand:  [128]Value;
+}
+
+# keep the first failure
+pub fun fail(w: *Work, why: Why) {
+    val first: bool = sel w.failed.none;
+    if (first) { w.failed = opt[Why].some{why}; }
+}
+
+# the end of one rewrite: ok, or its first failure, the builder's included
+pub fun finished(w: *Work) err[Why] {
+    if (sel w.failed.some) { ret err[Why].err{w.failed.some}; }
+    ret emit.done(?w.site);
+}
+
+# the integer type of a width
+pub fun integer(w: *Work, width: u32) Type {
+    val ty: res[Type, types.Error] = types.intern(?w.site.m.types, types.Shape.integer{types.Integer{width: width}});
+    if (sel ty.err) {
+        fail(w, Why.ir{module.Error.types{ty.err}});
+        ret w.wty;
+    }
+    ret ty.ok;
+}
+
+# room for n words that live until the visit ends, n at most MOST
+pub fun fresh(w: *Work, n: usize) Slice[Value] {
+    val got: res[*Value, allocator.Error] = allocator.zallocate[Value](w.keep, n);
+    if (sel got.err) {
+        fail(w, Why.alloc{got.err});
+        ret Slice[Value]{data: ?w.stand[0], size: n};
+    }
+    ret Slice[Value]{data: got.ok, size: n};
+}
+
+# the constant of an integer type holding x
+pub fun constant(w: *Work, ty: Type, x: Wide) Value {
+    val made: res[Value, Why] = emit.constant(?w.site, ty, x);
+    if (sel made.err) {
+        fail(w, made.err);
+        ret w.stand[0];
+    }
+    ret made.ok;
+}
+
+# the word holding n
+pub fun small(w: *Work, n: u64) Value {
+    ret constant(w, w.wty, word.small(n));
+}
+
+# the zero word
+pub fun zero(w: *Work) Value {
+    val cached: opt[Value] = w.zero;
+    if (sel cached.some) { ret cached.some; }
+    val z:    Value = constant(w, w.wty, word.zero());
+    val made: bool  = sel w.failed.none;
+    if (made) { w.zero = opt[Value].some{z}; }
+    ret z;
+}
+
+# the word whose every bit is one
+pub fun ones(w: *Work) Value {
+    ret constant(w, w.wty, word.ones(w.word));
+}
+
+# n zero words
+pub fun zeros(w: *Work, n: usize) Slice[Value] {
+    val out: Slice[Value] = fresh(w, n);
+    val z:   Value        = zero(w);
+    var i:   usize        = 0;
+    for (i < n) {
+        out.data[i] = z;
+        i           = i + 1;
+    }
+    ret out;
+}
+
+# whether a value is a constant every bit of which is zero
+pub fun is_zero(w: *Work, v: Value) bool {
+    val def: Def = w.site.b.values.data[v.index].def;
+    if (!(sel def.constant)) { ret false; }
+    val got: res[ConstantData, module.Error] = module.constant_data(w.site.m, def.constant);
+    if (sel got.err)           { ret false; }
+    if (sel got.ok.zero)       { ret true; }
+    if (!(sel got.ok.integer)) { ret false; }
+    var i: usize = 0;
+    for (i < got.ok.integer.words.size) {
+        if (got.ok.integer.words.data[i] != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the words of a value already split, or of a constant, which are made here
+pub fun words_of(w: *Work, v: Value, n: usize) Slice[Value] {
+    if (v.index::usize < w.words.len && w.words.data[v.index].size != 0) { ret w.words.data[v.index]; }
+    val got: res[opt[folder.Value], Why] = number.read(w.site.m, w.site.b, w.site.scratch, v);
+    if (sel got.err) {
+        fail(w, got.err);
+        ret Slice[Value]{data: ?w.stand[0], size: n};
+    }
+    if (sel got.ok.some) {
+        if (got.ok.some.lanes.size == 1) { ret split(w, word.of(got.ok.some.lanes.data[0].words), n); }
+    }
+    fail(w, Why.reason{"a wide value read before it was split"});
+    ret Slice[Value]{data: ?w.stand[0], size: n};
+}
+
+# the n words of a constant
+pub fun split(w: *Work, x: Wide, n: usize) Slice[Value] {
+    val out: Slice[Value] = fresh(w, n);
+    var i:   usize        = 0;
+    for (i < out.size) {
+        val piece: Wide = word.mask(word.shr(x, (i * w.word::usize)::u32), w.word);
+        if (word.is_zero(piece)) { out.data[i] = zero(w); }
+        or                       { out.data[i] = constant(w, w.wty, piece); }
+        i = i + 1;
+    }
+    ret out;
+}
+
+# record the words a value is split into
+pub fun hold(w: *Work, v: Value, words: Slice[Value]) {
+    for (w.words.len <= v.index::usize) {
+        val pushed: res[usize, allocator.Error] = vector.push[Slice[Value]](?w.words, Slice[Value]{data: nil, size: 0});
+        if (sel pushed.err) {
+            fail(w, Why.alloc{pushed.err});
+            ret;
+        }
+    }
+    w.words.data[v.index] = words;
+}
+
+# the words a value was split into, empty when it was not
+pub fun held(w: *Work, v: Value) Slice[Value] {
+    if (v.index::usize >= w.words.len) { ret Slice[Value]{data: nil, size: 0}; }
+    ret w.words.data[v.index];
+}
+
+pub fun add(w: *Work, a: Value, b: Value) Value {
+    if (is_zero(w, a)) { ret b; }
+    if (is_zero(w, b)) { ret a; }
+    ret emit.binary(?w.site, opcode.ADD, a, b);
+}
+
+pub fun sub(w: *Work, a: Value, b: Value) Value {
+    if (is_zero(w, b)) { ret a; }
+    ret emit.binary(?w.site, opcode.SUB, a, b);
+}
+
+pub fun mul(w: *Work, a: Value, b: Value) Value {
+    if (is_zero(w, a)) { ret a; }
+    if (is_zero(w, b)) { ret b; }
+    ret emit.binary(?w.site, opcode.MUL, a, b);
+}
+
+pub fun and_(w: *Work, a: Value, b: Value) Value {
+    if (is_zero(w, a)) { ret a; }
+    if (is_zero(w, b)) { ret b; }
+    ret emit.binary(?w.site, opcode.AND, a, b);
+}
+
+pub fun or_(w: *Work, a: Value, b: Value) Value {
+    if (is_zero(w, a)) { ret b; }
+    if (is_zero(w, b)) { ret a; }
+    ret emit.binary(?w.site, opcode.OR, a, b);
+}
+
+pub fun xor_(w: *Work, a: Value, b: Value) Value {
+    if (is_zero(w, a)) { ret b; }
+    if (is_zero(w, b)) { ret a; }
+    ret emit.binary(?w.site, opcode.XOR, a, b);
+}
+
+pub fun not_(w: *Work, a: Value) Value {
+    ret emit.unary(?w.site, opcode.NOT, a);
+}
+
+# a shift of a word by a count in a word, by the ir's rule for a count of the
+# width or more
+pub fun shift(w: *Work, code: Opcode, a: Value, count: Value) Value {
+    if (is_zero(w, count)) { ret a; }
+    if (is_zero(w, a))     { ret a; }
+    ret emit.binary(?w.site, code, a, count);
+}
+
+# a shift of a word by a constant count below the width
+pub fun shift_by(w: *Work, code: Opcode, a: Value, count: u32) Value {
+    if (count == 0 || is_zero(w, a)) { ret a; }
+    ret emit.binary(?w.site, code, a, small(w, count::u64));
+}
+
+# every bit of a word its sign bit
+pub fun fill(w: *Work, a: Value) Value {
+    ret shift_by(w, opcode.SHR_S, a, w.word - 1);
+}
+
+# a condition as a word, 0 or 1
+pub fun widen(w: *Work, c: Value) Value {
+    ret emit.convert(?w.site, opcode.EXT_U, c, w.wty);
+}
+
+# a condition: whether two words compare as an opcode compares them
+pub fun test(w: *Work, code: Opcode, a: Value, b: Value) Value {
+    ret emit.binary(?w.site, code, a, b);
+}
+
+# whether a word is zero
+pub fun none_set(w: *Work, a: Value) Value {
+    ret emit.binary(?w.site, opcode.EQ, a, zero(w));
+}
+
+# then where a condition holds, else otherwise
+pub fun pick(w: *Work, c: Value, then: Value, otherwise: Value) Value {
+    if (then.index == otherwise.index) { ret then; }
+    ret emit.ternary(?w.site, opcode.SELECT, c, then, otherwise);
+}
+
+# either of two conditions, none standing for one known not to hold
+pub fun either(w: *Work, a: opt[Value], b: opt[Value]) opt[Value] {
+    if (sel a.none) { ret b; }
+    if (sel b.none) { ret a; }
+    ret opt[Value].some{emit.binary(?w.site, opcode.OR, a.some, b.some)};
+}
+
+# a word and a flag, none where the flag is known not to be set
+# ---
+# value: the word
+# flag:  the flag
+pub rec Flagged {
+    value: Value;
+    flag:  opt[Value];
+}
+
+# an overflow form of two words: the word it gives and its flag
+fun flagged(w: *Work, code: Opcode, a: Value, b: Value) Flagged {
+    var ops: [2]Value    = [2]Value{a, b};
+    val i:   Instruction = emit.make(?w.site, code, Slice[Value]{data: ?ops[0], size: 2}, Slice[opcode.Immediate]{data: nil, size: 0});
+    ret Flagged{value: emit.result(?w.site, i, 0), flag: opt[Value].some{emit.result(?w.site, i, 1)}};
+}
+
+# the sum of two words and the carry out of it
+pub fun plus(w: *Work, a: Value, b: Value) Flagged {
+    if (is_zero(w, b)) { ret Flagged{value: a, flag: opt[Value].none{}}; }
+    if (is_zero(w, a)) { ret Flagged{value: b, flag: opt[Value].none{}}; }
+    ret flagged(w, opcode.ADD_OV_U, a, b);
+}
+
+# the difference of two words and the borrow out of it
+pub fun minus(w: *Work, a: Value, b: Value) Flagged {
+    if (is_zero(w, b)) { ret Flagged{value: a, flag: opt[Value].none{}}; }
+    ret flagged(w, opcode.SUB_OV_U, a, b);
+}
+
+# the sum of two words and a carry in, and the carry out
+pub fun carried(w: *Work, a: Value, b: Value, carry: opt[Value]) Flagged {
+    val first: Flagged = plus(w, a, b);
+    if (sel carry.none) { ret first; }
+    val second: Flagged = plus(w, first.value, widen(w, carry.some));
+    ret Flagged{value: second.value, flag: either(w, first.flag, second.flag)};
+}
+
+# the difference of two words less a borrow in, and the borrow out
+pub fun borrowed(w: *Work, a: Value, b: Value, borrow: opt[Value]) Flagged {
+    val first: Flagged = minus(w, a, b);
+    if (sel borrow.none) { ret first; }
+    val second: Flagged = minus(w, first.value, widen(w, borrow.some));
+    ret Flagged{value: second.value, flag: either(w, first.flag, second.flag)};
+}
+
+# a word plus a carry, the carry out not wanted
+pub fun plus_carry(w: *Work, a: Value, carry: opt[Value]) Value {
+    if (sel carry.none) { ret a; }
+    ret add(w, a, widen(w, carry.some));
+}
+
+# the high word of the product of two words read as unsigned, as the ir
+# writes a high multiply
+pub fun high(w: *Work, a: Value, b: Value) Value {
+    if (is_zero(w, a)) { ret a; }
+    if (is_zero(w, b)) { ret b; }
+    val x: Value = emit.convert(?w.site, opcode.EXT_U, a, w.double);
+    val y: Value = emit.convert(?w.site, opcode.EXT_U, b, w.double);
+    val p: Value = emit.binary(?w.site, opcode.MUL, x, y);
+    val s: Value = emit.binary(?w.site, opcode.SHR_U, p, constant(w, w.double, word.small(w.word::u64)));
+    ret emit.convert(?w.site, opcode.TRUNC, s, w.wty);
+}
