@@ -1,0 +1,1361 @@
+# calls, entries and returns lowered to the pieces the calling convention
+# places them in
+#
+# the target's convention classifies every call at its signature and the
+# number of its named arguments, every function's entry and every return at
+# the function's own signature, once, and the pass rewrites each into piece
+# form. a call becomes `call.placed`, a return `ret.placed` and the entry's
+# parameters become its pieces, the body recording where each arrives. every
+# operand of piece form is a scalar of at most a register's width, its place,
+# scale and fill held as immediates, so nothing after the pass classifies
+# again and no later legalisation of types touches it.
+#
+# memory carries what is not a scalar. a by-value aggregate is read piece by
+# piece from the memory it was loaded from, at the point it was loaded, or
+# from a stack slot it is stored to before the call. a value passed by
+# reference is copied to a stack slot the caller owns, and the piece is its
+# address. a result returned by reference lands in a slot whose address the
+# caller passes, and the callee rebuilds an incoming aggregate in a slot of
+# its own. the copies move whole words, and a piece whose size no integer has
+# is read and written in the widest words that fit it.
+#
+# the pass reads no value to decide anything: every load, store and copy it
+# makes follows from types and the convention alone, so it keeps constant
+# time, and every piece of a secret value is marked secret.
+#
+# a rebuilt value stands at every point the value it replaces did, so the
+# records that read the old one read it. an aggregate load the pass leaves
+# unused goes, and each variable bound to it is bound to the storage it read,
+# on the instruction that addresses that storage.
+#
+# what it refuses: a piece extended by a signedness the ir does not state, a
+# scalar split across pieces, and a piece in a register no piece type is made
+# for, each naming its value.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use rf: masc.core.register;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.build.Failure;
+use mirl.fold.word;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.Binding;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use Spot: mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use mirl.ir.place.Fill;
+use mirl.ir.place.Named;
+use mirl.ir.place.Place;
+use mirl.ir.place.Placed;
+use mirl.ir.place.Scale;
+use mirl.ir.point.Reads;
+use mirl.ir.point.Run;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.pass.analysis;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.target.Target;
+use mirl.target.abi.call;
+use mirl.target.abi.call.Aggregates;
+use mirl.target.abi.call.Statement;
+use mirl.target.abi.piece;
+use mirl.target.abi.piece.Assignment;
+use mirl.target.abi.piece.Passed;
+use mirl.target.abi.piece.Piece;
+use mirl.target.abi.piece.Side;
+use mirl.target.abi.piece.Uncarried;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.machine;
+use mirl.target.machine.Machine;
+use target_record: mirl.target.record;
+
+# the pass: it adds and removes instructions and entry parameters and never
+# touches the graph
+pub val ABI: Pass = Pass{name: "abi", kind: Kind.legalise{}, scope: Scope.module{run}, preserves: analysis.FLOW, time: Time.keeps{}, applies: convened};
+
+# a target's calls are lowered where its convention is a row
+fun convened(t: *Target) bool {
+    ret sel t.convention.row;
+}
+
+# one function's lowering
+# ---
+# m:      the module
+# mc:     the target's machine, whose convention classifies
+# l:      the module's data layout
+# f:      the function
+# entry:  its entry block
+# slots:  the stack slots made at the entry's head so far
+# ptr:    the pointer type a slot's address has
+# offset: the integer type an address offset has
+# unused: aggregate loads the pass read pieces from, which go once unused
+rec Work {
+    m:      *Module;
+    mc:     *Machine;
+    l:      *Layout;
+    f:      Function;
+    entry:  Block;
+    slots:  u32;
+    ptr:    Type;
+    offset: Type;
+    unused: Vector[Instruction];
+}
+
+fun body_of(w: *Work) *Body {
+    ret ?w.m.functions.data[w.f.index].body;
+}
+
+fun ir(r: err[module.Error]) err[Why] {
+    ret failure.edit(r);
+}
+
+fun shape_of(w: *Work, ty: Type) res[types.Shape, Why] {
+    val s: res[types.Shape, types.Error] = types.shape(?w.m.types, ty);
+    if (sel s.err) { ret res[types.Shape, Why].err{Why.ir{module.Error.types{s.err}}}; }
+    ret res[types.Shape, Why].ok{s.ok};
+}
+
+fun intern(w: *Work, s: types.Shape) res[Type, Why] {
+    val t: res[Type, types.Error] = types.intern(?w.m.types, s);
+    if (sel t.err) { ret res[Type, Why].err{Why.ir{module.Error.types{t.err}}}; }
+    ret res[Type, Why].ok{t.ok};
+}
+
+fun integer_type(w: *Work, width: u32) res[Type, Why] {
+    ret intern(w, types.Shape.integer{types.Integer{width: width}});
+}
+
+# whether a type is held in memory rather than as one scalar
+fun aggregate(s: types.Shape) bool {
+    ret sel s.array || sel s.structure || sel s.union;
+}
+
+fun size_of(w: *Work, ty: Type) res[u64, Why] {
+    val s: res[u64, target_record.Error] = layout.size(w.l, ty);
+    if (sel s.err) { ret res[u64, Why].err{Why.reason{"a value of a call with no size in memory"}}; }
+    ret res[u64, Why].ok{s.ok};
+}
+
+fun align_of(w: *Work, ty: Type) res[u64, Why] {
+    val s: res[u64, target_record.Error] = layout.align(w.l, ty);
+    if (sel s.err) { ret res[u64, Why].err{Why.reason{"a value of a call with no alignment in memory"}}; }
+    ret res[u64, Why].ok{s.ok};
+}
+
+# the alignment an access at an offset from storage aligned to align has
+fun aligned_at(align: u64, offset: u64) u64 {
+    if (offset == 0) { ret align; }
+    val low: u64 = offset & (0 - offset);
+    if (low < align) { ret low; }
+    ret align;
+}
+
+# the least legal integer width that holds this many bytes
+fun width_for(bytes: u64) u32 {
+    var i: usize = 0;
+    for (i < $length_of(types.Widths)) {
+        if (types.WIDTHS[i]::u64 >= bytes * 8) { ret types.WIDTHS[i]; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a constant integer of a type in the function
+fun integer(w: *Work, ty: Type, x: u64) res[Value, Why] {
+    val width: res[u32, types.Error] = types.width(?w.m.types, ty);
+    if (sel width.err) { ret res[Value, Why].err{Why.ir{module.Error.types{width.err}}}; }
+    val n:    usize                      = word.words_for(width.ok)::usize;
+    val room: res[*u64, allocator.Error] = allocator.zallocate[u64](w.m.a, n);
+    if (sel room.err) { ret res[Value, Why].err{Why.alloc{room.err}}; }
+    room.ok[0] = x;
+    val made: res[Constant, module.Error] = module.add_constant(w.m, ConstantData.integer{Bits{type: ty, words: Slice[u64]{data: room.ok, size: n}}});
+    allocator.deallocate[u64](w.m.a, room.ok, n);
+    if (sel made.err) { ret res[Value, Why].err{Why.ir{made.err}}; }
+    val at: res[Value, module.Error] = body.constant(w.m, w.f, made.ok);
+    if (sel at.err) { ret res[Value, Why].err{Why.ir{at.err}}; }
+    ret res[Value, Why].ok{at.ok};
+}
+
+fun no_immediates() Slice[Immediate] {
+    ret Slice[Immediate]{data: nil, size: 0};
+}
+
+fun no_targets() Slice[Branch] {
+    ret Slice[Branch]{data: nil, size: 0};
+}
+
+fun make(bld: *Builder, code: Opcode, operands: Slice[Value], immediates: Slice[Immediate]) Value {
+    ret build.value(bld, Request{opcode: code, operands: operands, immediates: immediates, targets: no_targets()});
+}
+
+fun unary(bld: *Builder, code: Opcode, v: Value, to: Type) Value {
+    var ops: [1]Value     = [1]Value{v};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{to}};
+    ret make(bld, code, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+fun binary(bld: *Builder, code: Opcode, a: Value, b: Value) Value {
+    var ops: [2]Value = [2]Value{a, b};
+    ret make(bld, code, Slice[Value]{data: ?ops[0], size: 2}, no_immediates());
+}
+
+fun load(bld: *Builder, address: Value, ty: Type, align: u64) Value {
+    var ops: [1]Value     = [1]Value{address};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{align}};
+    ret make(bld, opcode.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+}
+
+fun store(bld: *Builder, address: Value, v: Value, align: u64) {
+    var ops: [2]Value     = [2]Value{address, v};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+    build.emit(bld, Request{opcode: opcode.STORE, operands: Slice[Value]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+}
+
+# the address an offset past another
+fun address(w: *Work, bld: *Builder, base: Value, offset: u64) res[Value, Why] {
+    if (offset == 0) { ret res[Value, Why].ok{base}; }
+    val k: res[Value, Why] = integer(w, w.offset, offset);
+    if (sel k.err) { ret k; }
+    ret res[Value, Why].ok{binary(bld, opcode.PTR_ADD, base, k.ok)};
+}
+
+fun built(bld: *Builder) err[Why] {
+    val done: err[Failure] = build.done(bld);
+    if (sel done.err) { ret err[Why].err{Why.build{done.err}}; }
+    ret err[Why].ok{};
+}
+
+# a stack slot of a type at the entry's head, where every slot the pass makes
+# stands, so it dominates every use
+fun slot(w: *Work, ty: Type, align: u64) res[Value, Why] {
+    var bld: Builder = build.init(w.m);
+    build.enter(?bld, w.f);
+    build.at(?bld, w.entry, 0);
+    var imm: [3]Immediate = [3]Immediate{Immediate.ty{ty}, Immediate.ty{w.ptr}, Immediate.alignment{align}};
+    val v:   Value        = make(?bld, opcode.ALLOCA, Slice[Value]{data: nil, size: 0}, Slice[Immediate]{data: ?imm[0], size: 3});
+    val ok:  err[Why]     = built(?bld);
+    if (sel ok.err) { ret res[Value, Why].err{ok.err}; }
+    w.slots = w.slots + 1;
+    ret res[Value, Why].ok{v};
+}
+
+# the position of a placed instruction in its block
+fun position(b: *Body, k: Block, i: Instruction) u32 {
+    val list_of: *vector.Vector[Instruction] = ?b.blocks.data[k.index].instructions;
+    var p:       usize                       = 0;
+    for (p < list_of.len && list_of.data[p].index != i.index) { p = p + 1; }
+    ret p::u32;
+}
+
+fun block_of(b: *Body, i: Instruction) Block {
+    val at: Spot = b.instructions.data[i.index].place;
+    if (sel at.placed) { ret at.placed; }
+    ret Block{index: 0};
+}
+
+# the kind of register a place is in, none for a place that is no register
+fun kind_of(w: *Work, p: Place) opt[rf.Kind] {
+    if (!(sel p.register)) { ret opt[rf.Kind].none{}; }
+    val file: *rf.File = w.mc.registers.file;
+    val c:    u16      = rf.class_of(p.register);
+    if (file == nil || c::u32 >= file.class_count) { ret opt[rf.Kind].none{}; }
+    ret opt[rf.Kind].some{file.classes[c].kind};
+}
+
+# whether a scalar of a shape travels in a place as it is
+fun fits(w: *Work, s: types.Shape, p: Place) bool {
+    val k: opt[rf.Kind] = kind_of(w, p);
+    if (sel k.none)           { ret true; }
+    if (k.some == rf.FLOAT)   { ret sel s.float; }
+    if (k.some == rf.GENERAL) { ret sel s.integer || sel s.pointer; }
+    ret false;
+}
+
+# the type of a piece: the value's own when it carries the scalar whole in a
+# place that holds it as it is, a float of its size in a float register, and
+# otherwise the integer that holds its bytes
+fun piece_type(w: *Work, side: Side, p: Piece, of: Type, whole: bool) res[Type, Why] {
+    val s: res[types.Shape, Why] = shape_of(w, of);
+    if (sel s.err)                       { ret res[Type, Why].err{s.err}; }
+    if (whole && fits(w, s.ok, p.place)) { ret res[Type, Why].ok{of}; }
+    val k: opt[rf.Kind] = kind_of(w, p.place);
+    if (sel k.some) {
+        if (k.some == rf.FLOAT) {
+            if (p.size == 2) { ret intern(w, types.Shape.float{types.Float{format: types.BINARY16}}); }
+            if (p.size == 4) { ret intern(w, types.Shape.float{types.Float{format: types.BINARY32}}); }
+            if (p.size == 8) { ret intern(w, types.Shape.float{types.Float{format: types.BINARY64}}); }
+            ret res[Type, Why].err{Why.pieces{Uncarried.size{side}}};
+        }
+        if (k.some != rf.GENERAL) { ret res[Type, Why].err{Why.pieces{Uncarried.kind{side}}}; }
+    }
+    val width: u32 = width_for(p.size);
+    if (width == 0) { ret res[Type, Why].err{Why.pieces{Uncarried.size{side}}}; }
+    ret integer_type(w, width);
+}
+
+# refuse a piece the ir cannot state
+fun stated(side: Side, p: Piece) err[Why] {
+    if (sel p.fill.declared) { ret err[Why].err{Why.pieces{Uncarried.declared{side}}}; }
+    ret err[Why].ok{};
+}
+
+# read a piece of a size from memory into a type, in the widest words that
+# fit it when no integer has its size
+fun read(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u64, ty: Type) res[Value, Why] {
+    val s: res[types.Shape, Why] = shape_of(w, ty);
+    if (sel s.err) { ret res[Value, Why].err{s.err}; }
+    var exact: bool = true;
+    if (sel s.ok.integer) { exact = s.ok.integer.width::u64 == size * 8; }
+    if (exact) {
+        val at: res[Value, Why] = address(w, bld, base, offset);
+        if (sel at.err) { ret at; }
+        ret res[Value, Why].ok{load(bld, at.ok, ty, aligned_at(align, offset))};
+    }
+    var acc:  Value = Value{index: 0};
+    var any:  bool  = false;
+    var done: u64   = 0;
+    var word: u64   = 8;
+    for (word > 0) {
+        for (size - done >= word) {
+            val narrow: res[Type, Why] = integer_type(w, (word * 8)::u32);
+            if (sel narrow.err) { ret res[Value, Why].err{narrow.err}; }
+            val at: res[Value, Why] = address(w, bld, base, offset + done);
+            if (sel at.err) { ret at; }
+            var part: Value = unary(bld, opcode.EXT_U, load(bld, at.ok, narrow.ok, aligned_at(align, offset + done)), ty);
+            if (done > 0) {
+                val by: res[Value, Why] = integer(w, ty, done * 8);
+                if (sel by.err) { ret by; }
+                part = binary(bld, opcode.SHL, part, by.ok);
+            }
+            if (any) { acc = binary(bld, opcode.OR, acc, part); }
+            or       { acc = part; }
+            any  = true;
+            done = done + word;
+        }
+        word = word / 2;
+    }
+    if (!any) { ret res[Value, Why].err{Why.reason{"a piece of no bytes"}}; }
+    ret res[Value, Why].ok{acc};
+}
+
+# write a piece of a size to memory, in the widest words that fit it when no
+# integer has its size
+fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u64, v: Value, ty: Type) err[Why] {
+    val s: res[types.Shape, Why] = shape_of(w, ty);
+    if (sel s.err) { ret err[Why].err{s.err}; }
+    var exact: bool = true;
+    if (sel s.ok.integer) { exact = s.ok.integer.width::u64 == size * 8; }
+    if (exact) {
+        val at: res[Value, Why] = address(w, bld, base, offset);
+        if (sel at.err) { ret err[Why].err{at.err}; }
+        store(bld, at.ok, v, aligned_at(align, offset));
+        ret err[Why].ok{};
+    }
+    var done: u64 = 0;
+    var word: u64 = 8;
+    for (word > 0) {
+        for (size - done >= word) {
+            val narrow: res[Type, Why] = integer_type(w, (word * 8)::u32);
+            if (sel narrow.err) { ret err[Why].err{narrow.err}; }
+            var part: Value = v;
+            if (done > 0) {
+                val by: res[Value, Why] = integer(w, ty, done * 8);
+                if (sel by.err) { ret err[Why].err{by.err}; }
+                part = binary(bld, opcode.SHR_U, part, by.ok);
+            }
+            part = unary(bld, opcode.TRUNC, part, narrow.ok);
+            val at: res[Value, Why] = address(w, bld, base, offset + done);
+            if (sel at.err) { ret err[Why].err{at.err}; }
+            store(bld, at.ok, part, aligned_at(align, offset + done));
+            done = done + word;
+        }
+        word = word / 2;
+    }
+    ret err[Why].ok{};
+}
+
+# copy bytes from one storage to another in the widest words both alignments
+# allow
+fun copy(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64) err[Why] {
+    var done: u64 = 0;
+    var word: u64 = 8;
+    for (word > 0) {
+        if (word <= align || word == 1) {
+            for (size - done >= word) {
+                val ty: res[Type, Why] = integer_type(w, (word * 8)::u32);
+                if (sel ty.err) { ret err[Why].err{ty.err}; }
+                val src: res[Value, Why] = address(w, bld, from, done);
+                if (sel src.err) { ret err[Why].err{src.err}; }
+                val dst: res[Value, Why] = address(w, bld, to, done);
+                if (sel dst.err) { ret err[Why].err{dst.err}; }
+                store(bld, dst.ok, load(bld, src.ok, ty.ok, aligned_at(align, done)), aligned_at(align, done));
+                done = done + word;
+            }
+        }
+        word = word / 2;
+    }
+    ret err[Why].ok{};
+}
+
+# the load a value is, when the pass may read its memory in its place: one
+# neither volatile nor kept, so its memory is the value's at its point
+fun loaded(w: *Work, v: Value) opt[Instruction] {
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[v.index].def;
+    if (!(sel def.result)) { ret opt[Instruction].none{}; }
+    val i: Instruction      = def.result.instruction;
+    val d: *InstructionData = ?b.instructions.data[i.index];
+    if (d.opcode.index != opcode.LOAD.index)                { ret opt[Instruction].none{}; }
+    if (d.metadata.flags.volatile || d.metadata.flags.kept) { ret opt[Instruction].none{}; }
+    if (!(sel d.place.placed))                              { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{i};
+}
+
+fun note_unused(w: *Work, i: Instruction) err[Why] {
+    var k: usize = 0;
+    for (k < w.unused.len) {
+        if (w.unused.data[k].index == i.index) { ret err[Why].ok{}; }
+        k = k + 1;
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Instruction](?w.unused, i);
+    if (sel pushed.err) { ret failure.lost(pushed.err); }
+    ret err[Why].ok{};
+}
+
+# a value about to travel and what it travels from
+# ---
+# value:  the value
+# ty:     its type
+# shape:  its shape
+# secret: whether it is secret
+rec Sent {
+    value:  Value;
+    ty:     Type;
+    shape:  types.Shape;
+    secret: bool;
+}
+
+fun sent(w: *Work, v: Value) res[Sent, Why] {
+    val b:  *Body                 = body_of(w);
+    val ty: Type                  = b.values.data[v.index].type;
+    val s:  res[types.Shape, Why] = shape_of(w, ty);
+    if (sel s.err) { ret res[Sent, Why].err{s.err}; }
+    ret res[Sent, Why].ok{Sent{value: v, ty: ty, shape: s.ok, secret: b.values.data[v.index].secret}};
+}
+
+# the pieces of one value that travels out, at the end of out, with their
+# places
+# ---
+# w:      the lowering
+# bld:    the builder at the point the value travels from
+# side:   which value it is, for a refusal
+# x:      the value
+# passed: how it travels
+# asg:    the assignment
+# out:    the piece values
+# places: where each travels
+fun send(w: *Work, bld: *Builder, side: Side, x: Sent, passed: Passed, asg: *Assignment, out: *Vector[Value], places: *Vector[Placed]) err[Why] {
+    var n: u32 = 0;
+    for (n < passed.count) {
+        val p:  Piece    = piece.piece(asg, passed.first + n);
+        val ok: err[Why] = stated(side, p);
+        if (sel ok.err) { ret ok; }
+        n = n + 1;
+    }
+    if (sel passed.passing.reference) {
+        if (passed.count != 1) { ret err[Why].err{Why.reason{"a value by reference that travels in other than one piece"}}; }
+        val c:    piece.Copy      = passed.passing.reference;
+        val made: res[Value, Why] = slot(w, x.ty, c.align);
+        if (sel made.err) { ret err[Why].err{made.err}; }
+        var from: opt[Instruction] = opt[Instruction].none{};
+        if (aggregate(x.shape)) { from = loaded(w, x.value); }
+        if (sel from.some) {
+            val b:    *Body   = body_of(w);
+            val k:    Block   = block_of(b, from.some);
+            var near: Builder = build.init(w.m);
+            build.enter(?near, w.f);
+            build.derive(?near, from.some);
+            build.secret(?near, x.secret);
+            build.at(?near, k, position(b, k, from.some) + 1);
+            val copied: err[Why] = copy(w, ?near, b.instructions.data[from.some.index].operands.data[0], made.ok, c.size, c.align);
+            if (sel copied.err) { ret copied; }
+            val done: err[Why] = built(?near);
+            if (sel done.err) { ret done; }
+            val noted: err[Why] = note_unused(w, from.some);
+            if (sel noted.err) { ret noted; }
+        }
+        or {
+            val al: res[u64, Why] = align_of(w, x.ty);
+            if (sel al.err) { ret err[Why].err{al.err}; }
+            store(bld, made.ok, x.value, al.ok);
+        }
+        ret push(w, out, places, made.ok, piece.piece(asg, passed.first));
+    }
+    if (passed.count == 0) { ret err[Why].ok{}; }
+    if (!aggregate(x.shape)) {
+        val size: res[u64, Why] = size_of(w, x.ty);
+        if (sel size.err) { ret err[Why].err{size.err}; }
+        val p: Piece = piece.piece(asg, passed.first);
+        if (passed.count == 1 && p.offset == 0 && p.size == size.ok) {
+            val ty: res[Type, Why] = piece_type(w, side, p, x.ty, true);
+            if (sel ty.err) { ret err[Why].err{ty.err}; }
+            val v: res[Value, Why] = convert(w, bld, x.value, x.ty, ty.ok);
+            if (sel v.err) { ret err[Why].err{v.err}; }
+            ret push(w, out, places, v.ok, p);
+        }
+        val bits: res[Type, Why] = integer_type(w, (size.ok * 8)::u32);
+        if (sel bits.err) { ret err[Why].err{bits.err}; }
+        val whole: res[Value, Why] = convert(w, bld, x.value, x.ty, bits.ok);
+        if (sel whole.err) { ret err[Why].err{whole.err}; }
+        n = 0;
+        for (n < passed.count) {
+            val q: Piece = piece.piece(asg, passed.first + n);
+            if (q.offset + q.size > size.ok) { ret err[Why].err{Why.pieces{Uncarried.partial{side}}}; }
+            var part: Value = whole.ok;
+            if (q.offset > 0) {
+                val by: res[Value, Why] = integer(w, bits.ok, q.offset * 8);
+                if (sel by.err) { ret err[Why].err{by.err}; }
+                part = binary(bld, opcode.SHR_U, part, by.ok);
+            }
+            val narrow: res[Type, Why] = integer_type(w, width_for(q.size));
+            if (sel narrow.err)                  { ret err[Why].err{narrow.err}; }
+            if (!types.same(narrow.ok, bits.ok)) { part = unary(bld, opcode.TRUNC, part, narrow.ok); }
+            val ty: res[Type, Why] = piece_type(w, side, q, x.ty, false);
+            if (sel ty.err) { ret err[Why].err{ty.err}; }
+            val v: res[Value, Why] = convert(w, bld, part, narrow.ok, ty.ok);
+            if (sel v.err) { ret err[Why].err{v.err}; }
+            val pushed: err[Why] = push(w, out, places, v.ok, q);
+            if (sel pushed.err) { ret pushed; }
+            n = n + 1;
+        }
+        ret err[Why].ok{};
+    }
+    val al: res[u64, Why] = align_of(w, x.ty);
+    if (sel al.err) { ret err[Why].err{al.err}; }
+    val from: opt[Instruction] = loaded(w, x.value);
+    if (sel from.some) {
+        val b:    *Body   = body_of(w);
+        val k:    Block   = block_of(b, from.some);
+        var near: Builder = build.init(w.m);
+        build.enter(?near, w.f);
+        build.derive(?near, from.some);
+        build.secret(?near, x.secret);
+        build.at(?near, k, position(b, k, from.some) + 1);
+        val base: Value = b.instructions.data[from.some.index].operands.data[0];
+        n = 0;
+        for (n < passed.count) {
+            val p:  Piece          = piece.piece(asg, passed.first + n);
+            val ty: res[Type, Why] = piece_type(w, side, p, x.ty, false);
+            if (sel ty.err) { ret err[Why].err{ty.err}; }
+            val v: res[Value, Why] = read(w, ?near, base, p.offset, p.size, al.ok, ty.ok);
+            if (sel v.err) { ret err[Why].err{v.err}; }
+            val pushed: err[Why] = push(w, out, places, v.ok, p);
+            if (sel pushed.err) { ret pushed; }
+            n = n + 1;
+        }
+        val done: err[Why] = built(?near);
+        if (sel done.err) { ret done; }
+        ret note_unused(w, from.some);
+    }
+    val home: res[Value, Why] = slot(w, x.ty, al.ok);
+    if (sel home.err) { ret err[Why].err{home.err}; }
+    store(bld, home.ok, x.value, al.ok);
+    n = 0;
+    for (n < passed.count) {
+        val p:  Piece          = piece.piece(asg, passed.first + n);
+        val ty: res[Type, Why] = piece_type(w, side, p, x.ty, false);
+        if (sel ty.err) { ret err[Why].err{ty.err}; }
+        val v: res[Value, Why] = read(w, bld, home.ok, p.offset, p.size, al.ok, ty.ok);
+        if (sel v.err) { ret err[Why].err{v.err}; }
+        val pushed: err[Why] = push(w, out, places, v.ok, p);
+        if (sel pushed.err) { ret pushed; }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# a scalar as another scalar of the same size: an integer and a pointer by
+# their conversion, any other pair by its bits
+fun convert(w: *Work, bld: *Builder, v: Value, from: Type, to: Type) res[Value, Why] {
+    if (types.same(from, to)) { ret res[Value, Why].ok{v}; }
+    val a: res[types.Shape, Why] = shape_of(w, from);
+    if (sel a.err) { ret res[Value, Why].err{a.err}; }
+    val b: res[types.Shape, Why] = shape_of(w, to);
+    if (sel b.err)                            { ret res[Value, Why].err{b.err}; }
+    if (sel a.ok.pointer && sel b.ok.integer) { ret res[Value, Why].ok{unary(bld, opcode.PTRTOINT, v, to)}; }
+    if (sel a.ok.integer && sel b.ok.pointer) { ret res[Value, Why].ok{unary(bld, opcode.INTTOPTR, v, to)}; }
+    ret res[Value, Why].ok{unary(bld, opcode.BITCAST, v, to)};
+}
+
+fun push(w: *Work, out: *Vector[Value], places: *Vector[Placed], v: Value, p: Piece) err[Why] {
+    val a: res[usize, allocator.Error] = vector.push[Value](out, v);
+    if (sel a.err) { ret failure.lost(a.err); }
+    val b: res[usize, allocator.Error] = vector.push[Placed](places, Placed{place: p.place, scale: p.scale, fill: p.fill});
+    if (sel b.err) { ret failure.lost(b.err); }
+    ret err[Why].ok{};
+}
+
+fun place_of(places: *Vector[Placed], p: Piece) err[Why] {
+    val b: res[usize, allocator.Error] = vector.push[Placed](places, Placed{place: p.place, scale: p.scale, fill: p.fill});
+    if (sel b.err) { ret failure.lost(b.err); }
+    ret err[Why].ok{};
+}
+
+# the types of the pieces of one value that travels in, at the end of out,
+# with their places
+fun receive_types(w: *Work, side: Side, ty: Type, passed: Passed, asg: *Assignment, out: *Vector[Type], places: *Vector[Placed]) err[Why] {
+    val s: res[types.Shape, Why] = shape_of(w, ty);
+    if (sel s.err) { ret err[Why].err{s.err}; }
+    var whole: bool = false;
+    if (!(sel passed.passing.reference) && !aggregate(s.ok) && passed.count == 1) {
+        val size: res[u64, Why] = size_of(w, ty);
+        if (sel size.err) { ret err[Why].err{size.err}; }
+        val p: Piece = piece.piece(asg, passed.first);
+        whole = p.offset == 0 && p.size == size.ok;
+    }
+    if (sel passed.passing.reference && passed.count > 1) { ret err[Why].err{Why.reason{"a value by reference that travels in more than one piece"}}; }
+    var n: u32 = 0;
+    for (n < passed.count) {
+        val p:  Piece    = piece.piece(asg, passed.first + n);
+        val ok: err[Why] = stated(side, p);
+        if (sel ok.err) { ret ok; }
+        var t: Type = w.ptr;
+        if (!(sel passed.passing.reference)) {
+            val got: res[Type, Why] = piece_type(w, side, p, ty, whole);
+            if (sel got.err) { ret err[Why].err{got.err}; }
+            t = got.ok;
+        }
+        val pushed: res[usize, allocator.Error] = vector.push[Type](out, t);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        val placed: err[Why] = place_of(places, p);
+        if (sel placed.err) { ret placed; }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# rebuild one value that traveled in from its pieces, at the builder
+# ---
+# home:   the slot an aggregate by value is rebuilt in
+# pieces: its piece values, one per piece of passed
+fun rebuild(w: *Work, bld: *Builder, ty: Type, passed: Passed, asg: *Assignment, home: opt[Value], pieces: Slice[Value]) res[Value, Why] {
+    val s: res[types.Shape, Why] = shape_of(w, ty);
+    if (sel s.err) { ret res[Value, Why].err{s.err}; }
+    val al: res[u64, Why] = align_of(w, ty);
+    if (sel al.err)                   { ret res[Value, Why].err{al.err}; }
+    if (sel passed.passing.reference) { ret res[Value, Why].ok{load(bld, pieces.data[0], ty, al.ok)}; }
+    if (!aggregate(s.ok)) {
+        val size: res[u64, Why] = size_of(w, ty);
+        if (sel size.err) { ret res[Value, Why].err{size.err}; }
+        val first: Piece = piece.piece(asg, passed.first);
+        if (pieces.size == 1 && first.offset == 0 && first.size == size.ok) {
+            val v: Value = pieces.data[0];
+            ret convert(w, bld, v, body_of(w).values.data[v.index].type, ty);
+        }
+        val bits: res[Type, Why] = integer_type(w, (size.ok * 8)::u32);
+        if (sel bits.err) { ret res[Value, Why].err{bits.err}; }
+        var acc: Value = Value{index: 0};
+        var k:   u32   = 0;
+        for (k::usize < pieces.size) {
+            val q:      Piece          = piece.piece(asg, passed.first + k);
+            val v:      Value          = pieces.data[k];
+            val narrow: res[Type, Why] = integer_type(w, width_for(q.size));
+            if (sel narrow.err) { ret res[Value, Why].err{narrow.err}; }
+            val raw: res[Value, Why] = convert(w, bld, v, body_of(w).values.data[v.index].type, narrow.ok);
+            if (sel raw.err) { ret raw; }
+            var part: Value = raw.ok;
+            if (!types.same(narrow.ok, bits.ok)) { part = unary(bld, opcode.EXT_U, part, bits.ok); }
+            if (q.offset > 0) {
+                val by: res[Value, Why] = integer(w, bits.ok, q.offset * 8);
+                if (sel by.err) { ret by; }
+                part = binary(bld, opcode.SHL, part, by.ok);
+            }
+            if (k > 0) { acc = binary(bld, opcode.OR, acc, part); }
+            or         { acc = part; }
+            k = k + 1;
+        }
+        ret convert(w, bld, acc, bits.ok, ty);
+    }
+    if (sel home.none) { ret res[Value, Why].err{Why.reason{"an aggregate rebuilt with no slot"}}; }
+    var n: u32 = 0;
+    for (n::usize < pieces.size) {
+        val p:  Piece    = piece.piece(asg, passed.first + n);
+        val v:  Value    = pieces.data[n];
+        val pt: Type     = body_of(w).values.data[v.index].type;
+        val ok: err[Why] = write(w, bld, home.some, p.offset, p.size, al.ok, v, pt);
+        if (sel ok.err) { ret res[Value, Why].err{ok.err}; }
+        n = n + 1;
+    }
+    ret res[Value, Why].ok{load(bld, home.some, ty, al.ok)};
+}
+
+# the slot a value that travels in is rebuilt in, or none when it needs none
+fun home_for(w: *Work, ty: Type, passed: Passed) res[opt[Value], Why] {
+    if (sel passed.passing.reference) { ret res[opt[Value], Why].ok{opt[Value].none{}}; }
+    val s: res[types.Shape, Why] = shape_of(w, ty);
+    if (sel s.err)        { ret res[opt[Value], Why].err{s.err}; }
+    if (!aggregate(s.ok)) { ret res[opt[Value], Why].ok{opt[Value].none{}}; }
+    val al: res[u64, Why] = align_of(w, ty);
+    if (sel al.err) { ret res[opt[Value], Why].err{al.err}; }
+    val made: res[Value, Why] = slot(w, ty, al.ok);
+    if (sel made.err) { ret res[opt[Value], Why].err{made.err}; }
+    ret res[opt[Value], Why].ok{opt[Value].some{made.ok}};
+}
+
+fun classify(w: *Work, signature: Type, named: Named) res[Assignment, Why] {
+    val r: res[Assignment, call.Error] = call.classify(w.m.a, w.l, ?w.mc.convention, signature, Statement{aggregates: Aggregates.platform{}, named: named});
+    if (sel r.err) { ret res[Assignment, Why].err{Why.convention{r.err}}; }
+    ret res[Assignment, Why].ok{r.ok};
+}
+
+fun signature_of(w: *Work, ty: Type) res[types.Function, Why] {
+    val s: res[types.Function, types.Error] = types.signature(?w.m.types, ty);
+    if (sel s.err) { ret res[types.Function, Why].err{Why.ir{module.Error.types{s.err}}}; }
+    ret res[types.Function, Why].ok{s.ok};
+}
+
+# the function type of a piece form
+fun piece_signature(w: *Work, params: Slice[Type], results: Slice[Type]) res[Type, Why] {
+    ret intern(w, types.Shape.function{types.Function{params: params, results: results}});
+}
+
+# the piece the convention returns a result's address in, when it does
+fun returned_place(w: *Work) opt[Placed] {
+    val r: opt[rf.Id] = w.mc.convention.returned;
+    if (sel r.none) { ret opt[Placed].none{}; }
+    ret opt[Placed].some{Placed{place: Place.register{r.some}, scale: Scale.fixed{}, fill: Fill.exact{}}};
+}
+
+fun by_reference(asg: *Assignment) bool {
+    var i: usize = 0;
+    for (i < asg.results.len) {
+        if (sel asg.results.data[i].passing.reference) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the entry, rewritten so its parameters are its pieces
+# ---
+# ret: the parameter the caller's result address arrives in, when a result
+#      travels by reference
+fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], Why] {
+    val b:      *Body              = body_of(w);
+    val old:    usize              = b.blocks.data[w.entry.index].parameters.len;
+    var olds:   Vector[Value]      = vector.init[Value](w.m.a);
+    var homes:  Vector[opt[Value]] = vector.init[opt[Value]](w.m.a);
+    var tys:    Vector[Type]       = vector.init[Type](w.m.a);
+    var places: Vector[Placed]     = vector.init[Placed](w.m.a);
+    var params: Vector[Value]      = vector.init[Value](w.m.a);
+    fin {
+        vector.dnit[Value](?olds);
+        vector.dnit[opt[Value]](?homes);
+        vector.dnit[Type](?tys);
+        vector.dnit[Placed](?places);
+        vector.dnit[Value](?params);
+    }
+    if (old != asg.arguments.len) { ret res[opt[Value], Why].err{Why.reason{"an entry whose parameters are not its signature's"}}; }
+    var i: usize = 0;
+    for (i < old) {
+        val v:      Value                       = b.blocks.data[w.entry.index].parameters.data[i];
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?olds, v);
+        if (sel pushed.err) { ret res[opt[Value], Why].err{Why.alloc{pushed.err}}; }
+        val h: res[opt[Value], Why] = home_for(w, body_of(w).values.data[v.index].type, asg.arguments.data[i]);
+        if (sel h.err) { ret res[opt[Value], Why].err{h.err}; }
+        val kept: res[usize, allocator.Error] = vector.push[opt[Value]](?homes, h.ok);
+        if (sel kept.err) { ret res[opt[Value], Why].err{Why.alloc{kept.err}}; }
+        i = i + 1;
+    }
+    var carrier: opt[Value] = opt[Value].none{};
+    if (sel asg.address.some) {
+        val pushed: res[usize, allocator.Error] = vector.push[Type](?tys, w.ptr);
+        if (sel pushed.err) { ret res[opt[Value], Why].err{Why.alloc{pushed.err}}; }
+        val placed: err[Why] = place_of(?places, asg.address.some);
+        if (sel placed.err) { ret res[opt[Value], Why].err{placed.err}; }
+    }
+    i = 0;
+    for (i < old) {
+        val ty: Type     = body_of(w).values.data[olds.data[i].index].type;
+        val ok: err[Why] = receive_types(w, Side.argument{i::u32}, ty, asg.arguments.data[i], asg, ?tys, ?places);
+        if (sel ok.err) { ret res[opt[Value], Why].err{ok.err}; }
+        i = i + 1;
+    }
+    var first: u32 = 0;
+    i = 0;
+    for (i < tys.len) {
+        var secret: bool      = false;
+        var name:   opt[View] = opt[View].none{};
+        if (!(sel asg.address.some) || i != 0) {
+            val owner: opt[usize] = owner_of(asg, sel asg.address.some, i);
+            if (sel owner.some) {
+                val old_value: Value = olds.data[owner.some];
+                secret = body_of(w).values.data[old_value.index].secret;
+                val passed: Passed = asg.arguments.data[owner.some];
+                if (passed.count == 1 && sel passed.passing.value) { name = body_of(w).values.data[old_value.index].name; }
+            }
+        }
+        val added: res[Value, module.Error] = body.add_parameter(w.m, w.f, w.entry, Declaration{type: tys.data[i], secret: secret, name: name}, Slice[Value]{data: nil, size: 0});
+        if (sel added.err) { ret res[opt[Value], Why].err{Why.ir{added.err}}; }
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?params, added.ok);
+        if (sel pushed.err) { ret res[opt[Value], Why].err{Why.alloc{pushed.err}}; }
+        i = i + 1;
+    }
+    if (sel asg.address.some) {
+        carrier = opt[Value].some{params.data[0]};
+        first   = 1;
+    }
+    var bld: Builder = build.init(w.m);
+    build.enter(?bld, w.f);
+    build.at(?bld, w.entry, w.slots);
+    var at: u32 = first;
+    i = 0;
+    for (i < old) {
+        val v:      Value  = olds.data[i];
+        val passed: Passed = asg.arguments.data[i];
+        build.secret(?bld, body_of(w).values.data[v.index].secret);
+        val got: res[Value, Why] = rebuild(w, ?bld, body_of(w).values.data[v.index].type, passed, asg, homes.data[i], Slice[Value]{data: ?params.data[at], size: passed.count::usize});
+        if (sel got.err) { ret res[opt[Value], Why].err{got.err}; }
+        val done: err[Why] = built(?bld);
+        if (sel done.err) { ret res[opt[Value], Why].err{done.err}; }
+        val moved: err[Why] = ir(body.replace(w.m, w.f, v, got.ok, Records.follow{}));
+        if (sel moved.err) { ret res[opt[Value], Why].err{moved.err}; }
+        at = at + passed.count;
+        i  = i + 1;
+    }
+    val after: err[Why] = rebound(w, ?bld);
+    if (sel after.err) { ret res[opt[Value], Why].err{after.err}; }
+    i = 0;
+    for (i < old) {
+        val gone: err[Why] = ir(body.remove_parameter(w.m, w.f, w.entry, 0));
+        if (sel gone.err) { ret res[opt[Value], Why].err{gone.err}; }
+        i = i + 1;
+    }
+    val placed: err[Why] = ir(body.place_entry(w.m, w.f, Slice[Placed]{data: places.data, size: places.len}));
+    if (sel placed.err) { ret res[opt[Value], Why].err{placed.err}; }
+    ret res[opt[Value], Why].ok{carrier};
+}
+
+# bind each variable whose record at the entry now reads a parameter rebuilt
+# after that point from where it is rebuilt, the builder's cursor, the record
+# at the entry reading nothing until then, since the parameter is in pieces
+fun rebound(w: *Work, bld: *Builder) err[Why] {
+    val c: build.Cursor = build.cursor(bld);
+    if (!(sel c.at)) { ret err[Why].ok{}; }
+    val end:   u32         = c.at.index;
+    var moved: Vector[u32] = vector.init[u32](w.m.a);
+    fin { vector.dnit[u32](?moved); }
+    val b: *Body = body_of(w);
+    var k: u32   = 0;
+    for (k < end) {
+        val run: Run = b.instructions.data[b.blocks.data[w.entry.index].instructions.data[k].index].points;
+        var p:   u32 = run.first;
+        for (p != 0) {
+            val r:     u32   = p - 1;
+            val reads: Reads = b.points.data[r].reads;
+            if (sel reads.operand) {
+                val def: Def = b.values.data[reads.operand.value.index].def;
+                if (sel def.result) {
+                    val pushed: res[usize, allocator.Error] = vector.push[u32](?moved, r);
+                    if (sel pushed.err) { ret failure.lost(pushed.err); }
+                }
+            }
+            if (p == run.last) { brk; }
+            p = b.points.data[r].next;
+        }
+        k = k + 1;
+    }
+    var i: usize = 0;
+    for (i < moved.len) {
+        val r:     u32     = moved.data[i];
+        val named: Binding = body_of(w).points.data[r].binding;
+        val reads: Reads   = body_of(w).points.data[r].reads;
+        build.bind_at(bld, named, reads);
+        val ok: err[Why] = built(bld);
+        if (sel ok.err) { ret ok; }
+        val gone: err[Why] = ir(body.rebind(w.m, w.f, r, Reads.unavailable{}));
+        if (sel gone.err) { ret gone; }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# the argument a piece type of the entry's list belongs to
+fun owner_of(asg: *Assignment, addressed: bool, at: usize) opt[usize] {
+    var k: usize = at;
+    if (addressed) { k = k - 1; }
+    var i: usize = 0;
+    var n: usize = 0;
+    for (i < asg.arguments.len) {
+        n = n + asg.arguments.data[i].count::usize;
+        if (k < n) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# one return, rewritten into the pieces of its values
+fun lower_return(w: *Work, asg: *Assignment, r: Instruction, carrier: opt[Value]) err[Why] {
+    val b:     *Body = body_of(w);
+    val k:     Block = block_of(b, r);
+    val count: usize = b.instructions.data[r.index].operands.len;
+    if (count != asg.results.len) { ret err[Why].err{Why.reason{"a return whose values are not its function's results"}}; }
+    var given:  Vector[Value]  = vector.init[Value](w.m.a);
+    var out:    Vector[Value]  = vector.init[Value](w.m.a);
+    var places: Vector[Placed] = vector.init[Placed](w.m.a);
+    fin {
+        vector.dnit[Value](?given);
+        vector.dnit[Value](?out);
+        vector.dnit[Placed](?places);
+    }
+    var i: usize = 0;
+    for (i < count) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?given, b.instructions.data[r.index].operands.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    var bld: Builder = build.init(w.m);
+    build.enter(?bld, w.f);
+    build.derive(?bld, r);
+    build.at(?bld, k, position(body_of(w), k, r));
+    i = 0;
+    for (i < count) {
+        val x: res[Sent, Why] = sent(w, given.data[i]);
+        if (sel x.err) { ret err[Why].err{x.err}; }
+        val passed: Passed = asg.results.data[i];
+        build.secret(?bld, x.ok.secret);
+        if (sel passed.passing.reference) {
+            if (sel carrier.none) { ret err[Why].err{Why.reason{"a result by reference with no address to return it at"}}; }
+            val c:    piece.Copy       = passed.passing.reference;
+            var from: opt[Instruction] = opt[Instruction].none{};
+            if (aggregate(x.ok.shape)) { from = loaded(w, x.ok.value); }
+            if (sel from.some) {
+                val bb:   *Body   = body_of(w);
+                val kk:   Block   = block_of(bb, from.some);
+                var near: Builder = build.init(w.m);
+                build.enter(?near, w.f);
+                build.derive(?near, from.some);
+                build.secret(?near, x.ok.secret);
+                build.at(?near, kk, position(bb, kk, from.some) + 1);
+                val copied: err[Why] = copy(w, ?near, bb.instructions.data[from.some.index].operands.data[0], carrier.some, c.size, c.align);
+                if (sel copied.err) { ret copied; }
+                val done: err[Why] = built(?near);
+                if (sel done.err) { ret done; }
+                val noted: err[Why] = note_unused(w, from.some);
+                if (sel noted.err) { ret noted; }
+                build.at(?bld, k, position(body_of(w), k, r));
+            }
+            or {
+                val al: res[u64, Why] = align_of(w, x.ok.ty);
+                if (sel al.err) { ret err[Why].err{al.err}; }
+                store(?bld, carrier.some, x.ok.value, al.ok);
+            }
+        }
+        or {
+            val ok: err[Why] = send(w, ?bld, Side.result{i::u32}, x.ok, passed, asg, ?out, ?places);
+            if (sel ok.err) { ret ok; }
+            build.at(?bld, k, position(body_of(w), k, r));
+        }
+        i = i + 1;
+    }
+    val returned: opt[Placed] = returned_place(w);
+    if (sel carrier.some) {
+        if (sel returned.some) {
+            val pushed: res[usize, allocator.Error] = vector.push[Value](?out, carrier.some);
+            if (sel pushed.err) { ret failure.lost(pushed.err); }
+            val placed: res[usize, allocator.Error] = vector.push[Placed](?places, returned.some);
+            if (sel placed.err) { ret failure.lost(placed.err); }
+        }
+    }
+    build.secret(?bld, false);
+    build.replacing(?bld, r);
+    var imm: [1]Immediate = [1]Immediate{Immediate.places{Slice[Placed]{data: places.data, size: places.len}}};
+    build.emit(?bld, Request{opcode: opcode.RET_PLACED, operands: Slice[Value]{data: out.data, size: out.len}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+    ret built(?bld);
+}
+
+# one call, rewritten into the pieces of its arguments and results
+fun lower_call(w: *Work, c: Instruction) err[Why] {
+    val b: *Body            = body_of(w);
+    val d: *InstructionData = ?b.instructions.data[c.index];
+    if (d.immediates.len < 2) { ret err[Why].err{Why.reason{"a call with no signature or named count"}}; }
+    val stated_signature: Immediate = d.immediates.data[0];
+    val stated_named:     Immediate = d.immediates.data[1];
+    if (!(sel stated_signature.ty)) { ret err[Why].err{Why.reason{"a call with no signature"}}; }
+    if (!(sel stated_named.named))  { ret err[Why].err{Why.reason{"a call with no named count"}}; }
+    val signature: Type                 = stated_signature.ty;
+    val named:     Named                = stated_named.named;
+    val got:       res[Assignment, Why] = classify(w, signature, named);
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    var asg: Assignment = got.ok;
+    fin { piece.dnit(?asg); }
+
+    var given:   Vector[Value]      = vector.init[Value](w.m.a);
+    var olds:    Vector[Value]      = vector.init[Value](w.m.a);
+    var homes:   Vector[opt[Value]] = vector.init[opt[Value]](w.m.a);
+    var out:     Vector[Value]      = vector.init[Value](w.m.a);
+    var places:  Vector[Placed]     = vector.init[Placed](w.m.a);
+    var params:  Vector[Type]       = vector.init[Type](w.m.a);
+    var results: Vector[Type]       = vector.init[Type](w.m.a);
+    var after:   Vector[Placed]     = vector.init[Placed](w.m.a);
+    fin {
+        vector.dnit[Value](?given);
+        vector.dnit[Value](?olds);
+        vector.dnit[opt[Value]](?homes);
+        vector.dnit[Value](?out);
+        vector.dnit[Placed](?places);
+        vector.dnit[Type](?params);
+        vector.dnit[Type](?results);
+        vector.dnit[Placed](?after);
+    }
+    val callee: Value = d.operands.data[0];
+    var i:      usize = 1;
+    for (i < d.operands.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?given, d.operands.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.results.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?olds, d.results.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    if (given.len != asg.arguments.len || olds.len != asg.results.len) { ret err[Why].err{Why.reason{"a call whose operands are not its signature's"}}; }
+    var address: opt[Value] = opt[Value].none{};
+    if (sel asg.address.some) {
+        var ty:    Type = w.ptr;
+        var align: u64  = 1;
+        i = 0;
+        for (i < olds.len) {
+            if (sel asg.results.data[i].passing.reference) {
+                ty    = body_of(w).values.data[olds.data[i].index].type;
+                align = asg.results.data[i].passing.reference.align;
+            }
+            i = i + 1;
+        }
+        val made: res[Value, Why] = slot(w, ty, align);
+        if (sel made.err) { ret err[Why].err{made.err}; }
+        address = opt[Value].some{made.ok};
+    }
+    i = 0;
+    for (i < olds.len) {
+        val h: res[opt[Value], Why] = home_for(w, body_of(w).values.data[olds.data[i].index].type, asg.results.data[i]);
+        if (sel h.err) { ret err[Why].err{h.err}; }
+        val kept: res[usize, allocator.Error] = vector.push[opt[Value]](?homes, h.ok);
+        if (sel kept.err) { ret failure.lost(kept.err); }
+        i = i + 1;
+    }
+
+    val k:   Block   = block_of(body_of(w), c);
+    var bld: Builder = build.init(w.m);
+    build.enter(?bld, w.f);
+    build.derive(?bld, c);
+    val secret:  bool       = body_of(w).instructions.data[c.index].metadata.secret;
+    val carried: opt[Piece] = asg.address;
+    if (sel address.some) {
+        if (sel carried.some) {
+            val pushed: res[usize, allocator.Error] = vector.push[Value](?out, address.some);
+            if (sel pushed.err) { ret failure.lost(pushed.err); }
+            val placed: err[Why] = place_of(?places, carried.some);
+            if (sel placed.err) { ret placed; }
+        }
+    }
+    i = 0;
+    for (i < given.len) {
+        val x: res[Sent, Why] = sent(w, given.data[i]);
+        if (sel x.err) { ret err[Why].err{x.err}; }
+        build.at(?bld, k, position(body_of(w), k, c));
+        build.secret(?bld, x.ok.secret);
+        val ok: err[Why] = send(w, ?bld, Side.argument{i::u32}, x.ok, asg.arguments.data[i], ?asg, ?out, ?places);
+        if (sel ok.err) { ret ok; }
+        i = i + 1;
+    }
+    val count: res[opt[Value], Why] = counted(w, named, ?asg);
+    if (sel count.err) { ret err[Why].err{count.err}; }
+    val counter: opt[rf.Id] = w.mc.convention.count;
+    if (sel count.ok.some) {
+        if (sel counter.some) {
+            val pushed: res[usize, allocator.Error] = vector.push[Value](?out, count.ok.some);
+            if (sel pushed.err) { ret failure.lost(pushed.err); }
+            val placed: res[usize, allocator.Error] = vector.push[Placed](?places, Placed{place: Place.register{counter.some}, scale: Scale.fixed{}, fill: Fill.exact{}});
+            if (sel placed.err) { ret failure.lost(placed.err); }
+        }
+    }
+    i = 0;
+    for (i < out.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Type](?params, body_of(w).values.data[out.data[i].index].type);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < olds.len) {
+        val ty: Type     = body_of(w).values.data[olds.data[i].index].type;
+        val ok: err[Why] = receive_types(w, Side.result{i::u32}, ty, asg.results.data[i], ?asg, ?results, ?after);
+        if (sel ok.err) { ret ok; }
+        i = i + 1;
+    }
+    val returned: opt[Placed] = returned_place(w);
+    if (sel address.some) {
+        if (sel returned.some) {
+            val pushed: res[usize, allocator.Error] = vector.push[Type](?results, w.ptr);
+            if (sel pushed.err) { ret failure.lost(pushed.err); }
+            val placed: res[usize, allocator.Error] = vector.push[Placed](?after, returned.some);
+            if (sel placed.err) { ret failure.lost(placed.err); }
+        }
+    }
+    i = 0;
+    for (i < after.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Placed](?places, after.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    val sig: res[Type, Why] = piece_signature(w, Slice[Type]{data: params.data, size: params.len}, Slice[Type]{data: results.data, size: results.len});
+    if (sel sig.err) { ret err[Why].err{sig.err}; }
+
+    build.at(?bld, k, position(body_of(w), k, c));
+    build.secret(?bld, secret);
+    var operands: Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?operands); }
+    val first: res[usize, allocator.Error] = vector.push[Value](?operands, callee);
+    if (sel first.err) { ret failure.lost(first.err); }
+    i = 0;
+    for (i < out.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?operands, out.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    var imm:    [2]Immediate = [2]Immediate{Immediate.ty{sig.ok}, Immediate.places{Slice[Placed]{data: places.data, size: places.len}}};
+    val placed: Instruction  = build.emit(?bld, Request{opcode: opcode.CALL_PLACED, operands: Slice[Value]{data: operands.data, size: operands.len}, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: no_targets()});
+    val made:   err[Why]     = built(?bld);
+    if (sel made.err) { ret made; }
+
+    var at: u32 = 0;
+    i = 0;
+    for (i < olds.len) {
+        val passed: Passed        = asg.results.data[i];
+        val old:    Value         = olds.data[i];
+        val ty:     Type          = body_of(w).values.data[old.index].type;
+        var pieces: Vector[Value] = vector.init[Value](w.m.a);
+        fin { vector.dnit[Value](?pieces); }
+        if (sel passed.passing.reference) {
+            if (sel address.none) { ret err[Why].err{Why.reason{"a result by reference with no address"}}; }
+            val pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, address.some);
+            if (sel pushed.err) { ret failure.lost(pushed.err); }
+        }
+        or {
+            var n: u32 = 0;
+            for (n < passed.count) {
+                val pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, build.result(?bld, placed, at + n));
+                if (sel pushed.err) { ret failure.lost(pushed.err); }
+                n = n + 1;
+            }
+            at = at + passed.count;
+        }
+        val got: res[Value, Why] = rebuild(w, ?bld, ty, passed, ?asg, homes.data[i], Slice[Value]{data: pieces.data, size: pieces.len});
+        if (sel got.err) { ret err[Why].err{got.err}; }
+        val done: err[Why] = built(?bld);
+        if (sel done.err) { ret done; }
+        val moved: err[Why] = ir(body.replace(w.m, w.f, old, got.ok, Records.follow{}));
+        if (sel moved.err) { ret moved; }
+        i = i + 1;
+    }
+    ret ir(body.erase(w.m, w.f, c));
+}
+
+# the count a variadic call states in the convention's count register: how
+# many of its pieces travel in vector or float registers, none when the
+# convention has no count or the call is not variadic
+fun counted(w: *Work, named: Named, asg: *Assignment) res[opt[Value], Why] {
+    val r: opt[rf.Id] = w.mc.convention.count;
+    if (sel r.none || !(sel named.first)) { ret res[opt[Value], Why].ok{opt[Value].none{}}; }
+    var n: u64   = 0;
+    var i: usize = 0;
+    for (i < asg.pieces.len) {
+        val k: opt[rf.Kind] = kind_of(w, asg.pieces.data[i].place);
+        if (sel k.some) {
+            if (k.some == rf.FLOAT || k.some == rf.VECTOR) { n = n + 1; }
+        }
+        i = i + 1;
+    }
+    val ty: res[Type, Why] = integer_type(w, 8);
+    if (sel ty.err) { ret res[opt[Value], Why].err{ty.err}; }
+    val v: res[Value, Why] = integer(w, ty.ok, n);
+    if (sel v.err) { ret res[opt[Value], Why].err{v.err}; }
+    ret res[opt[Value], Why].ok{opt[Value].some{v.ok}};
+}
+
+# bind each variable a load's result is bound to the storage it read, on the
+# instruction that addresses it, and take the load out
+fun retire(w: *Work, l: Instruction) err[Why] {
+    val b: *Body            = body_of(w);
+    val d: *InstructionData = ?b.instructions.data[l.index];
+    if (!(sel d.place.placed)) { ret err[Why].ok{}; }
+    val v: Value = d.results.data[0];
+    if (b.values.data[v.index].uses.len != 0) { ret err[Why].ok{}; }
+    val base: Def = b.values.data[d.operands.data[0].index].def;
+    if (sel base.result) {
+        val owner: Instruction     = base.result.instruction;
+        var list:  Vector[Binding] = vector.init[Binding](w.m.a);
+        fin { vector.dnit[Binding](?list); }
+        val had: res[Slice[Binding], module.Error] = module.bound(w.m, b.instructions.data[owner.index].metadata.bindings);
+        if (sel had.err) { ret err[Why].err{Why.ir{had.err}}; }
+        var i: usize = 0;
+        for (i < had.ok.size) {
+            val pushed: res[usize, allocator.Error] = vector.push[Binding](?list, had.ok.data[i]);
+            if (sel pushed.err) { ret failure.lost(pushed.err); }
+            i = i + 1;
+        }
+        val before: usize = list.len;
+        i = 0;
+        for (i < b.values.data[v.index].bound.len) {
+            val r:     u32     = b.values.data[v.index].bound.data[i];
+            val named: Binding = b.points.data[r].binding;
+            var j:     usize   = 0;
+            var known: bool    = false;
+            for (j < list.len) {
+                if (list.data[j].index == named.index) { known = true; }
+                j = j + 1;
+            }
+            if (!known) {
+                val pushed: res[usize, allocator.Error] = vector.push[Binding](?list, named);
+                if (sel pushed.err) { ret failure.lost(pushed.err); }
+            }
+            i = i + 1;
+        }
+        if (list.len != before) {
+            val made: res[Bindings, module.Error] = module.bindings(w.m, Slice[Binding]{data: list.data, size: list.len});
+            if (sel made.err) { ret err[Why].err{Why.ir{made.err}}; }
+            var md: Metadata = body_of(w).instructions.data[owner.index].metadata;
+            md.bindings = made.ok;
+            val set: err[Why] = ir(body.set_metadata(w.m, w.f, owner, md));
+            if (sel set.err) { ret set; }
+        }
+    }
+    ret ir(body.erase(w.m, w.f, l));
+}
+
+# lower one function's entry, returns and calls
+fun lower(w: *Work) err[Why] {
+    val b:     *Body               = body_of(w);
+    var calls: Vector[Instruction] = vector.init[Instruction](w.m.a);
+    var rets:  Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin {
+        vector.dnit[Instruction](?calls);
+        vector.dnit[Instruction](?rets);
+    }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var p: usize = 0;
+            for (p < b.blocks.data[k].instructions.len) {
+                val i:    Instruction = b.blocks.data[k].instructions.data[p];
+                val code: Opcode      = b.instructions.data[i.index].opcode;
+                if (code.index == opcode.CALL.index) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Instruction](?calls, i);
+                    if (sel pushed.err) { ret failure.lost(pushed.err); }
+                }
+                if (code.index == opcode.RET.index) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Instruction](?rets, i);
+                    if (sel pushed.err) { ret failure.lost(pushed.err); }
+                }
+                p = p + 1;
+            }
+        }
+        k = k + 1;
+    }
+    val signature: Type                 = w.m.functions.data[w.f.index].data.signature;
+    val got:       res[Assignment, Why] = classify(w, signature, Named.all{});
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    var asg: Assignment = got.ok;
+    fin { piece.dnit(?asg); }
+    val entered: res[opt[Value], Why] = lower_entry(w, ?asg);
+    if (sel entered.err) { ret err[Why].err{entered.err}; }
+    var i: usize = 0;
+    for (i < rets.len) {
+        val ok: err[Why] = lower_return(w, ?asg, rets.data[i], entered.ok);
+        if (sel ok.err) { ret ok; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < calls.len) {
+        val ok: err[Why] = lower_call(w, calls.data[i]);
+        if (sel ok.err) { ret ok; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.unused.len) {
+        val ok: err[Why] = retire(w, w.unused.data[i]);
+        if (sel ok.err) { ret ok; }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun run(c: *Context) res[bool, Why] {
+    var mc:     Machine;
+    val opened: err[machine.Error] = machine.open(?mc, c.m.a, c.t);
+    if (sel opened.err) { ret res[bool, Why].err{Why.machine{opened.err}}; }
+    fin { machine.close(?mc); }
+    var l:   Layout                 = layout.of(c.t, ?c.m.types);
+    val ptr: res[Type, types.Error] = types.intern(?c.m.types, types.Shape.pointer{types.Pointer{space: 0}});
+    if (sel ptr.err) { ret res[bool, Why].err{Why.ir{module.Error.types{ptr.err}}}; }
+    val bytes: res[u64, target_record.Error] = layout.size(?l, ptr.ok);
+    if (sel bytes.err) { ret res[bool, Why].err{Why.reason{"a pointer with no size in memory"}}; }
+    val word: res[Type, types.Error] = types.intern(?c.m.types, types.Shape.integer{types.Integer{width: (bytes.ok * 8)::u32}});
+    if (sel word.err) { ret res[bool, Why].err{Why.ir{module.Error.types{word.err}}}; }
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < c.m.functions.len) {
+        val f: Function = Function{index: i::u32};
+        if (record.touches(c, f)) {
+            var w:  Work     = Work{m: c.m, mc: ?mc, l: ?l, f: f, entry: Block{index: 0}, slots: 0, ptr: ptr.ok, offset: word.ok, unused: vector.init[Instruction](c.m.a)};
+            val ok: err[Why] = lower(?w);
+            vector.dnit[Instruction](?w.unused);
+            if (sel ok.err) { ret res[bool, Why].err{ok.err}; }
+            changed = true;
+        }
+        i = i + 1;
+    }
+    ret res[bool, Why].ok{changed};
+}
