@@ -1,0 +1,338 @@
+# blocks: splitting one at an instruction and merging one into its single
+# predecessor
+#
+# a split moves the tail to a new block the head branches to, and a merge
+# puts each of the merged block's parameters' uses on the argument its one
+# edge passed, so a split followed by a merge restores the function.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.build.Failure;
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.debug.Location;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.ValueData;
+
+fun refused[T](e: module.Error) res[T, Error] {
+    ret res[T, Error].err{Error.ir{e}};
+}
+
+fun request(code: opcode.Opcode, operands: Slice[Value], targets: Slice[Branch]) Request {
+    ret Request{opcode: code, operands: operands, immediates: Slice[opcode.Immediate]{data: nil, size: 0}, targets: targets};
+}
+
+# split a block before an instruction: the instruction and those after it move
+# to a new block without parameters, and the block ends in a branch to it
+# ---
+# m:   the module
+# f:   the function
+# k:   the block
+# at:  the position of the first instruction moved
+# ret: the new block, or why it was refused, the body left as it was
+pub fun split(m: *Module, f: Function, k: Block, at: u32) res[Block, Error] {
+    val kd: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel kd.err)                          { ret refused[Block](kd.err); }
+    if (kd.ok.erased)                        { ret refused[Block](module.Error.removed{k}); }
+    if (at::usize >= kd.ok.instructions.len) { ret res[Block, Error].err{Error.position{at}}; }
+    val first: Instruction = kd.ok.instructions.data[at];
+
+    var b: Builder = build.init(m);
+    build.enter(?b, f);
+    build.derive(?b, first);
+    val tail:   Block        = build.block(?b, Slice[Declaration]{data: nil, size: 0});
+    val opened: err[Failure] = build.done(?b);
+    if (sel opened.err) { ret res[Block, Error].err{Error.build{opened.err}}; }
+    val moved: err[module.Error] = body.move(m, f, k, at, tail);
+    if (sel moved.err) {
+        body.erase_block(m, f, tail);
+        ret refused[Block](moved.err);
+    }
+    var to: [1]Branch = [1]Branch{Branch{block: tail, arguments: Slice[Value]{data: nil, size: 0}}};
+    build.at_end(?b, k);
+    build.emit(?b, request(opcode.BR, Slice[Value]{data: nil, size: 0}, Slice[Branch]{data: ?to[0], size: 1}));
+    val built: err[Failure] = build.done(?b);
+    if (sel built.err) {
+        body.move(m, f, tail, 0, k);
+        body.erase_block(m, f, tail);
+        ret res[Block, Error].err{Error.build{built.err}};
+    }
+    ret res[Block, Error].ok{tail};
+}
+
+# merge a block into its single predecessor, which must reach it by an
+# unconditional branch: each parameter's uses take the argument the branch
+# passed, the branch goes, and the block's instructions move to the end of the
+# predecessor
+#
+# a refusal after the parameters are substituted leaves a function that means
+# the same, with some parameters unused.
+# ---
+# m:   the module
+# f:   the function
+# k:   the block, not the entry
+# ret: the block it merged into, or why it was refused
+pub fun merge(m: *Module, f: Function, k: Block) res[Block, Error] {
+    val kd: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel kd.err)                                  { ret refused[Block](kd.err); }
+    if (kd.ok.erased)                                { ret refused[Block](module.Error.removed{k}); }
+    if (k.index == 0 || kd.ok.predecessors.len != 1) { ret res[Block, Error].err{Error.merge{k}}; }
+    val jump: Instruction                        = kd.ok.predecessors.data[0];
+    val jd:   res[InstructionData, module.Error] = body.instruction_data(m, f, jump);
+    if (sel jd.err) { ret refused[Block](jd.err); }
+    val at: Place = jd.ok.place;
+    if (jd.ok.opcode.index != opcode.BR.index) { ret res[Block, Error].err{Error.merge{k}}; }
+    if (!(sel at.placed))                      { ret res[Block, Error].err{Error.merge{k}}; }
+    val into: Block = at.placed;
+    if (into.index == k.index) { ret res[Block, Error].err{Error.merge{k}}; }
+
+    var params: vector.Vector[Value] = vector.init[Value](m.a);
+    var args:   vector.Vector[Value] = vector.init[Value](m.a);
+    fin {
+        vector.dnit[Value](?params);
+        vector.dnit[Value](?args);
+    }
+    val pass: vector.Vector[Value]        = jd.ok.edges.data[0].arguments;
+    val rp:   res[usize, allocator.Error] = vector.reserve[Value](?params, pass.len);
+    if (sel rp.err) { ret refused[Block](module.Error.alloc{rp.err}); }
+    val ra: res[usize, allocator.Error] = vector.reserve[Value](?args, pass.len);
+    if (sel ra.err) { ret refused[Block](module.Error.alloc{ra.err}); }
+    var j: usize = 0;
+    for (j < pass.len) {
+        vector.push[Value](?params, kd.ok.parameters.data[j]);
+        vector.push[Value](?args, pass.data[j]);
+        j = j + 1;
+    }
+
+    j = 0;
+    for (j < params.len) {
+        val put: err[module.Error] = body.replace(m, f, params.data[j], args.data[j]);
+        if (sel put.err) { ret refused[Block](put.err); }
+        j = j + 1;
+    }
+    val moved: err[module.Error] = body.move(m, f, k, 0, into);
+    if (sel moved.err) { ret refused[Block](moved.err); }
+    val gone: err[module.Error] = body.erase(m, f, jump);
+    if (sel gone.err) { ret refused[Block](gone.err); }
+    val dropped: err[module.Error] = body.erase_block(m, f, k);
+    if (sel dropped.err) { ret refused[Block](dropped.err); }
+    ret res[Block, Error].ok{into};
+}
+
+val UNSEEN: u32 = 0xffffffff;
+
+# the counterpart in g of a value of f, bound the first time it is seen
+fun pairs(map: *vector.Vector[u32], from: Value, to: Value) bool {
+    if (map.data[from.index] == UNSEEN) {
+        map.data[from.index] = to.index;
+        ret true;
+    }
+    ret map.data[from.index] == to.index;
+}
+
+fun same_values(map: *vector.Vector[u32], fb: *Body, gb: *Body, x: Value, y: Value) bool {
+    val xv: *ValueData = ?fb.values.data[x.index];
+    val yv: *ValueData = ?gb.values.data[y.index];
+    if (!types.same(xv.type, yv.type) || xv.secret != yv.secret) { ret false; }
+    if (sel xv.def.constant != sel yv.def.constant)              { ret false; }
+    if (sel xv.def.constant) {
+        if (sel yv.def.constant) { ret xv.def.constant.index == yv.def.constant.index; }
+    }
+    ret pairs(map, x, y);
+}
+
+fun same_metadata(x: Metadata, y: Metadata) bool {
+    if (sel x.location.some != sel y.location.some) { ret false; }
+    if (sel x.location.some) {
+        if (sel y.location.some && x.location.some.index != y.location.some.index) { ret false; }
+    }
+    if (sel x.site.some != sel y.site.some) { ret false; }
+    if (sel x.site.some) {
+        if (sel y.site.some && x.site.some.index != y.site.some.index) { ret false; }
+    }
+    ret x.flags.volatile == y.flags.volatile && x.secret == y.secret && x.bindings.index == y.bindings.index;
+}
+
+fun same_instruction(map: *vector.Vector[u32], blocks: *vector.Vector[u32], fb: *Body, gb: *Body, x: *InstructionData, y: *InstructionData) bool {
+    if (x.opcode.index != y.opcode.index || !same_metadata(x.metadata, y.metadata)) { ret false; }
+    if (x.operands.len != y.operands.len || x.results.len != y.results.len)         { ret false; }
+    if (x.immediates.len != y.immediates.len || x.edges.len != y.edges.len)         { ret false; }
+    var i: usize = 0;
+    for (i < x.operands.len) {
+        if (!same_values(map, fb, gb, x.operands.data[i], y.operands.data[i])) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.results.len) {
+        if (!same_values(map, fb, gb, x.results.data[i], y.results.data[i])) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.edges.len) {
+        val xe: *Edge = ?x.edges.data[i];
+        val ye: *Edge = ?y.edges.data[i];
+        if (blocks.data[xe.block.index] != ye.block.index || xe.arguments.len != ye.arguments.len) { ret false; }
+        var j: usize = 0;
+        for (j < xe.arguments.len) {
+            if (!same_values(map, fb, gb, xe.arguments.data[j], ye.arguments.data[j])) { ret false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether two functions have the same blocks in the same order, each with the
+# same parameters and instructions, up to the ids they were given
+fun same_function(m: *Module, f: Function, g: Function) bool {
+    val fg: res[*Body, module.Error] = module.body(m, f);
+    val gg: res[*Body, module.Error] = module.body(m, g);
+    if (sel fg.err) { ret false; }
+    if (sel gg.err) { ret false; }
+    val fb:     *Body              = fg.ok;
+    val gb:     *Body              = gg.ok;
+    var map:    vector.Vector[u32] = vector.init[u32](m.a);
+    var blocks: vector.Vector[u32] = vector.init[u32](m.a);
+    var live:   vector.Vector[u32] = vector.init[u32](m.a);
+    fin {
+        vector.dnit[u32](?map);
+        vector.dnit[u32](?blocks);
+        vector.dnit[u32](?live);
+    }
+    var i: usize = 0;
+    for (i < fb.values.len) {
+        vector.push[u32](?map, UNSEEN);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < gb.blocks.len) {
+        if (!gb.blocks.data[i].erased) { vector.push[u32](?live, i::u32); }
+        i = i + 1;
+    }
+    var n: usize = 0;
+    i = 0;
+    for (i < fb.blocks.len) {
+        if (fb.blocks.data[i].erased) { vector.push[u32](?blocks, UNSEEN); }
+        or {
+            if (n >= live.len) { ret false; }
+            vector.push[u32](?blocks, live.data[n]);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if (n != live.len) { ret false; }
+
+    i = 0;
+    for (i < fb.blocks.len) {
+        if (!fb.blocks.data[i].erased) {
+            val x: *BlockData = ?fb.blocks.data[i];
+            val y: *BlockData = ?gb.blocks.data[blocks.data[i]];
+            if (x.parameters.len != y.parameters.len || x.instructions.len != y.instructions.len) { ret false; }
+            var j: usize = 0;
+            for (j < x.parameters.len) {
+                if (!same_values(?map, fb, gb, x.parameters.data[j], y.parameters.data[j])) { ret false; }
+                j = j + 1;
+            }
+            j = 0;
+            for (j < x.instructions.len) {
+                val xi: *InstructionData = ?fb.instructions.data[x.instructions.data[j].index];
+                val yi: *InstructionData = ?gb.instructions.data[y.instructions.data[j].index];
+                if (!same_instruction(?map, ?blocks, fb, gb, xi, yi)) { ret false; }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun int(m: *Module, width: u32) Type {
+    val r: res[Type, types.Error] = types.intern(?m.types, types.Shape.integer{types.Integer{width: width}});
+    if (sel r.err) { ret Type{index: 0xffffffff}; }
+    ret r.ok;
+}
+
+# f(x, y) = (x + y) * x, every instruction at its own location
+fun sample(m: *Module, sig: Type, name: View) Function {
+    var b: Builder  = build.init(m);
+    val f: Function = build.function(?b, FunctionData{name: name, signature: sig});
+    build.enter(?b, f);
+    var decls: [2]Declaration = [2]Declaration{Declaration{type: int(m, 32), secret: false}, Declaration{type: int(m, 32), secret: false}};
+    val entry: Block          = build.block(?b, Slice[Declaration]{data: ?decls[0], size: 2});
+    build.at_end(?b, entry);
+    var xy: [2]Value = [2]Value{build.parameter(?b, entry, 0), build.parameter(?b, entry, 1)};
+    build.locate(?b, opt[Location].some{Location{index: 1}});
+    var ax: [2]Value = [2]Value{build.value(?b, request(opcode.ADD, Slice[Value]{data: ?xy[0], size: 2}, Slice[Branch]{data: nil, size: 0})), xy[0]};
+    build.locate(?b, opt[Location].some{Location{index: 2}});
+    var out: [1]Value = [1]Value{build.value(?b, request(opcode.MUL, Slice[Value]{data: ?ax[0], size: 2}, Slice[Branch]{data: nil, size: 0}))};
+    build.locate(?b, opt[Location].some{Location{index: 3}});
+    build.emit(?b, request(opcode.RET, Slice[Value]{data: ?out[0], size: 1}, Slice[Branch]{data: nil, size: 0}));
+    if (build.failed(?b)) { ret Function{index: 0xffffffff}; }
+    ret f;
+}
+
+test block__split_then_merge_restores {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val made: res[Module, module.Error] = module.init(?a, View{data: "riscv64", len: 7});
+    if (sel made.err) { ret 1; }
+    var m: Module = made.ok;
+    fin { module.dnit(?m); }
+    var params:  [2]Type                = [2]Type{int(?m, 32), int(?m, 32)};
+    var results: [1]Type                = [1]Type{int(?m, 32)};
+    val sig:     res[Type, types.Error] = types.intern(?m.types, types.Shape.function{types.Function{params: Slice[Type]{data: ?params[0], size: 2}, results: Slice[Type]{data: ?results[0], size: 1}}});
+    if (sel sig.err) { ret 1; }
+    val f: Function = sample(?m, sig.ok, View{data: "f", len: 1});
+    val g: Function = sample(?m, sig.ok, View{data: "g", len: 1});
+    if (f.index == 0xffffffff || g.index == 0xffffffff) { ret 2; }
+    if (!same_function(?m, f, g))                       { ret 2; }
+
+    val entry: Block             = Block{index: 0};
+    val tail:  res[Block, Error] = split(?m, f, entry, 1);
+    if (sel tail.err) { ret 3; }
+    val head: res[BlockData, module.Error] = body.block_data(?m, f, entry);
+    val rest: res[BlockData, module.Error] = body.block_data(?m, f, tail.ok);
+    if (sel head.err)                                                   { ret 4; }
+    if (sel rest.err)                                                   { ret 4; }
+    if (head.ok.instructions.len != 2 || rest.ok.instructions.len != 2) { ret 4; }
+    if (rest.ok.predecessors.len != 1)                                  { ret 4; }
+    if (same_function(?m, f, g))                                        { ret 4; }
+
+    val back: res[Block, Error] = merge(?m, f, tail.ok);
+    if (sel back.err)                 { ret 5; }
+    if (back.ok.index != entry.index) { ret 5; }
+    if (!same_function(?m, f, g))     { ret 6; }
+    ret 0;
+}
