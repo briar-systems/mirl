@@ -1,0 +1,567 @@
+# the parser of the machine form text
+#
+# it reads through the parser of the ir text form, so the lexer, the header and
+# the refusals with their line and column are that form's. the text is read in
+# two passes over a function: the first makes its virtual registers, slots and
+# blocks, so an operand can name a block written after it, and the second
+# appends each instruction, checked against its opcode's row. a register and an
+# instruction are looked up by the rows of the set's register file and catalog,
+# and a name those rows do not hold is refused.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mink.lib.fail.Fail;
+use mink.lib.model.reloc;
+
+use mirl.ir.debug.Binding;
+use mirl.ir.debug.Location;
+use mirl.ir.debug.Site;
+use mirl.ir.id.Symbol;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use reader: mirl.ir.text.parse;
+use mirl.ir.text.parse.lexer;
+use mirl.ir.text.parse.lexer.Token;
+use mirl.ir.text.parse.refusal.Named;
+use mirl.ir.text.parse.refusal.Reason;
+use mirl.ir.text.parse.refusal.Refusal;
+use mirl.ir.text.parse.state;
+use mirl.ir.text.parse.state.Mark;
+use mirl.ir.text.parse.state.Parser;
+use mirl.machine.class;
+use mirl.machine.class.Class;
+use mirl.machine.class.Physical;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.operand.Slot;
+use Address: mirl.machine.operand.Symbol;
+use mirl.machine.operand.Tied;
+use mirl.machine.operand.Virtual;
+use mirl.machine.pseudo;
+use mirl.machine.text.index;
+use mirl.machine.text.index.Index;
+use mirl.machine.text.item;
+use mirl.machine.text.item.Env;
+use mirl.machine.text.item.Item;
+use mirl.slice;
+
+use rf:   masc.core.register;
+use rows: masc.core.row;
+
+# the functions a text holds
+# ---
+# a:     the allocator the functions take
+# items: the functions, in the order of the text
+pub rec Unit {
+    a:     *allocator.Allocator;
+    items: vector.Vector[Item];
+}
+
+# give back a unit's functions
+pub fun dnit(u: *Unit) err[allocator.Error] {
+    var failed: err[allocator.Error] = err[allocator.Error].ok{};
+    var i:      usize                = 0;
+    for (i < u.items.len) {
+        val r: err[allocator.Error] = function.dnit(?u.items.data[i].function);
+        if (sel r.err && sel failed.ok) { failed = r; }
+        i = i + 1;
+    }
+    val r: err[allocator.Error] = vector.dnit[Item](?u.items);
+    if (sel r.err && sel failed.ok) { failed = r; }
+    ret failed;
+}
+
+# one instruction line of a function
+# ---
+# at:    the start of the line
+# block: the block it stands in
+rec Line {
+    at:    Mark;
+    block: u32;
+}
+
+# what one reading is made against
+# ---
+# p:   the parser
+# env: what the names mean
+# x:   the indexed names of the set
+rec Reading {
+    p:   *Parser;
+    env: *Env;
+    x:   *Index;
+}
+
+fun hash_name(v: *View) u64 {
+    ret slice.hash_view(0xcbf29ce484222325, @v);
+}
+
+fun same_name(a: *View, b: *View) bool {
+    ret slice.same_view(@a, @b);
+}
+
+fun unknown(p: *Parser, what: str, t: Token) {
+    state.fail_at(p, t.line, t.column, Reason.unknown{Named{what: what, name: t.raw}});
+}
+
+fun cstr(p: *Parser, v: View) opt[*u8] {
+    val got: res[*u8, allocator.Error] = allocator.allocate[u8](p.a, v.len + 1);
+    if (sel got.err) {
+        state.refuse_alloc(p, got.err);
+        ret opt[*u8].none{};
+    }
+    var i: usize = 0;
+    for (i < v.len) {
+        got.ok[i] = v.data[i];
+        i         = i + 1;
+    }
+    got.ok[v.len] = 0;
+    ret opt[*u8].some{got.ok};
+}
+
+fun kind_named(p: *Parser, t: Token) *reloc.Kind {
+    val c: opt[*u8] = cstr(p, t.text);
+    if (sel c.none) { ret nil; }
+    val k: res[*reloc.Kind, Fail] = reloc.by_name(c.some);
+    allocator.deallocate[u8](p.a, c.some, t.text.len + 1);
+    if (sel k.err) {
+        unknown(p, "relocation kind", t);
+        ret nil;
+    }
+    ret k.ok;
+}
+
+fun bounded(p: *Parser, t: Token, count: usize, what: str) u32 {
+    if (!state.ok(p)) { ret 0; }
+    if (t.value >= count::u64) {
+        state.fail_at(p, t.line, t.column, Reason.unresolved{Named{what: what, name: t.raw}});
+        ret 0;
+    }
+    ret t.value::u32;
+}
+
+fun class_of(r: *Reading) Class {
+    val p:    *Parser = r.p;
+    var none: Class   = Class.memory{nil};
+    if (state.accept_word(p, "class")) {
+        val t: Token = state.expect(p, lexer.UINT, "a class number");
+        if (!state.ok(p)) { ret none; }
+        var count: usize = 0;
+        if (r.x.file != nil) { count = r.x.file.class_count::usize; }
+        ret class.hardware(r.x.file, bounded(p, t, count, "register class")::u16);
+    }
+    if (state.accept_word(p, "memory")) {
+        val t: Token = state.expect(p, lexer.UINT, "a memory class number");
+        if (!state.ok(p)) { ret none; }
+        val k: u32 = bounded(p, t, r.env.memories.size, "memory class");
+        if (!state.ok(p)) { ret none; }
+        ret Class.memory{r.env.memories.data[k]};
+    }
+    state.expected(p, "class or memory");
+    ret none;
+}
+
+fun memory_cell(r: *Reading) Physical {
+    val p: *Parser = r.p;
+    state.expect(p, lexer.LBRACE, "{");
+    val c: Token = state.expect(p, lexer.UINT, "a memory class number");
+    val k: u32   = bounded(p, c, r.env.memories.size, "memory class");
+    state.expect(p, lexer.COLON, ":");
+    val n: u32 = state.number32(p);
+    state.expect(p, lexer.RBRACE, "}");
+    if (!state.ok(p)) { ret Physical.cell{class.Cell{class: nil, number: 0}}; }
+    ret Physical.cell{class.Cell{class: r.env.memories.data[k], number: n}};
+}
+
+fun register(r: *Reading) Register {
+    val p: *Parser = r.p;
+    val t: Token   = p.tok;
+    if (t.kind == lexer.LOCAL) {
+        state.advance(p);
+        ret Register.virtual{Virtual{index: state.resolve(p, ?p.values, "virtual register", t)}};
+    }
+    if (t.kind == lexer.LBRACE) { ret Register.physical{memory_cell(r)}; }
+    if (t.kind == lexer.WORD || t.kind == lexer.STRING) {
+        state.advance(p);
+        val id: opt[rf.Id] = index.register_named(r.x, t.text);
+        if (sel id.none) {
+            unknown(p, "register", t);
+            ret Register.physical{Physical.register{rf.NONE}};
+        }
+        ret Register.physical{Physical.register{id.some}};
+    }
+    state.expected(p, "a register");
+    ret Register.physical{Physical.register{rf.NONE}};
+}
+
+fun symbol(r: *Reading) Operand {
+    val p: *Parser = r.p;
+    val t: Token   = state.expect(p, lexer.SYMBOL, "a symbol");
+    var a: Address;
+    if (!state.ok(p)) { ret Operand.immediate{0}; }
+    val found: opt[Symbol] = module.find(p.m, t.text);
+    if (sel found.none) {
+        state.fail_at(p, t.line, t.column, Reason.unresolved{Named{what: "symbol", name: t.raw}});
+        ret Operand.immediate{0};
+    }
+    a.symbol = found.some;
+    a.addend = 0;
+    if (state.is(p, lexer.PLUS) || state.is(p, lexer.MINUS)) {
+        val negative: bool = state.is(p, lexer.MINUS);
+        state.advance(p);
+        val n: u64 = state.number(p);
+        if (n > 0x7fffffffffffffff && !(negative && n == 0x8000000000000000)) { state.fail(p, Reason.large{}); }
+        if (negative)                                                         { a.addend = (~n + 1)::i64; }
+        or                                                                    { a.addend = n::i64; }
+    }
+    state.expect(p, lexer.COLON, ":");
+    val k: Token = state.name(p, "a relocation kind");
+    a.kind = kind_named(p, k);
+    ret Operand.symbol{a};
+}
+
+fun immediate(p: *Parser) Operand {
+    var negative: bool = false;
+    if (state.accept(p, lexer.MINUS)) { negative = true; }
+    val line: u32 = p.tok.line;
+    val col:  u32 = p.tok.column;
+    val n:    u64 = state.number(p);
+    if (negative) {
+        if (n > 0x8000000000000000) { state.fail_at(p, line, col, Reason.large{}); }
+        ret Operand.immediate{(~n + 1)::i64};
+    }
+    if (n > 0x7fffffffffffffff) { state.fail_at(p, line, col, Reason.large{}); }
+    ret Operand.immediate{n::i64};
+}
+
+fun operand(r: *Reading) Operand {
+    val p: *Parser    = r.p;
+    val k: lexer.Kind = p.tok.kind;
+    if (k == lexer.LOCAL || k == lexer.WORD || k == lexer.STRING || k == lexer.LBRACE) {
+        val dest: Register = register(r);
+        if (!state.accept(p, lexer.EQUALS)) {
+            if (sel dest.virtual) { ret Operand.virtual{dest.virtual}; }
+            ret Operand.physical{dest.physical};
+        }
+        ret Operand.tied{Tied{dest: dest, source: register(r)}};
+    }
+    if (k == lexer.UINT || k == lexer.MINUS) { ret immediate(p); }
+    if (k == lexer.LBRACKET) {
+        state.advance(p);
+        val n: u32 = state.number32(p);
+        state.expect(p, lexer.RBRACKET, "]");
+        ret Operand.slot{Slot{index: n}};
+    }
+    if (k == lexer.LABEL) {
+        val t: Token = p.tok;
+        state.advance(p);
+        ret Operand.block{Block{index: state.resolve(p, ?p.blocks, "block", t)}};
+    }
+    if (k == lexer.SYMBOL) { ret symbol(r); }
+    state.expected(p, "an operand");
+    ret Operand.immediate{0};
+}
+
+fun metadata_word(p: *Parser) bool {
+    ret state.is_word(p, "loc") || state.is_word(p, "site") || state.is_word(p, "volatile") || state.is_word(p, "secret") || state.is_word(p, "bind");
+}
+
+# read the name of a debug entry, which is its kind's letter and its position
+fun ref(p: *Parser, letter: u8, count: usize, what: str) u32 {
+    val t: Token = state.expect(p, lexer.DREF, what);
+    if (!state.ok(p)) { ret 0; }
+    var n:    u64   = 0;
+    var i:    usize = 1;
+    var good: bool  = t.text.len > 1 && t.text.data[0] == letter;
+    for (good && i < t.text.len) {
+        val c: u8 = t.text.data[i];
+        if (c < '0' || c > '9' || n > 0x0fffffff) { good = false; }
+        or                                        { n = n * 10 + (c - '0')::u64; }
+        i = i + 1;
+    }
+    if (!good || n >= count::u64) {
+        state.fail_at(p, t.line, t.column, Reason.unresolved{Named{what: what, name: t.raw}});
+        ret 0;
+    }
+    ret n::u32;
+}
+
+fun metadata(p: *Parser) Metadata {
+    var md: Metadata;
+    if (state.accept_word(p, "loc")) {
+        md.location = opt[Location].some{Location{index: ref(p, 'l', p.m.debug.positions.len, "location")}};
+    }
+    if (state.accept_word(p, "site")) {
+        md.site = opt[Site].some{Site{index: ref(p, 's', p.m.debug.sites.len, "site")}};
+    }
+    if (state.accept_word(p, "volatile")) { md.flags = Flags{volatile: true}; }
+    if (state.accept_word(p, "secret"))   { md.secret = true; }
+    if (state.is_word(p, "bind")) {
+        val t: Token = p.tok;
+        state.advance(p);
+        state.expect(p, lexer.LBRACKET, "[");
+        var list: vector.Vector[Binding] = vector.init[Binding](p.a);
+        fin { vector.dnit[Binding](?list); }
+        if (!state.is(p, lexer.RBRACKET)) {
+            for {
+                state.push[Binding](p, ?list, Binding{index: ref(p, 'v', p.m.debug.bindings.len, "variable")});
+                if (!state.accept(p, lexer.COMMA)) { brk; }
+            }
+        }
+        state.expect(p, lexer.RBRACKET, "]");
+        if (!state.ok(p)) { ret md; }
+        val made: res[Bindings, module.Error] = module.bindings(p.m, Slice[Binding]{data: list.data, size: list.len});
+        if (sel made.err) {
+            state.fail_at(p, t.line, t.column, Reason.ir{made.err});
+            ret md;
+        }
+        md.bindings = made.ok;
+    }
+    ret md;
+}
+
+fun opcode(r: *Reading) Opcode {
+    val p:    *Parser = r.p;
+    var none: Opcode  = Opcode.pseudo{pseudo.COPY};
+    if (state.accept_word(p, "pseudo")) {
+        val t: Token = state.expect(p, lexer.WORD, "a pseudo-instruction");
+        if (!state.ok(p)) { ret none; }
+        val found: opt[pseudo.Pseudo] = pseudo.named(t.text);
+        if (sel found.none) {
+            unknown(p, "pseudo-instruction", t);
+            ret none;
+        }
+        ret Opcode.pseudo{found.some};
+    }
+    val t: Token = state.name(p, "an instruction");
+    if (!state.ok(p)) { ret none; }
+    var place: u32 = 0;
+    if (state.accept(p, lexer.LESS)) {
+        place = state.number32(p);
+        state.expect(p, lexer.GREATER, ">");
+    }
+    if (!state.ok(p)) { ret none; }
+    val row: opt[*rows.Row] = index.row_named(r.x, t.text, place);
+    if (sel row.none) {
+        unknown(p, "instruction", t);
+        ret none;
+    }
+    ret Opcode.row{row.some};
+}
+
+fun instruction(r: *Reading, f: *Function, ln: Line) {
+    val p: *Parser = r.p;
+    state.rewind(p, ln.at);
+    val line:     u32                    = p.tok.line;
+    val col:      u32                    = p.tok.column;
+    val op:       Opcode                 = opcode(r);
+    var operands: vector.Vector[Operand] = vector.init[Operand](p.a);
+    var columns:  vector.Vector[u32]     = vector.init[u32](p.a);
+    fin {
+        vector.dnit[Operand](?operands);
+        vector.dnit[u32](?columns);
+    }
+    if (state.ok(p) && !metadata_word(p) && !state.is(p, lexer.NEWLINE) && !state.is(p, lexer.END)) {
+        for {
+            state.push[u32](p, ?columns, p.tok.column);
+            state.push[Operand](p, ?operands, operand(r));
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    val md: Metadata = metadata(p);
+    state.expect_end(p);
+    if (!state.ok(p)) { ret; }
+    val made: res[Instruction, function.Error] = function.append(f, Block{index: ln.block}, op, Slice[Operand]{data: operands.data, size: operands.len}, md);
+    if (sel made.err) {
+        var at: u32            = col;
+        val e:  function.Error = made.err;
+        if (sel e.refused) {
+            if (e.refused.operand::usize < columns.len) { at = columns.data[e.refused.operand]; }
+        }
+        if (sel e.alloc) { state.refuse_alloc(p, e.alloc); }
+        or               { state.fail_at(p, line, at, Reason.machine{e}); }
+    }
+}
+
+# read the lines of a function into its virtual registers, slots and blocks,
+# and note where its instructions stand
+fun declare(r: *Reading, f: *Function, lines: *vector.Vector[Line]) {
+    val p:      *Parser = r.p;
+    var blocks: u32     = 0;
+    for (state.ok(p) && !state.is(p, lexer.RBRACE)) {
+        if (state.is(p, lexer.END))         { state.expected(p, "}"); }
+        or (state.accept(p, lexer.NEWLINE)) {}
+        or (state.accept_word(p, "virtual")) {
+            val t: Token = state.expect(p, lexer.LOCAL, "a virtual register");
+            state.expect(p, lexer.COLON, ":");
+            val c: Class = class_of(r);
+            state.expect_end(p);
+            if (!state.ok(p)) { ret; }
+            val made: res[Virtual, function.Error] = function.virtual(f, c);
+            if (sel made.err) {
+                state.fail_at(p, t.line, t.column, Reason.machine{made.err});
+                ret;
+            }
+            state.define(p, ?p.values, "virtual register", t, made.ok.index);
+        }
+        or (state.accept_word(p, "slot")) {
+            val at: Token = p.tok;
+            state.expect(p, lexer.LBRACKET, "[");
+            val n: u32 = state.number32(p);
+            state.expect(p, lexer.RBRACKET, "]");
+            state.expect(p, lexer.COLON, ":");
+            state.expect_word(p, "size");
+            val size: u64 = state.number(p);
+            state.expect_word(p, "align");
+            val align: u64 = state.number(p);
+            state.expect_end(p);
+            if (!state.ok(p)) { ret; }
+            if (n::usize != f.slots.len) {
+                state.fail_at(p, at.line, at.column, Reason.expected{"the next slot, in order"});
+                ret;
+            }
+            val made: res[Slot, function.Error] = function.slot(f, size, align);
+            if (sel made.err) { state.fail_at(p, at.line, at.column, Reason.machine{made.err}); }
+        }
+        or (state.is(p, lexer.LABEL)) {
+            val t: Token = p.tok;
+            state.advance(p);
+            state.expect(p, lexer.COLON, ":");
+            state.expect_end(p);
+            if (!state.ok(p)) { ret; }
+            val made: res[Block, function.Error] = function.block(f);
+            if (sel made.err) {
+                state.fail_at(p, t.line, t.column, Reason.machine{made.err});
+                ret;
+            }
+            state.define(p, ?p.blocks, "block", t, made.ok.index);
+            blocks = blocks + 1;
+        }
+        or {
+            if (blocks == 0) {
+                state.expected(p, "a block label");
+                ret;
+            }
+            state.push[Line](p, lines, Line{at: state.mark(p), block: blocks - 1});
+            state.skip_line(p);
+            state.expect_end(p);
+        }
+    }
+}
+
+fun function_item(r: *Reading, u: *Unit, seen: *map.MapBy[View, u32]) {
+    val p: *Parser = r.p;
+    state.expect_word(p, "function");
+    val t: Token = state.expect(p, lexer.SYMBOL, "a function symbol");
+    state.expect(p, lexer.LBRACE, "{");
+    state.expect_end(p);
+    if (!state.ok(p)) { ret; }
+    val found: opt[Symbol] = module.find(p.m, t.text);
+    if (sel found.none) {
+        state.fail_at(p, t.line, t.column, Reason.unresolved{Named{what: "function", name: t.raw}});
+        ret;
+    }
+    if (!(sel found.some.function)) {
+        state.fail_at(p, t.line, t.column, Reason.expected{"a function, not a global"});
+        ret;
+    }
+    if (map.contains_by[View, u32](seen, ?t.text)) {
+        state.fail_at(p, t.line, t.column, Reason.duplicate{Named{what: "function", name: t.raw}});
+        ret;
+    }
+    val noted: res[bool, allocator.Error] = map.insert_by[View, u32](seen, t.text, u.items.len::u32);
+    if (sel noted.err) {
+        state.refuse_alloc(p, noted.err);
+        ret;
+    }
+    map.clear_by[View, u32](?p.values);
+    map.clear_by[View, u32](?p.blocks);
+    var f:     Function            = function.init(p.a, r.env.set);
+    var lines: vector.Vector[Line] = vector.init[Line](p.a);
+    fin { vector.dnit[Line](?lines); }
+    declare(r, ?f, ?lines);
+    var i: usize = 0;
+    for (i < lines.len && state.ok(p)) {
+        instruction(r, ?f, lines.data[i]);
+        i = i + 1;
+    }
+    state.expect(p, lexer.RBRACE, "}");
+    state.expect_end(p);
+    if (state.ok(p)) {
+        val pushed: res[usize, allocator.Error] = vector.push[Item](?u.items, Item{symbol: found.some, function: f});
+        if (sel pushed.err) { state.refuse_alloc(p, pushed.err); }
+    }
+    if (!state.ok(p) || sel p.failed.some) { function.dnit(?f); }
+}
+
+fun read(a: *allocator.Allocator, m: *Module, env: *Env, text: View, versioned: bool) res[Unit, Refusal] {
+    var p: Parser;
+    state.init(?p, a, text);
+    fin { state.dnit(?p); }
+    val target: Token        = reader.header(?p, versioned);
+    val early:  opt[Refusal] = p.failed;
+    if (sel early.some) { ret res[Unit, Refusal].err{early.some}; }
+    if (!slice.same_view(target.text, module.target(m))) {
+        ret res[Unit, Refusal].err{Refusal{line: target.line, column: target.column, reason: Reason.expected{"the target of the module"}}};
+    }
+    state.attach(?p, m);
+    val made: res[Index, allocator.Error] = index.init(a, env.set);
+    if (sel made.err) {
+        ret res[Unit, Refusal].err{Refusal{line: target.line, column: target.column, reason: Reason.alloc{made.err}}};
+    }
+    var x: Index = made.ok;
+    fin { index.dnit(?x); }
+    var r:    Reading              = Reading{p: ?p, env: env, x: ?x};
+    var u:    Unit                 = Unit{a: a, items: vector.init[Item](a)};
+    var seen: map.MapBy[View, u32] = map.init_by[View, u32](a, hash_name, same_name);
+    fin { map.dnit_by[View, u32](?seen); }
+    for (state.ok(?p) && !state.is(?p, lexer.END)) {
+        if (state.accept(?p, lexer.NEWLINE)) {}
+        or (state.is_word(?p, "function"))   { function_item(?r, ?u, ?seen); }
+        or                                   { state.expected(?p, "a function"); }
+    }
+    val failed: opt[Refusal] = p.failed;
+    if (sel failed.some) {
+        dnit(?u);
+        ret res[Unit, Refusal].err{failed.some};
+    }
+    ret res[Unit, Refusal].ok{u};
+}
+
+# read a machine form text that begins with its version line
+# ---
+# a:    the allocator the functions take
+# m:    the module whose symbols and debug entries the text names, and whose
+#       target the text names
+# env:  what the names of the text mean
+# text: the text, which a refusal's names are views of
+# ret:  the functions, which the caller releases, or the first line refused
+pub fun parse(a: *allocator.Allocator, m: *Module, env: *Env, text: View) res[Unit, Refusal] {
+    ret read(a, m, env, text, true);
+}
+
+# read a machine form text that has no version line, as the machine text files
+# of the tree do, so a file stays valid across releases
+pub fun parse_body(a: *allocator.Allocator, m: *Module, env: *Env, text: View) res[Unit, Refusal] {
+    ret read(a, m, env, text, false);
+}
