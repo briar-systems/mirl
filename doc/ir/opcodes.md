@@ -515,7 +515,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - typing:
   - `address` is a pointer
 - results: none
-- effects: writes memory
+- effects: writes memory, may be kept
   - traps when the address in `address` cannot be accessed
 - secrecy: no results
 - vector: none
@@ -940,7 +940,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
   - `byte` is an integer of width 8
   - `length` is an integer
 - results: none
-- effects: writes memory
+- effects: writes memory, may be kept
   - traps when the address in `destination` cannot be accessed
 - secrecy: no results
 - vector: none

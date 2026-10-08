@@ -110,7 +110,7 @@ An instruction is an opcode applied to operands, immediates and edges, with resu
 - **immediates** are facts of the instruction that are not values, such as a type, an alignment, a memory ordering or a lane index. A row states one per slot, in order.
 - **edges** pair a target block with its arguments.
 - **results** are the values the instruction defines, in order. A row derives their types.
-- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile`), its secrecy mark and the debug bindings of the variables whose storage its result addresses.
+- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile` and `kept`), its secrecy mark and the debug bindings of the variables whose storage its result addresses.
 
 A variable's value is bound by a **value binding record** at a program point of a block, before an instruction or at the block's entry. A record is not an instruction and no instruction walk sees it. It reads a value and a salvage expression over it, or nothing when what it read is gone, and reading a value is never a use of it (see [ir/debug.md](ir/debug.md)).
 
@@ -147,6 +147,7 @@ A row states what executing an instance may do beyond giving its results.
 - whether it **reads** or **writes** memory,
 - whether it is **speculatable**, so that it may run where its result is not needed. A speculatable row never traps, reads or writes.
 - whether it is **mergeable**, so that two instances with the same operands give the same results and one may stand for both. A mergeable row never writes. A row with a memory ordering is never speculatable or mergeable.
+- whether it is **keepable**, so that an instance may carry the `kept` flag (see section 6.5). A keepable row writes memory, never reads it, is not mergeable and has no memory ordering. The keepable rows are `store` and `mem.fill`.
 
 
 ## 6. Semantics
@@ -210,6 +211,16 @@ The memory of a stack slot holds no defined value until it is stored to, and it 
 `mem.copy` copies a byte count between two addresses, and the ranges may overlap. `mem.fill` sets a byte count at an address to one byte value.
 
 A `volatile` flag on an instruction makes its memory access observable. It is never merged, moved or removed.
+
+A `kept` flag on a store or a fill makes its write a fixed fact. It is how a front end wipes memory that held a secret. The mark is a fact of the instruction, stated once in its metadata record, and every pass reads it from there. The one checker refuses it on an instance of a row that is not keepable, so the builder never makes such an instruction and the verifier's typing rule refuses one.
+
+- No pass removes a kept write, narrows it, merges it with another write or forwards its value away, even when the memory is dead afterwards, as on a slot about to leave scope or a buffer about to be freed. Dead store removal, stack promotion, scalar replacement, load forwarding and store merging all hold it fixed. Stack promotion refuses a slot that a kept write stores into, so the write stays.
+- Kept writes keep their order relative to each other.
+- A kept write's length and timing depend on its size alone, never on the bytes it writes, so the bytes may be secret and the write is compatible with constant time.
+- Kept is not volatile. It does not stop unrelated memory operations from moving around it, and it never makes the access observable to anything other than memory.
+- `set_metadata` may set the mark and refuses to take it off, and `supplant` refuses to put an instruction without the mark in the place of one with it. `erase` and `remove_dead` refuse a placed kept instruction, so no pass can take one away alone. Every edit and copy that moves or copies an instruction carries its metadata record whole, so the mark goes with it. A kept write goes only with a set of blocks no edge from outside enters and that does not hold the entry, through `erase_unreached`, since it can never run there. The undo of an edit (`rewind`, `restore`) puts back what was, and is no removal.
+
+Legalisation and emission inherit an obligation for a kept fill. It is never lowered to a call of an external or preemptible symbol, such as a library `memset` that the linker may resolve to anything, including a routine an optimiser later folds away. A kept fill is either expanded inline into kept stores, or it calls a helper that mirl emits itself, local to the module, whose own stores are kept. This holds for a fill whose length is known only at run time as much as for a constant one. Any rewrite of a kept store into other stores, such as a split of a wide store, marks every store it makes kept.
 
 An atomic access is over integers only. `atomic.load` and `atomic.store` access an integer of the stated type. The read-modify-write opcodes (`atomic.add`, `atomic.sub`, `atomic.and`, `atomic.or`, `atomic.xor`, `atomic.nand`, `atomic.xchg`, `atomic.smax`, `atomic.smin`, `atomic.umax`, `atomic.umin`) give the value held before the update. `atomic.cmpxchg` gives the value held before and an `i1` that is 1 when the exchange happened. Each states its ordering as an immediate. A load may be `relaxed`, `acquire` or `seq_cst`. A store may be `relaxed`, `release` or `seq_cst`. A read-modify-write may state any ordering, and the failure ordering of a compare and exchange is a load ordering. `fence` states `acquire`, `release`, `acq_rel` or `seq_cst`.
 
