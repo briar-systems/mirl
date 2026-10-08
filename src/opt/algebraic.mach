@@ -1,0 +1,377 @@
+# algebraic simplification: an operation the identities of its opcode make
+# redundant is replaced by what it gives
+#
+# the identities are the facts of the algebra table, read against the opcode
+# rows and never listed here: an element that leaves the other operand as it
+# is, an element that absorbs it, an element that leaves zero, what two equal
+# operands give, and what an operation of one operand gives twice over. an
+# integer constant is such an element when every lane of it at its full width
+# says so.
+#
+# a rewrite never removes a trap: the opcode's row states what traps, and an
+# element in the position the trap reads is left alone. the constant an
+# operation gives on equal operands is asked of the folder, never worked out
+# here. two constants are the folder's to fold. a float operation is simplified
+# only where the algebra table states an identity exact for every bit pattern,
+# which is a sign flip twice and a magnitude taken twice, since both change a
+# sign bit and nothing else. a sum with zero, a product with one and the rest
+# change a signalling not-a-number, a negative zero or a not-a-number's
+# payload, so no entry states them.
+#
+# a result keeps its secrecy. a secret result is never given a public value,
+# since a constant is public and a secret zero can only be computed from a
+# secret, so the instruction is left, and so is one marked secret or kept. the
+# pass adds no branch on a value, so it keeps constant time. work is queued by what it reads, and a
+# replaced value queues its users, so the pass reaches a fixed point without
+# rescanning the function.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use folder: mirl.fold;
+use mirl.fold.algebra;
+use mirl.fold.algebra.Algebra;
+use mirl.fold.algebra.Element;
+use mirl.fold.algebra.Facts;
+use mirl.fold.word;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.constant.Bits;
+use mirl.ir.function.Body;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Row;
+use mirl.ir.opcode.Trap;
+use mirl.ir.opcode.Traps;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Def;
+use mirl.opt.number;
+use mirl.opt.queue;
+use mirl.pass.analysis;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+
+# the pass: it adds and removes instructions and never touches the graph
+pub val ALGEBRAIC: Pass = Pass{name: "algebraic", kind: Kind.optimise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}};
+
+# what an instruction is found to give
+# ---
+# nothing:       no identity applies
+# value:         a value that already stands, that replaces the result
+# vanish:        zero
+# equal_zero:    zero, from two equal operands
+# equal_settled: what the operation gives on two equal operands, which is one
+#                constant whatever they are
+tag Found: u8 {
+    nothing;
+    value: Value;
+    vanish;
+    equal_zero;
+    equal_settled;
+}
+
+# one visit
+# ---
+# m:       the module
+# f:       the function
+# b:       its body
+# scratch: storage for one instruction at a time, reset between them
+# q:       the instructions to look at
+# changed: the function was changed
+rec Work {
+    m:       *Module;
+    f:       Function;
+    b:       *Body;
+    scratch: *allocator.Allocator;
+    q:       queue.Queue;
+    changed: bool;
+}
+
+fun constant(w: *Work, v: Value) bool {
+    val def: Def = w.b.values.data[v.index].def;
+    ret sel def.constant;
+}
+
+# whether a constant value is an element in every lane at its full width
+fun holds(w: *Work, v: Value, e: Element) res[bool, Why] {
+    val got: res[opt[folder.Value], Why] = number.read(w.m, w.b, w.scratch, v);
+    if (sel got.err)     { ret res[bool, Why].err{got.err}; }
+    if (sel got.ok.none) { ret res[bool, Why].ok{false}; }
+    var n: usize = 0;
+    for (n < got.ok.some.lanes.size) {
+        val bits:  Bits                     = got.ok.some.lanes.data[n];
+        val width: res[u32, folder.Refusal] = folder.bits_of(?w.m.types, bits.type);
+        if (sel width.err) { ret res[bool, Why].err{number.refusal(width.err)}; }
+        val x:   word.Wide = word.of(bits.words);
+        var yes: bool      = false;
+        if (sel e.zero) { yes = word.is_zero(x); }
+        or (sel e.one)  { yes = word.compare(x, word.small(1)) == 0; }
+        or (sel e.ones) { yes = word.compare(x, word.ones(width.ok)) == 0; }
+        if (!yes)       { ret res[bool, Why].ok{false}; }
+        n = n + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
+
+# whether the row traps for an operand that is this constant at this position
+fun trips(w: *Work, row: *Row, pos: u32, v: Value) res[bool, Why] {
+    var n: usize = 0;
+    for (n < $length_of(Traps)) {
+        val t: Trap = row.effects.traps[n];
+        if (sel t.zero) {
+            if (t.zero == pos) {
+                val h: res[bool, Why] = holds(w, v, Element.zero{});
+                if (sel h.err) { ret h; }
+                if (h.ok)      { ret h; }
+            }
+        }
+        or (sel t.overflow) {
+            if (t.overflow.divisor == pos) {
+                val h: res[bool, Why] = holds(w, v, Element.ones{});
+                if (sel h.err) { ret h; }
+                if (h.ok)      { ret h; }
+            }
+        }
+        or (!(sel t.unstated)) { ret res[bool, Why].ok{true}; }
+        n = n + 1;
+    }
+    ret res[bool, Why].ok{false};
+}
+
+# whether the row can trap at all
+fun traps(row: *Row) bool {
+    var n: usize = 0;
+    for (n < $length_of(Traps)) {
+        if (!(sel row.effects.traps[n].unstated)) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# the identity of an operation whose two operands are one value
+fun equal(f: Facts, row: *Row, a: Value) Found {
+    if (traps(row))         { ret Found.nothing{}; }
+    if (sel f.same.operand) { ret Found.value{a}; }
+    if (sel f.same.zero)    { ret Found.equal_zero{}; }
+    if (sel f.same.settled) { ret Found.equal_settled{}; }
+    ret Found.nothing{};
+}
+
+# the identities of an operation with a constant at position s
+fun element(w: *Work, d: *InstructionData, row: *Row, f: Facts, s: u32) res[Found, Why] {
+    val e:     Value = d.operands.data[s];
+    val other: Value = d.operands.data[1 - s];
+    if (!constant(w, e)) { ret res[Found, Why].ok{Found.nothing{}}; }
+    if (!(sel f.neutral.none)) {
+        val h: res[bool, Why] = holds(w, e, f.neutral);
+        if (sel h.err) { ret res[Found, Why].err{h.err}; }
+        if (h.ok) {
+            val t: res[bool, Why] = trips(w, row, s, e);
+            if (sel t.err) { ret res[Found, Why].err{t.err}; }
+            if (!t.ok)     { ret res[Found, Why].ok{Found.value{other}}; }
+        }
+    }
+    if (!(sel f.absorbing.none)) {
+        val h: res[bool, Why] = holds(w, e, f.absorbing);
+        if (sel h.err) { ret res[Found, Why].err{h.err}; }
+        if (h.ok) {
+            val t: res[bool, Why] = trips(w, row, s, e);
+            if (sel t.err) { ret res[Found, Why].err{t.err}; }
+            if (!t.ok)     { ret res[Found, Why].ok{Found.value{e}}; }
+        }
+    }
+    if (!(sel f.vanishing.none) && s == 1) {
+        val h: res[bool, Why] = holds(w, e, f.vanishing);
+        if (sel h.err) { ret res[Found, Why].err{h.err}; }
+        if (h.ok) {
+            val t: res[bool, Why] = trips(w, row, s, e);
+            if (sel t.err) { ret res[Found, Why].err{t.err}; }
+            if (!t.ok)     { ret res[Found, Why].ok{Found.vanish{}}; }
+        }
+    }
+    ret res[Found, Why].ok{Found.nothing{}};
+}
+
+fun binary(w: *Work, d: *InstructionData, row: *Row, a: Algebra) res[Found, Why] {
+    val x: Value = d.operands.data[0];
+    val y: Value = d.operands.data[1];
+    if (constant(w, x) && constant(w, y)) { ret res[Found, Why].ok{Found.nothing{}}; }
+    if (x.index == y.index)               { ret res[Found, Why].ok{equal(a.facts, row, x)}; }
+    val right: res[Found, Why] = element(w, d, row, a.facts, 1);
+    if (sel right.err)           { ret right; }
+    if (!(sel right.ok.nothing)) { ret right; }
+    if (!a.commutative)          { ret right; }
+    ret element(w, d, row, a.facts, 0);
+}
+
+# the identity of an operation applied to the result of the same operation
+fun unary(w: *Work, d: *InstructionData, row: *Row, a: Algebra) Found {
+    val x:   Value = d.operands.data[0];
+    val def: Def   = w.b.values.data[x.index].def;
+    if (!(sel def.result)) { ret Found.nothing{}; }
+    if (traps(row))        { ret Found.nothing{}; }
+    val inner: *InstructionData = ?w.b.instructions.data[def.result.instruction.index];
+    if (inner.opcode.index != d.opcode.index || inner.operands.len != 1 || !(sel inner.place.placed)) { ret Found.nothing{}; }
+    if (sel a.facts.twice.undo)                                                                       { ret Found.value{inner.operands.data[0]}; }
+    if (sel a.facts.twice.same)                                                                       { ret Found.value{x}; }
+    ret Found.nothing{};
+}
+
+fun find(w: *Work, d: *InstructionData) res[Found, Why] {
+    val got: opt[Row] = opcode.row(d.opcode);
+    if (sel got.none) { ret res[Found, Why].ok{Found.nothing{}}; }
+    var row: Row     = got.some;
+    val a:   Algebra = algebra.algebra(d.opcode);
+    val n:   u32     = opcode.fixed(?row);
+    if (d.operands.len != n::usize) { ret res[Found, Why].ok{Found.nothing{}}; }
+    if (n == 2)                     { ret binary(w, d, ?row, a); }
+    if (n == 1)                     { ret res[Found, Why].ok{unary(w, d, ?row, a)}; }
+    ret res[Found, Why].ok{Found.nothing{}};
+}
+
+# replace an instruction's result by a value and take the instruction out
+fun swap(w: *Work, i: Instruction, old: Value, new: Value) err[Why] {
+    var users: vector.Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin { vector.dnit[Instruction](?users); }
+    val copied: err[Why] = queue.copy_uses(w.b, old, ?users);
+    if (sel copied.err) { ret copied; }
+    val r: err[Why] = failure.edit(body.replace(w.m, w.f, old, new, Records.follow{}));
+    if (sel r.err) { ret r; }
+    val gone: err[Why] = failure.edit(body.erase(w.m, w.f, i));
+    if (sel gone.err) { ret gone; }
+    w.changed = true;
+    ret queue.want_all(?w.q, ?users);
+}
+
+# the constant an operation gives on two zeros of its operands' type
+fun settled(w: *Work, d: *InstructionData, ty: Type) res[opt[Value], Why] {
+    val zero: res[folder.Value, Why] = number.zero_of(w.m, w.scratch, ty);
+    if (sel zero.err) { ret res[opt[Value], Why].err{zero.err}; }
+    var ops: [2]folder.Operand = [2]folder.Operand{folder.Operand{value: zero.ok, secret: false}, folder.Operand{value: zero.ok, secret: false}};
+    val req: folder.Request    = folder.Request{opcode: d.opcode, operands: Slice[folder.Operand]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: d.immediates.data, size: d.immediates.len}};
+    val out: folder.Outcome    = folder.fold(w.scratch, ?w.m.types, req);
+    if (sel out.refused) {
+        if (sel out.refused.unfoldable || sel out.refused.trap) { ret res[opt[Value], Why].ok{opt[Value].none{}}; }
+        ret res[opt[Value], Why].err{number.refusal(out.refused)};
+    }
+    if (out.folded.results.size != 1) { ret res[opt[Value], Why].err{Why.reason{"the folder gave a different number of results than the instruction has"}}; }
+    val at: res[Value, Why] = number.place(w.m, w.f, w.scratch, out.folded.results.data[0]);
+    if (sel at.err) { ret res[opt[Value], Why].err{at.err}; }
+    ret res[opt[Value], Why].ok{opt[Value].some{at.ok}};
+}
+
+# the zero of a type as a value of the function, as a folded zero stands
+fun zero(w: *Work, ty: Type) res[Value, Why] {
+    val z: res[folder.Value, Why] = number.zero_of(w.m, w.scratch, ty);
+    if (sel z.err) { ret res[Value, Why].err{z.err}; }
+    ret number.place(w.m, w.f, w.scratch, z.ok);
+}
+
+# act on what an instruction was found to give
+fun apply(w: *Work, i: Instruction, found: Found) err[Why] {
+    val old:    Value = w.b.instructions.data[i.index].results.data[0];
+    val ty:     Type  = w.b.values.data[old.index].type;
+    val secret: bool  = w.b.values.data[old.index].secret;
+    if (sel found.value) {
+        val new: Value = found.value;
+        if (!types.same(w.b.values.data[new.index].type, ty)) { ret err[Why].ok{}; }
+        if (secret && !w.b.values.data[new.index].secret)     { ret err[Why].ok{}; }
+        ret swap(w, i, old, new);
+    }
+    val operand: Type = w.b.values.data[w.b.instructions.data[i.index].operands.data[0].index].type;
+    if (secret) { ret err[Why].ok{}; }
+    if (sel found.equal_settled) {
+        val at: res[opt[Value], Why] = settled(w, ?w.b.instructions.data[i.index], operand);
+        if (sel at.err)     { ret err[Why].err{at.err}; }
+        if (sel at.ok.none) { ret err[Why].ok{}; }
+        ret swap(w, i, old, at.ok.some);
+    }
+    val z: res[Value, Why] = zero(w, ty);
+    if (sel z.err) { ret err[Why].err{z.err}; }
+    ret swap(w, i, old, z.ok);
+}
+
+# whether the instruction is one the pass may rewrite
+fun open(d: *InstructionData) bool {
+    if (!(sel d.place.placed))     { ret false; }
+    if (d.metadata.flags.volatile) { ret false; }
+    if (d.metadata.flags.kept)     { ret false; }
+    if (d.metadata.secret)         { ret false; }
+    ret d.results.len == 1;
+}
+
+fun simplify(w: *Work, i: Instruction) err[Why] {
+    val d: *InstructionData = ?w.b.instructions.data[i.index];
+    if (!open(d)) { ret err[Why].ok{}; }
+    val found: res[Found, Why] = find(w, d);
+    if (sel found.err)        { ret err[Why].err{found.err}; }
+    if (sel found.ok.nothing) { ret err[Why].ok{}; }
+    ret apply(w, i, found.ok);
+}
+
+# queue every instruction, the first to run first
+fun seed(w: *Work) err[Why] {
+    var k: usize = w.b.blocks.len;
+    for (k > 0) {
+        k = k - 1;
+        if (!w.b.blocks.data[k].erased) {
+            val list: *vector.Vector[Instruction] = ?w.b.blocks.data[k].instructions;
+            var n:    usize                       = list.len;
+            for (n > 0) {
+                n = n - 1;
+                val r: err[Why] = queue.want(?w.q, list.data[n]);
+                if (sel r.err) { ret r; }
+            }
+        }
+    }
+    ret err[Why].ok{};
+}
+
+# simplify one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var w: Work = Work{m: c.m, f: u.f, b: got.ok, scratch: ?scratch, q: queue.init(c.m.a), changed: false};
+    fin { queue.dnit(?w.q); }
+    val seeded: err[Why] = seed(?w);
+    if (sel seeded.err) { ret res[bool, Why].err{seeded.err}; }
+    for (!queue.empty(?w.q)) {
+        val i: Instruction = queue.take(?w.q);
+        arena.reset(?ar);
+        val r: err[Why] = simplify(?w, i);
+        if (sel r.err) { ret res[bool, Why].err{r.err}; }
+    }
+    ret res[bool, Why].ok{w.changed};
+}
