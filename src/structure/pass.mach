@@ -1,0 +1,265 @@
+# the structurizer as a legalisation: it runs where the target declares that
+# control flow must be structured, and rewrites any graph until its shape is
+#
+# each round mends the first flaw the shape finds, threads every value the
+# rewrite left short of a use, and asks again, until the graph is structured.
+# the tree of regions is then the structure analysis of the function, cached
+# for the emitter, so it is always read from the graph as it is and no side
+# table can drift from it.
+#
+# it keeps constant time. a function that requires it branches on no secret,
+# so every branch a dispatch replaces is public, every selector is public and
+# every test of one is a branch on public data, of fixed latency and taken
+# along public paths only. splitting copies blocks without changing what runs
+# along any path. a selector replacing a secret branch is itself secret, so a
+# function that breaks the requirement still shows that it does.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.allocator.page;
+use std.format;
+use io: std.io.writer;
+
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.id.Function;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.text.equal;
+use mirl.ir.text.parse.parse_body;
+use mirl.ir.text.parse.refusal.Refusal;
+use mirl.ir.text.printer;
+use mirl.ir.text.sink;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.record.applies;
+use mirl.structure.region;
+use mirl.structure.region.Structure;
+use mirl.structure.repair;
+use mirl.structure.rewrite;
+use mirl.structure.shape;
+use mirl.structure.shape.Flaw;
+use mirl.structure.shape.Work;
+use targets: mirl.target;
+use mirl.target.Capabilities;
+use mirl.target.Control;
+use mirl.target.Target;
+use mirl.verify;
+
+# the pass: it reshapes the graph, recomputes every analysis after its last
+# edit and leaves them all, the structure among them, valid
+pub val STRUCTURIZE: Pass = Pass{name: "structure", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: cache.ALL, time: Time.keeps{}, applies: structured};
+
+# whether a target needs structured control flow
+fun structured(caps: *Capabilities) bool {
+    ret sel caps.control.structured;
+}
+
+fun forgotten(c: *cache.Cache, f: Function) err[Why] {
+    val r: err[allocator.Error] = cache.forget(c, f);
+    if (sel r.err) { ret err[Why].err{Why.alloc{r.err}}; }
+    ret err[Why].ok{};
+}
+
+# one round: thread values the last rewrite left short, or mend the first
+# flaw, or find the graph structured
+# ---
+# ret: whether it changed the function, none once the graph is structured
+fun step(u: *Unit, w: *Work) res[opt[bool], Why] {
+    val c: *cache.Cache     = u.context.cache;
+    val m: *Module          = u.context.m;
+    val g: res[*Graph, Why] = analysis.graph_of(c, u.f);
+    if (sel g.err) { ret res[opt[bool], Why].err{g.err}; }
+    val d: res[*Dominance, Why] = analysis.dominance_of(c, u.f);
+    if (sel d.err) { ret res[opt[bool], Why].err{d.err}; }
+    val l: res[*Loops, Why] = analysis.loops_of(c, u.f);
+    if (sel l.err) { ret res[opt[bool], Why].err{l.err}; }
+    val threaded: res[bool, Why] = repair.repair(m, u.f, d.ok);
+    if (sel threaded.err) { ret res[opt[bool], Why].err{threaded.err}; }
+    if (threaded.ok)      { ret res[opt[bool], Why].ok{opt[bool].some{true}}; }
+    var s: Structure = region.init(m.a);
+    fin { region.dnit(?s); }
+    val found: res[opt[Flaw], allocator.Error] = shape.find(m.a, g.ok, d.ok, l.ok, w, ?s);
+    if (sel found.err)     { ret res[opt[bool], Why].err{Why.alloc{found.err}}; }
+    if (sel found.ok.none) { ret res[opt[bool], Why].ok{opt[bool].none{}}; }
+    val mended: err[Why] = rewrite.mend(m, u.f, g.ok, d.ok, found.ok.some, w);
+    if (sel mended.err) { ret res[opt[bool], Why].err{mended.err}; }
+    ret res[opt[bool], Why].ok{opt[bool].some{true}};
+}
+
+# the most rounds a function of b blocks and e edges takes
+#
+# no rewrite but a tangle's makes or keeps a cycle entered at two blocks, and
+# each tangle's takes its entries out of every cycle left, so there are at
+# most b of those. a latch is mended once per header, and only a tangle makes
+# a header. an exit or a merge is mended at the outermost construct a walk
+# from the entry finds unsettled, its edges then leaving through one block,
+# and a later rewrite unsettles it again only by mending a construct nested
+# in it, which it does at most once for each of the b constructs around an
+# edge's source. so every edge is moved at most b + 1 times, every move is a
+# round, and a round that threads values follows each one.
+fun rounds(b: usize, e: usize) usize {
+    ret 2 * (b + e + 1) * (b + 2) + 64;
+}
+
+fun edges(g: *Graph) usize {
+    var n: usize = 0;
+    var i: u32   = 0;
+    for (i < g.count) {
+        n = n + graph.successors(g, i).size;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# structure one function, refusing one that has not settled within the
+# rounds its graph as given can take
+fun visit(u: *Unit) res[bool, Why] {
+    val m: *Module          = u.context.m;
+    val g: res[*Graph, Why] = analysis.graph_of(u.context.cache, u.f);
+    if (sel g.err) { ret res[bool, Why].err{g.err}; }
+    val limit:   usize = rounds(g.ok.count::usize, edges(g.ok));
+    var rounds:  usize = 0;
+    var changed: bool  = false;
+    var w:       Work  = shape.init(m.a);
+    fin { shape.dnit(?w); }
+    for {
+        val r: res[opt[bool], Why] = step(u, ?w);
+        if (sel r.err)     { ret res[bool, Why].err{r.err}; }
+        if (sel r.ok.none) { brk; }
+        changed = true;
+        val dropped: err[Why] = forgotten(u.context.cache, u.f);
+        if (sel dropped.err) { ret res[bool, Why].err{dropped.err}; }
+        rounds = rounds + 1;
+        if (rounds > limit) { ret res[bool, Why].err{Why.reason{"the graph did not settle into a structured shape"}}; }
+    }
+    val s: res[*Structure, Why] = analysis.structure_of(u.context.cache, u.f);
+    if (sel s.err) { ret res[bool, Why].err{s.err}; }
+    ret res[bool, Why].ok{changed};
+}
+
+# the target of the tests: the first row that requires structured control
+# flow, or while no row does, one that leaves it free declared to require it
+#[testing]
+fun target(t: *Target) bool {
+    val structured: opt[*Target] = targets.first(targets.requires_structure);
+    val free:       opt[*Target] = targets.first(targets.leaves_control_free);
+    if (sel structured.some) { @t = @structured.some; }
+    or (sel free.some)       { @t = @free.some; }
+    or                       { ret false; }
+    t.caps.control = Control.structured{};
+    ret true;
+}
+
+# a module of ir text, after a line naming the target
+#[testing]
+fun parsed(a: *allocator.Allocator, t: *Target, body: str, out: *Module) bool {
+    var text: sink.Sink = sink.init(a);
+    fin { sink.dnit(?text); }
+    var w: io.Writer = sink.writer(?text);
+    format.write_str(?w, "target \"");
+    format.write_str(?w, t.name);
+    format.write_str(?w, "\"\n");
+    format.write_str(?w, body);
+    val r: res[Module, Refusal] = parse_body(a, sink.view(?text));
+    if (sel r.err) { ret false; }
+    @out = r.ok;
+    ret true;
+}
+
+# run the structurizer over every function of before, verify the module and
+# compare it with after, then check that a second run changes nothing and
+# leaves each function's structure cached
+#[testing]
+fun check(before: str, after: str) i32 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var t: Target;
+    if (!target(?t))                     { ret 1; }
+    if (!applies(?STRUCTURIZE, ?t.caps)) { ret 1; }
+    var m: Module;
+    if (!parsed(?a, ?t, before, ?m)) { ret 2; }
+    fin { module.dnit(?m); }
+    var want: Module;
+    if (!parsed(?a, ?t, after, ?want)) { ret 3; }
+    fin { module.dnit(?want); }
+    var c: cache.Cache = cache.init(?m, ?t, analysis.rows());
+    fin { cache.dnit(?c); }
+    var x: Context = Context{m: ?m, t: ?t, cache: ?c, pass: ?STRUCTURIZE};
+    var f: usize   = 0;
+    for (f < m.functions.len) {
+        var u: Unit           = Unit{context: ?x, f: Function{index: f::u32}};
+        val r: res[bool, Why] = visit(?u);
+        if (sel r.err) { ret 4; }
+        f = f + 1;
+    }
+    val checked: err[verify.Error] = verify.against(?m, ?t);
+    if (sel checked.err) { ret 5; }
+    val same: res[bool, printer.Error] = equal.same(?m, ?want);
+    if (sel same.err) { ret 6; }
+    if (!same.ok)     { ret 6; }
+    f = 0;
+    for (f < m.functions.len) {
+        var u: Unit           = Unit{context: ?x, f: Function{index: f::u32}};
+        val r: res[bool, Why] = visit(?u);
+        if (sel r.err)                                { ret 7; }
+        if (sel r.ok && r.ok)                         { ret 7; }
+        if (!cache.held(?c, u.f, analysis.STRUCTURE)) { ret 8; }
+        f = f + 1;
+    }
+    ret 0;
+}
+
+test structure__irreducible_gets_a_dispatch {
+    # the later entry of @split holds one instruction, so it is split. that of
+    # @dispatch holds three, more than the dispatch over two entries, so the
+    # cycle is entered through a dispatch, which is then the loop's header
+    val before: str = "function @split: fun(i1, i32) -> (i32) {\n^entry(%c: i1, %x: i32):\n    cbr %c, ^a(%x), ^b(%x)\n^a(%p: i32):\n    %q = add %p, i32 1\n    %t = lt.s %q, i32 10\n    cbr %t, ^b(%q), ^out(%q)\n^b(%r: i32):\n    br ^a(%r)\n^out(%v: i32):\n    ret %v\n}\nfunction @dispatch: fun(i1, i32) -> (i32) {\n^entry(%c: i1, %x: i32):\n    cbr %c, ^a(%x), ^b(%x)\n^a(%p: i32):\n    %q = add %p, i32 1\n    %t = lt.s %q, i32 10\n    cbr %t, ^b(%q), ^out(%q)\n^b(%r: i32):\n    %s = mul %r, i32 3\n    %u = sub %s, i32 1\n    br ^a(%u)\n^out(%v: i32):\n    ret %v\n}\n";
+    val after:  str = "function @split: fun(i1, i32) -> (i32) {\n^entry(%c: i1, %x: i32):\n    cbr %c, ^a(%x), ^b2(%x)\n^a(%p: i32):\n    %q = add %p, i32 1\n    %t = lt.s %q, i32 10\n    cbr %t, ^b(%q), ^out(%q)\n^b(%r: i32):\n    br ^a(%r)\n^out(%v: i32):\n    ret %v\n^b2(%r2: i32):\n    br ^a(%r2)\n}\nfunction @dispatch: fun(i1, i32) -> (i32) {\n^entry(%c: i1, %x: i32):\n    cbr %c, ^head(i32 0, %x, i32 zero), ^second(i32 1, i32 zero, %x)\n^a(%p: i32):\n    %q = add %p, i32 1\n    %t = lt.s %q, i32 10\n    cbr %t, ^latch(i32 1, i32 zero, %q), ^out(%q)\n^b(%r: i32):\n    %s = mul %r, i32 3\n    %u = sub %s, i32 1\n    br ^latch(i32 0, %u, i32 zero)\n^out(%v: i32):\n    ret %v\n^head(%case: i32, %to_a: i32, %to_b: i32):\n    %is_a = eq %case, i32 0\n    cbr %is_a, ^a(%to_a), ^b(%to_b)\n^second(%c1: i32, %a1: i32, %b1: i32):\n    br ^head(%c1, %a1, %b1)\n^latch(%c2: i32, %a2: i32, %b2: i32):\n    br ^head(%c2, %a2, %b2)\n}\n";
+    ret check(before, after);
+}
+
+test structure__two_exits_leave_through_one {
+    # each loop leaves to two blocks, so both exits of each enter one
+    # synthetic exit that dispatches to them. in @find the found branch tests
+    # a secret, so the selector is secret. in @nest the inner body returns
+    # past the outer loop: the inner exit passes the case it was left by on to
+    # the outer loop's exit, so each loop leaves only through its own
+    val before: str = "function @find: fun(i32, i32) -> (i32) {\n^entry(%n: i32, %k: secret i32):\n    br ^head(i32 0)\n^head(%i: i32):\n    %more = lt.s %i, %n\n    cbr %more, ^body, ^none\n^body:\n    %hit = eq %i, %k\n    cbr %hit, ^found(%i), ^next\n^next:\n    %j = add %i, i32 1\n    br ^head(%j)\n^found(%r: i32):\n    ret %r\n^none:\n    ret i32 0\n}\nfunction @nest: fun(i32) -> (i32) {\n^entry(%n: i32):\n    br ^outer(i32 0)\n^outer(%i: i32):\n    %o = lt.s %i, %n\n    cbr %o, ^inner(i32 0), ^done\n^inner(%j: i32):\n    %p = lt.s %j, %n\n    cbr %p, ^body, ^onext\n^body:\n    %s = add %i, %j\n    %hit = eq %s, i32 7\n    cbr %hit, ^early(%s), ^jnext\n^jnext:\n    %j1 = add %j, i32 1\n    br ^inner(%j1)\n^onext:\n    %i1 = add %i, i32 1\n    br ^outer(%i1)\n^early(%r: i32):\n    ret %r\n^done:\n    ret i32 0\n}\n";
+    val after:  str = "function @find: fun(i32, i32) -> (i32) {\n^entry(%n: i32, %k: secret i32):\n    br ^head(i32 0)\n^head(%i: i32):\n    %more = lt.s %i, %n\n    cbr %more, ^body, ^exit(i32 0, i32 zero)\n^body:\n    %hit = eq %i, %k\n    cbr %hit, ^exit(i32 1, %i), ^next\n^next:\n    %j = add %i, i32 1\n    br ^head(%j)\n^found(%r: i32):\n    ret %r\n^none:\n    ret i32 0\n^exit(%case: secret i32, %to_found: i32):\n    %is_none = eq %case, i32 0\n    cbr %is_none, ^none, ^found(%to_found)\n}\nfunction @nest: fun(i32) -> (i32) {\n^entry(%n: i32):\n    br ^outer(i32 0)\n^outer(%i: i32):\n    %o = lt.s %i, %n\n    cbr %o, ^inner(i32 0), ^outer_exit(i32 0, i32 zero)\n^inner(%j: i32):\n    %p = lt.s %j, %n\n    cbr %p, ^body, ^inner_exit(i32 0, i32 zero, i32 zero)\n^body:\n    %s = add %i, %j\n    %hit = eq %s, i32 7\n    cbr %hit, ^inner_exit(i32 1, i32 1, %s), ^jnext\n^jnext:\n    %j1 = add %j, i32 1\n    br ^inner(%j1)\n^onext:\n    %i1 = add %i, i32 1\n    br ^outer(%i1)\n^early(%r: i32):\n    ret %r\n^done:\n    ret i32 0\n^outer_exit(%oc: i32, %to_early: i32):\n    %is_done = eq %oc, i32 0\n    cbr %is_done, ^done, ^early(%to_early)\n^inner_exit(%ic: i32, %on_case: i32, %on_early: i32):\n    %is_onext = eq %ic, i32 0\n    cbr %is_onext, ^onext, ^outer_exit(%on_case, %on_early)\n}\n";
+    ret check(before, after);
+}
+
+test structure__selection_gets_one_merge {
+    # the arms of ^inner reconverge on ^join, the merge of the selection
+    # around it, so they meet first in a synthetic merge of their own
+    val before: str = "function @pick: fun(i1, i1, i32) -> (i32) {\n^entry(%a: i1, %b: i1, %x: i32):\n    cbr %a, ^inner, ^other\n^inner:\n    cbr %b, ^left, ^right\n^left:\n    %l = add %x, i32 1\n    br ^join(%l)\n^right:\n    %r = add %x, i32 2\n    br ^join(%r)\n^other:\n    br ^join(%x)\n^join(%v: i32):\n    ret %v\n}\n";
+    val after:  str = "function @pick: fun(i1, i1, i32) -> (i32) {\n^entry(%a: i1, %b: i1, %x: i32):\n    cbr %a, ^inner, ^other\n^inner:\n    cbr %b, ^left, ^right\n^left:\n    %l = add %x, i32 1\n    br ^merge(%l)\n^right:\n    %r = add %x, i32 2\n    br ^merge(%r)\n^other:\n    br ^join(%x)\n^join(%v: i32):\n    ret %v\n^merge(%m: i32):\n    br ^join(%m)\n}\n";
+    ret check(before, after);
+}
+
+test structure__block_arguments_survive {
+    # ^limit used %j, which ^step made and dominated it through. the synthetic
+    # exit joins ^step with ^head, so %j becomes an argument of ^limit that
+    # the exit carries in its place, passing zero for the other case
+    val before: str = "function @scan: fun(i32) -> (i32) {\n^entry(%n: i32):\n    br ^head(i32 0)\n^head(%i: i32):\n    %sq = mul %i, %i\n    %big = gt.s %sq, %n\n    cbr %big, ^over, ^step\n^step:\n    %j = add %i, i32 1\n    %done = eq %j, i32 100\n    cbr %done, ^limit, ^head(%j)\n^over:\n    ret %sq\n^limit:\n    ret %j\n}\n";
+    val after:  str = "function @scan: fun(i32) -> (i32) {\n^entry(%n: i32):\n    br ^head(i32 0)\n^head(%i: i32):\n    %sq = mul %i, %i\n    %big = gt.s %sq, %n\n    cbr %big, ^exit(i32 0, i32 zero), ^step\n^step:\n    %j = add %i, i32 1\n    %done = eq %j, i32 100\n    cbr %done, ^exit(i32 1, %j), ^head(%j)\n^over:\n    ret %sq\n^limit(%last: i32):\n    ret %last\n^exit(%case: i32, %to_limit: i32):\n    %is_over = eq %case, i32 0\n    cbr %is_over, ^over, ^limit(%to_limit)\n}\n";
+    ret check(before, after);
+}
