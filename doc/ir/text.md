@@ -1,6 +1,6 @@
 # The text form
 
-A module and its text are interchangeable. The text form is the printed form of a module, written for people and for tests, and a front end may write it instead of calling the builder. `mirl.ir.text.print(w, m)` writes a module to any `std.io.writer.Writer`, and `mirl.ir.text.same(a, b)` compares two modules for structural equality. The printer writes the grammar below and the reader of the text form reads it.
+A module and its text are interchangeable. The text form is the printed form of a module, written for people and for tests, and a front end may write it instead of calling the builder. `mirl.ir.text.print(w, m)` writes a module to any `std.io.writer.Writer`, and `mirl.ir.text.same(a, b)` compares two modules for structural equality. `mirl.ir.text.print` writes the grammar below. `mirl.ir.text.parse.parse(a, text)` reads a text that begins with its version line into a module, and `mirl.ir.text.parse.parse_body(a, text)` reads a text that has no version line, as the IR text files under `test/ir` do. A refusal names the line and the reason, and `mirl.ir.text.describe` spells it.
 
 ## Version and stability
 

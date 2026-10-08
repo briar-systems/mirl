@@ -234,8 +234,9 @@ The library refuses the edits that would make a secret value public by a path ot
 - A branch argument that is secret is refused for a parameter that is public. This applies when an instruction is built, when an edge is retargeted and when a block parameter is added with its incoming arguments.
 - `replace`, which moves every use of a value to another value, refuses a secret replacement for a public value.
 - `supplant`, which puts one instruction in the place of another, refuses a result that is secret where the one it replaces gave a public result.
+- `set_metadata`, which replaces an instruction's metadata record whole, may raise the secrecy mark and refuses to lower it, so the secrecy of a declared row's results cannot drift from the mark through this edit.
 
-An edit that replaces an instruction's metadata record whole is not refused, and the verifier holds what the edits do not, as a rule (see section 8). It reads the secrecy mark again, so a mark that no longer matches the stored results is refused. Every result must be secret exactly as its row's secrecy rule gives, and no edge may pass a secret value to a public parameter.
+The verifier states the same facts as a rule (see section 8). Every result must be secret exactly as its row's secrecy rule gives, and no edge may pass a secret value to a public parameter.
 
 ### 7.1 Constant time
 
