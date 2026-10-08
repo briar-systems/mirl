@@ -1,0 +1,556 @@
+# constant folding: an operation on constants becomes the constant it computes,
+# a branch on a constant condition becomes a jump, and a block parameter every
+# edge passes the same constant for becomes that constant
+#
+# the pass never evaluates an opcode. every operation goes to the constant
+# folder, which answers with the results or refuses, and a refusal leaves the
+# instruction to run, so a trap happens at run time. an instruction that is
+# volatile, kept or secret stays as it is, since a constant is public. work
+# is queued by what it reads: a replaced value queues its users, and an edge
+# that changes queues its target's parameters, so the pass reaches a fixed
+# point without rescanning the function. the blocks a folded branch cuts off
+# are removed so that a parameter is judged by the edges that can run. the pass
+# only removes work and adds no branch on a value, so it keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build;
+use mirl.build.Failure;
+use folder: mirl.fold;
+use mirl.fold.word;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.cfg.prune;
+use mirl.ir.constant.Aggregate;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Def;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+
+# the pass: it can remove blocks and values, so no analysis outlives it
+pub val FOLD: Pass = Pass{name: "fold", kind: Kind.optimise{}, scope: Scope.function{visit}, preserves: cache.NONE, time: Time.keeps{}};
+
+# one visit
+# ---
+# c:       the run
+# m:       the module
+# f:       the function
+# b:       its body
+# scratch: storage for one fold at a time, reset between folds
+# ready:   the instructions to look at, and whether each is queued
+# due:     the blocks whose parameters to look at, and whether each is queued
+# stale:   a branch changed, so the cached analyses of the function are wrong
+# cut_due: blocks may have become unreachable
+# changed: the function was changed
+rec Work {
+    c:       *Context;
+    m:       *Module;
+    f:       Function;
+    b:       *Body;
+    scratch: *allocator.Allocator;
+    ready:   vector.Vector[Instruction];
+    queued:  vector.Vector[u8];
+    due:     vector.Vector[Block];
+    waiting: vector.Vector[u8];
+    stale:   bool;
+    cut_due: bool;
+    changed: bool;
+}
+
+fun grow(v: *vector.Vector[u8], n: usize) err[Why] {
+    for (v.len < n) {
+        val pushed: res[usize, allocator.Error] = vector.push[u8](v, 0);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+    }
+    ret err[Why].ok{};
+}
+
+fun want(w: *Work, i: Instruction) err[Why] {
+    val sized: err[Why] = grow(?w.queued, i.index::usize + 1);
+    if (sel sized.err)               { ret sized; }
+    if (w.queued.data[i.index] != 0) { ret err[Why].ok{}; }
+    w.queued.data[i.index] = 1;
+    val pushed: res[usize, allocator.Error] = vector.push[Instruction](?w.ready, i);
+    if (sel pushed.err) { ret failure.lost(pushed.err); }
+    ret err[Why].ok{};
+}
+
+fun want_block(w: *Work, k: Block) err[Why] {
+    if (k.index == 0 || w.waiting.data[k.index] != 0) { ret err[Why].ok{}; }
+    w.waiting.data[k.index] = 1;
+    val pushed: res[usize, allocator.Error] = vector.push[Block](?w.due, k);
+    if (sel pushed.err) { ret failure.lost(pushed.err); }
+    ret err[Why].ok{};
+}
+
+# queue the instructions that use a value, and the parameters of the blocks
+# the ones that branch pass it to
+fun users(w: *Work, list: *vector.Vector[Instruction]) err[Why] {
+    var n: usize = 0;
+    for (n < list.len) {
+        val r: err[Why] = want(w, list.data[n]);
+        if (sel r.err) { ret r; }
+        val d: *InstructionData = ?w.b.instructions.data[list.data[n].index];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            val t: err[Why] = want_block(w, d.edges.data[e].block);
+            if (sel t.err) { ret t; }
+            e = e + 1;
+        }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# copy the users of a value, which the edit about to be made rewrites
+fun users_of(w: *Work, v: Value, out: *vector.Vector[Instruction]) err[Why] {
+    val list: *vector.Vector[Instruction] = ?w.b.values.data[v.index].uses;
+    var n:    usize                       = 0;
+    for (n < list.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Instruction](out, list.data[n]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun zeros(w: *Work, n: usize) res[Slice[u64], Why] {
+    val got: res[*u64, allocator.Error] = allocator.zallocate[u64](w.scratch, n);
+    if (sel got.err) { ret res[Slice[u64], Why].err{Why.alloc{got.err}}; }
+    ret res[Slice[u64], Why].ok{Slice[u64]{data: got.ok, size: n}};
+}
+
+# the bits of one lane of a constant, a zero given its words
+fun lane(w: *Work, ty: Type, c: ConstantData) res[Bits, Why] {
+    if (sel c.integer) { ret res[Bits, Why].ok{c.integer}; }
+    if (sel c.float)   { ret res[Bits, Why].ok{c.float}; }
+    if (!(sel c.zero)) { ret res[Bits, Why].err{Why.reason{"a number lane that is no number"}}; }
+    val bits: res[u32, folder.Refusal] = folder.bits_of(?w.m.types, ty);
+    if (sel bits.err) { ret res[Bits, Why].err{Why.reason{"a number lane whose width is unknown"}}; }
+    val ws: res[Slice[u64], Why] = zeros(w, word.words_for(bits.ok)::usize);
+    if (sel ws.err) { ret res[Bits, Why].err{ws.err}; }
+    ret res[Bits, Why].ok{Bits{type: ty, words: ws.ok}};
+}
+
+# whether a type is an integer or a float
+fun number(w: *Work, ty: Type) res[bool, Why] {
+    val k: res[types.Kind, types.Error] = types.kind(?w.m.types, ty);
+    if (sel k.err) { ret res[bool, Why].err{Why.ir{module.Error.types{k.err}}}; }
+    ret res[bool, Why].ok{sel k.ok.integer || sel k.ok.float};
+}
+
+# a constant value as the folder reads it, none when it is not a number or a
+# vector of numbers
+fun read(w: *Work, v: Value) res[opt[folder.Value], Why] {
+    val def: Def = w.b.values.data[v.index].def;
+    if (!(sel def.constant)) { ret res[opt[folder.Value], Why].ok{opt[folder.Value].none{}}; }
+    val got: res[ConstantData, module.Error] = module.constant_data(w.m, def.constant);
+    if (sel got.err) { ret res[opt[folder.Value], Why].err{Why.ir{got.err}}; }
+    val ty:    Type                          = w.b.values.data[v.index].type;
+    val shape: res[types.Shape, types.Error] = types.shape(?w.m.types, ty);
+    if (sel shape.err) { ret res[opt[folder.Value], Why].err{Why.ir{module.Error.types{shape.err}}}; }
+    var one:  Type  = ty;
+    var many: usize = 1;
+    if (sel shape.ok.vector) {
+        one  = shape.ok.vector.element;
+        many = shape.ok.vector.lanes::usize;
+    }
+    or (!(sel shape.ok.integer || sel shape.ok.float)) { ret res[opt[folder.Value], Why].ok{opt[folder.Value].none{}}; }
+    val num: res[bool, Why] = number(w, one);
+    if (sel num.err) { ret res[opt[folder.Value], Why].err{num.err}; }
+    if (!num.ok)     { ret res[opt[folder.Value], Why].ok{opt[folder.Value].none{}}; }
+
+    val room: res[*Bits, allocator.Error] = allocator.zallocate[Bits](w.scratch, many);
+    if (sel room.err) { ret res[opt[folder.Value], Why].err{Why.alloc{room.err}}; }
+    var n: usize = 0;
+    for (n < many) {
+        var at: ConstantData = got.ok;
+        if (sel got.ok.aggregate) {
+            val e: res[ConstantData, module.Error] = module.constant_data(w.m, got.ok.aggregate.elements.data[n]);
+            if (sel e.err) { ret res[opt[folder.Value], Why].err{Why.ir{e.err}}; }
+            at = e.ok;
+        }
+        val bits: res[Bits, Why] = lane(w, one, at);
+        if (sel bits.err) { ret res[opt[folder.Value], Why].err{bits.err}; }
+        room.ok[n] = bits.ok;
+        n          = n + 1;
+    }
+    ret res[opt[folder.Value], Why].ok{opt[folder.Value].some{folder.Value{type: ty, lanes: Slice[Bits]{data: room.ok, size: many}}}};
+}
+
+fun same_bits(x: Bits, y: Bits) bool {
+    if (!types.same(x.type, y.type) || x.words.size != y.words.size) { ret false; }
+    var n: usize = 0;
+    for (n < x.words.size) {
+        if (x.words.data[n] != y.words.data[n]) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+fun same_value(x: folder.Value, y: folder.Value) bool {
+    if (!types.same(x.type, y.type) || x.lanes.size != y.lanes.size) { ret false; }
+    var n: usize = 0;
+    for (n < x.lanes.size) {
+        if (!same_bits(x.lanes.data[n], y.lanes.data[n])) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# the value of a folded constant in the function
+fun place(w: *Work, v: folder.Value) res[Value, Why] {
+    val lanes: res[*Constant, allocator.Error] = allocator.zallocate[Constant](w.scratch, v.lanes.size);
+    if (sel lanes.err) { ret res[Value, Why].err{Why.alloc{lanes.err}}; }
+    var n: usize = 0;
+    for (n < v.lanes.size) {
+        val bits: Bits                         = v.lanes.data[n];
+        val num:  res[types.Kind, types.Error] = types.kind(?w.m.types, bits.type);
+        if (sel num.err) { ret res[Value, Why].err{Why.ir{module.Error.types{num.err}}}; }
+        var data: ConstantData = ConstantData.float{bits};
+        if (sel num.ok.integer) { data = ConstantData.integer{bits}; }
+        val made: res[Constant, module.Error] = module.add_constant(w.m, data);
+        if (sel made.err) { ret res[Value, Why].err{Why.ir{made.err}}; }
+        lanes.ok[n] = made.ok;
+        n           = n + 1;
+    }
+    var c: Constant                     = lanes.ok[0];
+    val k: res[types.Kind, types.Error] = types.kind(?w.m.types, v.type);
+    if (sel k.err) { ret res[Value, Why].err{Why.ir{module.Error.types{k.err}}}; }
+    if (sel k.ok.vector) {
+        val made: res[Constant, module.Error] = module.add_constant(w.m, ConstantData.aggregate{Aggregate{type: v.type, elements: Slice[Constant]{data: lanes.ok, size: v.lanes.size}}});
+        if (sel made.err) { ret res[Value, Why].err{Why.ir{made.err}}; }
+        c = made.ok;
+    }
+    val at: res[Value, module.Error] = body.constant(w.m, w.f, c);
+    if (sel at.err) { ret res[Value, Why].err{Why.ir{at.err}}; }
+    ret res[Value, Why].ok{at.ok};
+}
+
+fun refusal(r: folder.Refusal) Why {
+    if (sel r.alloc)   { ret Why.alloc{r.alloc}; }
+    if (sel r.check)   { ret Why.reason{"the folder found an instruction mistyped"}; }
+    if (sel r.operand) { ret Why.reason{"the folder found a constant that is not as wide as its type"}; }
+    ret Why.reason{"the folder could not read a type"};
+}
+
+# whether the instruction is one the pass may rewrite
+fun open(d: *InstructionData) bool {
+    if (!(sel d.place.placed))     { ret false; }
+    if (d.metadata.flags.volatile) { ret false; }
+    if (d.metadata.flags.kept)     { ret false; }
+    ret !d.metadata.secret;
+}
+
+# replace the results of an instruction by the constants the folder gave
+fun settle(w: *Work, i: Instruction, done: folder.Folded) err[Why] {
+    var list: vector.Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin { vector.dnit[Instruction](?list); }
+    var consts: vector.Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?consts); }
+    val results: *vector.Vector[Value] = ?w.b.instructions.data[i.index].results;
+    var n:       usize                 = 0;
+    for (n < results.len) {
+        val c: res[Value, Why] = place(w, done.results.data[n]);
+        if (sel c.err) { ret err[Why].err{c.err}; }
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?consts, c.ok);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        val u: err[Why] = users_of(w, results.data[n], ?list);
+        if (sel u.err) { ret u; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < results.len) {
+        val r: err[Why] = failure.edit(body.replace(w.m, w.f, results.data[n], consts.data[n], Records.follow{}));
+        if (sel r.err) { ret r; }
+        n = n + 1;
+    }
+    val gone: err[Why] = failure.edit(body.erase(w.m, w.f, i));
+    if (sel gone.err) { ret gone; }
+    ret users(w, ?list);
+}
+
+# fold one instruction whose operands are all constants
+fun fold_one(w: *Work, i: Instruction) err[Why] {
+    val d: *InstructionData = ?w.b.instructions.data[i.index];
+    if (!open(d) || d.results.len == 0) { ret err[Why].ok{}; }
+    var s: usize = 0;
+    for (s < d.results.len) {
+        if (w.b.values.data[d.results.data[s].index].secret) { ret err[Why].ok{}; }
+        s = s + 1;
+    }
+    var operands: vector.Vector[folder.Operand] = vector.init[folder.Operand](w.scratch);
+    var n:        usize                         = 0;
+    for (n < d.operands.len) {
+        val v:   Value                       = d.operands.data[n];
+        val got: res[opt[folder.Value], Why] = read(w, v);
+        if (sel got.err)     { ret err[Why].err{got.err}; }
+        if (sel got.ok.none) { ret err[Why].ok{}; }
+        val pushed: res[usize, allocator.Error] = vector.push[folder.Operand](?operands, folder.Operand{value: got.ok.some, secret: w.b.values.data[v.index].secret});
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        n = n + 1;
+    }
+    val req: folder.Request = folder.Request{opcode: d.opcode, operands: Slice[folder.Operand]{data: operands.data, size: operands.len}, immediates: Slice[Immediate]{data: d.immediates.data, size: d.immediates.len}};
+    val out: folder.Outcome = folder.fold(w.scratch, ?w.m.types, req);
+    if (sel out.refused) {
+        if (sel out.refused.unfoldable || sel out.refused.trap) { ret err[Why].ok{}; }
+        ret err[Why].err{refusal(out.refused)};
+    }
+    if (out.folded.secret)                        { ret err[Why].ok{}; }
+    if (out.folded.results.size != d.results.len) { ret err[Why].err{Why.reason{"the folder gave a different number of results than the instruction has"}}; }
+    val r: err[Why] = settle(w, i, out.folded);
+    if (sel r.err) { ret r; }
+    w.changed = true;
+    ret err[Why].ok{};
+}
+
+# turn a branch on a constant condition into a jump along the edge it takes
+fun jump(w: *Work, i: Instruction) err[Why] {
+    val d: *InstructionData = ?w.b.instructions.data[i.index];
+    if (!open(d)) { ret err[Why].ok{}; }
+    val got: res[opt[folder.Value], Why] = read(w, d.operands.data[0]);
+    if (sel got.err)     { ret err[Why].err{got.err}; }
+    if (sel got.ok.none) { ret err[Why].ok{}; }
+    var take: usize = 1;
+    if ((got.ok.some.lanes.data[0].words.data[0] & 1) != 0) { take = 0; }
+    val cut:  Block     = d.edges.data[1 - take].block;
+    val keep: Block     = d.edges.data[take].block;
+    var to:   [1]Branch = [1]Branch{Branch{block: keep, arguments: Slice[Value]{data: d.edges.data[take].arguments.data, size: d.edges.data[take].arguments.len}}};
+
+    var bld: build.Builder = build.init(w.m);
+    build.enter(?bld, w.f);
+    build.derive(?bld, i);
+    build.replacing(?bld, i);
+    build.emit(?bld, Request{opcode: opcode.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?to[0], size: 1}});
+    val built: err[Failure] = build.done(?bld);
+    if (sel built.err) { ret err[Why].err{Why.build{built.err}}; }
+
+    w.changed = true;
+    w.stale   = true;
+    w.cut_due = true;
+    val a: err[Why] = want_block(w, cut);
+    if (sel a.err) { ret a; }
+    ret want_block(w, keep);
+}
+
+# the parameter of a block, when every edge into it passes one constant for it
+fun parameter(w: *Work, k: Block, j: usize) err[Why] {
+    val p: Value = w.b.blocks.data[k.index].parameters.data[j];
+    if (w.b.values.data[p.index].secret) { ret err[Why].ok{}; }
+    val preds: *vector.Vector[Instruction] = ?w.b.blocks.data[k.index].predecessors;
+    var first: Value                       = p;
+    var held:  folder.Value;
+    var seen:  bool                        = false;
+    var n:     usize                       = 0;
+    for (n < preds.len) {
+        val d: *InstructionData = ?w.b.instructions.data[preds.data[n].index];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            if (d.edges.data[e].block.index == k.index) {
+                val arg: Value                       = d.edges.data[e].arguments.data[j];
+                val got: res[opt[folder.Value], Why] = read(w, arg);
+                if (sel got.err)     { ret err[Why].err{got.err}; }
+                if (sel got.ok.none) { ret err[Why].ok{}; }
+                if (!seen) {
+                    seen  = true;
+                    first = arg;
+                    held  = got.ok.some;
+                }
+                or (arg.index != first.index && !same_value(held, got.ok.some)) { ret err[Why].ok{}; }
+            }
+            e = e + 1;
+        }
+        n = n + 1;
+    }
+    if (!seen) { ret err[Why].ok{}; }
+
+    var list: vector.Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin { vector.dnit[Instruction](?list); }
+    val u: err[Why] = users_of(w, p, ?list);
+    if (sel u.err) { ret u; }
+    val r: err[Why] = failure.edit(body.replace(w.m, w.f, p, first, Records.follow{}));
+    if (sel r.err) { ret r; }
+    val gone: err[Why] = failure.edit(body.remove_parameter(w.m, w.f, k, j::u32));
+    if (sel gone.err) { ret gone; }
+    w.changed = true;
+    ret users(w, ?list);
+}
+
+# the parameters of a block, last first so a removal leaves the others in place
+fun parameters(w: *Work, k: Block) err[Why] {
+    if (w.b.blocks.data[k.index].erased) { ret err[Why].ok{}; }
+    var j: usize = w.b.blocks.data[k.index].parameters.len;
+    for (j > 0) {
+        j = j - 1;
+        val r: err[Why] = parameter(w, k, j);
+        if (sel r.err) { ret r; }
+    }
+    ret err[Why].ok{};
+}
+
+# remove the blocks the entry no longer reaches, queueing the blocks they
+# branched to, whose parameters have fewer edges to judge
+fun cut(w: *Work) err[Why] {
+    if (w.stale) {
+        val dropped: err[allocator.Error] = cache.forget(w.c.cache, w.f);
+        if (sel dropped.err) { ret failure.lost(dropped.err); }
+        w.stale = false;
+    }
+    val got: res[*Dominance, Why] = analysis.dominance_of(w.c.cache, w.f);
+    if (sel got.err) { ret err[Why].err{got.err}; }
+    var any: bool  = false;
+    var k:   usize = 0;
+    for (k < w.b.blocks.len) {
+        if (!w.b.blocks.data[k].erased && !dominance.reachable(got.ok, k::u32)) {
+            any = true;
+            val list: *vector.Vector[Instruction] = ?w.b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                val d: *InstructionData = ?w.b.instructions.data[list.data[i].index];
+                var e: usize            = 0;
+                for (e < d.edges.len) {
+                    val t: err[Why] = want_block(w, d.edges.data[e].block);
+                    if (sel t.err) { ret t; }
+                    e = e + 1;
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    if (!any) { ret err[Why].ok{}; }
+    val pruned: err[Error] = prune.unreached(w.m, w.f, got.ok);
+    if (sel pruned.err) { ret err[Why].err{Why.cfg{pruned.err}}; }
+    val dropped: err[allocator.Error] = cache.forget(w.c.cache, w.f);
+    if (sel dropped.err) { ret failure.lost(dropped.err); }
+    w.changed = true;
+    ret err[Why].ok{};
+}
+
+# queue every instruction and every block parameter, the first to run last
+fun seed(w: *Work) err[Why] {
+    var k: usize = w.b.blocks.len;
+    for (k > 0) {
+        k = k - 1;
+        if (!w.b.blocks.data[k].erased) {
+            val b: err[Why] = want_block(w, Block{index: k::u32});
+            if (sel b.err) { ret b; }
+            val list: *vector.Vector[Instruction] = ?w.b.blocks.data[k].instructions;
+            var i:    usize                       = list.len;
+            for (i > 0) {
+                i = i - 1;
+                val r: err[Why] = want(w, list.data[i]);
+                if (sel r.err) { ret r; }
+            }
+        }
+    }
+    ret err[Why].ok{};
+}
+
+fun drain(w: *Work, ar: *arena.Arena) err[Why] {
+    for (w.ready.len != 0 && !w.cut_due) {
+        val i: Instruction = w.ready.data[w.ready.len - 1];
+        w.ready.len            = w.ready.len - 1;
+        w.queued.data[i.index] = 0;
+        arena.reset(ar);
+        val d: *InstructionData = ?w.b.instructions.data[i.index];
+        if (sel d.place.placed) {
+            var r: err[Why] = err[Why].ok{};
+            if (d.opcode.index == opcode.CBR.index) { r = jump(w, i); }
+            or                                      { r = fold_one(w, i); }
+            if (sel r.err)                          { ret r; }
+        }
+    }
+    ret err[Why].ok{};
+}
+
+fun settle_blocks(w: *Work, ar: *arena.Arena) err[Why] {
+    for (w.due.len != 0) {
+        val k: Block = w.due.data[w.due.len - 1];
+        w.due.len               = w.due.len - 1;
+        w.waiting.data[k.index] = 0;
+        arena.reset(ar);
+        val r: err[Why] = parameters(w, k);
+        if (sel r.err) { ret r; }
+    }
+    ret err[Why].ok{};
+}
+
+# fold the constants of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var w: Work = Work{c: c, m: c.m, f: u.f, b: got.ok, scratch: ?scratch, ready: vector.init[Instruction](c.m.a), queued: vector.init[u8](c.m.a), due: vector.init[Block](c.m.a), waiting: vector.init[u8](c.m.a), stale: false, cut_due: true, changed: false};
+    fin {
+        vector.dnit[Instruction](?w.ready);
+        vector.dnit[u8](?w.queued);
+        vector.dnit[Block](?w.due);
+        vector.dnit[u8](?w.waiting);
+    }
+    val sized: err[Why] = grow(?w.waiting, w.b.blocks.len);
+    if (sel sized.err) { ret res[bool, Why].err{sized.err}; }
+    val seeded: err[Why] = seed(?w);
+    if (sel seeded.err) { ret res[bool, Why].err{seeded.err}; }
+
+    for {
+        if (w.cut_due) {
+            w.cut_due = false;
+            val r: err[Why] = cut(?w);
+            if (sel r.err) { ret res[bool, Why].err{r.err}; }
+        }
+        val folded: err[Why] = drain(?w, ?ar);
+        if (sel folded.err) { ret res[bool, Why].err{folded.err}; }
+        if (w.cut_due)      { cnt; }
+        val params: err[Why] = settle_blocks(?w, ?ar);
+        if (sel params.err)                                   { ret res[bool, Why].err{params.err}; }
+        if (w.ready.len == 0 && w.due.len == 0 && !w.cut_due) { brk; }
+    }
+    ret res[bool, Why].ok{w.changed};
+}
