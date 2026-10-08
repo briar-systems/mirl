@@ -46,7 +46,22 @@ The ir has no high multiply and no widening multiply. Both are written as a mult
 - A sum, difference, product, `and`, `or`, `xor`, `neg`, `not` and `shl` take either extension, since the bits above the narrow width do not reach the bits below it. Division, remainder and comparisons extend with the sign or with zeros as their opcode reads its operands, and `shr.u` and `shr.s` extend the shifted operand to match. A shift count is always extended with zeros.
 - The shift rule holds at the narrow width: a count of the narrow width or more shifts every bit out at the wide width too.
 - A division by zero traps at the wide width exactly when the narrow one does. A signed division or remainder of the least narrow value by minus one does not trap at the wide width, so the dividend is replaced by the least wide value in that case, which traps there. The opcode row states which operands the trap reads, and the replacement is a select, so the pass adds no branch.
-- A vector of narrow integers and a width above the widest listed are not its job. The counts (`clz`, `ctz`, `popcnt`), `bswap` and the overflow forms are left until the algebra table states them (`mirl.legal.LEFT`).
+- A vector of narrow integers and a width above the widest listed are not its job. The counts (`clz`, `ctz`, `popcnt`), `bswap` and the overflow forms are left, since a count reads the bits an extension adds, a swap moves them and an overflow at the wide width is not the overflow at the narrow one (`mirl.legal.LEFT`).
+
+### Wide arithmetic
+
+An integer wider than the widest width in `widths.alu` (`mirl.target.widest`) is split by the `wide` legalisation into words of that width, low word first, and every operation on it is rewritten over the words by one algorithm for every width and every word: a 512 bit integer over 32 bit words takes the path a 128 bit integer over 64 bit words takes. Every width in `widths.integers` is held within the widest alu width, so a target never declares an integer register it cannot compute at.
+
+- A sum carries and a difference borrows from word to word through `add.ov.u` and `sub.ov.u`, the ir's carry and borrow, which a target selects as its carry forms where it has them and as a comparison where it has none (`sltu` on RISC-V).
+- A product sums the low and high words of the product of every pair of words. The high word is written as the ir's high multiply at twice the word, so a target's `high` or `full` rows select it (`mulhu` on RISC-V) and the multiply forms legalisation builds it where there are none.
+- A shift by a constant moves whole words and then bits across them. A shift by a value does the same through selects on the bits of its count, and a count of the width or more gives 0 or the sign fill.
+- A comparison decides on the top word, read as its opcode reads it, and falls to the words below, read as unsigned, only where those are equal.
+- The counts, the byte swap and the overflow forms are computed over the words. An extension, a truncation, a select, a load, a store and a block parameter are one per word, and an access carries its flags to every word at the word's offset in the target's byte order.
+- Nothing it builds branches, so the pass keeps constant time, and every word of a secret value is secret.
+- An `i1` a store writes or a load reads is held in memory as the integer of its layout size, 0 or 1.
+- A variable bound to no more than the low word reads it from the low word. One bound to more than a word, which no one record can read from two words, is unavailable.
+
+A wide value at a function's entry, a call or a return is the abi legalisation's, which runs before it. A wide division, remainder or conversion to or from a float is left to the checked division and conversion helpers (`mirl.legal.wide.leaves`). A vector of wide lanes and a wide access through a logical address are refused.
 
 ## Asking for layout
 
