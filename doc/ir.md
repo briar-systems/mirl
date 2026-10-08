@@ -12,6 +12,7 @@ The specification is split by subject.
 | [ir/fold.md](ir/fold.md) | the constant folder |
 | [ir/target.md](ir/target.md) | targets, capabilities, data layout and attributes |
 | [ir/debug.md](ir/debug.md) | the debug table |
+| [machine/select.md](machine/select.md) | instruction selection into the machine form: the table, the rule tie-break and the class of a type |
 
 Names in code style such as `mirl.verify.against` are modules and functions of the library. The library is reached through its `mirl.*` modules, and the aggregate module `mirl` re-exports all of them.
 
@@ -309,3 +310,4 @@ The text form reserves the word `asm` for these items, and spells their block th
 - the constant folder, [ir/fold.md](ir/fold.md)
 - targets, data layout, argument passing and attributes, [ir/target.md](ir/target.md)
 - the debug table, [ir/debug.md](ir/debug.md)
+- instruction selection into the machine form, [machine/select.md](machine/select.md)
