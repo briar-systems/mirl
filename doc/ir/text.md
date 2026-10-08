@@ -172,7 +172,7 @@ attributes
 
 functions
 
-  function    = [ "export" ] "function" symbol ":" type
+  function    = [ "export" ] "function" symbol ":" type [ "constant_time" ]
                 [ "{" newline { block } "}" ] newline ;
   block       = label [ "(" param { "," param } ")" ] ":" newline { line } ;
   param       = local ":" [ "secret" ] type ;
@@ -186,6 +186,9 @@ functions
   ordering    = "relaxed" | "acquire" | "release" | "acq_rel" | "seq_cst" ;
   target      = label [ "(" operand { "," operand } ")" ] ;
   assembly    = "asm" ... ;
+
+  `constant_time` marks a function that must run in time independent of its
+  secret values.
 
   a function without braces is declared here and defined by another module.
   its first block is its entry, whose parameters are its parameters. only
