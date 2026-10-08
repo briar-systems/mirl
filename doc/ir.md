@@ -111,7 +111,7 @@ An instruction is an opcode applied to operands, immediates and edges, with resu
 - **immediates** are facts of the instruction that are not values, such as a type, an alignment, a memory ordering or a lane index. A row states one per slot, in order.
 - **edges** pair a target block with its arguments.
 - **results** are the values the instruction defines, in order. A row derives their types.
-- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile` and `kept`), its secrecy mark and the debug bindings of the variables whose storage its result addresses.
+- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile`, `kept` and `bounded`), its secrecy mark and the debug bindings of the variables whose storage its result addresses.
 
 A variable's value is bound by a **value binding record** at a program point of a block, before an instruction or at the block's entry. A record is not an instruction and no instruction walk sees it. It reads a value and a salvage expression over it, or nothing when what it read is gone, and reading a value is never a use of it (see [ir/debug.md](ir/debug.md)).
 
@@ -212,6 +212,8 @@ The memory of a stack slot holds no defined value until it is stored to, and it 
 `mem.copy` copies a byte count between two addresses, and the ranges may overlap. `mem.fill` sets a byte count at an address to one byte value.
 
 A `volatile` flag on an instruction makes its memory access observable. It is never merged, moved or removed.
+
+A `bounded` flag on a shift says its count is below its operand's width, so a machine shift that takes the count modulo the width gives the result the shift states. Only a row with a shift by the width or more rule takes it. The shift bounding legalisation sets it and recomputes it from scratch on every run, and selection reads it to emit the plain instruction.
 
 A `kept` flag on a store or a fill makes its write a fixed fact. It is how a front end wipes memory that held a secret. The mark is a fact of the instruction, stated once in its metadata record, and every pass reads it from there. The one checker refuses it on an instance of a row that is not keepable, so the builder never makes such an instruction and the verifier's typing rule refuses one.
 

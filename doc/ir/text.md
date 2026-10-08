@@ -181,7 +181,7 @@ functions
   step        = word ( constant | type ) ;
   instruction = [ local { "," local } "=" ] ( operation | assembly ) ;
   operation   = word [ entry { "," entry } ] [ "loc" dref ] [ "site" dref ]
-                [ "volatile" ] [ "kept" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
+                [ "volatile" ] [ "kept" ] [ "bounded" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
   entry       = operand | immediate | target ;
   operand     = local | constant ;
   immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]" ) ;
@@ -190,7 +190,8 @@ functions
   assembly    = "asm" ... ;
 
   `kept` marks a store or a fill whose write no pass may take away (see
-  the specification's memory section).
+  the specification's memory section). `bounded` marks a shift whose count is
+  below its operand's width.
 
   `constant_time` marks a function that must run in time independent of its
   secret values.
