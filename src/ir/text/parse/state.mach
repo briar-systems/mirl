@@ -1,0 +1,340 @@
+# the parser's state and the pieces every reader is written from
+#
+# a parser keeps the first refusal, after which every read answers a stand-in
+# and every advance is skipped, so a caller reads one outcome at the end.
+#
+# the text is read in passes over saved positions: a pass declares what later
+# passes name, so a name is resolved by looking it up and never by guessing.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.ir.module.Module;
+use mirl.ir.text.parse.lexer;
+use mirl.ir.text.parse.lexer.Kind;
+use mirl.ir.text.parse.lexer.Lexer;
+use mirl.ir.text.parse.lexer.Token;
+use mirl.ir.text.parse.refusal.Named;
+use mirl.ir.text.parse.refusal.Reason;
+use mirl.ir.text.parse.refusal.Refusal;
+use mirl.slice;
+
+val NONE: u32 = 0xffffffff;
+
+# a name each kind of debug entry and each value and block of the function
+# being read is bound by, and the index it stands for
+pub def Scope: map.MapBy[View, u32];
+
+# a saved position, to read a stretch of text again
+pub rec Mark {
+    lex: Lexer;
+    tok: Token;
+}
+
+# one reading of a text
+# ---
+# a:      the allocator everything the parser makes is taken from
+# lex:    where the next token is read from
+# tok:    the token being looked at
+# failed: the first refusal, none while the text is well formed
+# m:      the module being made
+# b:      the builder every record of it is made through
+# owned:  the names decoded from quoted strings
+# files:  the names of source files
+# places: the names of source locations
+# sites:  the names of inlining sites
+# dtypes: the names of debug types
+# vars:   the names of variables
+# values: the names of the values of the function being read, which hold
+#         UNBUILT until the instruction giving them is built
+# blocks: the names of its blocks
+pub rec Parser {
+    a:      *allocator.Allocator;
+    lex:    Lexer;
+    tok:    Token;
+    failed: opt[Refusal];
+    m:      *Module;
+    b:      Builder;
+    owned:  vector.Vector[View];
+    files:  Scope;
+    places: Scope;
+    sites:  Scope;
+    dtypes: Scope;
+    vars:   Scope;
+    values: Scope;
+    blocks: Scope;
+}
+
+# the index of a value whose instruction is not built yet
+pub val UNBUILT: u32 = 0xffffffff;
+
+fun hash_name(v: *View) u64 {
+    ret slice.hash_view(0xcbf29ce484222325, @v);
+}
+
+fun same_name(a: *View, b: *View) bool {
+    ret slice.same_view(@a, @b);
+}
+
+fun scope(a: *allocator.Allocator) Scope {
+    ret map.init_by[View, u32](a, hash_name, same_name);
+}
+
+# a parser over text, reading its first token
+# ---
+# p:    where the parser is made, which must not move while it is used
+# a:    the allocator
+# text: the text, which must outlive the parser
+pub fun init(p: *Parser, a: *allocator.Allocator, text: View) {
+    p.a      = a;
+    p.failed = opt[Refusal].none{};
+    p.owned  = vector.init[View](a);
+    p.files  = scope(a);
+    p.places = scope(a);
+    p.sites  = scope(a);
+    p.dtypes = scope(a);
+    p.vars   = scope(a);
+    p.values = scope(a);
+    p.blocks = scope(a);
+    p.lex    = lexer.init(text, a, ?p.owned);
+    advance(p);
+}
+
+# read into a module, which must outlive the parser and be made once the
+# header has named its target
+pub fun attach(p: *Parser, m: *Module) {
+    p.m = m;
+    p.b = build.init(m);
+}
+
+# give back everything the parser holds
+pub fun dnit(p: *Parser) {
+    var i: usize = 0;
+    for (i < p.owned.len) {
+        allocator.deallocate[u8](p.a, p.owned.data[i].data, p.owned.data[i].len);
+        i = i + 1;
+    }
+    vector.dnit[View](?p.owned);
+    map.dnit_by[View, u32](?p.files);
+    map.dnit_by[View, u32](?p.places);
+    map.dnit_by[View, u32](?p.sites);
+    map.dnit_by[View, u32](?p.dtypes);
+    map.dnit_by[View, u32](?p.vars);
+    map.dnit_by[View, u32](?p.values);
+    map.dnit_by[View, u32](?p.blocks);
+}
+
+# whether the text has been well formed so far
+pub fun ok(p: *Parser) bool {
+    ret sel p.failed.none;
+}
+
+# refuse at a position, unless a refusal is already kept
+pub fun fail_at(p: *Parser, line: u32, column: u32, r: Reason) {
+    if (ok(p)) { p.failed = opt[Refusal].some{Refusal{line: line, column: column, reason: r}}; }
+}
+
+# refuse at the token being looked at
+pub fun fail(p: *Parser, r: Reason) {
+    fail_at(p, p.tok.line, p.tok.column, r);
+}
+
+# refuse because something else was expected here
+pub fun expected(p: *Parser, what: str) {
+    fail(p, Reason.expected{what});
+}
+
+# keep the allocator's refusal of storage
+pub fun refuse_alloc(p: *Parser, e: allocator.Error) {
+    fail(p, Reason.alloc{e});
+}
+
+# push onto a vector, refusing when the allocator does
+pub fun push[T](p: *Parser, v: *vector.Vector[T], item: T) {
+    if (!ok(p)) { ret; }
+    val r: res[usize, allocator.Error] = vector.push[T](v, item);
+    if (sel r.err) { refuse_alloc(p, r.err); }
+}
+
+# refuse when the builder has been refused, at a position
+pub fun built(p: *Parser, line: u32, column: u32) {
+    val done: err[build.Failure] = build.done(?p.b);
+    if (sel done.err) { fail_at(p, line, column, Reason.build{done.err}); }
+}
+
+# read the next token
+pub fun advance(p: *Parser) {
+    if (!ok(p)) { ret; }
+    p.tok = lexer.next(?p.lex);
+    if (p.tok.kind != lexer.BAD) { ret; }
+    val fault: opt[allocator.Error] = p.tok.fault;
+    if (sel fault.some) { refuse_alloc(p, fault.some); }
+    or                  { fail(p, Reason.unexpected{p.tok.note}); }
+}
+
+# save the position of the token being looked at
+pub fun mark(p: *Parser) Mark {
+    ret Mark{lex: p.lex, tok: p.tok};
+}
+
+# go back to a saved position
+pub fun rewind(p: *Parser, at: Mark) {
+    p.lex = at.lex;
+    p.tok = at.tok;
+}
+
+# whether the token being looked at is of a kind
+pub fun is(p: *Parser, kind: Kind) bool {
+    ret ok(p) && p.tok.kind == kind;
+}
+
+# whether the token being looked at is a word spelled as s
+pub fun is_word(p: *Parser, s: str) bool {
+    ret ok(p) && p.tok.kind == lexer.WORD && lexer.spelled(p.tok.text, s);
+}
+
+# read a token of a kind if one is there
+pub fun accept(p: *Parser, kind: Kind) bool {
+    if (!is(p, kind)) { ret false; }
+    advance(p);
+    ret true;
+}
+
+# read a word spelled as s if one is there
+pub fun accept_word(p: *Parser, s: str) bool {
+    if (!is_word(p, s)) { ret false; }
+    advance(p);
+    ret true;
+}
+
+# read a token of a kind, or refuse naming what was expected
+pub fun expect(p: *Parser, kind: Kind, what: str) Token {
+    val t: Token = p.tok;
+    if (!ok(p)) { ret t; }
+    if (t.kind != kind) {
+        expected(p, what);
+        ret t;
+    }
+    advance(p);
+    ret t;
+}
+
+# read a word spelled as s, or refuse
+pub fun expect_word(p: *Parser, s: str) {
+    if (!accept_word(p, s)) { expected(p, s); }
+}
+
+# read the end of a line
+pub fun expect_end(p: *Parser) {
+    if (!ok(p))                  { ret; }
+    if (p.tok.kind == lexer.END) { ret; }
+    if (p.tok.kind != lexer.NEWLINE) {
+        expected(p, "the end of the line");
+        ret;
+    }
+    advance(p);
+}
+
+# read a number that fits in 64 bits
+pub fun number(p: *Parser) u64 {
+    val t: Token = expect(p, lexer.UINT, "a number");
+    if (!ok(p)) { ret 0; }
+    if (t.wide) {
+        fail_at(p, t.line, t.column, Reason.large{});
+        ret 0;
+    }
+    ret t.value;
+}
+
+# read a number that fits in 32 bits
+pub fun number32(p: *Parser) u32 {
+    val line: u32 = p.tok.line;
+    val col:  u32 = p.tok.column;
+    val n:    u64 = number(p);
+    if (n > 0xffffffff) {
+        fail_at(p, line, col, Reason.large{});
+        ret 0;
+    }
+    ret n::u32;
+}
+
+# read a name written as a word, a number or a string
+pub fun name(p: *Parser, what: str) Token {
+    val t: Token = p.tok;
+    if (!ok(p)) { ret t; }
+    if (t.kind != lexer.WORD && t.kind != lexer.UINT && t.kind != lexer.STRING) {
+        expected(p, what);
+        ret t;
+    }
+    advance(p);
+    ret t;
+}
+
+# read the rest of the line without looking at it, but for how it is spelled
+pub fun skip_line(p: *Parser) {
+    for (ok(p) && p.tok.kind != lexer.NEWLINE && p.tok.kind != lexer.END) { advance(p); }
+}
+
+# read from a `{` past its matching `}`
+pub fun skip_braces(p: *Parser) {
+    var depth: u32 = 0;
+    for (ok(p)) {
+        if (p.tok.kind == lexer.END) {
+            expected(p, "}");
+            ret;
+        }
+        if (p.tok.kind == lexer.LBRACE) { depth = depth + 1; }
+        if (p.tok.kind == lexer.RBRACE) { depth = depth - 1; }
+        advance(p);
+        if (depth == 0) { ret; }
+    }
+}
+
+# bind a name in a scope to an index, refusing a name already bound
+pub fun define(p: *Parser, s: *Scope, what: str, t: Token, index: u32) {
+    if (!ok(p)) { ret; }
+    if (map.contains_by[View, u32](s, ?t.text)) {
+        fail_at(p, t.line, t.column, Reason.duplicate{Named{what: what, name: t.raw}});
+        ret;
+    }
+    val r: res[bool, allocator.Error] = map.insert_by[View, u32](s, t.text, index);
+    if (sel r.err) { refuse_alloc(p, r.err); }
+}
+
+# the index a name is bound to, or none
+pub fun lookup(s: *Scope, nm: View) opt[u32] {
+    val got: opt[*u32] = map.get_by[View, u32](s, ?nm);
+    if (sel got.none) { ret opt[u32].none{}; }
+    ret opt[u32].some{@got.some};
+}
+
+# the index a name is bound to, refusing at the token a name nothing defines
+pub fun resolve(p: *Parser, s: *Scope, what: str, t: Token) u32 {
+    if (!ok(p)) { ret NONE; }
+    val got: opt[u32] = lookup(s, t.text);
+    if (sel got.none) {
+        fail_at(p, t.line, t.column, Reason.unresolved{Named{what: what, name: t.raw}});
+        ret NONE;
+    }
+    ret got.some;
+}
+
+# rebind a bound name to another index
+pub fun rebind(p: *Parser, s: *Scope, nm: View, index: u32) {
+    if (!ok(p)) { ret; }
+    val r: res[bool, allocator.Error] = map.insert_by[View, u32](s, nm, index);
+    if (sel r.err) { refuse_alloc(p, r.err); }
+}

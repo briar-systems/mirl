@@ -1,0 +1,499 @@
+# reading a function body
+#
+# a body is read in three steps. the first makes every block, with its
+# parameters, and binds every name an instruction gives, so a branch can name
+# a block written after it and a use can name a value defined after it. the
+# second builds each instruction through the builder once every value it uses
+# is built, since the builder types an instruction from its operands. a block's
+# instructions go to the position their line stands at whatever order they are
+# built in. the third refuses what is left: a value nothing defines, or one
+# that is only defined by an instruction that needs it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build;
+use mirl.ir.body;
+use mirl.ir.debug.Binding;
+use mirl.ir.debug.Location;
+use mirl.ir.debug.Site;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Flags;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.text.parse.debug;
+use mirl.ir.text.parse.lexer;
+use mirl.ir.text.parse.lexer.Token;
+use mirl.ir.text.parse.refusal.Named;
+use mirl.ir.text.parse.refusal.Reason;
+use mirl.ir.text.parse.state;
+use mirl.ir.text.parse.state.Mark;
+use mirl.ir.text.parse.state.Parser;
+use mirl.ir.text.parse.ty;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+
+# an instruction line
+# ---
+# at:     the start of the line
+# block:  the block it stands in, by position in the body
+# built:  the instruction has been built
+# line:   where it starts
+# column: where it starts
+rec Line {
+    at:     Mark;
+    block:  usize;
+    built:  bool;
+    line:   u32;
+    column: u32;
+}
+
+# a branch target while its arguments are being read
+# ---
+# block: the block it enters
+# first: where its arguments start among the arguments of the instruction
+# count: how many it has
+rec Target {
+    block: Block;
+    first: usize;
+    count: usize;
+}
+
+# the lists one instruction is read into
+rec Parts {
+    operands: vector.Vector[Value];
+    args:     vector.Vector[Value];
+    imms:     vector.Vector[opcode.Immediate];
+    starts:   vector.Vector[usize];
+    lanes:    vector.Vector[u32];
+    targets:  vector.Vector[Target];
+    branches: vector.Vector[Branch];
+    bindings: vector.Vector[Binding];
+    results:  vector.Vector[Token];
+}
+
+fun parts(p: *Parser) Parts {
+    ret Parts{
+        operands: vector.init[Value](p.a),
+        args:     vector.init[Value](p.a),
+        imms:     vector.init[opcode.Immediate](p.a),
+        starts:   vector.init[usize](p.a),
+        lanes:    vector.init[u32](p.a),
+        targets:  vector.init[Target](p.a),
+        branches: vector.init[Branch](p.a),
+        bindings: vector.init[Binding](p.a),
+        results:  vector.init[Token](p.a),
+    };
+}
+
+fun release(x: *Parts) {
+    vector.dnit[Value](?x.operands);
+    vector.dnit[Value](?x.args);
+    vector.dnit[opcode.Immediate](?x.imms);
+    vector.dnit[usize](?x.starts);
+    vector.dnit[u32](?x.lanes);
+    vector.dnit[Target](?x.targets);
+    vector.dnit[Branch](?x.branches);
+    vector.dnit[Binding](?x.bindings);
+    vector.dnit[Token](?x.results);
+}
+
+# read a block's label, parameters and colon, and make the block
+fun header(p: *Parser, blocks: *vector.Vector[Block]) {
+    val t:     Token                      = state.expect(p, lexer.LABEL, "a block label");
+    var decls: vector.Vector[Declaration] = vector.init[Declaration](p.a);
+    var names: vector.Vector[Token]       = vector.init[Token](p.a);
+    fin {
+        vector.dnit[Declaration](?decls);
+        vector.dnit[Token](?names);
+    }
+    if (state.accept(p, lexer.LPAREN)) {
+        for {
+            val local: Token = state.expect(p, lexer.LOCAL, "a parameter");
+            state.expect(p, lexer.COLON, ":");
+            val secret: bool = state.accept_word(p, "secret");
+            val type:   Type = ty.ty(p);
+            state.push[Declaration](p, ?decls, Declaration{type: type, secret: secret, name: opt[View].some{local.text}});
+            state.push[Token](p, ?names, local);
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+        state.expect(p, lexer.RPAREN, ")");
+    }
+    state.expect(p, lexer.COLON, ":");
+    state.expect_end(p);
+    if (!state.ok(p)) { ret; }
+    val k: Block = build.block(?p.b, Slice[Declaration]{data: decls.data, size: decls.len});
+    build.label(?p.b, k, t.text);
+    state.built(p, t.line, t.column);
+    state.define(p, ?p.blocks, "block", t, blocks.len::u32);
+    state.push[Block](p, blocks, k);
+    var i: usize = 0;
+    for (i < names.len && state.ok(p)) {
+        val v: Value = build.parameter(?p.b, k, i::u32);
+        state.define(p, ?p.values, "value", names.data[i], v.index);
+        i = i + 1;
+    }
+    state.built(p, t.line, t.column);
+}
+
+# read an instruction line's results, binding each name unbuilt, and leave the rest
+fun register(p: *Parser, blocks: *vector.Vector[Block], lines: *vector.Vector[Line]) {
+    if (blocks.len == 0) {
+        state.expected(p, "a block label");
+        ret;
+    }
+    val at:  Mark = state.mark(p);
+    val ln:  u32  = p.tok.line;
+    val col: u32  = p.tok.column;
+    if (state.is(p, lexer.LOCAL)) {
+        for {
+            val t: Token = state.expect(p, lexer.LOCAL, "a result");
+            state.define(p, ?p.values, "value", t, state.UNBUILT);
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+        state.expect(p, lexer.EQUALS, "=");
+    }
+    state.skip_line(p);
+    state.expect_end(p);
+    state.push[Line](p, lines, Line{at: at, block: blocks.len - 1, built: false, line: ln, column: col});
+}
+
+# whether every value an instruction line reads is built, and the first that is not
+fun ready(p: *Parser, ln: Line, blame: *Token) bool {
+    state.rewind(p, ln.at);
+    var has: bool = false;
+    for (state.ok(p) && !state.is(p, lexer.NEWLINE) && !state.is(p, lexer.END)) {
+        if (state.is(p, lexer.EQUALS)) { has = true; }
+        state.advance(p);
+    }
+    state.rewind(p, ln.at);
+    var reading: bool = !has;
+    var all:     bool = true;
+    for (state.ok(p) && !state.is(p, lexer.NEWLINE) && !state.is(p, lexer.END)) {
+        if (state.is(p, lexer.EQUALS)) { reading = true; }
+        if (reading && state.is(p, lexer.LOCAL)) {
+            val index: u32 = state.resolve(p, ?p.values, "value", p.tok);
+            if (state.ok(p) && index == state.UNBUILT) {
+                if (all) { @blame = p.tok; }
+                all = false;
+            }
+        }
+        state.advance(p);
+    }
+    ret all;
+}
+
+fun find_opcode(p: *Parser, t: Token) opt[opcode.Opcode] {
+    var i: u32 = 0;
+    for (i < opcode.rows()) {
+        val r: opt[opcode.Row] = opcode.row(opcode.Opcode{index: i});
+        if (sel r.some && lexer.spelled(t.text, r.some.name)) { ret opt[opcode.Opcode].some{opcode.Opcode{index: i}}; }
+        i = i + 1;
+    }
+    state.fail_at(p, t.line, t.column, Reason.unknown{Named{what: "opcode", name: t.raw}});
+    ret opt[opcode.Opcode].none{};
+}
+
+fun slot_of(r: *opcode.Row, name: View) opt[u32] {
+    var k: u32 = 0;
+    for (k < opcode.slots(r)) {
+        if (lexer.spelled(name, r.immediates[k].name)) { ret opt[u32].some{k}; }
+        k = k + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# read a local or a constant as a value
+fun operand(p: *Parser) Value {
+    val t: Token = p.tok;
+    if (!state.ok(p)) { ret Value{index: state.UNBUILT}; }
+    if (t.kind == lexer.LOCAL) {
+        state.advance(p);
+        ret Value{index: state.resolve(p, ?p.values, "value", t)};
+    }
+    val c: Constant = ty.constant(p);
+    if (!state.ok(p)) { ret Value{index: state.UNBUILT}; }
+    val v: Value = build.use_constant(?p.b, c);
+    state.built(p, t.line, t.column);
+    ret v;
+}
+
+fun ordering(p: *Parser) opcode.Ordering {
+    if (state.accept_word(p, "relaxed")) { ret opcode.Ordering.relaxed{}; }
+    if (state.accept_word(p, "acquire")) { ret opcode.Ordering.acquire{}; }
+    if (state.accept_word(p, "release")) { ret opcode.Ordering.release{}; }
+    if (state.accept_word(p, "acq_rel")) { ret opcode.Ordering.acq_rel{}; }
+    if (state.accept_word(p, "seq_cst")) { ret opcode.Ordering.seq_cst{}; }
+    state.expected(p, "a memory ordering");
+    ret opcode.Ordering.relaxed{};
+}
+
+# read what a slot holds
+fun immediate(p: *Parser, h: opcode.Holds, x: *Parts) {
+    var imm:   opcode.Immediate = opcode.Immediate.lane{0};
+    var start: usize            = 0;
+    if (sel h.ty)        { imm = opcode.Immediate.ty{ty.ty(p)}; }
+    or (sel h.alignment) { imm = opcode.Immediate.alignment{state.number(p)}; }
+    or (sel h.ordering)  { imm = opcode.Immediate.ordering{ordering(p)}; }
+    or (sel h.lane)      { imm = opcode.Immediate.lane{state.number32(p)}; }
+    or (sel h.lanes) {
+        start = x.lanes.len;
+        state.expect(p, lexer.LBRACKET, "[");
+        if (!state.is(p, lexer.RBRACKET)) {
+            for {
+                state.push[u32](p, ?x.lanes, state.number32(p));
+                if (!state.accept(p, lexer.COMMA)) { brk; }
+            }
+        }
+        state.expect(p, lexer.RBRACKET, "]");
+        imm = opcode.Immediate.lanes{Slice[u32]{data: nil, size: x.lanes.len - start}};
+    }
+    state.push[opcode.Immediate](p, ?x.imms, imm);
+    state.push[usize](p, ?x.starts, start);
+}
+
+fun target(p: *Parser, blocks: *vector.Vector[Block], x: *Parts) {
+    val t:     Token = state.expect(p, lexer.LABEL, "a block");
+    val k:     u32   = state.resolve(p, ?p.blocks, "block", t);
+    val first: usize = x.args.len;
+    if (state.accept(p, lexer.LPAREN)) {
+        if (!state.is(p, lexer.RPAREN)) {
+            for {
+                state.push[Value](p, ?x.args, operand(p));
+                if (!state.accept(p, lexer.COMMA)) { brk; }
+            }
+        }
+        state.expect(p, lexer.RPAREN, ")");
+    }
+    if (!state.ok(p)) { ret; }
+    state.push[Target](p, ?x.targets, Target{block: blocks.data[k], first: first, count: x.args.len - first});
+}
+
+fun metadata_word(p: *Parser) bool {
+    ret state.is_word(p, "loc") || state.is_word(p, "site") || state.is_word(p, "volatile") || state.is_word(p, "secret") || state.is_word(p, "bind");
+}
+
+fun at_entry(p: *Parser) bool {
+    if (state.is(p, lexer.LOCAL) || state.is(p, lexer.LABEL)) { ret true; }
+    ret state.is(p, lexer.WORD) && !metadata_word(p);
+}
+
+# read the operands, immediates and targets of an operation
+fun entries(p: *Parser, r: *opcode.Row, blocks: *vector.Vector[Block], x: *Parts) {
+    var phase: u8 = 0;
+    if (!at_entry(p)) { ret; }
+    for {
+        val t: Token = p.tok;
+        if (t.kind == lexer.LABEL) {
+            phase = 2;
+            target(p, blocks, x);
+        }
+        or {
+            var slot: opt[u32] = opt[u32].none{};
+            if (t.kind == lexer.WORD) { slot = slot_of(r, t.text); }
+            if (sel slot.some) {
+                if (phase > 1 || slot.some != x.imms.len::u32) { state.expected(p, "the next immediate, in the order of the row"); }
+                phase = 1;
+                state.advance(p);
+                if (state.ok(p)) { immediate(p, r.immediates[slot.some].holds, x); }
+            }
+            or {
+                if (phase != 0) { state.expected(p, "an immediate or a target"); }
+                state.push[Value](p, ?x.operands, operand(p));
+            }
+        }
+        if (!state.accept(p, lexer.COMMA)) { brk; }
+    }
+}
+
+fun metadata(p: *Parser, x: *Parts) {
+    if (state.accept_word(p, "loc")) {
+        val l: u32 = debug.ref(p, ?p.places, "location");
+        build.locate(?p.b, opt[Location].some{Location{index: l}});
+    }
+    if (state.accept_word(p, "site")) {
+        val s: u32 = debug.ref(p, ?p.sites, "site");
+        build.site(?p.b, opt[Site].some{Site{index: s}});
+    }
+    if (state.accept_word(p, "volatile")) { build.flags(?p.b, Flags{volatile: true}); }
+    if (state.accept_word(p, "secret"))   { build.secret(?p.b, true); }
+    if (state.is_word(p, "bind")) {
+        val t: Token = p.tok;
+        state.advance(p);
+        state.expect(p, lexer.LBRACKET, "[");
+        if (!state.is(p, lexer.RBRACKET)) {
+            for {
+                val v: u32 = debug.ref(p, ?p.vars, "variable");
+                state.push[Binding](p, ?x.bindings, Binding{index: v});
+                if (!state.accept(p, lexer.COMMA)) { brk; }
+            }
+        }
+        state.expect(p, lexer.RBRACKET, "]");
+        if (!state.ok(p)) { ret; }
+        val list: res[Bindings, module.Error] = module.bindings(p.m, Slice[Binding]{data: x.bindings.data, size: x.bindings.len});
+        if (sel list.err) {
+            state.fail_at(p, t.line, t.column, Reason.ir{list.err});
+            ret;
+        }
+        build.bind(?p.b, list.ok);
+    }
+}
+
+# point the lane lists of the immediates into the store they were read into,
+# and make the branches from the targets
+fun settle(x: *Parts) {
+    var k: usize = 0;
+    for (k < x.imms.len) {
+        val old: opcode.Immediate = x.imms.data[k];
+        if (sel old.lanes) {
+            var data: *u32 = nil;
+            if (old.lanes.size > 0) { data = ?x.lanes.data[x.starts.data[k]]; }
+            x.imms.data[k] = opcode.Immediate.lanes{Slice[u32]{data: data, size: old.lanes.size}};
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < x.targets.len) {
+        val t:    Target = x.targets.data[k];
+        var data: *Value = nil;
+        if (t.count > 0) { data = ?x.args.data[t.first]; }
+        vector.push[Branch](?x.branches, Branch{block: t.block, arguments: Slice[Value]{data: data, size: t.count}});
+        k = k + 1;
+    }
+}
+
+# how many instructions of a line's block stand before it and are built
+fun position(lines: *vector.Vector[Line], i: usize) u32 {
+    var n: u32   = 0;
+    var j: usize = 0;
+    for (j < i) {
+        if (lines.data[j].block == lines.data[i].block && lines.data[j].built) { n = n + 1; }
+        j = j + 1;
+    }
+    ret n;
+}
+
+# build one instruction line
+fun instruction(p: *Parser, f: Function, blocks: *vector.Vector[Block], lines: *vector.Vector[Line], i: usize) {
+    val ln: Line = lines.data[i];
+    state.rewind(p, ln.at);
+    var x: Parts = parts(p);
+    fin { release(?x); }
+    if (state.is(p, lexer.LOCAL)) {
+        for {
+            val t: Token = state.expect(p, lexer.LOCAL, "a result");
+            state.push[Token](p, ?x.results, t);
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+        state.expect(p, lexer.EQUALS, "=");
+    }
+    val w: Token = p.tok;
+    if (state.is_word(p, "asm")) {
+        state.fail(p, Reason.unsupported{"inline assembly"});
+        ret;
+    }
+    state.expect(p, lexer.WORD, "an opcode");
+    if (!state.ok(p)) { ret; }
+    val code: opt[opcode.Opcode] = find_opcode(p, w);
+    if (sel code.none) { ret; }
+    val row: opt[opcode.Row] = opcode.row(code.some);
+    if (sel row.none) { ret; }
+    val r: opcode.Row = row.some;
+    entries(p, ?r, blocks, ?x);
+    metadata(p, ?x);
+    state.expect_end(p);
+    if (!state.ok(p)) { ret; }
+    settle(?x);
+
+    build.at(?p.b, blocks.data[ln.block], position(lines, i));
+    val made: Instruction = build.emit(?p.b, Request{
+        opcode:     code.some,
+        operands:   Slice[Value]{data: x.operands.data, size: x.operands.len},
+        immediates: Slice[opcode.Immediate]{data: x.imms.data, size: x.imms.len},
+        targets:    Slice[Branch]{data: x.branches.data, size: x.branches.len},
+    });
+    build.plain(?p.b);
+    state.built(p, ln.line, ln.column);
+    if (!state.ok(p)) { ret; }
+    val d: res[InstructionData, module.Error] = body.instruction_data(p.m, f, made);
+    if (sel d.err) {
+        state.fail_at(p, ln.line, ln.column, Reason.ir{d.err});
+        ret;
+    }
+    if (d.ok.results.len != x.results.len) {
+        state.fail_at(p, ln.line, ln.column, Reason.results{d.ok.results.len::u32});
+        ret;
+    }
+    var k: usize = 0;
+    for (k < x.results.len && state.ok(p)) {
+        val v: Value = build.result(?p.b, made, k::u32);
+        build.name(?p.b, v, x.results.data[k].text);
+        state.rebind(p, ?p.values, x.results.data[k].text, v.index);
+        k = k + 1;
+    }
+    state.built(p, ln.line, ln.column);
+}
+
+# read the body of function f, from its `{`
+pub fun function(p: *Parser, f: Function, at: Mark) {
+    state.rewind(p, at);
+    map.clear_by[View, u32](?p.values);
+    map.clear_by[View, u32](?p.blocks);
+    build.enter(?p.b, f);
+    var blocks: vector.Vector[Block] = vector.init[Block](p.a);
+    var lines:  vector.Vector[Line]  = vector.init[Line](p.a);
+    fin {
+        vector.dnit[Block](?blocks);
+        vector.dnit[Line](?lines);
+    }
+    state.expect(p, lexer.LBRACE, "{");
+    state.expect_end(p);
+    for (state.ok(p) && !state.is(p, lexer.RBRACE)) {
+        if (state.is(p, lexer.END))         { state.expected(p, "}"); }
+        or (state.accept(p, lexer.NEWLINE)) {}
+        or (state.is(p, lexer.LABEL))       { header(p, ?blocks); }
+        or                                  { register(p, ?blocks, ?lines); }
+    }
+
+    var left:     usize = lines.len;
+    var progress: bool  = true;
+    var blame:    Token;
+    for (state.ok(p) && left > 0 && progress) {
+        progress = false;
+        var i: usize = 0;
+        for (i < lines.len && state.ok(p)) {
+            if (!lines.data[i].built && ready(p, lines.data[i], ?blame)) {
+                instruction(p, f, ?blocks, ?lines, i);
+                if (state.ok(p)) {
+                    lines.data[i].built = true;
+                    left                = left - 1;
+                    progress            = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    if (state.ok(p) && left > 0) {
+        var i: usize = 0;
+        for (lines.data[i].built) { i = i + 1; }
+        ready(p, lines.data[i], ?blame);
+        state.fail_at(p, blame.line, blame.column, Reason.unresolved{Named{what: "value", name: blame.raw}});
+    }
+}
