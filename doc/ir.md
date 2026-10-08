@@ -110,7 +110,9 @@ An instruction is an opcode applied to operands, immediates and edges, with resu
 - **immediates** are facts of the instruction that are not values, such as a type, an alignment, a memory ordering or a lane index. A row states one per slot, in order.
 - **edges** pair a target block with its arguments.
 - **results** are the values the instruction defines, in order. A row derives their types.
-- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile`), its secrecy mark and its debug bindings.
+- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile`), its secrecy mark and the debug bindings of the variables whose storage its result addresses.
+
+A variable's value is bound by a **value binding record** at a program point of a block, before an instruction or at the block's entry. A record is not an instruction and no instruction walk sees it. It reads a value and a salvage expression over it, or nothing when what it read is gone, and reading a value is never a use of it (see [ir/debug.md](ir/debug.md)).
 
 An instruction's typing, effects and secrecy are its opcode's row in the opcode table. The table is data, and the verifier, the printer, the parser, the folder and every pass read the same row. The reference in [ir/opcodes.md](ir/opcodes.md) is written from the table, so it states for every opcode its operands, immediates, targets, typing rules, result types, effects, secrecy rule and vector class.
 
@@ -272,6 +274,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 10 | `secrecy` | every result is secret exactly as its row's secrecy rule gives, and no edge passes a secret value to a public parameter |
 | 11 | `dominance` | every use in a reached block is dominated by its definition, and so is every branch argument at its edge |
 | 12 | `debug` | every location, inlining site and binding that an instruction's metadata names is an entry of the debug table |
+| 13 | `binding` | every value binding record stands before an instruction of its block, in the order of their points, names a variable of the debug table and reads a defined value through an expression that applies to its type, and in a reached block the value dominates the record's point |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
