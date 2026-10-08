@@ -242,7 +242,11 @@ The verifier states the same facts as a rule (see section 8). Every result must 
 
 A function that is constant time must have no secret-dependent branch, no secret-dependent address, and no operation whose latency depends on its operands. The IR carries what that check needs, which is the secrecy of every value and the metadata of every instruction. The target states which operations are constant time through its timing declaration. A row of it names an operation (`multiply`, `multiply_high`, `divide` or `shift`), an operand width and a condition, which is either always or the presence of a named extension such as RISC-V's `zkt`. A target that states no row for an operation does not guarantee it.
 
-The check itself belongs to `mirl.ct`. This version of the library does not implement it and does not yet give a function a constant-time marker, so the IR neither marks a function constant time nor refuses a target that cannot meet the requirement.
+A function requires constant time when its declaration says so. `FunctionData` has a `constant_time` flag, set when the function is declared and read by every pass. The text form writes it as `constant_time` after the function's type (see [ir/text.md](ir/text.md)).
+
+Every pass declares whether it keeps the requirement. A pass that may branch on a value or otherwise change how long the code takes declares that it breaks it, and that is the default. The pass driver in `mirl.pass` never gives such a pass a function that requires constant time, so the pass needs no check of its own. A module pass asks the driver's `touches` before it rewrites a function.
+
+The check itself belongs to `mirl.ct`. This version of the library does not implement it, so it does not yet refuse a function or a target that cannot meet the requirement.
 
 
 ## 8. The verifier
