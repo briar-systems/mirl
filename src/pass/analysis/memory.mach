@@ -26,10 +26,17 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
+use std.allocator;
+use std.collections.vector;
+
+use mirl.fold.algebra;
+use mirl.fold.algebra.Algebra;
+use mirl.fold.algebra.Op;
 use mirl.fold.word;
 use mirl.ir.block.BlockData;
 use mirl.ir.cfg.loops;
@@ -45,6 +52,7 @@ use mirl.ir.instruction.InstructionData;
 use mirl.ir.module;
 use mirl.ir.module.Module;
 use mirl.ir.opcode;
+use mirl.ir.opcode.Opcode;
 use mirl.ir.opcode.Row;
 use types: mirl.ir.type;
 use mirl.ir.type.Type;
@@ -111,15 +119,15 @@ pub tag Alias: u8 {
 # writes:   it may write
 # anywhere: it may touch any byte, since it goes through no address
 # ordered:  it is ordered against every other access
-# count:    how many of places are used
-# places:   where it reads or writes, through each address operand
+# places:   where it reads or writes, one for each address operand it has,
+#           with no limit on how many. the caller gives them back with
+#           `release`
 pub rec Effect {
     reads:    bool;
     writes:   bool;
     anywhere: bool;
     ordered:  bool;
-    count:    u32;
-    places:   [2]Place;
+    places:   vector.Vector[Place];
 }
 
 # how far apart iterations touch the same bytes
@@ -134,24 +142,17 @@ pub tag Carried: u8 {
     unknown;
 }
 
-# how an accumulator combines
-pub tag Combine: u8 {
-    sum;
-    product;
-    both;
-    either;
-    differ;
-}
-
 # an accumulator a loop updates each trip
 # ---
-# combine: how it combines
-# float:   it is a float, so its result depends on the order unless the reader
-#          is allowed to reassociate. an integer accumulator is exact in any
-#          order
+# op:    how it combines, a sum, product, and, or or exclusive or
+# float: it is a float accumulator
+# exact: its result is the same in any order, which the algebra table states
+#        of the operation and which no float accumulator has, so a float sum
+#        needs the reader's permission to reassociate
 pub rec Reduction {
-    combine: Combine;
-    float:   bool;
+    op:    Op;
+    float: bool;
+    exact: bool;
 }
 
 # the memory analysis of one function
@@ -239,7 +240,8 @@ fun opaque(v: Value) Offset {
 
 # an i128 as an i64, none when it does not fit
 fun narrowed(x: i128) opt[i64] {
-    if (x > 9223372036854775807::i128 || x < -9223372036854775807::i128) { ret opt[i64].none{}; }
+    val bound: i128 = 1::i128 << 63;
+    if (x >= bound || x < -bound) { ret opt[i64].none{}; }
     ret opt[i64].some{x::i64};
 }
 
@@ -326,19 +328,19 @@ fun offset_of(w: *Walk, v: Value, terms: u32) Offset {
     val made: opt[*InstructionData] = read.made(w.body, v);
     if (sel made.none) { ret opaque(v); }
     val ins: *InstructionData = made.some;
-    val c:   u32              = ins.opcode.index;
+    val op:  Op               = algebra.algebra(ins.opcode).op;
     if (ins.operands.len != 2) { ret opaque(v); }
     val x: Offset = offset_of(w, ins.operands.data[0], terms + 1);
     val y: Offset = offset_of(w, ins.operands.data[1], terms + 1);
-    if (c == opcode.ADD.index) {
+    if (sel op.sum) {
         val r: opt[Offset] = combine(x, y, 1);
         if (sel r.some) { ret r.some; }
     }
-    if (c == opcode.SUB.index) {
+    if (sel op.difference) {
         val r: opt[Offset] = combine(x, y, -1);
         if (sel r.some) { ret r.some; }
     }
-    if (c == opcode.MUL.index) {
+    if (sel op.product) {
         if (fixed(y)) {
             val r: opt[Offset] = scaled(x, y.constant);
             if (sel r.some) { ret r.some; }
@@ -348,7 +350,7 @@ fun offset_of(w: *Walk, v: Value, terms: u32) Offset {
             if (sel r.some) { ret r.some; }
         }
     }
-    if (c == opcode.SHL.index && fixed(y) && y.constant >= 0 && y.constant < 62) {
+    if (sel op.shift_left && fixed(y) && y.constant >= 0 && y.constant < 62) {
         val r: opt[Offset] = scaled(x, 1::i64 << y.constant::u64);
         if (sel r.some) { ret r.some; }
     }
@@ -453,7 +455,7 @@ pub fun alias(a: Place, b: Place) Alias {
     ret Alias.may{};
 }
 
-fun ordering_of(ins: *InstructionData, r: *Row) bool {
+fun ordering_of(ins: *InstructionData) bool {
     var i: usize = 0;
     for (i < ins.immediates.len) {
         val imm: opcode.Immediate = ins.immediates.data[i];
@@ -512,7 +514,8 @@ fun extent(w: *Walk, ins: *InstructionData, r: *Row) opt[u64] {
 # i:   the instruction
 # ret: its effect, or why the query was refused
 pub fun effect_of(mem: *Memory, i: Instruction) res[Effect, Why] {
-    var e:   Effect;
+    var e: Effect;
+    e.places = vector.init[Place](mem.m.a);
     val got: res[*Body, module.Error] = module.body(mem.m, mem.f);
     if (sel got.err) { ret res[Effect, Why].err{Why.ir{got.err}}; }
     var w: Walk;
@@ -526,28 +529,36 @@ pub fun effect_of(mem: *Memory, i: Instruction) res[Effect, Why] {
     e.reads  = r.effects.reads;
     e.writes = r.effects.writes;
     if (!e.reads && !e.writes) { ret res[Effect, Why].ok{e}; }
-    e.ordered = ordering_of(ins, ?r);
+    e.ordered = ordering_of(ins);
     val size: opt[u64] = extent(?w, ins, ?r);
     val n:    u32      = opcode.fixed(?r);
     var k:    u32      = 0;
     for (k < n && k::usize < ins.operands.len && !w.failed) {
         if (sel r.operands[k].role.address) {
-            if (e.count >= 2) { e.anywhere = true; }
-            or {
-                var p: Place = locate(?w, ins.operands.data[k]);
-                if (sel size.some) {
-                    p.sized = true;
-                    p.size  = size.some;
-                }
-                e.places[e.count] = p;
-                e.count           = e.count + 1;
+            var p: Place = locate(?w, ins.operands.data[k]);
+            if (sel size.some) {
+                p.sized = true;
+                p.size  = size.some;
+            }
+            val pushed: res[usize, allocator.Error] = vector.push[Place](?e.places, p);
+            if (sel pushed.err) {
+                vector.dnit[Place](?e.places);
+                ret res[Effect, Why].err{Why.alloc{pushed.err}};
             }
         }
         k = k + 1;
     }
-    if (e.count == 0) { e.anywhere = true; }
-    if (w.failed)     { ret res[Effect, Why].err{w.why}; }
+    if (w.failed) {
+        vector.dnit[Place](?e.places);
+        ret res[Effect, Why].err{w.why};
+    }
+    if (e.places.len == 0) { e.anywhere = true; }
     ret res[Effect, Why].ok{e};
+}
+
+# give back the storage of an effect
+pub fun release(e: *Effect) err[allocator.Error] {
+    ret vector.dnit[Place](?e.places);
 }
 
 # whether two instructions' effects must keep their order
@@ -557,11 +568,11 @@ pub fun conflicts(a: Effect, b: Effect) bool {
     if (a.ordered || b.ordered)   { ret true; }
     if (!a.writes && !b.writes)   { ret false; }
     if (a.anywhere || b.anywhere) { ret true; }
-    var i: u32 = 0;
-    for (i < a.count) {
-        var j: u32 = 0;
-        for (j < b.count) {
-            val al: Alias = alias(a.places[i], b.places[j]);
+    var i: usize = 0;
+    for (i < a.places.len) {
+        var j: usize = 0;
+        for (j < b.places.len) {
+            val al: Alias = alias(a.places.data[i], b.places.data[j]);
             if (!(sel al.no)) { ret true; }
             j = j + 1;
         }
@@ -622,8 +633,9 @@ fun stepped(w: *Walk, arg: Value, param: Value) opt[i64] {
     if (!checked(w, arg)) { ret opt[i64].none{}; }
     val made: opt[*InstructionData] = read.made(w.body, arg);
     if (sel made.none) { ret opt[i64].none{}; }
-    val ins: *InstructionData = made.some;
-    if (ins.opcode.index != opcode.ADD.index || ins.operands.len != 2) { ret opt[i64].none{}; }
+    val ins:  *InstructionData = made.some;
+    val form: Algebra          = algebra.algebra(ins.opcode);
+    if (!(sel form.op.sum) || !form.commutative || ins.operands.len != 2) { ret opt[i64].none{}; }
     var other: Value = ins.operands.data[1];
     if (ins.operands.data[1].index == param.index) { other = ins.operands.data[0]; }
     or (ins.operands.data[0].index != param.index) { ret opt[i64].none{}; }
@@ -703,17 +715,10 @@ pub fun carried(mem: *Memory, lp: u32, first: Place, then: Place) res[Carried, W
     ret res[Carried, Why].ok{Carried.distance{least::u64}};
 }
 
-fun combiner(code: u32) opt[Combine] {
-    if (code == opcode.ADD.index || code == opcode.FADD.index) { ret opt[Combine].some{Combine.sum{}}; }
-    if (code == opcode.MUL.index || code == opcode.FMUL.index) { ret opt[Combine].some{Combine.product{}}; }
-    if (code == opcode.AND.index)                              { ret opt[Combine].some{Combine.both{}}; }
-    if (code == opcode.OR.index)                               { ret opt[Combine].some{Combine.either{}}; }
-    if (code == opcode.XOR.index)                              { ret opt[Combine].some{Combine.differ{}}; }
-    ret opt[Combine].none{};
-}
-
-fun floating(code: u32) bool {
-    ret code == opcode.FADD.index || code == opcode.FMUL.index;
+# whether an operation can fold an accumulator in any operand order
+fun reducing(a: Algebra) bool {
+    if (!a.commutative) { ret false; }
+    ret sel a.op.sum || sel a.op.product || sel a.op.both || sel a.op.either || sel a.op.differ;
 }
 
 fun inside(w: *Walk, lp: u32, i: Instruction) bool {
@@ -771,8 +776,8 @@ pub fun reduction(mem: *Memory, lp: u32, param: Value) res[opt[Reduction], Why] 
                     if (sel made.none) { ret none; }
                     val op:   *InstructionData = made.some;
                     val c:    u32              = op.opcode.index;
-                    val kind: opt[Combine]     = combiner(c);
-                    if (sel kind.none || op.operands.len != 2)                                                { ret none; }
+                    val form: Algebra          = algebra.algebra(op.opcode);
+                    if (!reducing(form) || op.operands.len != 2)                                              { ret none; }
                     if (op.operands.data[0].index == op.operands.data[1].index)                               { ret none; }
                     if (op.operands.data[0].index != param.index && op.operands.data[1].index != param.index) { ret none; }
                     if (seen && c != code)                                                                    { ret none; }
@@ -793,7 +798,8 @@ pub fun reduction(mem: *Memory, lp: u32, param: Value) res[opt[Reduction], Why] 
         }
         u = u + 1;
     }
-    val combine: opt[Combine] = combiner(code);
-    if (sel combine.none) { ret none; }
-    ret res[opt[Reduction], Why].ok{opt[Reduction].some{Reduction{combine: combine.some, float: floating(code)}}};
+    val form: Algebra                      = algebra.algebra(Opcode{index: code});
+    val ty:   res[types.Kind, types.Error] = types.kind(?mem.m.types, w.body.values.data[param.index].type);
+    if (sel ty.err) { ret res[opt[Reduction], Why].err{Why.ir{module.Error.types{ty.err}}}; }
+    ret res[opt[Reduction], Why].ok{opt[Reduction].some{Reduction{op: form.op, float: sel ty.ok.float, exact: form.associative}}};
 }
