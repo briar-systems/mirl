@@ -1,0 +1,458 @@
+# copies of blocks: a region of a function's blocks, or its whole body, made in
+# the same function or another through the builder
+#
+# each copied block takes its source's parameters, and each copied instruction
+# its source's whole metadata record, with every value and block of the region
+# read through the map. a value from outside the region stands for itself in
+# the same function, and must be bound in the map in another, except a
+# constant, whose value in the copy's function stands for it. the copies keep
+# the source's inlining site, and an inliner sets its own on them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.build.Failure;
+use mirl.build.remap;
+use mirl.build.remap.Remap;
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.Binding;
+use mirl.ir.debug.Location;
+use mirl.ir.debug.Site;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.ir.value.ValueData;
+
+fun alloc(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.ir{module.Error.alloc{e}}};
+}
+
+# what one copy is making, so a refusal can take it back out
+# ---
+# blocks: the copies of the region's blocks, in the region's order
+# made:   the copied instructions, in the order they were made
+rec Work {
+    blocks: vector.Vector[Block];
+    made:   vector.Vector[Instruction];
+}
+
+# take back what a refused copy made, latest first
+fun undo(m: *Module, to: Function, w: *Work) {
+    var i: usize = w.made.len;
+    for (i > 0) {
+        i = i - 1;
+        body.erase(m, to, w.made.data[i]);
+    }
+    i = w.blocks.len;
+    for (i > 0) {
+        i = i - 1;
+        body.erase_block(m, to, w.blocks.data[i]);
+    }
+}
+
+# a value used before its copy can be made: defined by an instruction of the
+# region and not yet bound
+fun waiting(fb: *Body, inside: *vector.Vector[bool], r: *Remap, v: Value) bool {
+    val bound: opt[Value] = remap.value(r, v);
+    if (sel bound.some) { ret false; }
+    val def: Def = fb.values.data[v.index].def;
+    if (!(sel def.result)) { ret false; }
+    val at: Place = fb.instructions.data[def.result.instruction.index].place;
+    if (!(sel at.placed)) { ret false; }
+    ret at.placed.index::usize < inside.len && inside.data[at.placed.index];
+}
+
+# the first value an instruction uses before its copy can be made
+fun unready(fb: *Body, inside: *vector.Vector[bool], r: *Remap, i: Instruction) opt[Value] {
+    val d: *InstructionData = ?fb.instructions.data[i.index];
+    var k: usize            = 0;
+    for (k < d.operands.len) {
+        if (waiting(fb, inside, r, d.operands.data[k])) { ret opt[Value].some{d.operands.data[k]}; }
+        k = k + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val args: *vector.Vector[Value] = ?d.edges.data[e].arguments;
+        k = 0;
+        for (k < args.len) {
+            if (waiting(fb, inside, r, args.data[k])) { ret opt[Value].some{args.data[k]}; }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+    ret opt[Value].none{};
+}
+
+# copy each region block as an empty block with its source's parameters, bound
+# in r, where w has room for every copy
+fun open(m: *Module, b: *Builder, from: Function, region: *vector.Vector[Block], r: *Remap, w: *Work) err[Error] {
+    var decls: vector.Vector[Declaration] = vector.init[Declaration](m.a);
+    fin { vector.dnit[Declaration](?decls); }
+    var i: usize = 0;
+    for (i < region.len) {
+        val k:  Block                        = region.data[i];
+        val kd: res[BlockData, module.Error] = body.block_data(m, from, k);
+        if (sel kd.err) { ret err[Error].err{Error.ir{kd.err}}; }
+        decls.len = 0;
+        var j: usize = 0;
+        for (j < kd.ok.parameters.len) {
+            val v: res[ValueData, module.Error] = body.value_data(m, from, kd.ok.parameters.data[j]);
+            if (sel v.err) { ret err[Error].err{Error.ir{v.err}}; }
+            val pushed: res[usize, allocator.Error] = vector.push[Declaration](?decls, Declaration{type: v.ok.type, secret: v.ok.secret});
+            if (sel pushed.err) { ret alloc(pushed.err); }
+            j = j + 1;
+        }
+        val copy:  Block        = build.block(b, Slice[Declaration]{data: decls.data, size: decls.len});
+        val built: err[Failure] = build.done(b);
+        if (sel built.err) { ret err[Error].err{Error.build{built.err}}; }
+        vector.push[Block](?w.blocks, copy);
+        val bound: err[allocator.Error] = remap.bind_block(r, k, copy);
+        if (sel bound.err) { ret alloc(bound.err); }
+        j = 0;
+        for (j < decls.len) {
+            val p:  Value                = build.parameter(b, copy, j::u32);
+            val pb: err[allocator.Error] = remap.bind_value(r, kd.ok.parameters.data[j], p);
+            if (sel pb.err) { ret alloc(pb.err); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# copy every instruction of the region, each once the values it uses have copies
+fun fill(m: *Module, b: *Builder, from: Function, region: *vector.Vector[Block], inside: *vector.Vector[bool], r: *Remap, w: *Work) err[Error] {
+    var done: vector.Vector[usize] = vector.init[usize](m.a);
+    fin { vector.dnit[usize](?done); }
+    val room: res[usize, allocator.Error] = vector.reserve[usize](?done, region.len);
+    if (sel room.err) { ret alloc(room.err); }
+    var i: usize = 0;
+    for (i < region.len) {
+        vector.push[usize](?done, 0);
+        i = i + 1;
+    }
+    var left: bool = true;
+    for (left) {
+        left = false;
+        var moved: bool  = false;
+        var stuck: Value = Value{index: 0};
+        var seen:  bool  = false;
+        i = 0;
+        for (i < region.len) {
+            val got: res[*Body, module.Error] = module.body(m, from);
+            if (sel got.err) { ret err[Error].err{Error.ir{got.err}}; }
+            val fb: *Body = got.ok;
+            build.at_end(b, w.blocks.data[i]);
+            for (done.data[i] < fb.blocks.data[region.data[i].index].instructions.len) {
+                val src:  Instruction = fb.blocks.data[region.data[i].index].instructions.data[done.data[i]];
+                val wait: opt[Value]  = unready(fb, inside, r, src);
+                if (sel wait.some) {
+                    if (!seen) {
+                        stuck = wait.some;
+                        seen  = true;
+                    }
+                    left = true;
+                    brk;
+                }
+                val kept: res[usize, allocator.Error] = vector.reserve[Instruction](?w.made, 1);
+                if (sel kept.err) { ret alloc(kept.err); }
+                val copy:  Instruction  = build.copy(b, from, src, r);
+                val built: err[Failure] = build.done(b);
+                if (sel built.err) { ret err[Error].err{Error.build{built.err}}; }
+                vector.push[Instruction](?w.made, copy);
+                done.data[i] = done.data[i] + 1;
+                moved        = true;
+            }
+            i = i + 1;
+        }
+        if (left && !moved) { ret err[Error].err{Error.undefined{stuck}}; }
+    }
+    ret err[Error].ok{};
+}
+
+# copy a region of a function's blocks into a function, the same one or another
+#
+# a refusal takes back the copies made, all but an entry block copied into an
+# empty body, which stays empty.
+# ---
+# m:      the module
+# from:   the function the region is in
+# to:     the function the copies are made in
+# blocks: the region, each block once
+# r:      the map, read for values from outside the region and given every
+#         source block, parameter and result of the region bound to its copy
+# ret:    ok, or why it was refused
+pub fun region(m: *Module, from: Function, to: Function, blocks: Slice[Block], r: *Remap) err[Error] {
+    val got: res[*Body, module.Error] = module.body(m, from);
+    if (sel got.err) { ret err[Error].err{Error.ir{got.err}}; }
+    var inside: vector.Vector[bool]  = vector.init[bool](m.a);
+    var list:   vector.Vector[Block] = vector.init[Block](m.a);
+    var w:      Work                 = Work{blocks: vector.init[Block](m.a), made: vector.init[Instruction](m.a)};
+    fin {
+        vector.dnit[bool](?inside);
+        vector.dnit[Block](?list);
+        vector.dnit[Block](?w.blocks);
+        vector.dnit[Instruction](?w.made);
+    }
+    val count: usize                       = got.ok.blocks.len;
+    val ri:    res[usize, allocator.Error] = vector.reserve[bool](?inside, count);
+    if (sel ri.err) { ret alloc(ri.err); }
+    val rl: res[usize, allocator.Error] = vector.reserve[Block](?list, blocks.size);
+    if (sel rl.err) { ret alloc(rl.err); }
+    val rb: res[usize, allocator.Error] = vector.reserve[Block](?w.blocks, blocks.size);
+    if (sel rb.err) { ret alloc(rb.err); }
+    var i: usize = 0;
+    for (i < count) {
+        vector.push[bool](?inside, false);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < blocks.size) {
+        val k: Block = blocks.data[i];
+        if (k.index::usize >= count)            { ret err[Error].err{Error.ir{module.Error.block{k}}}; }
+        if (got.ok.blocks.data[k.index].erased) { ret err[Error].err{Error.ir{module.Error.removed{k}}}; }
+        if (!inside.data[k.index]) {
+            inside.data[k.index] = true;
+            vector.push[Block](?list, k);
+        }
+        i = i + 1;
+    }
+
+    var b: Builder = build.init(m);
+    build.enter(?b, to);
+    val opened: err[Error] = open(m, ?b, from, ?list, r, ?w);
+    if (sel opened.err) {
+        undo(m, to, ?w);
+        ret opened;
+    }
+    val filled: err[Error] = fill(m, ?b, from, ?list, ?inside, r, ?w);
+    if (sel filled.err) { undo(m, to, ?w); }
+    ret filled;
+}
+
+# copy every block of a function's body into another function, as `region`
+pub fun whole(m: *Module, from: Function, to: Function, r: *Remap) err[Error] {
+    val got: res[*Body, module.Error] = module.body(m, from);
+    if (sel got.err) { ret err[Error].err{Error.ir{got.err}}; }
+    var list: vector.Vector[Block] = vector.init[Block](m.a);
+    fin { vector.dnit[Block](?list); }
+    var i: usize = 0;
+    for (i < got.ok.blocks.len) {
+        if (!got.ok.blocks.data[i].erased) {
+            val pushed: res[usize, allocator.Error] = vector.push[Block](?list, Block{index: i::u32});
+            if (sel pushed.err) { ret alloc(pushed.err); }
+        }
+        i = i + 1;
+    }
+    ret region(m, from, to, Slice[Block]{data: list.data, size: list.len}, r);
+}
+
+fun request(code: opcode.Opcode, operands: Slice[Value], targets: Slice[Branch]) Request {
+    ret Request{opcode: code, operands: operands, immediates: Slice[opcode.Immediate]{data: nil, size: 0}, targets: targets};
+}
+
+fun no_values() Slice[Value] {
+    ret Slice[Value]{data: nil, size: 0};
+}
+
+fun no_targets() Slice[Branch] {
+    ret Slice[Branch]{data: nil, size: 0};
+}
+
+fun int(m: *Module, width: u32) Type {
+    val r: res[Type, types.Error] = types.intern(?m.types, types.Shape.integer{types.Integer{width: width}});
+    if (sel r.err) { ret Type{index: 0xffffffff}; }
+    ret r.ok;
+}
+
+fun same_metadata(x: Metadata, y: Metadata) bool {
+    if (sel x.location.some != sel y.location.some) { ret false; }
+    if (sel x.location.some) {
+        if (sel y.location.some && x.location.some.index != y.location.some.index) { ret false; }
+    }
+    if (sel x.site.some != sel y.site.some) { ret false; }
+    if (sel x.site.some) {
+        if (sel y.site.some && x.site.some.index != y.site.some.index) { ret false; }
+    }
+    ret x.flags.volatile == y.flags.volatile && x.secret == y.secret && x.bindings.index == y.bindings.index;
+}
+
+# whether a copy's value is the one r gives for the source's, or for a
+# constant the copy's function's value of it
+fun mapped(m: *Module, from: Function, to: Function, r: *Remap, source: Value, copy: Value) bool {
+    val d: res[ValueData, module.Error] = body.value_data(m, from, source);
+    if (sel d.err) { ret false; }
+    if (sel d.ok.def.constant) {
+        val c: res[Value, module.Error] = body.constant(m, to, d.ok.def.constant);
+        ret sel c.ok && c.ok.index == copy.index;
+    }
+    val bound: opt[Value] = remap.value(r, source);
+    ret sel bound.some && bound.some.index == copy.index;
+}
+
+# f(x) loops i from x while i < 0 by i + x, with a location, site, flags,
+# secrecy and bindings spread over its instructions
+fun looping(m: *Module, sig: Type) Function {
+    var b:    Builder        = build.init(m);
+    val f:    Function       = build.function(?b, FunctionData{name: View{data: "f", len: 1}, signature: sig});
+    val zero: Constant       = build.constant(?b, ConstantData.zero{int(m, 32)});
+    var decl: [1]Declaration = [1]Declaration{Declaration{type: int(m, 32), secret: false}};
+    build.enter(?b, f);
+    val entry: Block    = build.block(?b, Slice[Declaration]{data: ?decl[0], size: 1});
+    val head:  Block    = build.block(?b, Slice[Declaration]{data: ?decl[0], size: 1});
+    val step:  Block    = build.block(?b, Slice[Declaration]{data: nil, size: 0});
+    val exit:  Block    = build.block(?b, Slice[Declaration]{data: nil, size: 0});
+    var x:     [1]Value = [1]Value{build.parameter(?b, entry, 0)};
+    val i:     Value    = build.parameter(?b, head, 0);
+
+    build.at_end(?b, entry);
+    build.locate(?b, opt[Location].some{Location{index: 1}});
+    var into: [1]Branch = [1]Branch{Branch{block: head, arguments: Slice[Value]{data: ?x[0], size: 1}}};
+    build.emit(?b, request(opcode.BR, no_values(), Slice[Branch]{data: ?into[0], size: 1}));
+
+    build.at_end(?b, head);
+    build.site(?b, opt[Site].some{Site{index: 2}});
+    var against: [2]Value  = [2]Value{i, build.use_constant(?b, zero)};
+    var cond:    [1]Value  = [1]Value{build.value(?b, request(opcode.LT_U, Slice[Value]{data: ?against[0], size: 2}, no_targets()))};
+    var arms:    [2]Branch = [2]Branch{Branch{block: step, arguments: no_values()}, Branch{block: exit, arguments: no_values()}};
+    build.emit(?b, request(opcode.CBR, Slice[Value]{data: ?cond[0], size: 1}, Slice[Branch]{data: ?arms[0], size: 2}));
+
+    build.at_end(?b, step);
+    build.flags(?b, Flags{volatile: true});
+    var ix:   [2]Value = [2]Value{i, x[0]};
+    var next: [1]Value = [1]Value{build.value(?b, request(opcode.ADD, Slice[Value]{data: ?ix[0], size: 2}, no_targets()))};
+    build.secret(?b, true);
+    build.value(?b, request(opcode.ADD, Slice[Value]{data: ?ix[0], size: 2}, no_targets()));
+    build.plain(?b);
+    var back: [1]Branch = [1]Branch{Branch{block: head, arguments: Slice[Value]{data: ?next[0], size: 1}}};
+    build.emit(?b, request(opcode.BR, no_values(), Slice[Branch]{data: ?back[0], size: 1}));
+
+    build.at_end(?b, exit);
+    var out: [1]Value = [1]Value{i};
+    build.emit(?b, request(opcode.RET, Slice[Value]{data: ?out[0], size: 1}, no_targets()));
+    if (build.failed(?b)) { ret Function{index: 0xffffffff}; }
+
+    var bound: [1]Binding                   = [1]Binding{Binding{index: 7}};
+    val list:  res[Bindings, module.Error]  = module.bindings(m, Slice[Binding]{data: ?bound[0], size: 1});
+    val sd:    res[BlockData, module.Error] = body.block_data(m, f, step);
+    if (sel list.err) { ret Function{index: 0xffffffff}; }
+    if (sel sd.err)   { ret Function{index: 0xffffffff}; }
+    val adds: Instruction                        = sd.ok.instructions.data[0];
+    val ad:   res[InstructionData, module.Error] = body.instruction_data(m, f, adds);
+    if (sel ad.err) { ret Function{index: 0xffffffff}; }
+    var md: Metadata = ad.ok.metadata;
+    md.bindings = list.ok;
+    val set: err[module.Error] = body.set_metadata(m, f, adds, md);
+    if (sel set.err) { ret Function{index: 0xffffffff}; }
+    ret f;
+}
+
+test copy__remaps_every_value_and_keeps_metadata {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val made: res[Module, module.Error] = module.init(?a, View{data: "riscv64", len: 7});
+    if (sel made.err) { ret 1; }
+    var m: Module = made.ok;
+    fin { module.dnit(?m); }
+    var one: [1]Type                = [1]Type{int(?m, 32)};
+    val sig: res[Type, types.Error] = types.intern(?m.types, types.Shape.function{types.Function{params: Slice[Type]{data: ?one[0], size: 1}, results: Slice[Type]{data: ?one[0], size: 1}}});
+    if (sel sig.err) { ret 1; }
+    val f: Function = looping(?m, sig.ok);
+    if (f.index == 0xffffffff) { ret 2; }
+    var b: Builder  = build.init(?m);
+    val g: Function = build.function(?b, FunctionData{name: View{data: "g", len: 1}, signature: sig.ok});
+    if (build.failed(?b)) { ret 2; }
+
+    var r: Remap = remap.init(?a);
+    fin { remap.dnit(?r); }
+    val copied: err[Error] = whole(?m, f, g, ?r);
+    if (sel copied.err) { ret 3; }
+
+    var checked: usize = 0;
+    var k:       u32   = 0;
+    for (k < 4) {
+        val source: Block      = Block{index: k};
+        val twin:   opt[Block] = remap.block(?r, source);
+        if (sel twin.none) { ret 4; }
+        val sd: res[BlockData, module.Error] = body.block_data(?m, f, source);
+        val cd: res[BlockData, module.Error] = body.block_data(?m, g, twin.some);
+        if (sel sd.err)                                       { ret 4; }
+        if (sel cd.err)                                       { ret 4; }
+        if (sd.ok.parameters.len != cd.ok.parameters.len)     { ret 4; }
+        if (sd.ok.instructions.len != cd.ok.instructions.len) { ret 4; }
+        var p: usize = 0;
+        for (p < sd.ok.parameters.len) {
+            if (!mapped(?m, f, g, ?r, sd.ok.parameters.data[p], cd.ok.parameters.data[p])) { ret 5; }
+            p = p + 1;
+        }
+        var i: usize = 0;
+        for (i < sd.ok.instructions.len) {
+            val s: res[InstructionData, module.Error] = body.instruction_data(?m, f, sd.ok.instructions.data[i]);
+            val c: res[InstructionData, module.Error] = body.instruction_data(?m, g, cd.ok.instructions.data[i]);
+            if (sel s.err)                                    { ret 6; }
+            if (sel c.err)                                    { ret 6; }
+            if (s.ok.opcode.index != c.ok.opcode.index)       { ret 6; }
+            if (!same_metadata(s.ok.metadata, c.ok.metadata)) { ret 7; }
+            var o: usize = 0;
+            for (o < s.ok.operands.len) {
+                if (!mapped(?m, f, g, ?r, s.ok.operands.data[o], c.ok.operands.data[o])) { ret 8; }
+                o = o + 1;
+            }
+            o = 0;
+            for (o < s.ok.results.len) {
+                if (!mapped(?m, f, g, ?r, s.ok.results.data[o], c.ok.results.data[o])) { ret 8; }
+                o = o + 1;
+            }
+            var e: usize = 0;
+            for (e < s.ok.edges.len) {
+                val to: opt[Block] = remap.block(?r, s.ok.edges.data[e].block);
+                if (!(sel to.some && to.some.index == c.ok.edges.data[e].block.index)) { ret 9; }
+                o = 0;
+                for (o < s.ok.edges.data[e].arguments.len) {
+                    if (!mapped(?m, f, g, ?r, s.ok.edges.data[e].arguments.data[o], c.ok.edges.data[e].arguments.data[o])) { ret 9; }
+                    o = o + 1;
+                }
+                e = e + 1;
+            }
+            checked = checked + 1;
+            i       = i + 1;
+        }
+        k = k + 1;
+    }
+    if (checked != 7) { ret 10; }
+    ret 0;
+}
