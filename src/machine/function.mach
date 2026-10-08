@@ -1,0 +1,576 @@
+# machine functions: blocks, instructions, virtual registers and frame slots
+#
+# a function is made for one instruction set of masc, the target's, whose
+# register file and catalog rows every instruction is checked against when it
+# is appended. its first block is its entry.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.fail.keep;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.metadata.Metadata;
+use mirl.machine.block.BlockData;
+use mirl.machine.class;
+use mirl.machine.class.Cell;
+use mirl.machine.class.Class;
+use mirl.machine.class.Memory;
+use mirl.machine.class.Physical;
+use mirl.machine.instruction;
+use mirl.machine.instruction.Context;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.instruction.Refusal;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Tied;
+use mirl.machine.operand.Virtual;
+use mirl.machine.pseudo;
+use mirl.machine.view;
+use mirl.slice;
+
+use masc.core.ct;
+use masc.core.effect;
+use masc.core.extension;
+use masc.core.field;
+use mo: masc.core.operand;
+use rf: masc.core.register;
+use masc.core.relax;
+use rows: masc.core.row;
+use mset: masc.core.set;
+use masc.core.spelling;
+use masc.core.walk;
+
+# a frame slot
+# ---
+# size:  its bytes
+# align: the alignment it needs, a power of two
+pub rec SlotData {
+    size:  u64;
+    align: u64;
+}
+
+# one machine function
+# ---
+# a:            the allocator its storage takes
+# set:          the instruction set it is made for
+# blocks:       its blocks, the entry first
+# instructions: its instructions, indexed by their ids
+# virtuals:     the class of each virtual register
+# slots:        its frame slots
+pub rec Function {
+    a:            *allocator.Allocator;
+    set:          *mset.Set;
+    blocks:       vector.Vector[BlockData];
+    instructions: vector.Vector[InstructionData];
+    virtuals:     vector.Vector[Class];
+    slots:        vector.Vector[SlotData];
+}
+
+# why a function refused a request
+# ---
+# alloc:   the allocator refused storage
+# refused: an instruction does not stand against its opcode's row
+# class:   a class the target's register file has no row for
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    refused: Refusal;
+    class:   Class;
+}
+
+# an empty function for an instruction set
+pub fun init(a: *allocator.Allocator, set: *mset.Set) Function {
+    ret Function{
+        a:            a,
+        set:          set,
+        blocks:       vector.init[BlockData](a),
+        instructions: vector.init[InstructionData](a),
+        virtuals:     vector.init[Class](a),
+        slots:        vector.init[SlotData](a),
+    };
+}
+
+# give back a function's storage
+pub fun dnit(f: *Function) err[allocator.Error] {
+    var failed: err[allocator.Error] = err[allocator.Error].ok{};
+    var i:      usize                = 0;
+    for (i < f.instructions.len) {
+        keep(?failed, slice.release[Operand](f.a, f.instructions.data[i].operands));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        keep(?failed, vector.dnit[Instruction](?f.blocks.data[i].instructions));
+        i = i + 1;
+    }
+    keep(?failed, vector.dnit[BlockData](?f.blocks));
+    keep(?failed, vector.dnit[InstructionData](?f.instructions));
+    keep(?failed, vector.dnit[Class](?f.virtuals));
+    keep(?failed, vector.dnit[SlotData](?f.slots));
+    ret failed;
+}
+
+# the register file of a function's instruction set, nil when it has none
+pub fun file(f: *Function) *rf.File {
+    if (f.set.codec == nil) { ret nil; }
+    ret f.set.codec.registers;
+}
+
+fun catalog(f: *Function) rows.Rows {
+    if (f.set.codec == nil) { ret rows.Rows{at: nil, len: 0}; }
+    ret f.set.codec.rows;
+}
+
+# add a block after the last
+pub fun block(f: *Function) res[Block, Error] {
+    val b: BlockData                   = BlockData{instructions: vector.init[Instruction](f.a)};
+    val p: res[usize, allocator.Error] = vector.push[BlockData](?f.blocks, b);
+    if (sel p.err) { ret res[Block, Error].err{Error.alloc{p.err}}; }
+    ret res[Block, Error].ok{Block{index: (f.blocks.len - 1)::u32}};
+}
+
+# add a virtual register of a class, of the function's register file or memory-backed
+pub fun virtual(f: *Function, c: Class) res[Virtual, Error] {
+    if (!class.valid(c) || (sel c.hardware && c.hardware.file != file(f))) { ret res[Virtual, Error].err{Error.class{c}}; }
+    val p: res[usize, allocator.Error] = vector.push[Class](?f.virtuals, c);
+    if (sel p.err) { ret res[Virtual, Error].err{Error.alloc{p.err}}; }
+    ret res[Virtual, Error].ok{Virtual{index: (f.virtuals.len - 1)::u32}};
+}
+
+# the class of a virtual register
+pub fun class_of(f: *Function, v: Virtual) Class {
+    ret f.virtuals.data[v.index];
+}
+
+# add a frame slot
+pub fun slot(f: *Function, size: u64, align: u64) res[Slot, Error] {
+    val p: res[usize, allocator.Error] = vector.push[SlotData](?f.slots, SlotData{size: size, align: align});
+    if (sel p.err) { ret res[Slot, Error].err{Error.alloc{p.err}}; }
+    ret res[Slot, Error].ok{Slot{index: (f.slots.len - 1)::u32}};
+}
+
+# append an instruction to a block, checked against its opcode's row
+# ---
+# f:        the function
+# b:        the block
+# op:       the opcode
+# operands: the operands, copied
+# metadata: the metadata record of the ir instruction it came from
+# ret:      the instruction, or why it was refused
+pub fun append(f: *Function, b: Block, op: Opcode, operands: Slice[Operand], metadata: Metadata) res[Instruction, Error] {
+    if (b.index::usize >= f.blocks.len) { ret res[Instruction, Error].err{Error.refused{Refusal{operand: instruction.NO_OPERAND, what: instruction.UNKNOWN_BLOCK}}}; }
+    var c: Context = Context{
+        file:     file(f),
+        rows:     catalog(f),
+        virtuals: Slice[Class]{data: f.virtuals.data, size: f.virtuals.len},
+        slots:    f.slots.len::u32,
+        blocks:   f.blocks.len::u32,
+    };
+    val checked: err[Refusal] = instruction.check(?c, op, operands);
+    if (sel checked.err) { ret res[Instruction, Error].err{Error.refused{checked.err}}; }
+    val owned: res[Slice[Operand], allocator.Error] = slice.copy[Operand](f.a, operands);
+    if (sel owned.err) { ret res[Instruction, Error].err{Error.alloc{owned.err}}; }
+    val room: res[usize, allocator.Error] = vector.reserve[Instruction](?f.blocks.data[b.index].instructions, 1);
+    if (sel room.err) {
+        slice.release[Operand](f.a, owned.ok);
+        ret res[Instruction, Error].err{Error.alloc{room.err}};
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[InstructionData](?f.instructions, InstructionData{opcode: op, operands: owned.ok, metadata: metadata});
+    if (sel pushed.err) {
+        slice.release[Operand](f.a, owned.ok);
+        ret res[Instruction, Error].err{Error.alloc{pushed.err}};
+    }
+    val id: Instruction = Instruction{index: (f.instructions.len - 1)::u32};
+    vector.push[Instruction](?f.blocks.data[b.index].instructions, id);
+    ret res[Instruction, Error].ok{id};
+}
+
+# an instruction's record
+pub fun data(f: *Function, i: Instruction) *InstructionData {
+    ret ?f.instructions.data[i.index];
+}
+
+# the instructions of a block, in order
+pub fun instructions(f: *Function, b: Block) Slice[Instruction] {
+    val list: *vector.Vector[Instruction] = ?f.blocks.data[b.index].instructions;
+    ret Slice[Instruction]{data: list.data, size: list.len};
+}
+
+# the register an instruction's row fixes operand `at` to, none when it is not fixed
+pub fun fixed(f: *Function, i: Instruction, at: u32) opt[rf.Id] {
+    ret instruction.fixed(file(f), data(f, i).opcode, at);
+}
+
+# the graph of a function's blocks, valid until its blocks next change
+pub fun graph_of(f: *Function) res[Graph, allocator.Error] {
+    ret view.of(f.a, Slice[BlockData]{data: f.blocks.data, size: f.blocks.len}, Slice[InstructionData]{data: f.instructions.data, size: f.instructions.len});
+}
+
+# a register file of one general class of four registers, and rows over it
+#[testing]
+val T_CLASSES: [1]rf.Class = [1]rf.Class{
+    rf.Class{kind: rf.GENERAL, width: rf.Scaled{fixed: 32, per: 0, scale: 0}, count: 4},
+};
+
+#[testing]
+val T_REGISTERS: [4]rf.Register = [4]rf.Register{
+    rf.Register{name: "r0", class: 0, number: 0, bank: 0, offset: rf.Scaled{fixed: 0, per: 0, scale: 0}, stride: rf.Scaled{fixed: 0, per: 0, scale: 0}, count: rf.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    rf.Register{name: "r1", class: 0, number: 1, bank: 1, offset: rf.Scaled{fixed: 0, per: 0, scale: 0}, stride: rf.Scaled{fixed: 0, per: 0, scale: 0}, count: rf.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    rf.Register{name: "r2", class: 0, number: 2, bank: 2, offset: rf.Scaled{fixed: 0, per: 0, scale: 0}, stride: rf.Scaled{fixed: 0, per: 0, scale: 0}, count: rf.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    rf.Register{name: "r3", class: 0, number: 3, bank: 3, offset: rf.Scaled{fixed: 0, per: 0, scale: 0}, stride: rf.Scaled{fixed: 0, per: 0, scale: 0}, count: rf.Scaled{fixed: 1, per: 0, scale: 0}, flags: rf.STACK, requires: extension.Ids{at: nil, len: 0}},
+};
+
+#[testing]
+val T_FILE: rf.File = rf.File{
+    scales:         nil,
+    scale_count:    0,
+    classes:        ?T_CLASSES[0],
+    class_count:    1,
+    registers:      ?T_REGISTERS[0],
+    register_count: 4,
+    aliases:        nil,
+    alias_count:    0,
+    columns:        nil,
+    column_count:   0,
+};
+
+#[testing]
+val T_GENERAL: [1]u16 = [1]u16{0};
+
+#[testing]
+val T_REG: mo.Register = mo.Register{classes: mo.Classes{at: ?T_GENERAL[0], len: 1}, first: 0, count: 0, excluded: mo.Numbers{at: nil, len: 0}};
+
+#[testing]
+val T_NONE: mo.Register = mo.Register{classes: mo.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: mo.Numbers{at: nil, len: 0}};
+
+#[testing]
+val T_DISP: mo.Immediate = mo.Immediate{bits: 12, signed: true, scale: 0, bias: 0, fixup: mo.NO_FIXUP, format: mo.INTEGER, excluded: mo.Integers{at: nil, len: 0}};
+
+#[testing]
+val T_OFFSET: mo.Immediate = mo.Immediate{bits: 16, signed: true, scale: 0, bias: 0, fixup: 1, format: mo.INTEGER, excluded: mo.Integers{at: nil, len: 0}};
+
+# a widening multiply whose low half and high half are fixed to r0 and r1
+#[testing]
+val T_WIDE_OPERANDS: [3]mo.Operand = [3]mo.Operand{
+    mo.Operand{shape: mo.Shape.register{T_REG}, role: mo.READ_WRITE, width: 32, quantity: mo.ONE},
+    mo.Operand{shape: mo.Shape.register{T_REG}, role: mo.WRITE, width: 32, quantity: mo.ONE},
+    mo.Operand{shape: mo.Shape.register{T_REG}, role: mo.READ, width: 32, quantity: mo.ONE},
+};
+
+# a two-address add, its destination read and written
+#[testing]
+val T_ADD_OPERANDS: [2]mo.Operand = [2]mo.Operand{
+    mo.Operand{shape: mo.Shape.register{T_REG}, role: mo.READ_WRITE, width: 32, quantity: mo.ONE},
+    mo.Operand{shape: mo.Shape.register{T_REG}, role: mo.READ, width: 32, quantity: mo.ONE},
+};
+
+# a load from memory to a register
+#[testing]
+val T_LOAD_OPERANDS: [2]mo.Operand = [2]mo.Operand{
+    mo.Operand{shape: mo.Shape.register{T_REG}, role: mo.WRITE, width: 32, quantity: mo.ONE},
+    mo.Operand{shape: mo.Shape.memory{mo.Memory{base: T_REG, index: T_NONE, segment: T_NONE, scales: 0, disp: T_DISP, forms: mo.ABSOLUTE}}, role: mo.READ, width: 32, quantity: mo.ONE},
+};
+
+# a jump, and a branch taken when a register is nonzero
+#[testing]
+val T_JUMP_OPERANDS: [1]mo.Operand = [1]mo.Operand{
+    mo.Operand{shape: mo.Shape.relative{mo.Relative{offset: T_OFFSET, anchor: mo.END}}, role: mo.READ, width: 0, quantity: mo.ONE},
+};
+
+#[testing]
+val T_BRANCH_OPERANDS: [2]mo.Operand = [2]mo.Operand{
+    mo.Operand{shape: mo.Shape.register{T_REG}, role: mo.READ, width: 32, quantity: mo.ONE},
+    mo.Operand{shape: mo.Shape.relative{mo.Relative{offset: T_OFFSET, anchor: mo.END}}, role: mo.READ, width: 0, quantity: mo.ONE},
+};
+
+#[testing]
+val T_WIDE_FIXED: [2]effect.Fixed = [2]effect.Fixed{effect.Fixed{operand: 0, register: 0}, effect.Fixed{operand: 1, register: 1}};
+
+#[testing]
+val T_PLAIN: effect.Effect = effect.Effect{
+    implicit: effect.Registers{read: effect.Set{words: nil, len: 0}, written: effect.Set{words: nil, len: 0}},
+    flags:    effect.Flags{read: effect.Set{words: nil, len: 0}, written: effect.Set{words: nil, len: 0}, undefined: effect.Set{words: nil, len: 0}, kept: effect.Set{words: nil, len: 0}},
+    memory:   effect.Accesses{at: nil, len: 0},
+    control:  effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: field.NO_OPERAND},
+    stack:    effect.Stack.none{},
+    latency:  effect.ONE,
+    fixed:    effect.Fixeds{at: nil, len: 0},
+};
+
+#[testing]
+val T_WIDE_EFFECT: effect.Effect = effect.Effect{
+    implicit: effect.Registers{read: effect.Set{words: nil, len: 0}, written: effect.Set{words: nil, len: 0}},
+    flags:    effect.Flags{read: effect.Set{words: nil, len: 0}, written: effect.Set{words: nil, len: 0}, undefined: effect.Set{words: nil, len: 0}, kept: effect.Set{words: nil, len: 0}},
+    memory:   effect.Accesses{at: nil, len: 0},
+    control:  effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: field.NO_OPERAND},
+    stack:    effect.Stack.none{},
+    latency:  effect.FEW,
+    fixed:    effect.Fixeds{at: ?T_WIDE_FIXED[0], len: 2},
+};
+
+#[testing]
+val T_ROWS: [5]rows.Row = [5]rows.Row{
+    rows.Row{mnemonic: "wide", operands: rows.Operands{at: ?T_WIDE_OPERANDS[0], len: 3}, encoding: field.Fields{at: nil, len: 0}, requires: extension.Ids{at: nil, len: 0}, effect: ?T_WIDE_EFFECT, ct: ?ct.DEPENDENT, flags: 0},
+    rows.Row{mnemonic: "add", operands: rows.Operands{at: ?T_ADD_OPERANDS[0], len: 2}, encoding: field.Fields{at: nil, len: 0}, requires: extension.Ids{at: nil, len: 0}, effect: ?T_PLAIN, ct: ?ct.DEPENDENT, flags: 0},
+    rows.Row{mnemonic: "load", operands: rows.Operands{at: ?T_LOAD_OPERANDS[0], len: 2}, encoding: field.Fields{at: nil, len: 0}, requires: extension.Ids{at: nil, len: 0}, effect: ?T_PLAIN, ct: ?ct.DEPENDENT, flags: 0},
+    rows.Row{mnemonic: "jump", operands: rows.Operands{at: ?T_JUMP_OPERANDS[0], len: 1}, encoding: field.Fields{at: nil, len: 0}, requires: extension.Ids{at: nil, len: 0}, effect: ?T_PLAIN, ct: ?ct.DEPENDENT, flags: 0},
+    rows.Row{mnemonic: "bnz", operands: rows.Operands{at: ?T_BRANCH_OPERANDS[0], len: 2}, encoding: field.Fields{at: nil, len: 0}, requires: extension.Ids{at: nil, len: 0}, effect: ?T_PLAIN, ct: ?ct.DEPENDENT, flags: 0},
+};
+
+#[testing]
+val T_CODEC: walk.Codec = walk.Codec{fields: nil, registers: ?T_FILE, rows: rows.Rows{at: ?T_ROWS[0], len: 5}, dispatch: nil};
+
+#[testing]
+val T_SET: mset.Set = mset.Set{arches: mset.Arches{at: nil, len: 0}, codec: ?T_CODEC, extensions: nil, bindings: mset.Bindings{at: nil, len: 0}, relax: relax.Relaxations{at: nil, len: 0}, fill: nil, syntaxes: spelling.Syntaxes{at: nil, len: 0}};
+
+# sixteen bytes of memory a target names as registers
+#[testing]
+val T_PAGE: Memory = Memory{width: 8, count: 16};
+
+#[testing]
+fun t_append(f: *Function, b: Block, op: Opcode, operands: *Operand, count: usize) res[Instruction, Error] {
+    var md: Metadata;
+    ret append(f, b, op, Slice[Operand]{data: operands, size: count}, md);
+}
+
+#[testing]
+fun t_ok(r: res[Instruction, Error]) bool {
+    ret sel r.ok;
+}
+
+#[testing]
+fun t_refused(r: res[Instruction, Error], at: u32, what: str) bool {
+    ret sel r.err && (sel r.err.refused && (r.err.refused.operand == at && r.err.refused.what == what));
+}
+
+#[testing]
+fun reg(n: u16) Operand {
+    ret Operand.physical{Physical.register{rf.make(0, n)}};
+}
+
+test append__fixed_operands_come_from_the_row {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var f: Function = init(?a, ?T_SET);
+    fin { dnit(?f); }
+    val general: Class             = class.hardware(?T_FILE, 0);
+    val b:       res[Block, Error] = block(?f);
+    if (sel b.err) { ret 1; }
+    var v: [3]Operand;
+    var k: u32 = 0;
+    for (k < 3) {
+        val made: res[Virtual, Error] = virtual(?f, general);
+        if (sel made.err) { ret 1; }
+        v[k] = Operand.virtual{made.ok};
+        k    = k + 1;
+    }
+    val wide: Opcode                  = Opcode.row{?T_ROWS[0]};
+    val made: res[Instruction, Error] = t_append(?f, b.ok, wide, ?v[0], 3);
+    if (sel made.err) { ret 2; }
+    val low:  opt[rf.Id] = fixed(?f, made.ok, 0);
+    val high: opt[rf.Id] = fixed(?f, made.ok, 1);
+    val src:  opt[rf.Id] = fixed(?f, made.ok, 2);
+    if (!(sel low.some && low.some == rf.id_of(?T_REGISTERS[0])))   { ret 3; }
+    if (!(sel high.some && high.some == rf.id_of(?T_REGISTERS[1]))) { ret 3; }
+    if (!sel src.none)                                              { ret 3; }
+    var wrong: [3]Operand = [3]Operand{reg(2), reg(1), reg(3)};
+    if (!t_refused(t_append(?f, b.ok, wide, ?wrong[0], 3), 0, instruction.FIXED)) { ret 4; }
+    var right: [3]Operand = [3]Operand{reg(0), reg(1), reg(3)};
+    if (!t_ok(t_append(?f, b.ok, wide, ?right[0], 3))) { ret 5; }
+    var swapped: [3]Operand = [3]Operand{reg(0), reg(2), reg(1)};
+    if (!t_refused(t_append(?f, b.ok, wide, ?swapped[0], 3), 1, instruction.FIXED)) { ret 6; }
+    ret 0;
+}
+
+#[testing]
+#[embed("../machine.mach")]
+val SURFACE:     [_]u8;
+#[testing]
+#[embed("block.mach")]
+val BLOCK:       [_]u8;
+#[testing]
+#[embed("class.mach")]
+val CLASS:       [_]u8;
+#[testing]
+#[embed("function.mach")]
+val FUNCTION:    [_]u8;
+#[testing]
+#[embed("instruction.mach")]
+val INSTRUCTION: [_]u8;
+#[testing]
+#[embed("operand.mach")]
+val OPERAND:     [_]u8;
+#[testing]
+#[embed("pseudo.mach")]
+val PSEUDO:      [_]u8;
+#[testing]
+#[embed("view.mach")]
+val VIEW:        [_]u8;
+
+# whether a source holds a followed directly by b, the two written apart here
+# so the needles never match themselves
+#[testing]
+fun mentions(src: *u8, size: usize, a: str, b: str) bool {
+    val la: usize = str_len(a);
+    val lb: usize = str_len(b);
+    var i:  usize = 0;
+    for (i + la + lb <= size) {
+        var k:    usize = 0;
+        var same: bool  = true;
+        for (same && k < la + lb) {
+            var want: u8 = 0;
+            if (k < la)             { want = a[k]; }
+            or                      { want = b[k - la]; }
+            if (src[i + k] != want) { same = false; }
+            k = k + 1;
+        }
+        if (same) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether a source names an architecture, its registers or a target's architecture row
+#[testing]
+fun names_arch(src: *u8, size: usize) bool {
+    ret mentions(src, size, "x8", "6") || mentions(src, size, "aarc", "h") || mentions(src, size, "risc", "v") || mentions(src, size, "rv", "32") || mentions(src, size, "rv", "64") || mentions(src, size, "arm", "64") || mentions(src, size, "i3", "86") || mentions(src, size, "amd", "64") || mentions(src, size, "was", "m") || mentions(src, size, "spi", "rv") || mentions(src, size, "xm", "m") || mentions(src, size, "ra", "x") || mentions(src, size, ".", "arch") || mentions(src, size, "arch", "es.") || mentions(src, size, "mset.", "find");
+}
+
+test virtual__a_memory_backed_class_stands_wherever_a_register_class_does {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var f: Function = init(?a, ?T_SET);
+    fin { dnit(?f); }
+    val general: Class    = class.hardware(?T_FILE, 0);
+    val memory:  Class    = Class.memory{?T_PAGE};
+    val cell:    Physical = Physical.cell{Cell{class: ?T_PAGE, number: 3}};
+    if (!class.same(memory, Class.memory{?T_PAGE}) || class.same(memory, general))             { ret 1; }
+    if (class.width(memory).fixed != 8 || class.count(memory) != 16)                           { ret 1; }
+    if (!class.holds(memory, cell) || class.holds(memory, Physical.register{rf.make(0, 3)}))   { ret 1; }
+    if (!class.holds(general, Physical.register{rf.make(0, 3)}) || class.holds(general, cell)) { ret 1; }
+    val held: opt[Class] = class.of(file(?f), cell);
+    if (!(sel held.some && class.same(held.some, memory))) { ret 1; }
+
+    val b: res[Block, Error]   = block(?f);
+    val m: res[Virtual, Error] = virtual(?f, memory);
+    val g: res[Virtual, Error] = virtual(?f, general);
+    val s: res[Slot, Error]    = slot(?f, 1, 1);
+    if (sel b.err)                               { ret 2; }
+    if (sel m.err)                               { ret 2; }
+    if (sel g.err)                               { ret 2; }
+    if (sel s.err)                               { ret 2; }
+    if (!class.same(class_of(?f, m.ok), memory)) { ret 2; }
+    var copy: [2]Operand = [2]Operand{Operand.virtual{m.ok}, Operand.virtual{g.ok}};
+    if (!t_ok(t_append(?f, b.ok, Opcode.pseudo{pseudo.COPY}, ?copy[0], 2))) { ret 3; }
+    var spill: [2]Operand = [2]Operand{Operand.slot{s.ok}, Operand.virtual{m.ok}};
+    if (!t_ok(t_append(?f, b.ok, Opcode.pseudo{pseudo.SPILL}, ?spill[0], 2))) { ret 3; }
+    val load: Opcode     = Opcode.row{?T_ROWS[2]};
+    var from: [2]Operand = [2]Operand{Operand.virtual{g.ok}, Operand.virtual{m.ok}};
+    if (!t_ok(t_append(?f, b.ok, load, ?from[0], 2))) { ret 4; }
+    var assigned: [2]Operand = [2]Operand{reg(2), Operand.physical{cell}};
+    if (!t_ok(t_append(?f, b.ok, load, ?assigned[0], 2))) { ret 4; }
+    var into: [2]Operand = [2]Operand{Operand.virtual{m.ok}, Operand.virtual{g.ok}};
+    if (!t_refused(t_append(?f, b.ok, load, ?into[0], 2), 0, instruction.CLASS)) { ret 5; }
+
+    if (names_arch(?SURFACE[0], $length_of(SURFACE)))         { ret 6; }
+    if (names_arch(?BLOCK[0], $length_of(BLOCK)))             { ret 6; }
+    if (names_arch(?CLASS[0], $length_of(CLASS)))             { ret 6; }
+    if (names_arch(?FUNCTION[0], $length_of(FUNCTION)))       { ret 6; }
+    if (names_arch(?INSTRUCTION[0], $length_of(INSTRUCTION))) { ret 6; }
+    if (names_arch(?OPERAND[0], $length_of(OPERAND)))         { ret 6; }
+    if (names_arch(?PSEUDO[0], $length_of(PSEUDO)))           { ret 6; }
+    if (names_arch(?VIEW[0], $length_of(VIEW)))               { ret 6; }
+    # the scan finds what is there
+    if (!mentions(?CLASS[0], $length_of(CLASS), "memory-", "backed")) { ret 7; }
+    ret 0;
+}
+
+test append__a_tied_operand_is_held_to_its_destination {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var f: Function = init(?a, ?T_SET);
+    fin { dnit(?f); }
+    val general: Class = class.hardware(?T_FILE, 0);
+    var b:       [3]Block;
+    var k:       u32   = 0;
+    for (k < 3) {
+        val made: res[Block, Error] = block(?f);
+        if (sel made.err) { ret 1; }
+        b[k] = made.ok;
+        k    = k + 1;
+    }
+    var v: [3]Virtual;
+    k = 0;
+    for (k < 3) {
+        val made: res[Virtual, Error] = virtual(?f, general);
+        if (sel made.err) { ret 1; }
+        v[k] = made.ok;
+        k    = k + 1;
+    }
+    val add:  Opcode  = Opcode.row{?T_ROWS[1]};
+    val load: Opcode  = Opcode.row{?T_ROWS[2]};
+    val jump: Opcode  = Opcode.row{?T_ROWS[3]};
+    val bnz:  Opcode  = Opcode.row{?T_ROWS[4]};
+    val tied: Operand = Operand.tied{Tied{dest: Register.virtual{v[1]}, source: Register.virtual{v[0]}}};
+
+    # the entry jumps into a loop whose body is a two-address add
+    var enter: [1]Operand = [1]Operand{Operand.block{b[1]}};
+    if (!t_ok(t_append(?f, b[0], jump, ?enter[0], 1))) { ret 2; }
+    var bump: [2]Operand = [2]Operand{tied, Operand.virtual{v[2]}};
+    if (!t_ok(t_append(?f, b[1], add, ?bump[0], 2))) { ret 2; }
+    var back: [2]Operand = [2]Operand{Operand.virtual{v[1]}, Operand.block{b[1]}};
+    if (!t_ok(t_append(?f, b[1], bnz, ?back[0], 2))) { ret 2; }
+    var leave: [1]Operand = [1]Operand{Operand.block{b[2]}};
+    if (!t_ok(t_append(?f, b[1], jump, ?leave[0], 1))) { ret 2; }
+
+    # a tie stands only where the row reads and writes one register
+    var written: [2]Operand       = [2]Operand{tied, Operand.slot{Slot{index: 0}}};
+    val s:       res[Slot, Error] = slot(?f, 4, 4);
+    if (sel s.err)                                                                      { ret 3; }
+    if (!t_refused(t_append(?f, b[1], load, ?written[0], 2), 0, instruction.TIED_ROLE)) { ret 3; }
+
+    # once assigned, both halves are one location
+    var apart: [2]Operand = [2]Operand{Operand.tied{Tied{dest: Register.physical{Physical.register{rf.make(0, 0)}}, source: Register.physical{Physical.register{rf.make(0, 1)}}}}, reg(2)};
+    if (!t_refused(t_append(?f, b[1], add, ?apart[0], 2), 0, instruction.UNTIED)) { ret 4; }
+    var one: [2]Operand = [2]Operand{Operand.tied{Tied{dest: Register.physical{Physical.register{rf.make(0, 2)}}, source: Register.physical{Physical.register{rf.make(0, 2)}}}}, reg(1)};
+    if (!t_ok(t_append(?f, b[1], add, ?one[0], 2))) { ret 4; }
+
+    # dominance and loop nesting run unchanged on the machine blocks
+    val got: res[Graph, allocator.Error] = graph_of(?f);
+    if (sel got.err) { ret 5; }
+    var g: Graph = got.ok;
+    fin { graph.dnit(?g); }
+    val dom: res[Dominance, allocator.Error] = dominance.compute(?a, ?g);
+    if (sel dom.err) { ret 5; }
+    var d: Dominance = dom.ok;
+    fin { dominance.dnit(?d); }
+    val nest: res[Loops, allocator.Error] = loops.compute(?a, ?g, ?d);
+    if (sel nest.err) { ret 5; }
+    var l: Loops = nest.ok;
+    fin { loops.dnit(?l); }
+    val exit: opt[u32] = dominance.idom(?d, 2);
+    if (!(sel exit.some && exit.some == 1) || !dominance.dominates(?d, 0, 2))          { ret 6; }
+    if (loops.count(?l) != 1 || loops.loop(?l, 0).header != 1)                         { ret 7; }
+    if (loops.depth(?l, 1) != 1 || loops.depth(?l, 0) != 0 || loops.depth(?l, 2) != 0) { ret 7; }
+    ret 0;
+}
