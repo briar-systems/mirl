@@ -1,0 +1,261 @@
+# the branches of a laid out function
+#
+# before layout every successor of a block is a block operand of one of its
+# instructions, so a conditional branch is followed by a jump. a jump to the
+# block that follows is dropped, and a conditional branch whose taken arm is
+# the block that follows is inverted, so it jumps to the other arm and falls
+# through to the one that follows, and the jump after it is dropped.
+#
+# the inverse of a conditional branch is the branch its row's relaxation
+# starts with: the longer form of an out-of-range branch is its inverse over
+# a jump, so masc already states which row it is and how its operands follow
+# from the branch's. a branch whose row has no such form stays as it is.
+#
+# a plan is made without changing the function and applied without failing.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.cfg.graph.NONE;
+use mirl.machine.class.Physical;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.instruction.Refusal;
+use mirl.machine.layout.exit;
+use mirl.machine.layout.exit.Exit;
+use mirl.machine.layout.thread;
+use mirl.machine.layout.thread.Threads;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+
+use rf: masc.core.register;
+use masc.core.relax;
+use rows: masc.core.row;
+
+# a branch to invert
+# ---
+# at:    the branch
+# op:    the opcode of its inverse
+# first: where the inverse's operands start in the plan's store
+# count: how many operands it has
+rec Inversion {
+    at:    Instruction;
+    op:    Opcode;
+    first: usize;
+    count: usize;
+}
+
+# what layout changes beyond the order
+# ---
+# inversions: the branches to invert
+# drops:      the blocks whose last instruction, a jump to the block that follows, goes
+# store:      the operands of the inverted branches
+pub rec Plan {
+    inversions: vector.Vector[Inversion];
+    drops:      vector.Vector[u32];
+    store:      vector.Vector[Operand];
+}
+
+# why a plan was not made
+# ---
+# alloc:   the allocator refused storage
+# inverse: the inverse of a branch masc's relaxation states does not stand against its row
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    inverse: Invalid;
+}
+
+# a branch whose inverse is refused
+# ---
+# at:  the branch
+# why: the refusal
+pub rec Invalid {
+    at:  Instruction;
+    why: Refusal;
+}
+
+# give back a plan's storage
+pub fun release(p: *Plan) {
+    vector.dnit[Inversion](?p.inversions);
+    vector.dnit[u32](?p.drops);
+    vector.dnit[Operand](?p.store);
+}
+
+# the operand a source of the inverse's relaxation form gives, none when it states no operand of the branch
+fun source(f: *Function, d: *InstructionData, s: relax.Source, to: Block) opt[Operand] {
+    if (sel s.operand) {
+        if (s.operand::usize >= d.operands.size) { ret opt[Operand].none{}; }
+        ret opt[Operand].some{d.operands.data[s.operand]};
+    }
+    if (sel s.flipped) {
+        if (s.flipped.operand::usize >= d.operands.size) { ret opt[Operand].none{}; }
+        val o: Operand = d.operands.data[s.flipped.operand];
+        if (!(sel o.immediate)) { ret opt[Operand].none{}; }
+        ret opt[Operand].some{Operand.immediate{o.immediate ^ s.flipped.mask::i64}};
+    }
+    if (sel s.register) {
+        val file: *rf.File = instruction.file_of(f.set);
+        if (file == nil || s.register >= file.register_count) { ret opt[Operand].none{}; }
+        ret opt[Operand].some{Operand.physical{Physical.register{rf.id_of(?file.registers[s.register])}}};
+    }
+    if (sel s.immediate) { ret opt[Operand].some{Operand.immediate{s.immediate}}; }
+    if (sel s.past)      { ret opt[Operand].some{Operand.block{to}}; }
+    ret opt[Operand].none{};
+}
+
+# the inverse of a conditional branch that jumps to `to` where it does not, made into the plan
+# ---
+# ret: ok with whether the branch has an inverse, or why it was refused
+fun invert(f: *Function, p: *Plan, at: Instruction, to: Block) res[bool, Error] {
+    val d:  *InstructionData = function.data(f, at);
+    val op: Opcode           = d.opcode;
+    if (!(sel op.row)) { ret res[bool, Error].ok{false}; }
+    val index: opt[u32] = instruction.row_index(f.set, op.row);
+    if (sel index.none) { ret res[bool, Error].ok{false}; }
+    val found: opt[*relax.Relaxation] = relax.find(f.set.relax, index.some);
+    if (sel found.none)           { ret res[bool, Error].ok{false}; }
+    if (found.some.form.len == 0) { ret res[bool, Error].ok{false}; }
+    val step: relax.Step = found.some.form.at[0];
+    val all:  rows.Rows  = instruction.rows_of(f.set);
+    if (step.row >= all.len) { ret res[bool, Error].ok{false}; }
+    val row: *rows.Row = ?all.at[step.row];
+    if (step.values.len::usize != d.operands.size || row.operands.len != step.values.len) { ret res[bool, Error].ok{false}; }
+    val first: usize = p.store.len;
+    var k:     u32   = 0;
+    var past:  bool  = false;
+    for (k < step.values.len) {
+        val s: relax.Source = step.values.at[k];
+        past = past || sel s.past;
+        val o: opt[Operand] = source(f, d, s, to);
+        if (sel o.none) {
+            p.store.len = first;
+            ret res[bool, Error].ok{false};
+        }
+        val pushed: res[usize, allocator.Error] = vector.push[Operand](?p.store, o.some);
+        if (sel pushed.err) {
+            p.store.len = first;
+            ret res[bool, Error].err{Error.alloc{pushed.err}};
+        }
+        k = k + 1;
+    }
+    if (!past) {
+        p.store.len = first;
+        ret res[bool, Error].ok{false};
+    }
+    val inverse: Opcode       = Opcode.row{row};
+    val checked: err[Refusal] = function.check(f, inverse, Slice[Operand]{data: ?p.store.data[first], size: step.values.len::usize});
+    if (sel checked.err) {
+        p.store.len = first;
+        ret res[bool, Error].err{Error.inverse{Invalid{at: at, why: checked.err}}};
+    }
+    val listed: res[usize, allocator.Error] = vector.push[Inversion](?p.inversions, Inversion{at: at, op: inverse, first: first, count: step.values.len::usize});
+    if (sel listed.err) {
+        p.store.len = first;
+        ret res[bool, Error].err{Error.alloc{listed.err}};
+    }
+    ret res[bool, Error].ok{true};
+}
+
+# the block a jump goes to once bypassed blocks are gone
+fun landed(t: *Threads, e: Exit) Block {
+    ret Block{index: thread.resolve(t, e.block.index)};
+}
+
+fun drop(p: *Plan, b: u32) err[Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[u32](?p.drops, b);
+    if (sel pushed.err) { ret err[Error].err{Error.alloc{pushed.err}}; }
+    ret err[Error].ok{};
+}
+
+# plan the jump a block ends in, which goes when the block that follows is where it jumps, and the branch before it,
+# which is inverted when the block that follows is where it jumps and the jump goes elsewhere
+fun plan_block(f: *Function, t: *Threads, p: *Plan, b: u32, next: u32) err[Error] {
+    val list: Slice[Instruction] = function.instructions(f, Block{index: b});
+    if (list.size == 0) { ret err[Error].ok{}; }
+    val jump: opt[Exit] = exit.exit_of(f.set, function.data(f, list.data[list.size - 1]));
+    if (sel jump.none)         { ret err[Error].ok{}; }
+    if (jump.some.conditional) { ret err[Error].ok{}; }
+    val to: Block = landed(t, jump.some);
+    if (to.index == next) { ret drop(p, b); }
+    if (list.size < 2)    { ret err[Error].ok{}; }
+    val before: Instruction = list.data[list.size - 2];
+    val branch: opt[Exit]   = exit.exit_of(f.set, function.data(f, before));
+    if (sel branch.none)          { ret err[Error].ok{}; }
+    if (!branch.some.conditional) { ret err[Error].ok{}; }
+    val taken: Block = landed(t, branch.some);
+    if (taken.index != next || taken.index == to.index) { ret err[Error].ok{}; }
+    val inverted: res[bool, Error] = invert(f, p, before, to);
+    if (sel inverted.err) { ret err[Error].err{inverted.err}; }
+    if (!inverted.ok)     { ret err[Error].ok{}; }
+    ret drop(p, b);
+}
+
+# plan the branches of a function laid out in an order
+# ---
+# a:     the allocator the plan takes
+# f:     the function, unchanged
+# t:     where its bypassed blocks land
+# order: the blocks that stay, in the order they are laid out
+# ret:   what to change, or why it could not be planned
+pub fun plan(a: *allocator.Allocator, f: *Function, t: *Threads, order: Slice[u32]) res[Plan, Error] {
+    var p: Plan  = Plan{inversions: vector.init[Inversion](a), drops: vector.init[u32](a), store: vector.init[Operand](a)};
+    var n: usize = 0;
+    for (n < order.size) {
+        var next: u32 = NONE;
+        if (n + 1 < order.size) { next = order.data[n + 1]; }
+        val planned: err[Error] = plan_block(f, t, ?p, order.data[n], next);
+        if (sel planned.err) {
+            release(?p);
+            ret res[Plan, Error].err{planned.err};
+        }
+        n = n + 1;
+    }
+    ret res[Plan, Error].ok{p};
+}
+
+# apply a plan: every operand naming a bypassed block names the block it lands at, the planned branches are
+# inverted and the jumps that fall through go. nothing here fails, the plan having been checked
+pub fun apply(f: *Function, t: *Threads, p: *Plan) {
+    var i: usize = 0;
+    for (i < p.inversions.len) {
+        val v: Inversion = p.inversions.data[i];
+        function.replace(f, v.at, v.op, Slice[Operand]{data: ?p.store.data[v.first], size: v.count});
+        i = i + 1;
+    }
+    var b: u32 = 0;
+    for (b::usize < f.blocks.len) {
+        if (!thread.removed(t, b)) {
+            val list: Slice[Instruction] = function.instructions(f, Block{index: b});
+            var k:    usize              = 0;
+            for (k < list.size) {
+                val d: *InstructionData = function.data(f, list.data[k]);
+                var o: usize            = 0;
+                for (o < d.operands.size) {
+                    val at: Operand = d.operands.data[o];
+                    if (sel at.block) { d.operands.data[o] = Operand.block{Block{index: thread.resolve(t, at.block.index)}}; }
+                    o = o + 1;
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    i = 0;
+    for (i < p.drops.len) {
+        function.detach_last(f, Block{index: p.drops.data[i]});
+        i = i + 1;
+    }
+}
