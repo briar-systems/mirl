@@ -117,6 +117,8 @@ mirl.target.abi.classify(a, ?layout, ?r, signature, statement)      # res[Assign
 
 `classify` describes each argument and result type through the **type view**, a tree of nodes whose every size, alignment and offset was asked of the data layout, and runs the row's result classifier and then its argument classifier over it. It is the only caller of a row's classifiers. The **assignment** it returns states, for each argument and result, whether it travels by value or by reference to a copy the caller makes and owns, and its **pieces**: for each piece a place (a register by masc's identity, a stack offset, or an operand of the target's own call form), the offset and size of the bytes it carries, how the offset and size scale, and how the rest of its place is filled.
 
+The integers are signless, so a convention that extends a narrow integer by the source type's signedness leaves the piece **declared**, and `classify` fills it from the extension the signature states for that parameter or result: sign or zero extended. A declared piece whose parameter or result states none is refused, naming it, and is never guessed.
+
 The call's **statement** says how its language passes aggregates (by the platform's C rules, or each by reference to a copy the caller makes) and how many of its arguments are named. Both have an unstated zero case, which is refused.
 
 The one row is `lp64d`, the RISC-V convention of RV64 with hardware double precision, to the RISC-V ELF psABI 1.0.
