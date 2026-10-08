@@ -251,7 +251,9 @@ The check itself belongs to `mirl.ct`. This version of the library does not impl
 
 ## 8. The verifier
 
-The verifier checks a module against the target it names. `mirl.verify.check(m)` finds the target among the target rows by the module's target name, and `mirl.verify.against(m, t)` checks against a given target. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
+The verifier checks a module against the target it names. `mirl.verify.check(m)` finds the target among the target rows by the module's target name and checks the module as it stands before legalisation, and `mirl.verify.against(m, t, stage)` checks against a given target at a given stage. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
+
+The stage says how far the module has come through its schedule. `open` is any module before legalisation, so no rule that holds only of legal code applies to it. `legal` is a module past every legalisation, and carries a lookup of the region tree each function's structure analysis holds. The pass driver verifies a run as `open` until it reaches the last legalisation of its plan, and as `legal` from that pass's own verification on.
 
 A refusal is a defect in the producer that made the module and never a diagnostic about the program the module was made from. It names the rule, where the module breaks it (function, block, instruction, global, constant or type, whichever apply) and a short description of the fact that does not hold.
 
@@ -272,6 +274,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 10 | `secrecy` | every result is secret exactly as its row's secrecy rule gives, and no edge passes a secret value to a public parameter |
 | 11 | `dominance` | every use in a reached block is dominated by its definition, and so is every branch argument at its edge |
 | 12 | `debug` | every location, inlining site and binding that an instruction's metadata names is an entry of the debug table |
+| 13 | `structured` | past legalisation on a target that declares structured control, every function with a body is the tree of regions its structure analysis holds, and the tree keeps the rules of structured control: every selection and loop header strictly dominates its merge, no block is the merge or the continue target of two constructs, every block the entry reaches is in exactly one region, a selection's arms start at its header's edges in order, a loop's body starts at its header and its continue sequence at its continue target, a loop is entered back by exactly one edge from that target, and every edge goes on to the next region of its sequence, to the merge of the construct around it, to the innermost loop's merge or to its continue target, so a construct is entered only at its header. A refusal names the construct's header and the rule broken |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
