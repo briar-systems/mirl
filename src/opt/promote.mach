@@ -1,0 +1,839 @@
+# promotion of stack slots to values
+#
+# a slot whose address is only loaded from and stored to at the slot's own
+# type holds one value at a time, so the memory is replaced by the value that
+# reaches each load. a value merged where paths join becomes a block
+# parameter at the dominance frontier of the blocks that store, in the blocks
+# where the slot is read. a load that no store reaches gives a zero of the
+# slot's type. a slot with debug bindings keeps them: every store, and every
+# parameter made, is followed by an identity that carries the variable as a
+# value, since only an instruction holds a binding.
+#
+# it changes no branch and no address, so it keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.types.string.str;
+use std.types.string.str_len;
+
+use std.allocator;
+use std.allocator.arena;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.ir.body;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.cfg.prune;
+use mirl.ir.constant.ConstantData;
+use ir_debug: mirl.ir.debug;
+use mirl.ir.debug.Binding;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.UNBOUND;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.text.equal;
+use reader: mirl.ir.text.parse;
+use mirl.ir.text.parse.refusal.Refusal;
+use mirl.ir.text.printer;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.cache.Cache;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use targets: mirl.target;
+use mirl.target.Target;
+use mirl.verify;
+
+# no value reaches: the slot has not been stored to
+val UNDEF: u32 = 0xffffffff;
+# the high bit marks the parameter made in a block, the rest its index
+val PHI: u32 = 0x80000000;
+
+val NOT:   u8 = 0;
+val LOAD:  u8 = 1;
+val STORE: u8 = 2;
+
+# the pass
+# ---
+# it keeps no analysis, since it may take unreached blocks out of the graph
+pub val PROMOTE: Pass = Pass{name: "promote", kind: Kind.optimise{}, scope: Scope.function{visit}, time: Time.keeps{}};
+
+# one slot being promoted
+# ---
+# m, f, b:  the module, the function and its body
+# dom:      the function's dominance
+# s:        the allocator of the slot's scratch, reset for each slot
+# tag:      for every instruction of the function, whether it loads or
+#           stores the slot, borrowed
+# which:    for every such instruction, its position among the loads or the
+#           stores, borrowed
+# alloca:   the slot's instruction
+# pointer:  its address
+# type:     its type
+# bindings: its debug bindings
+# secret:   its values are secret
+# isptr:    it holds a pointer
+# members:  the loads and stores in no order
+# loads:    the loads in program order
+# stores:   the stores in program order
+# loadval:  what reaches each load, as a `Val`
+# sval:     the value each store leaves, as a value index
+# stored:   per block, whether it stores
+# upward:   per block, whether it loads before it stores
+# touched:  per block, whether it loads or stores
+# live:     per block, whether the slot is read on entry to it
+# cand:     per block, whether a parameter is placed in it
+# phi:      per block, whether it gets one
+# outv:     what reaches the end of each block, as a `Val`
+# param:    the parameter made in each block, as a value index
+# result:   the value that stands for it, the parameter or its identity
+# zero:     the zero of the slot's type, when needed
+# step:     the zero integer an identity of a pointer adds
+rec Slot {
+    m:        *Module;
+    f:        Function;
+    b:        *Body;
+    dom:      *Dominance;
+    s:        *allocator.Allocator;
+    tag:      *vector.Vector[u8];
+    which:    *vector.Vector[u32];
+    alloca:   Instruction;
+    pointer:  Value;
+    type:     Type;
+    bindings: Bindings;
+    secret:   bool;
+    isptr:    bool;
+    members:  vector.Vector[Instruction];
+    loads:    vector.Vector[Instruction];
+    stores:   vector.Vector[Instruction];
+    loadval:  vector.Vector[u32];
+    sval:     vector.Vector[u32];
+    stored:   vector.Vector[u8];
+    upward:   vector.Vector[u8];
+    touched:  vector.Vector[u8];
+    live:     vector.Vector[u8];
+    cand:     vector.Vector[u8];
+    phi:      vector.Vector[u8];
+    outv:     vector.Vector[u32];
+    param:    vector.Vector[u32];
+    result:   vector.Vector[u32];
+    zero:     Value;
+    step:     Value;
+}
+
+fun alloc(e: allocator.Error) err[Why] {
+    ret err[Why].err{Why.alloc{e}};
+}
+
+fun lift(r: err[module.Error]) err[Why] {
+    if (sel r.err) { ret err[Why].err{Why.ir{r.err}}; }
+    ret err[Why].ok{};
+}
+
+fun add[T](v: *vector.Vector[T], x: T) err[Why] {
+    val r: res[usize, allocator.Error] = vector.push[T](v, x);
+    if (sel r.err) { ret alloc(r.err); }
+    ret err[Why].ok{};
+}
+
+fun filled[T](a: *allocator.Allocator, n: usize, x: T, out: *vector.Vector[T]) err[Why] {
+    @out = vector.init[T](a);
+    val room: res[usize, allocator.Error] = vector.reserve[T](out, n);
+    if (sel room.err) { ret alloc(room.err); }
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[Why] = add[T](out, x);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun block_of(x: *Slot, i: Instruction) usize {
+    val at: Place = x.b.instructions.data[i.index].place;
+    if (sel at.placed) { ret at.placed.index::usize; }
+    ret 0;
+}
+
+fun position(x: *Slot, k: usize, i: Instruction) u32 {
+    val list: *vector.Vector[Instruction] = ?x.b.blocks.data[k].instructions;
+    var n:    usize                       = 0;
+    for (n < list.len) {
+        if (list.data[n].index == i.index) { ret n::u32; }
+        n = n + 1;
+    }
+    ret 0;
+}
+
+# what tags an instruction of the function as an access of the slot
+fun tag_of(x: *Slot, i: Instruction) u8 {
+    if (i.index::usize >= x.tag.len) { ret NOT; }
+    ret x.tag.data[i.index];
+}
+
+# whether the slot's address is only loaded from and stored to at its type,
+# and which instructions do so
+fun collect(x: *Slot) res[bool, Why] {
+    val uses: Slice[Instruction] = Slice[Instruction]{data: x.b.values.data[x.pointer.index].uses.data, size: x.b.values.data[x.pointer.index].uses.len};
+    var n:    usize              = 0;
+    for (n < uses.size) {
+        val d: *InstructionData = ?x.b.instructions.data[uses.data[n].index];
+        if (!(sel d.place.placed) || d.metadata.flags.volatile) { ret res[bool, Why].ok{false}; }
+        var kind: u8 = NOT;
+        if (d.opcode.index == opcode.LOAD.index) {
+            if (sel d.immediates.data[0].ty && types.same(d.immediates.data[0].ty, x.type)) { kind = LOAD; }
+        }
+        or (d.opcode.index == opcode.STORE.index) {
+            val stored: Value = d.operands.data[1];
+            if (stored.index != x.pointer.index && types.same(x.b.values.data[stored.index].type, x.type)) { kind = STORE; }
+        }
+        if (kind == NOT) { ret res[bool, Why].ok{false}; }
+        x.tag.data[uses.data[n].index] = kind;
+        val r: err[Why] = add[Instruction](?x.members, uses.data[n]);
+        if (sel r.err) { ret res[bool, Why].err{r.err}; }
+        n = n + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
+
+fun release(x: *Slot) {
+    var n: usize = 0;
+    for (n < x.members.len) {
+        x.tag.data[x.members.data[n].index] = NOT;
+        n                                   = n + 1;
+    }
+}
+
+# list the loads and stores in program order, and per block what they do
+fun scan(x: *Slot) err[Why] {
+    var n: usize = 0;
+    for (n < x.members.len) {
+        x.touched.data[block_of(x, x.members.data[n])] = 1;
+        n                                              = n + 1;
+    }
+    val order: Slice[u32] = dominance.order(x.dom);
+    n = 0;
+    for (n < order.size) {
+        val k: usize = order.data[n]::usize;
+        if (x.touched.data[k] != 0) {
+            val list: *vector.Vector[Instruction] = ?x.b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                val inst: Instruction = list.data[i];
+                val t:    u8          = tag_of(x, inst);
+                if (t == LOAD) {
+                    x.which.data[inst.index] = x.loads.len::u32;
+                    if (x.stored.data[k] == 0) { x.upward.data[k] = 1; }
+                    val r: err[Why] = add[Instruction](?x.loads, inst);
+                    if (sel r.err) { ret r; }
+                }
+                or (t == STORE) {
+                    x.which.data[inst.index] = x.stores.len::u32;
+                    x.stored.data[k]         = 1;
+                    val r: err[Why] = add[Instruction](?x.stores, inst);
+                    if (sel r.err) { ret r; }
+                }
+                i = i + 1;
+            }
+        }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# whether every load reads the same secrecy and every store leaves it
+fun secrecy(x: *Slot) bool {
+    if (x.loads.len == 0) { ret true; }
+    x.secret = x.b.values.data[x.b.instructions.data[x.loads.data[0].index].results.data[0].index].secret;
+    var n: usize = 0;
+    for (n < x.loads.len) {
+        val r: Value = x.b.instructions.data[x.loads.data[n].index].results.data[0];
+        if (x.b.values.data[r.index].secret != x.secret) { ret false; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < x.stores.len) {
+        val v: Value = x.b.instructions.data[x.stores.data[n].index].operands.data[1];
+        if (x.b.values.data[v.index].secret != x.secret) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# the blocks that read the slot on entry, and where parameters go
+fun place(x: *Slot) err[Why] {
+    var work: vector.Vector[u32] = vector.init[u32](x.s);
+    var n:    usize              = 0;
+    for (n < x.upward.len) {
+        if (x.upward.data[n] != 0) {
+            val r: err[Why] = add[u32](?work, n::u32);
+            if (sel r.err) { ret r; }
+        }
+        n = n + 1;
+    }
+    for (work.len > 0) {
+        val k: usize = work.data[work.len - 1]::usize;
+        work.len = work.len - 1;
+        if (x.live.data[k] == 0) {
+            x.live.data[k] = 1;
+            val preds: *vector.Vector[Instruction] = ?x.b.blocks.data[k].predecessors;
+            var p:     usize                       = 0;
+            for (p < preds.len) {
+                val from: usize = block_of(x, preds.data[p]);
+                if (x.stored.data[from] == 0 && x.live.data[from] == 0) {
+                    val r: err[Why] = add[u32](?work, from::u32);
+                    if (sel r.err) { ret r; }
+                }
+                p = p + 1;
+            }
+        }
+    }
+
+    var inwork: vector.Vector[u8];
+    val made:   err[Why] = filled[u8](x.s, x.stored.len, 0, ?inwork);
+    if (sel made.err) { ret made; }
+    n = 0;
+    for (n < x.stored.len) {
+        if (x.stored.data[n] != 0) {
+            inwork.data[n] = 1;
+            val r: err[Why] = add[u32](?work, n::u32);
+            if (sel r.err) { ret r; }
+        }
+        n = n + 1;
+    }
+    for (work.len > 0) {
+        val k: u32 = work.data[work.len - 1];
+        work.len = work.len - 1;
+        val front: Slice[u32] = dominance.frontier(x.dom, k);
+        var y:     usize      = 0;
+        for (y < front.size) {
+            val to: usize = front.data[y]::usize;
+            if (x.cand.data[to] == 0) {
+                x.cand.data[to] = 1;
+                if (inwork.data[to] == 0) {
+                    inwork.data[to] = 1;
+                    val r: err[Why] = add[u32](?work, to::u32);
+                    if (sel r.err) { ret r; }
+                }
+            }
+            y = y + 1;
+        }
+    }
+    n = 0;
+    for (n < x.cand.len) {
+        if (x.cand.data[n] != 0 && x.live.data[n] != 0) { x.phi.data[n] = 1; }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# what reaches every load and the end of every block, walking the dominator
+# tree from the entry
+fun rename(x: *Slot) err[Why] {
+    val order: Slice[u32] = dominance.order(x.dom);
+    var n:     usize      = 0;
+    for (n < order.size) {
+        val k:   usize = order.data[n]::usize;
+        var cur: u32   = UNDEF;
+        if (x.phi.data[k] != 0) { cur = PHI | k::u32; }
+        or (k != 0) {
+            val up: opt[u32] = dominance.idom(x.dom, k::u32);
+            if (sel up.some) { cur = x.outv.data[up.some::usize]; }
+        }
+        if (x.touched.data[k] != 0) {
+            val list: *vector.Vector[Instruction] = ?x.b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                val inst: Instruction = list.data[i];
+                val t:    u8          = tag_of(x, inst);
+                if (t == LOAD)  { x.loadval.data[x.which.data[inst.index]] = cur; }
+                or (t == STORE) { cur = x.which.data[inst.index]; }
+                i = i + 1;
+            }
+        }
+        x.outv.data[k] = cur;
+        n              = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# whether a value reaches the slot on some path with no store
+fun reaches_nothing(x: *Slot) bool {
+    var n: usize = 0;
+    for (n < x.loadval.len) {
+        if (x.loadval.data[n] == UNDEF) { ret true; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < x.phi.len) {
+        if (x.phi.data[n] != 0) {
+            val preds: *vector.Vector[Instruction] = ?x.b.blocks.data[n].predecessors;
+            var p:     usize                       = 0;
+            for (p < preds.len) {
+                if (x.outv.data[block_of(x, preds.data[p])] == UNDEF) { ret true; }
+                p = p + 1;
+            }
+        }
+        n = n + 1;
+    }
+    ret false;
+}
+
+fun any_phi(x: *Slot) bool {
+    var n: usize = 0;
+    for (n < x.phi.len) {
+        if (x.phi.data[n] != 0) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
+fun zero_of(x: *Slot, ty: Type) res[Value, Why] {
+    val c: res[Constant, module.Error] = module.add_constant(x.m, ConstantData.zero{ty});
+    if (sel c.err) { ret res[Value, Why].err{Why.ir{c.err}}; }
+    val v: res[Value, module.Error] = body.constant(x.m, x.f, c.ok);
+    if (sel v.err) { ret res[Value, Why].err{Why.ir{v.err}}; }
+    ret res[Value, Why].ok{v.ok};
+}
+
+# the value a `Val` stands for
+fun resolve(x: *Slot, v: u32) Value {
+    if (v == UNDEF)     { ret x.zero; }
+    if ((v & PHI) != 0) { ret Value{index: x.result.data[(v & ~PHI)::usize]}; }
+    ret Value{index: x.sval.data[v::usize]};
+}
+
+# the bindings the slot's variables keep as values
+fun value_bindings(x: *Slot) res[Bindings, Why] {
+    val list: res[Slice[Binding], module.Error] = module.bound(x.m, x.bindings);
+    if (sel list.err) { ret res[Bindings, Why].err{Why.ir{list.err}}; }
+    var out: vector.Vector[Binding] = vector.init[Binding](x.s);
+    var n:   usize                  = 0;
+    for (n < list.ok.size) {
+        var keep: Binding                                = list.ok.data[n];
+        val got:  res[ir_debug.Variable, ir_debug.Error] = ir_debug.variable(?x.m.debug, keep);
+        if (sel got.err) { ret res[Bindings, Why].err{Why.reason{"a binding of the slot is not in the debug table"}}; }
+        if (sel got.ok.holds.storage) {
+            var v: ir_debug.Variable = got.ok;
+            v.holds = ir_debug.Holds.value{};
+            val made: res[Binding, ir_debug.Error] = ir_debug.bind(?x.m.debug, v);
+            if (sel made.err) {
+                if (sel made.err.alloc) { ret res[Bindings, Why].err{Why.alloc{made.err.alloc}}; }
+                ret res[Bindings, Why].err{Why.reason{"the debug table refused a binding"}};
+            }
+            keep = made.ok;
+        }
+        val pushed: err[Why] = add[Binding](?out, keep);
+        if (sel pushed.err) { ret res[Bindings, Why].err{pushed.err}; }
+        n = n + 1;
+    }
+    val id: res[Bindings, module.Error] = module.bindings(x.m, Slice[Binding]{data: out.data, size: out.len});
+    if (sel id.err) { ret res[Bindings, Why].err{Why.ir{id.err}}; }
+    ret res[Bindings, Why].ok{id.ok};
+}
+
+# a copy of a value that carries a binding, put at a position
+fun identity(x: *Slot, b: *Builder, v: Value, k: usize, at: u32, origin: opt[Instruction], list: Bindings) res[Value, Why] {
+    build.at(b, Block{index: k::u32}, at);
+    build.plain(b);
+    if (sel origin.some) { build.derive(b, origin.some); }
+    build.bind(b, list);
+    var operands: [2]Value     = [2]Value{v, x.step};
+    var imms:     [1]Immediate = [1]Immediate{Immediate.ty{x.type}};
+    var req:      Request      = Request{opcode: opcode.BITCAST, operands: Slice[Value]{data: ?operands[0], size: 1}, immediates: Slice[Immediate]{data: ?imms[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}};
+    if (x.isptr) {
+        req = Request{opcode: opcode.PTR_ADD, operands: Slice[Value]{data: ?operands[0], size: 2}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: nil, size: 0}};
+    }
+    val r:    Value              = build.value(b, req);
+    val done: err[build.Failure] = build.done(b);
+    if (sel done.err) { ret res[Value, Why].err{Why.build{done.err}}; }
+    ret res[Value, Why].ok{r};
+}
+
+# make the parameters, give every store its value, replace the loads, pass
+# the values on each edge and take the memory out
+fun apply(x: *Slot) err[Why] {
+    val bound: bool     = x.bindings.index != UNBOUND.index;
+    var list:  Bindings = UNBOUND;
+    if (bound) {
+        val made: res[Bindings, Why] = value_bindings(x);
+        if (sel made.err) { ret err[Why].err{made.err}; }
+        list = made.ok;
+    }
+    if (any_phi(x) || x.loadval.len > 0) {
+        val z: res[Value, Why] = zero_of(x, x.type);
+        if (sel z.err) { ret err[Why].err{z.err}; }
+        x.zero = z.ok;
+    }
+    if (bound && x.isptr) {
+        val wide: res[Type, types.Error] = types.intern(?x.m.types, types.Shape.integer{types.Integer{width: 64}});
+        if (sel wide.err) { ret err[Why].err{Why.ir{module.Error.types{wide.err}}}; }
+        val z: res[Value, Why] = zero_of(x, wide.ok);
+        if (sel z.err) { ret err[Why].err{z.err}; }
+        x.step = z.ok;
+    }
+    var b: Builder = build.init(x.m);
+    build.enter(?b, x.f);
+
+    var k: usize = 0;
+    for (k < x.phi.len) {
+        if (x.phi.data[k] != 0) {
+            var incoming: vector.Vector[Value] = vector.init[Value](x.s);
+            val count:    usize                = x.b.blocks.data[k].predecessors.len;
+            var n:        usize                = 0;
+            for (n < count) {
+                val r: err[Why] = add[Value](?incoming, x.zero);
+                if (sel r.err) { ret r; }
+                n = n + 1;
+            }
+            val declared: Declaration              = Declaration{type: x.type, secret: x.secret, name: opt[View].none{}};
+            val p:        res[Value, module.Error] = body.add_parameter(x.m, x.f, Block{index: k::u32}, declared, Slice[Value]{data: incoming.data, size: incoming.len});
+            if (sel p.err) { ret err[Why].err{Why.ir{p.err}}; }
+            x.param.data[k]  = p.ok.index;
+            x.result.data[k] = p.ok.index;
+            if (bound) {
+                val q: res[Value, Why] = identity(x, ?b, p.ok, k, 0, opt[Instruction].none{}, list);
+                if (sel q.err) { ret err[Why].err{q.err}; }
+                x.result.data[k] = q.ok.index;
+            }
+        }
+        k = k + 1;
+    }
+
+    var n: usize = 0;
+    for (n < x.stores.len) {
+        val inst: Instruction = x.stores.data[n];
+        var v:    Value       = x.b.instructions.data[inst.index].operands.data[1];
+        val def:  Def         = x.b.values.data[v.index].def;
+        if (sel def.result) {
+            val from: Instruction = def.result.instruction;
+            if (tag_of(x, from) == LOAD) { v = resolve(x, x.loadval.data[x.which.data[from.index]::usize]); }
+        }
+        if (bound) {
+            val blk: usize           = block_of(x, inst);
+            val q:   res[Value, Why] = identity(x, ?b, v, blk, position(x, blk, inst), opt[Instruction].some{inst}, list);
+            if (sel q.err) { ret err[Why].err{q.err}; }
+            v = q.ok;
+        }
+        x.sval.data[n] = v.index;
+        n              = n + 1;
+    }
+
+    n = 0;
+    for (n < x.loads.len) {
+        val old: Value    = x.b.instructions.data[x.loads.data[n].index].results.data[0];
+        val r:   err[Why] = lift(body.replace(x.m, x.f, old, resolve(x, x.loadval.data[n])));
+        if (sel r.err) { ret r; }
+        n = n + 1;
+    }
+
+    k = 0;
+    for (k < x.phi.len) {
+        if (x.phi.data[k] != 0) {
+            val r: err[Why] = pass_on(x, k);
+            if (sel r.err) { ret r; }
+        }
+        k = k + 1;
+    }
+
+    n = 0;
+    for (n < x.stores.len) {
+        val r: err[Why] = lift(body.erase(x.m, x.f, x.stores.data[n]));
+        if (sel r.err) { ret r; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < x.loads.len) {
+        val r: err[Why] = lift(body.erase(x.m, x.f, x.loads.data[n]));
+        if (sel r.err) { ret r; }
+        n = n + 1;
+    }
+    ret lift(body.erase(x.m, x.f, x.alloca));
+}
+
+# give the parameter made in a block the value that reaches the end of each
+# block that enters it
+fun pass_on(x: *Slot, k: usize) err[Why] {
+    var preds: vector.Vector[Instruction] = vector.init[Instruction](x.s);
+    var n:     usize                      = 0;
+    for (n < x.b.blocks.data[k].predecessors.len) {
+        val r: err[Why] = add[Instruction](?preds, x.b.blocks.data[k].predecessors.data[n]);
+        if (sel r.err) { ret r; }
+        n = n + 1;
+    }
+    val def: Def   = x.b.values.data[x.param.data[k]::usize].def;
+    var at:  usize = 0;
+    if (sel def.parameter) { at = def.parameter.index::usize; }
+    n = 0;
+    for (n < preds.len) {
+        val inst: Instruction = preds.data[n];
+        var rank: usize       = 0;
+        var j:    usize       = 0;
+        for (j < n) {
+            if (preds.data[j].index == inst.index) { rank = rank + 1; }
+            j = j + 1;
+        }
+        val d:    *InstructionData = ?x.b.instructions.data[inst.index];
+        var edge: usize            = 0;
+        var seen: usize            = 0;
+        for (edge < d.edges.len) {
+            if (d.edges.data[edge].block.index == k::u32) {
+                if (seen == rank) { brk; }
+                seen = seen + 1;
+            }
+            edge = edge + 1;
+        }
+        var args: vector.Vector[Value] = vector.init[Value](x.s);
+        j = 0;
+        for (j < d.edges.data[edge].arguments.len) {
+            val r: err[Why] = add[Value](?args, d.edges.data[edge].arguments.data[j]);
+            if (sel r.err) { ret r; }
+            j = j + 1;
+        }
+        args.data[at] = resolve(x, x.outv.data[block_of(x, inst)]);
+        val moved: err[Why] = lift(body.retarget(x.m, x.f, inst, edge::u32, Block{index: k::u32}, Slice[Value]{data: args.data, size: args.len}));
+        if (sel moved.err) { ret moved; }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun shaped(x: *Slot, n: usize) err[Why] {
+    val a: err[Why] = filled[u8](x.s, n, 0, ?x.stored);
+    if (sel a.err) { ret a; }
+    val b: err[Why] = filled[u8](x.s, n, 0, ?x.upward);
+    if (sel b.err) { ret b; }
+    val c: err[Why] = filled[u8](x.s, n, 0, ?x.touched);
+    if (sel c.err) { ret c; }
+    val d: err[Why] = filled[u8](x.s, n, 0, ?x.live);
+    if (sel d.err) { ret d; }
+    val e: err[Why] = filled[u8](x.s, n, 0, ?x.cand);
+    if (sel e.err) { ret e; }
+    val f: err[Why] = filled[u8](x.s, n, 0, ?x.phi);
+    if (sel f.err) { ret f; }
+    val g: err[Why] = filled[u32](x.s, n, UNDEF, ?x.outv);
+    if (sel g.err) { ret g; }
+    val h: err[Why] = filled[u32](x.s, n, UNDEF, ?x.param);
+    if (sel h.err) { ret h; }
+    ret filled[u32](x.s, n, UNDEF, ?x.result);
+}
+
+# promote one slot, or leave it where it is
+fun promote_one(c: *Context, dom: *Dominance, s: *allocator.Allocator, tag: *vector.Vector[u8], which: *vector.Vector[u32], f: Function, alloca: Instruction) res[bool, Why] {
+    val got: res[*Body, module.Error] = module.body(c.m, f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val b:   *Body            = got.ok;
+    val d:   *InstructionData = ?b.instructions.data[alloca.index];
+    val imm: Immediate        = d.immediates.data[0];
+    if (!(sel d.place.placed)) { ret res[bool, Why].ok{false}; }
+    if (!(sel imm.ty))         { ret res[bool, Why].ok{false}; }
+    var x: Slot;
+    x.m        = c.m;
+    x.f        = f;
+    x.b        = b;
+    x.dom      = dom;
+    x.s        = s;
+    x.tag      = tag;
+    x.which    = which;
+    x.alloca   = alloca;
+    x.pointer  = d.results.data[0];
+    x.type     = imm.ty;
+    x.bindings = d.metadata.bindings;
+    val kind: res[types.Kind, types.Error] = types.kind(?c.m.types, x.type);
+    if (sel kind.err)                                                                             { ret res[bool, Why].err{Why.ir{module.Error.types{kind.err}}}; }
+    if (!(sel kind.ok.integer || sel kind.ok.float || sel kind.ok.pointer || sel kind.ok.vector)) { ret res[bool, Why].ok{false}; }
+    x.isptr = sel kind.ok.pointer;
+
+    x.members = vector.init[Instruction](s);
+    x.loads   = vector.init[Instruction](s);
+    x.stores  = vector.init[Instruction](s);
+    x.loadval = vector.init[u32](s);
+    x.sval    = vector.init[u32](s);
+    val n:    usize    = b.blocks.len;
+    val made: err[Why] = shaped(?x, n);
+    if (sel made.err) { ret res[bool, Why].err{made.err}; }
+    fin { release(?x); }
+
+    val ours: res[bool, Why] = collect(?x);
+    if (sel ours.err) { ret ours; }
+    if (!ours.ok)     { ret res[bool, Why].ok{false}; }
+    val scanned: err[Why] = scan(?x);
+    if (sel scanned.err) { ret res[bool, Why].err{scanned.err}; }
+    if (!secrecy(?x))    { ret res[bool, Why].ok{false}; }
+    val loadvals: err[Why] = filled[u32](s, x.loads.len, UNDEF, ?x.loadval);
+    if (sel loadvals.err) { ret res[bool, Why].err{loadvals.err}; }
+    val storevals: err[Why] = filled[u32](s, x.stores.len, UNDEF, ?x.sval);
+    if (sel storevals.err) { ret res[bool, Why].err{storevals.err}; }
+    val placed: err[Why] = place(?x);
+    if (sel placed.err)     { ret res[bool, Why].err{placed.err}; }
+    if (x.phi.data[0] != 0) { ret res[bool, Why].ok{false}; }
+    val named: err[Why] = rename(?x);
+    if (sel named.err)                   { ret res[bool, Why].err{named.err}; }
+    if (x.secret && reaches_nothing(?x)) { ret res[bool, Why].ok{false}; }
+
+    val applied: err[Why] = apply(?x);
+    if (sel applied.err) { ret res[bool, Why].err{applied.err}; }
+    ret res[bool, Why].ok{true};
+}
+
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val b:       *Body = got.ok;
+    var changed: bool  = false;
+
+    val first: res[*Dominance, Why] = analysis.dominance_of(c.cache, u.f);
+    if (sel first.err) { ret res[bool, Why].err{first.err}; }
+    var tree:      *Dominance = first.ok;
+    var unreached: bool       = false;
+    var k:         usize      = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased && !dominance.reachable(tree, k::u32)) { unreached = true; }
+        k = k + 1;
+    }
+    if (unreached) {
+        val cut: err[Error] = prune.unreached(c.m, u.f, tree);
+        if (sel cut.err) { ret res[bool, Why].err{Why.cfg{cut.err}}; }
+        val dropped: err[allocator.Error] = cache.forget(c.cache, u.f);
+        if (sel dropped.err) { ret res[bool, Why].err{Why.alloc{dropped.err}}; }
+        val again: res[*Dominance, Why] = analysis.dominance_of(c.cache, u.f);
+        if (sel again.err) { ret res[bool, Why].err{again.err}; }
+        tree    = again.ok;
+        changed = true;
+    }
+
+    var slots: vector.Vector[Instruction] = vector.init[Instruction](c.m.a);
+    fin { vector.dnit[Instruction](?slots); }
+    val order: Slice[u32] = dominance.order(tree);
+    var n:     usize      = 0;
+    for (n < order.size) {
+        val list: *vector.Vector[Instruction] = ?b.blocks.data[order.data[n]].instructions;
+        var i:    usize                       = 0;
+        for (i < list.len) {
+            if (b.instructions.data[list.data[i].index].opcode.index == opcode.ALLOCA.index) {
+                val r: err[Why] = add[Instruction](?slots, list.data[i]);
+                if (sel r.err) { ret res[bool, Why].err{r.err}; }
+            }
+            i = i + 1;
+        }
+        n = n + 1;
+    }
+    if (slots.len == 0) { ret res[bool, Why].ok{changed}; }
+
+    var tag:    vector.Vector[u8];
+    var which:  vector.Vector[u32];
+    val tagged: err[Why] = filled[u8](c.m.a, b.instructions.len, NOT, ?tag);
+    if (sel tagged.err) { ret res[bool, Why].err{tagged.err}; }
+    fin { vector.dnit[u8](?tag); }
+    val placed: err[Why] = filled[u32](c.m.a, b.instructions.len, 0, ?which);
+    if (sel placed.err) { ret res[bool, Why].err{placed.err}; }
+    fin { vector.dnit[u32](?which); }
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    n = 0;
+    for (n < slots.len) {
+        arena.reset(?ar);
+        val r: res[bool, Why] = promote_one(c, tree, ?scratch, ?tag, ?which, u.f, slots.data[n]);
+        if (sel r.err) { ret r; }
+        if (r.ok)      { changed = true; }
+        n = n + 1;
+    }
+    ret res[bool, Why].ok{changed};
+}
+
+#[testing]
+fun read(a: *allocator.Allocator, text: str, out: *Module) bool {
+    val r: res[Module, Refusal] = reader.parse_body(a, View{data: text, len: str_len(text)});
+    if (sel r.err) { ret false; }
+    @out = r.ok;
+    ret true;
+}
+
+# promote the text, and compare it with the text it should become
+#[testing]
+fun becomes(input: str, expected: str) i32 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var m: Module;
+    if (!read(?a, input, ?m)) { ret 1; }
+    fin { module.dnit(?m); }
+    var want: Module;
+    if (!read(?a, expected, ?want)) { ret 2; }
+    fin { module.dnit(?want); }
+    val row: opt[*Target] = targets.row(0);
+    if (sel row.none) { ret 3; }
+    var held: Cache = cache.init(?m, analysis.rows());
+    fin { cache.dnit(?held); }
+    var context: Context = Context{m: ?m, t: row.some, cache: ?held, pass: ?PROMOTE};
+    var f:       usize   = 0;
+    for (f < m.functions.len) {
+        var u: Unit = Unit{context: ?context, f: Function{index: f::u32}};
+        if (m.functions.data[f].body.blocks.len > 0) {
+            val ran: res[bool, Why] = visit(?u);
+            if (sel ran.err) { ret 4; }
+        }
+        f = f + 1;
+    }
+    val checked: err[verify.Error] = verify.against(?m, row.some);
+    if (sel checked.err) { ret 6; }
+    val same: res[bool, printer.Error] = equal.same(?m, ?want);
+    if (sel same.err) { ret 5; }
+    if (!same.ok)     { ret 5; }
+    ret 0;
+}
+
+test promote__a_slot_whose_address_escapes_stays_in_memory {
+    val text: str = "target \"riscv64-linux\"\nfunction @sink: fun(ptr) -> ()\nfunction @f: fun(i32) -> (i32) {\n^entry(%x: i32):\n    %p = alloca type i32, pointer ptr, align 4\n    store %p, %x, align 4\n    call ptr @sink, %p, signature fun(ptr) -> ()\n    %v = load %p, type i32, align 4\n    ret %v\n}\n";
+    ret becomes(text, text);
+}
+
+test promote__a_value_merged_at_a_join_becomes_a_block_parameter {
+    val input: str = "target \"riscv64-linux\"\nfunction @f: fun(i1, i32, i32) -> (i32) {\n^entry(%c: i1, %a: i32, %b: i32):\n    %p = alloca type i32, pointer ptr, align 4\n    cbr %c, ^left, ^right\n^left:\n    store %p, %a, align 4\n    br ^join\n^right:\n    store %p, %b, align 4\n    br ^join\n^join:\n    %v = load %p, type i32, align 4\n    ret %v\n}\n";
+    val want:  str = "target \"riscv64-linux\"\nfunction @f: fun(i1, i32, i32) -> (i32) {\n^entry(%c: i1, %a: i32, %b: i32):\n    cbr %c, ^left, ^right\n^left:\n    br ^join(%a)\n^right:\n    br ^join(%b)\n^join(%v: i32):\n    ret %v\n}\n";
+    ret becomes(input, want);
+}
+
+test promote__a_slot_read_before_any_store_gives_zero {
+    val input: str = "target \"riscv64-linux\"\nfunction @f: fun() -> (i32) {\n^entry:\n    %p = alloca type i32, pointer ptr, align 4\n    %v = load %p, type i32, align 4\n    ret %v\n}\n";
+    val want:  str = "target \"riscv64-linux\"\nfunction @f: fun() -> (i32) {\n^entry:\n    ret i32 zero\n}\n";
+    ret becomes(input, want);
+}
