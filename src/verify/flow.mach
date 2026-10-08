@@ -1,11 +1,14 @@
-# the ssa rule: every use is dominated by its definition
+# the ssa rule: every use is dominated by its definition, and the binding
+# rule: every value binding record stands at a point of its block and reads a
+# value that dominates that point
 #
 # dominance is mirl.ir.cfg's over the body's graph. a block parameter is
 # defined at its block's entry, a result just after its instruction, and a
 # constant everywhere. an edge argument is used at the instruction that holds
 # the edge. a block the entry does not reach is dominated by every block, so
 # each use in it holds vacuously, while a definition in it dominates no use in
-# a reached block.
+# a reached block. a record is a point just before the instruction it names,
+# so it reads a value as an operand of that instruction would.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -23,6 +26,7 @@ use mirl.ir.cfg.dominance;
 use mirl.ir.cfg.dominance.Dominance;
 use mirl.ir.cfg.graph;
 use mirl.ir.cfg.graph.Graph;
+use mirl.ir.debug;
 use mirl.ir.function.Body;
 use mirl.ir.id.Block;
 use mirl.ir.id.Function;
@@ -32,12 +36,16 @@ use mirl.ir.instruction.InstructionData;
 use mirl.ir.instruction.Place;
 use mirl.ir.module;
 use mirl.ir.module.Module;
+use mirl.ir.point.Point;
+use mirl.ir.point.Reads;
+use mirl.ir.type.Type;
 use mirl.ir.value.Def;
 use mirl.verify.failure.Found;
 use mirl.verify.failure.Run;
 use mirl.verify.failure.at_instruction;
 use mirl.verify.failure.broken;
 use mirl.verify.failure.exhausted;
+use mirl.verify.failure.in_block;
 use mirl.verify.failure.in_function;
 
 # whether a definition reaches a use at position `at` of block `k`
@@ -85,7 +93,59 @@ fun uses_of(m: *Module, f: Function, b: *Body, dom: *Dominance, positions: *vect
     ret err[Found].ok{};
 }
 
-fun dominance_of(m: *Module, f: Function) err[Found] {
+# a value the body gave out whose definition has not been removed
+fun defined(b: *Body, v: Value) bool {
+    if (v.index::usize >= b.values.len) { ret false; }
+    val def: Def = b.values.data[v.index].def;
+    ret !(sel def.removed);
+}
+
+fun point_of(m: *Module, f: Function, b: *Body, dom: *Dominance, positions: *vector.Vector[u32], id: Block, inst: Instruction, pt: Point) err[Found] {
+    val known: res[debug.Variable, debug.Error] = debug.variable(?m.debug, pt.binding);
+    if (sel known.err) { ret broken(at_instruction(m, f, id, inst), "a value binding record naming no variable of the debug table"); }
+    val reads: Reads = pt.reads;
+    if (!(sel reads.operand)) { ret err[Found].ok{}; }
+    val v: Value = reads.operand.value;
+    if (!defined(b, v)) { ret broken(at_instruction(m, f, id, inst), "a value binding record reading a value the body does not define"); }
+    val given: res[Type, module.Error] = module.salvaged(m, b.values.data[v.index].type, reads.operand.expression);
+    if (sel given.err)                                                                                        { ret broken(at_instruction(m, f, id, inst), "a salvage expression that does not apply to the value it reads"); }
+    if (dominance.reachable(dom, id.index) && !reaches(b, dom, positions, id, positions.data[inst.index], v)) { ret broken(at_instruction(m, f, id, inst), "a value binding record whose value does not dominate its point"); }
+    ret err[Found].ok{};
+}
+
+fun points_of(m: *Module, f: Function, b: *Body, dom: *Dominance, positions: *vector.Vector[u32]) err[Found] {
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        val id: Block      = Block{index: k::u32};
+        val bd: *BlockData = ?b.blocks.data[k];
+        if (!bd.erased) {
+            if (bd.ending.first != 0) { ret broken(in_block(m, f, id), "a value binding record after its block's last instruction"); }
+            var i: usize = 0;
+            for (i < bd.instructions.len) {
+                val inst: Instruction = bd.instructions.data[i];
+                var r:    u32         = b.instructions.data[inst.index].points.first;
+                var seen: usize       = 0;
+                for (r != 0) {
+                    if (r::usize > b.points.len || seen == b.points.len) { ret broken(at_instruction(m, f, id, inst), "a run of value binding records the body does not hold"); }
+                    val pt:    Point      = b.points.data[r - 1];
+                    val found: err[Found] = point_of(m, f, b, dom, positions, id, inst, pt);
+                    if (sel found.err) { ret found; }
+                    r    = pt.next;
+                    seen = seen + 1;
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Found].ok{};
+}
+
+# a walk of a body that reads its dominance and each placed instruction's
+# position in its block
+def Walk: fun(*Module, Function, *Body, *Dominance, *vector.Vector[u32]) err[Found];
+
+fun dominance_of(m: *Module, f: Function, walk: Walk) err[Found] {
     val b: *Body = ?m.functions.data[f.index].body;
     if (b.blocks.len == 0) { ret err[Found].ok{}; }
     var positions: vector.Vector[u32] = vector.init[u32](m.a);
@@ -116,7 +176,7 @@ fun dominance_of(m: *Module, f: Function) err[Found] {
         dominance.dnit(?dom);
         graph.dnit(?view);
     }
-    ret uses_of(m, f, b, ?dom, ?positions);
+    ret walk(m, f, b, ?dom, ?positions);
 }
 
 # the graph of a function's body and its dominance, both the caller's to give
@@ -137,13 +197,25 @@ pub fun shape(m: *Module, f: Function, g: *Graph, d: *Dominance) err[Found] {
     ret err[Found].ok{};
 }
 
-# every use in a block the entry reaches is dominated by its definition
-pub fun ssa(run: *Run) err[Found] {
+fun each_function(run: *Run, walk: Walk) err[Found] {
     var f: usize = 0;
     for (f < run.m.functions.len) {
-        val r: err[Found] = dominance_of(run.m, Function{index: f::u32});
+        val r: err[Found] = dominance_of(run.m, Function{index: f::u32}, walk);
         if (sel r.err) { ret r; }
         f = f + 1;
     }
     ret err[Found].ok{};
+}
+
+# every use in a block the entry reaches is dominated by its definition
+pub fun ssa(run: *Run) err[Found] {
+    ret each_function(run, uses_of);
+}
+
+# every value binding record stands before an instruction of its block, in
+# the order of their points, names a variable of the debug table, and reads a
+# defined value through an expression that applies to it, a value that
+# dominates its point when the entry reaches its block
+pub fun bindings(run: *Run) err[Found] {
+    ret each_function(run, points_of);
 }
