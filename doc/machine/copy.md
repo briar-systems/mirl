@@ -31,6 +31,6 @@ A copy is refused, naming it and the operand where there is one, when an operand
 
 ## Limits
 
-- A parallel copy whose locations share storage across pairs without being equal, as x86's eax and ax, is refused rather than ordered by the storage each pair touches.
+- A parallel copy whose locations share storage across pairs without being equal, as x86's eax and ax, is refused rather than ordered by the storage each pair touches (#212).
 - A cell is never a free location, since a convention states no cell a call clobbers, so a cycle of cells is broken only by a swap.
 - RISC-V states no move between classes, since selection places no copy between them.
