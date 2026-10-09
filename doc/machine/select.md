@@ -35,6 +35,8 @@ The abi legalisation leaves every call, entry and return in piece form, each pie
 
 Selection is the one place the convention's clobbers reach the register allocator. `select(s, m, f, ?calls)` takes the registers a call leaves undefined (`Resolved.clobbered`) and the allocator's locations, and gives the machine function with one `live.Clobber` per clobbered register at every instruction it emits that calls, the table's call forms and the lookup alike.
 
+The other half of the allocator's request is the allowed set. `allowed.of_machine(a, ?machine, ?locations, keeps)` lists it from the opened machine: every register the selection admits that masc gives no fixed role and the convention does not reserve, the frame pointer left out when `keeps_pointer` says the frame keeps it, and every memory cell. `Request{at, registers, allowed, clobbers}` is that list beside selection's clobbers.
+
 A value of an aggregate type has no register and is refused as `aggregate`. The abi legalisation leaves one only where a value is loaded whole from memory, which a later legalisation has to split.
 
 ## Choosing among rules
