@@ -93,7 +93,8 @@ The `helpers` legalisation (`mirl.legal.HELPERS`) runs after promotion and befor
 - The multiply and the division hold under the condition the target row states for each, read on the build's basis as a float operation's is: RISC-V multiplies under `zmmul`, which `m` implies, and divides under `m`, and every other target always. Where the condition is not met no width has the instruction.
 - A multiply at a width the target has no multiply for calls the helper of its width, a multiply by a constant and the double width product of a high half included, so no product reaches the integer legalisations there. Where the target multiplies at the word, a wider integer is left to the wide legalisation, which splits it into products of words.
 - A conversion between a float and an integer wider than the target's arithmetic calls the helper of its width and format. Where the integer's value fits a word, or the float is no nan and lies within the word's range, the target's conversion at the word runs instead. A target's own conversion that gives something else for a nan or a value out of range is corrected by its selection rules, and the helpers' conversions at the word are always in range.
-- A float operation a helper row stands in for (`stands`), `frem`, calls the helper of its format where the format is held and has no native form of it under the build's basis. A vector of floats is refused, since it is scalarised first, and a format the target does not hold is left to the legalisation that expands it.
+- A float operation a helper row stands in for (`stands`), `frem`, calls the helper of its format where the format is held and has no native form of it under the build's basis. A vector of floats is refused, since it is scalarised first.
+- A float, or a vector of floats, of a format the target holds no unit for is refused by its type (`Why.unheld`), since no legalisation computes such a format yet. A soft float target holds none, so its float code stops here and never reaches selection.
 - A copy or fill on a target whose `bulk` is `none` calls the helper of the length's width and the address space. A kept fill calls nothing another module could define: it is a loop of kept stores of its byte, one address a step, in its place.
 - The native paths branch on a value, so a function that requires constant time calls the helper whatever the value. Every helper runs in a time that depends on nothing but a length, and a copy or fill whose length is secret in such a function is refused with the one constant time refusal (`Why.timing`).
 
@@ -181,7 +182,18 @@ A named float no wider than FLEN takes a float register, and a wider one passes 
 
 Every row reserves the global and thread pointers. The rows that pass floats in float registers also reserve the float control and status register, `fcsr` and its `frm` and `fflags` fields. The psABI gives `fcsr` thread storage duration, so a call neither saves nor clobbers the rounding mode that a dynamic rounding reads or the flags that every float operation accrues. A soft float row names no float register, so it resolves on a selection that has none.
 
-`riscv64-linux` and `riscv64-freestanding` call under `lp64d`, and `riscv32-linux` under `ilp32d`.
+The RISC-V targets and the floor each states:
+
+| target | baseline | convention | floats |
+|---|---|---|---|
+| `riscv64-linux` | `rv64gc` | `lp64d` | F and D |
+| `riscv64-freestanding` | `rv64ifd` | `lp64d` | F and D |
+| `riscv64imac-freestanding` | `rv64imac` | `lp64` | software |
+| `riscv32-linux` | `rv32gc` | `ilp32d` | F and D |
+| `riscv32-freestanding` | `rv32i` | `ilp32` | software |
+| `riscv32imac-freestanding` | `rv32imac` | `ilp32` | software |
+
+A freestanding target's baseline is the least its convention needs, so a build assumes no extension a chip of that target may lack and adds the rest through `open_with`. A chip below a target's floor is a target of its own. A soft float target holds no float format, so every float operation is a helper call.
 
 ## Addresses
 
