@@ -31,7 +31,7 @@ The capability declarations are
 | `addressing` | memory is addressed physically, or only by access chains (logical) |
 | `values` | values are untyped, or carry their type into the output |
 | `evaluation` | operations take operands from named values, or from an operand stack |
-| `widths` | the address spaces and how a pointer into each is held, the register width, the widths integer arithmetic runs natively at, and the integer widths a value holds natively |
+| `widths` | the address spaces, how a pointer into each is held and the rules the types in each are laid out by (`c`, `std140`, `std430` or `scalar`), the register width, the widths integer arithmetic runs natively at, and the integer widths a value holds natively |
 | `vectors` | none, or a vector unit with a register width, the lane counts allowed and the lane types with how each is carried out (packed or by scalar expansion) |
 | `formats` | the number formats computed natively, each under the condition the build must meet to compute in it, with the not-a-number it returns (`canonical`, `propagate` or `unspecified`), the operations of `OPTIONAL` it computes natively and under which condition, and whether a constant of it is `made` in registers or `loaded` from read-only data, or none |
 | `arithmetic` | the widths with a native multiply of the low half and the condition it holds under, the multiply forms beyond it (one row per width and sign: the high half or the whole product, as signed, unsigned or mixed operands, or none), how a shift treats a count at or past the width (`wraps`, `undefined` or `saturates`), the operations on single bits it selects as they stand (`both`, `either`, `differ`, `compare`, or none), the widths of its native division, the condition they hold under and what it does with a zero divisor and with a signed overflow (`traps` or `quiet`), and its division of a two-word dividend by a word divisor: none, or the word widths it runs at and what it does with a zero divisor and with a quotient that does not fit the word |
@@ -115,24 +115,27 @@ A front end never computes a size, an alignment or an offset. It asks mirl, and 
 
 ```
 val l: Layout = mirl.target.of(target, ?module.types);
-mirl.target.size(?l, ty)          # res[u64, Error], bytes
-mirl.target.align(?l, ty)         # res[u64, Error], a power of two
-mirl.target.extent(?l, ty)        # res[Extent, Error], size and alignment together
-mirl.target.offset(?l, ty, i)     # res[u64, Error], member i of a structure or union
-mirl.target.offsets(?l, ty, out)  # err[Error], every member of a structure in one walk
+mirl.target.size(?l, ty, space)          # res[u64, Error], bytes
+mirl.target.align(?l, ty, space)         # res[u64, Error], a power of two
+mirl.target.extent(?l, ty, space)        # res[Extent, Error], size and alignment together
+mirl.target.offset(?l, ty, space, i)     # res[u64, Error], member i of a structure or union
+mirl.target.offsets(?l, ty, space, out)  # err[Error], every member of a structure in one walk
+mirl.target.stride(?l, ty, space)        # res[u64, Error], the bytes from one element of an array to the next
 ```
 
-`of` takes the target a module names (found by `mirl.target.by_name(module.target)`) and the module's type table. The query is for any IR type.
+`of` takes the target a module names (found by `mirl.target.by_name(module.target)`) and the module's type table. The query is for any IR type, laid out in an address space: the one a pointer to it points into, and the default space 0 for a call's values, a frame slot of the convention and a global. Each space's row states the rules its memory is laid out by, and a type is laid out by those rules throughout, members included. Every C target states `c` for each of its spaces. SPIR-V states `std140` for a Uniform block, `std430` for PushConstant, StorageBuffer and PhysicalStorageBuffer, and `c` for the storage classes whose layout Vulkan does not fix.
 
-- An integer or float is a row of the target's data layout, one for each legal width and each number format.
-- A pointer is the size and alignment of the pointer row for its address space. A pointer into a logical space has none and is refused as `unsized`.
-- A vector is its element's size times its lane count, rounded up to its alignment. Its alignment follows the vector rule of the target, which is either the element's alignment or, for a vector at least as wide as the narrowest vector register, the widest register size that the vector fills.
-- An array is its element's size times its count and has its element's alignment.
-- A structure places each member at the next multiple of the member's alignment, or at the offset it states, and rounds its size up to the largest member alignment.
+- An integer or float is a row of the target's data layout, one for each legal width and each number format. Under `c` it has the row's alignment, and under `std140`, `std430` and `scalar` its size, which is refused as `ruled` when it is not a power of two.
+- A pointer is the size of the pointer row for its address space, aligned as a scalar of that row. A pointer into a logical space has none and is refused as `unsized`.
+- A vector is its element's size times its lane count. Under `c` it is rounded up to its alignment, which follows the vector rule of the target: either the element's alignment or, for a vector at least as wide as the narrowest vector register, the widest register size that the vector fills. Under `scalar` it has its element's alignment. Under `std140` and `std430` a vector of two lanes has twice its element's alignment and one of three or four lanes four times, so a vector of three lanes is not a multiple of its alignment, and any other lane count is refused as `ruled`.
+- An array has its element's alignment, rounded up to 16 under `std140`. Its stride is the one it states, or its element's size rounded up to the array's alignment, and its size is the stride times its count. A stated stride shorter than the element or not a multiple of the alignment is refused as `stride`.
+- A structure places each member at the next multiple of the member's alignment, or at the offset it states. It has the largest member alignment, rounded up to 16 under `std140`, and its size is rounded up to it.
 - A function type or a target handle has no size and is refused as `unsized`.
-- A union is as large as its largest member rounded up to the largest member alignment, with every member at offset 0.
+- A union is as large as its largest member rounded up to the largest member alignment, with every member at offset 0. Only `c` lays one out, and the other rules refuse it as `ruled`.
 
-A request that cannot be answered is refused with a reason. The reasons are an unstated fact (the target leaves it out), a pointer into an unknown address space, an unsized type, a stated offset that is misaligned or overlaps the member before it, a member index past the type's members, an offset asked of a type that is not a structure or union, and a size that does not fit in 64 bits.
+These are Vulkan's extended alignment (`std140`), base alignment (`std430`) and scalar alignment (`scalar`), with the stride an array leaves unstated placed as tightly as they allow. Under `c` an array's stride is its element's size and every type's size is a multiple of its alignment, so the rules are those of the target's C compiler.
+
+A request that cannot be answered is refused with a reason. The reasons are an unstated fact (the target leaves it out), an address space the target has no row for, an unsized type, a stated offset that is misaligned or overlaps the member before it, a stated stride the rules refuse, a type the space's rules do not lay out, a member index past the type's members, an offset asked of a type that is not a structure or union or a stride of one that is not an array, and a size that does not fit in 64 bits.
 
 ## Argument passing
 
