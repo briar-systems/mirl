@@ -45,6 +45,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 ## Emission
 
 - One builder holds the object's sections. A function is a named label exposed as a function symbol of the binding and visibility its linkage states, placed at the target's function alignment in the text section. A block is an anonymous label.
+- A function symbol's size is its range: its own label and an anonymous label placed after its last instruction, before the alignment padding of whatever follows. masc measures the distance between them once it has laid the section out, so relaxation is counted and padding is not, and mirl never counts a byte. Each unit's end label is made before any function is named, so a symbol is exposed once with its range whether a call or its unit names it first. A function no unit emits states no size. A part of a function placed apart, as a cold part, would be a unit of its own symbol and range. The size is a fact of mink's neutral symbol, and how a container carries it is mink's: ELF states it as `st_size`, COFF in its function table, and Mach-O by the next symbol.
 - Every global the module defines is a named label exposed as a data symbol, or a thread-local one, of its linkage and its type's size, after the functions. It is placed in the section it states, or the one its facts pick (doc/ir.md), at its alignment or its type's. A section is opened once per name, and a global naming a section the code or another global names with another kind is refused. The globals that state no section share one section of each kind. A section is aligned to `code.text` when its kind executes and to `code.data` otherwise.
 - An initial value is its bytes, laid out by the data layout in the architecture's byte order, and a datum for each address in it, an absolute reference of the pointer's width to the symbol plus its offset, which masc relocates as a fixup. One every bit zero is zero fill, which holds no bytes in a zero filled section. A global the module does not define is an undefined symbol, named when an operand or a datum first names it.
 - An operand takes the masc value its row's position reads: a register, an immediate, an enumerant or a condition, or a label with a fixup. A block operand is a label of the operand's own fixup. A symbol operand names the function's or global's label and takes the fixup kind the set binds its relocation kind to, read through an index of the set's bindings built once. Where several fixup kinds are bound to one relocation kind, the operand's own is taken, else the emission is refused.
@@ -63,8 +64,6 @@ A global is refused, naming it, when its initial value holds an address and the 
 ## Limits
 
 - Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (#197, masc#41).
-- The object is checked in memory, structurally. Writing it as ELF and reading it back is #198, which waits for mink#23.
-- Function symbols carry no size, which is unknown until masc lays the section out.
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
