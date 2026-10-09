@@ -24,7 +24,7 @@ The abi legalisation puts every call, entry and return in piece form before sele
 
 - A call to a symbol is `auipc x1` and `jalr x1, x1, 0` under `call_plt_pair`, which the linker may relax. A call through a register is `jalr x1`. A return is `jalr x0, x1, 0`.
 - An `alloca` is the `address` pseudo of a frame slot of its type.
-- The address of a symbol follows the target's relocation model. Under `static` it is `lui` and `addi` (`hi20`, `lo12_i`). Under `pie` and `pic` a symbol that is not preemptible is `auipc` and `addi` (`pcrel_hi20`, `pcrel_lo12_i`), and a preemptible one is `auipc` and a load from the global offset table (`got_pcrel_hi20`) (see [ir/target.md](../ir/target.md)).
+- The address of a symbol follows the target's relocation model. Under `static` it is `lui` and `addi` (`hi20`, `lo12_i`). Under `pie` and `pic` a symbol that is not preemptible is `auipc` and `addi` (`pcrel_hi20`, `pcrel_lo12_i`), and a preemptible one is `auipc` and a load from the global offset table (`got_pcrel_hi20`) (see [ir/target.md](../ir/target.md)). `func.addr` selects to the same pair for its function, by the same hooks, since a function's address on RISC-V is a data address (`functions` is `addresses`).
 - A thread-local variable follows the access the target declares for its model. Local exec is `lui`, `add` of `tp` and `addi` (`tprel_hi20`, `tprel_lo12_i`). Initial exec is `auipc`, a load (`tls_got_pcrel_hi20`) and `add` of `tp`. General dynamic is `auipc` and `addi` into `a0` (`tls_gd_pcrel_hi20`), a call to the target's lookup function, which reads and writes `a0`, and a copy out of `a0`.
 - Every pc-relative low part names its high part's instruction as its partner (`pcrel_lo12_i`), the label the relocation is applied at.
 
@@ -70,6 +70,8 @@ The declared operations are in `declared.mach`, each with the job that closes it
 - `frem`, which no instruction does. The helpers legalisation calls the helper of its format in its place, since the RISC-V rows state no native `frem`, so it is not declared.
 - `mem.copy` and `mem.fill`, which no instruction does. The helpers legalisation turns each into a call of a helper, or a kept fill into a loop of kept stores, before selection (see [target](../ir/target.md)).
 - A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
+- `ptr.member` and `ptr.index`, which the address legalisation folds to a `ptr.add` of a byte offset, and `switch`, which the compare chain legalisation lowers to `eq` and `cbr` (see [target](../ir/target.md)). The rules select what they leave: a store or load at a member's constant offset takes it as its displacement, and a multiply of an index by an element size that is a power of two is a shift.
+- `extract` and `insert`, since the target holds aggregate values in no register. Nothing takes them apart before selection yet, so selection refuses them (#178).
 
 Some operations select only for the operands a base form covers.
 

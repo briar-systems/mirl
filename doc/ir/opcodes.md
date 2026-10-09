@@ -141,6 +141,12 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `mul.high.u` | `lhs`, `rhs` | none | lanewise | propagates |
 | `mul.high.s` | `lhs`, `rhs` | none | lanewise | propagates |
 | `mul.high.su` | `lhs`, `rhs` | none | lanewise | propagates |
+| `ptr.member` | `address` | `type` a type, `member` a member index | none | propagates |
+| `ptr.index` | `address`, `index` | `type` a type | none | propagates |
+| `switch` | `selector` | `cases` a case list | none | no results |
+| `extract` | `aggregate` | `member` a member index | none | propagates |
+| `insert` | `aggregate`, `value` | `member` a member index | none | propagates |
+| `func.addr` | none | `function` a function of the module, `pointer` a type | none | propagates |
 
 ### `add`
 
@@ -552,6 +558,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: none
+- address: formed or read as a number, so only under physical addressing once legal
 
 ### `br`
 
@@ -738,6 +745,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: none
+- address: formed or read as a number, so only under physical addressing once legal
 
 ### `vsplat`
 
@@ -1534,6 +1542,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: none
+- address: formed or read as a number, so only under physical addressing once legal
 
 ### `reduce.mul`
 
@@ -2086,4 +2095,92 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: lanewise
+
+### `ptr.member`
+
+- operands: `address`
+- immediates: `type` a type, `member` a member index
+- targets: 0
+- typing:
+  - `address` is a pointer
+  - the type in `type` is a structure
+  - `member` is below the member count of the type in `type`, or its element count when it is an array
+- results:
+  - one result of the type of `address`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: none
+- address: of the member `member` names of the type in `type`, at `address`
+
+### `ptr.index`
+
+- operands: `address`, `index`
+- immediates: `type` a type
+- targets: 0
+- typing:
+  - `address` is a pointer
+  - `index` is an integer
+  - the type in `type` is an array
+- results:
+  - one result of the type of `address`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: none
+- address: of the element `index` names, read as signed, of the type in `type`, at `address`
+
+### `switch`
+
+- operands: `selector`
+- immediates: `cases` a case list
+- targets: at least 1, ends its block
+- typing:
+  - `selector` is an integer
+  - `cases` holds one value per target after the first, in strictly increasing order, each below two to the width of `selector`, which is at most 64 bits
+- results: none
+- effects: none
+- secrecy: no results
+- vector: none
+
+### `extract`
+
+- operands: `aggregate`
+- immediates: `member` a member index
+- targets: 0
+- typing:
+  - `aggregate` is a structure or an array
+  - `member` is below the member count of `aggregate`, or its element count when it is an array
+- results:
+  - one result of the type of the member `member` names of `aggregate`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: none
+
+### `insert`
+
+- operands: `aggregate`, `value`
+- immediates: `member` a member index
+- targets: 0
+- typing:
+  - `aggregate` is a structure or an array
+  - `member` is below the member count of `aggregate`, or its element count when it is an array
+  - `value` is the type of the member `member` names of `aggregate`
+- results:
+  - one result of the type of `aggregate`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: none
+
+### `func.addr`
+
+- operands: none
+- immediates: `function` a function of the module, `pointer` a type
+- targets: 0
+- typing:
+  - the type in `pointer` is a pointer
+- results:
+  - one result of the type in `pointer`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: none
+- address: of the function `function` names, the only way code names a function's address
 
