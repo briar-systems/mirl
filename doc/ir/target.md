@@ -13,10 +13,12 @@ A target holds
 - `caps`, its capability declarations,
 - `data`, the facts data layout reads,
 - `convention`, the calling convention its calls are made under (see [Argument passing](#argument-passing)),
-- `baseline`, the extensions code for it may assume, in masc's spelling, from which `mirl.target.register.machine.open` makes masc's selection, the registers it gives and the convention resolved through them. A build adds extensions on top of it through `mirl.target.register.machine.open_with`, which takes extension names as masc's catalog names them and refuses one it does not know by name, `choose` makes the selection alone for a target with no convention yet, and the machine holds the one resolved selection that selection, the convention and the allocator's allowed set read,
+- `baseline`, the extensions code for it may assume, in masc's spelling, from which a family's `open` makes masc's selection (`mirl.target.basis.choose`) and the convention resolved through it. A build adds extensions on top of it through the extension names `open` is given, as masc's catalog names them, and one it does not know is refused by name. The build holds the one resolved selection that the passes, the convention and the back end read,
 - `addresses`, how code reaches an address (see [Addresses](#addresses)).
 
-A target states a machine when it has both a baseline and a convention row (`mirl.target.register.machine.stated`). The selection is a fact of its own: a build opens what it holds of its target through `mirl.target.register.machine.build`, a `Build` of the basis (the selection, for every target with a baseline) and the machine (for a target that states a convention too, its basis the same one), and hands it to the pass driver. The driver's context carries both to every pass, no pass opens either of its own, every extension condition is read against the basis, and a pass that needs the convention refuses a run that holds no machine (`Why.unmachined`), so an extension the build adds reaches every consumer, with or without a convention, and nothing falls back to the baseline.
+A target is served by the one family of `mirl.target.families` that admits its capabilities, and none or several is refused as unserved (`mirl.target.family`). A family is one record: its `name`, `admits` over the capabilities, `legal`, the rows the target runs after the neutral prefix, `open`, which makes the target's `Build` in place, `back`, its back end, and `close`, which gives back what `open` made. A `Build` (`mirl.target.build`) exists only once `open` succeeds and holds the `basis` (the selection), the `convention` resolved through it and the family's own `state`. The register family (`mirl.target.register.family`) admits allocated registers, free control, physical addressing and register evaluation, opens the register machine of `mirl.target.register.machine` and refuses a target that states no convention row (`uncarried`), and its back end is `mirl.machine.compile`.
+
+The pass schedule is split by what it reads. A neutral row (`mirl.pass.Row`) runs a `Pass`, which reads the target and the selection, if a family opened one, through its context. A family's row (`mirl.pass.Step`) may run a `Lowering` as well, which is given the build, so a pass that needs the convention reads it from the build and is never run where none was opened. A served target runs the neutral prefix (`mirl.pass.rows.prefix`: promotion, the typed address folding and the compare chain, the two applying by addressing and control alone) and then its family's rows over its build, and a target no family serves runs the neutral rows alone (`mirl.pass.rows.neutral`) with no selection. Every extension condition is read against the selection, so an extension the build adds reaches every consumer and nothing falls back to the baseline.
 
 `mirl.target.declared(t)` says whether a target is complete. Every declaration has an unstated zero case, so a row left zeroed reads as incomplete and never as an answer. A list that may rightly be empty sits under a case of its own, so an empty list is a stated answer.
 
@@ -26,7 +28,7 @@ The capability declarations are
 
 | declaration | what it states |
 |---|---|
-| `registers` | values live in registers the pipeline allocates, or not |
+| `registers` | values live in registers the pipeline allocates, in locals it assigns by live range, or nowhere it assigns |
 | `control` | control flow is free, or must be structured |
 | `addressing` | memory is addressed physically, or only by access chains (logical) |
 | `functions` | a function's address, the value `func.addr` gives, is a location as a data address is (`addresses`), or a slot of an indirect call table (`slots`) |
