@@ -165,6 +165,8 @@ The call's **statement** says how its language passes aggregates (by the platfor
 
 The one row is `lp64d`, the RISC-V convention of RV64 with hardware double precision, to the RISC-V ELF psABI 1.0.
 
+lp64d reserves the global and thread pointers and the float control and status register, `fcsr` and its `frm` and `fflags` fields. The psABI gives `fcsr` thread storage duration, so a call neither saves nor clobbers the rounding mode that a dynamic rounding reads or the flags that every float operation accrues.
+
 ## Addresses
 
 A target states its address model, or `uncarried` when it has none yet and no address is selected. The model is the relocation model, `static`, `pie` or `pic`, and the access each thread-local model of the ir is reached by: local exec, initial exec, general dynamic through the runtime function `lookup` names, a descriptor, a per variable thunk or an index into the thread's module table. `mirl.target.address.reach(model, defined, linkage, tls)` says how one symbol is reached: absolutely, by its distance from the code, through the global offset table, or by its thread-local access. Under `static` every symbol is reached absolutely. Under `pie` and `pic` reach reads one fact, `mirl.target.address.preemptible(relocation, linkage, defined)`, which holds the whole rule of the specification for what the model builds: `static` and `pie` build an executable and `pic` a shared object. A preemptible symbol goes through the table, and any other is reached by its distance from the code, defined or not, so the linker refuses a hidden or internal reference that ends up undefined. Selection reads this and never a target's name, and names relocations by mink's kinds.
