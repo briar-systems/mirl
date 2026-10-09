@@ -44,7 +44,7 @@ mirl "0.1.0"
 target "riscv64"
 global @counter: i32 linkage global visibility default = i32 7
 
-function @f.main_1: fun(i32) -> (i32) {
+function @f.main_1: fun(i32) -> (i32) linkage global visibility default {
 ^entry(%x: i32):
     %x.1 = add %x, i32 1
     %0 = add %x.1, i32 1
@@ -158,15 +158,17 @@ constants
 
 globals
 
-  global      = [ "export" ] "global" symbol ":" type
-                "linkage" word "visibility" word
+  global      = [ "export" ] "global" symbol ":" type linkage
                 [ "align" uint ] [ "section" string ] [ "tls" model ]
                 [ "=" constant ] newline ;
   model       = "general_dynamic" | "local_dynamic" | "initial_exec" | "local_exec" ;
+  linkage     = "linkage" word "visibility" word ;
 
-  linkage and visibility are spelled by the names of mink's symbol rows:
-  local, global, weak, unique, and default, protected, hidden, internal. a
-  global with no initial value is defined by another module.
+  a function or global states its linkage, its binding and its visibility,
+  spelled by the names of mink's symbol rows: local, global, weak, unique,
+  and default, protected, hidden, internal. a global with no initial value
+  is defined by another module, so its binding is one other objects may
+  refer to, any but local.
 
 attributes
 
@@ -177,8 +179,8 @@ attributes
 
 functions
 
-  function    = [ "export" ] "function" symbol ":" type [ "constant_time" ]
-                [ "{" newline { block } "}" ] newline ;
+  function    = [ "export" ] "function" symbol ":" type linkage [ "constant_time" ]
+                [ [ "placed" places ] "{" newline { block } "}" ] newline ;
   block       = label [ "(" param { "," param } ")" ] ":" newline { line } ;
   param       = local ":" [ "secret" ] type ;
   line        = newline | binding newline | instruction newline ;
@@ -202,8 +204,9 @@ functions
   `constant_time` marks a function that must run in time independent of its
   secret values.
 
-  a function without braces is declared here and defined by another module.
-  its first block is its entry, whose parameters are its parameters. only
+  a function without braces is declared here and defined by another module,
+  so its binding is not local. its first block is its entry, whose
+  parameters are its parameters. only
   the blocks of a body that are not erased print, and only the instructions
   placed in them, so a detached or erased instruction and an erased block
   do not print.
