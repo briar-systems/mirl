@@ -98,7 +98,9 @@ Values and blocks may carry a name for the text form. A name carries no meaning,
 
 A body is a graph of **blocks**. A block declares **parameters** and holds a list of instructions that ends in exactly one **terminator**. There are no phi instructions. Every edge into a block passes one argument per parameter of the block, in order, and each argument has the type of its parameter. A terminator names its targets and their arguments. The entry block's parameters are the function's parameters, in number and type.
 
-The terminators are `br` (one target), `cbr` (two targets, taken on a condition of 1 and 0), `ret` and `unreachable`.
+The terminators are `br` (one target), `cbr` (two targets, taken on a condition of 1 and 0), `switch`, `ret` and `unreachable`.
+
+`switch` branches on an integer selector of at most 64 bits. Its case list holds one value per target after the first, in strictly increasing order, each the selector's bits read unsigned, and it goes to the target after the first whose case is the selector's value, or to the first target when no case is. A target may be named by more than one edge. A target whose control is free has it lowered to a compare chain by legalisation, and a structured target keeps it whole for its own multi-way branch, SPIR-V's `OpSwitch` and WebAssembly's `br_table` (see [ir/target.md](ir/target.md)).
 
 Any graph shape is allowed, including loops with several entries and blocks with several exits. A target that needs structured control flow gets its structure from the structurizer, so a front end never structures its control flow. Blocks and instructions that are removed from a body keep their ids but are erased, and they take no part in the module.
 
@@ -123,16 +125,18 @@ An instruction's typing, effects and secrecy are its opcode's row in the opcode 
 
 One checker, `mirl.ir.opcode.check`, types an instance of a row by interpreting its rules. A rule speaks of **subjects**, which are the type of a fixed operand or the type held by a type immediate, and of **classes**, which are sets of types. The reference writes each rule as a sentence. The vocabulary is
 
-- a subject is in a class: any type, an integer, an integer of a given width, a float, a pointer, a function type, an integer of a whole number of bytes, a vector, or a scalar (an integer, a float or a pointer),
+- a subject is in a class: any type, an integer, an integer of a given width, a float, a pointer, a function type, an integer of a whole number of bytes, a vector, a scalar (an integer, a float or a pointer), a structure, an array, or an aggregate (a structure or an array),
 - two subjects are the same type,
 - both subjects are scalars, or both are vectors of the same lane count,
 - the lane types of two subjects are the same, a scalar being its own lane,
 - one subject has more bits than another, or the same number of bits. Bits are counted from the type table and the number format table alone, never a data layout, so only integers, floats and vectors of them have a bit width,
 - the tail operands are the parameters of a function type, the results of the function the instruction is in, or the lanes of a vector type,
 - a lane index is below the lane count of the vectors it indexes, and a lane list has one index per lane of the result,
-- a memory ordering immediate is among those allowed.
+- a memory ordering immediate is among those allowed,
+- a member index names a member of an aggregate, below a structure's member count or an array's element count, and a subject is the type of that member,
+- a case list holds one value per target after the first, in strictly increasing order, each within the width of a selector of at most 64 bits.
 
-Each result is derived from a subject. It has the subject's type, or it is an `i1` (or a vector of `i1` with the subject's lanes) for a comparison or flag, or it is the lane type of a vector, or the list of results of a function type.
+Each result is derived from a subject. It has the subject's type, or it is an `i1` (or a vector of `i1` with the subject's lanes) for a comparison or flag, or it is the lane type of a vector, or the list of results of a function type, or the type of a member of an aggregate.
 
 ### 5.2 Vector classes
 
@@ -142,7 +146,11 @@ A row's vector class says how it applies to vectors.
 - **across**: it takes one vector as a whole and gives a scalar, and its classes speak of the lanes of that vector. These are the reductions.
 - **none**: it takes no vector as a lane operation. Vector construction and lane access are opcodes of this class and state their types through their immediates.
 
-### 5.3 Effects
+### 5.3 Address formation
+
+A row states how it forms an address. Most form none. `ptr.add`, `ptrtoint` and `inttoptr` form or read one as a number, which only physical addressing gives meaning, so the verifier refuses them past legalisation on a target whose addressing is logical. `ptr.member` and `ptr.index` form one from the type they walk: the address of a member of a structure or of an element of an array, at the address they take. A target whose addressing is physical folds them to a `ptr.add` of the byte offset its data layout gives, and one whose addressing is logical keeps them, as SPIR-V's access chains reach memory.
+
+### 5.4 Effects
 
 A row states what executing an instance may do beyond giving its results.
 
@@ -216,6 +224,8 @@ The ordered comparisons (`feq.o`, `fne.o`, `flt.o`, `fle.o`, `fgt.o`, `fge.o`) a
 
 `load` reads a value of the stated type from an address, `store` writes one, and each states the alignment the access may assume as an immediate. An alignment is a power of two. `alloca` gives the address of a stack slot of the stated type and alignment. `ptr.add` adds an integer byte count to an address.
 
+`ptr.member` gives the address of a member of the structure at an address, the structure's type and the member's index stated as immediates. `ptr.index` gives the address of an element of the array at an address, the array's type stated and the element's index an integer operand read as signed. Neither reads memory, and neither checks the index against the array's count, so an index past it gives an address past the array as `ptr.add` would. The address is in the space of the one each takes.
+
 The memory of a stack slot holds no defined value until it is stored to, and it is not zero. A `load` that no store reaches gives an unspecified value of the stated type: any bit pattern, the same one on every read until the next store, and never poison, so nothing after it is undefined. The verifier does not refuse it, since whether a store reaches it depends on the path taken. A front end that wants a zero stores one. A pass may choose any value for it, and the promotion of stack slots chooses a zero of the type.
 
 `mem.copy` copies a byte count between two addresses, and the ranges may overlap. `mem.fill` sets a byte count at an address to one byte value.
@@ -242,7 +252,11 @@ An atomic access is over integers only. `atomic.load` and `atomic.store` access 
 
 The reductions take one vector and give a scalar of its lane type. The integer reductions (`reduce.add`, `reduce.mul`, `reduce.and`, `reduce.or`, `reduce.xor` and the signed and unsigned minimum and maximum) are exact. A float reduction states its order. A **sequential** reduction (`reduce.fadd.seq`, `reduce.fmul.seq`) combines the lanes one after another from the first, so the result is exactly the one that order gives. A **reassociable** reduction (`reduce.fadd.any`, `reduce.fmul.any`) combines the lanes in any order and grouping, so the result is any one such an order gives. The minimum and maximum reductions combine as `fmin`, `fmax`, `fminnum` and `fmaxnum` do.
 
-### 6.7 Calls and returns
+### 6.7 Aggregates
+
+`extract` gives one member of a structure value or one element of an array value, by a constant index immediate, and `insert` gives the aggregate with that member replaced by a value of the member's type. They take an aggregate whole, so a target that holds aggregate values in no register has them taken apart before selection.
+
+### 6.8 Calls and returns
 
 `call` takes the callee's address, the arguments and an immediate stating the signature called through. Its results are the signature's results. `ret` takes the results of the function it is in. How arguments and results are passed is not in the IR. It is decided from the function type and the target (see [ir/target.md](ir/target.md)).
 
@@ -309,6 +323,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 16 | `linkage` | every function with no body and every global with no initial value, which another module defines, has a binding other objects may refer to |
 | 17 | `placement` | every section a global states is thread-local exactly when the global is, writable unless the global is constant, and zero filled only for a global that is not constant and whose initial value is every bit zero |
 | 18 | `thread` | no global's initial value holds the address of a thread-local global, stated in the module or declared, since it has no one static address and is reached only through code by its model |
+| 19 | `addressing` | past legalisation on a target that declares logical addressing, no instruction forms or reads an address as a number: no row whose address formation is arithmetic, which `ptr.add`, `ptrtoint` and `inttoptr` are |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
