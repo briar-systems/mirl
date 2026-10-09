@@ -158,8 +158,8 @@ constants
 
 globals
 
-  global      = [ "export" ] "global" symbol ":" type linkage
-                [ "align" uint ] [ "section" string ] [ "tls" model ]
+  global      = [ "export" ] "global" symbol ":" type linkage [ "constant" ]
+                [ "align" uint ] [ "section" string word ] [ "tls" model ]
                 [ "=" constant ] newline ;
   model       = "general_dynamic" | "local_dynamic" | "initial_exec" | "local_exec" ;
   linkage     = "linkage" word "visibility" word ;
@@ -169,6 +169,10 @@ globals
   and default, protected, hidden, internal. a global with no initial value
   is defined by another module, so its binding is one other objects may
   refer to, any but local.
+
+  `constant` states that the program never writes the global. a section is
+  its name and its kind, spelled by the name of a row of mink's section
+  kinds: text, rodata, relro, data, bss, tdata, tbss and the rest.
 
 attributes
 
