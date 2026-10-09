@@ -41,7 +41,7 @@ This is the text of a module with one global and one function. The version line 
 
 ```text
 mirl "0.1.0"
-target "riscv64"
+target "riscv64" "linux" "lp64d" "rv64gc"
 global @counter: i32 linkage global visibility default = i32 7
 
 function @f.main_1: fun(i32) -> (i32) linkage global visibility default {
@@ -112,11 +112,14 @@ module
   file        = target { item } ;
   items       = { item } ;
   version     = "mirl" string newline ;
-  target      = "target" string newline ;
+  target      = "target" string string string string newline ;
   item        = newline | debug | global | function | attribute ;
 
   `parse` reads a module, `parse_body` a file and `parse_into` items. the
-  version line is the first line, and a reader refuses a version other than
+  target line spells the target's tuple, its architecture and system as
+  mink's catalogs name their rows, its convention as mirl's convention row
+  is named and its baseline as masc spells the selection, in that order,
+  each empty where the target carries none. the version line is the first line, and a reader refuses a version other than
   its own, and refuses a version line in a file. a reader takes items in any
   order. a symbol, a value or a block may be named before it is defined, and
   so may a debug entry named from a body or a debug type named from a debug

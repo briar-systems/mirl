@@ -1,14 +1,13 @@
 # Targets, data layout and attributes
 
-A **target** is data. It names an architecture and a system, declares what code generation needs to know about them and states the facts that data layout reads. Nothing in the pipeline reads a target's name to decide what to do. Every decision reads a declaration. A new target is a new row in `mirl.target`'s table and never a new case in a pass.
+A **target** is data. It is the tuple of its architecture and system, rows of mink's catalogs, its calling convention, a row of mirl's, and its baseline, as masc spells the selection. It declares what code generation needs to know about them and states the facts that data layout reads. A target has no name of its own: `mirl.target.name` derives one from the tuple for diagnostics, and nothing looks it up. Every decision reads a declaration. A new target is a new row in `mirl.target`'s table and never a new case in a pass.
 
-A module names its target by the target's name. The verifier's first rule requires the name to be a row of the table whose declarations are all stated (see rule 0 in [the specification](../ir.md)). The table has one row at this version, `riscv64-linux`.
+A module names its target by its tuple, each part as its owner spells it and empty for a part the target does not carry (`mirl.ir.module.Tuple`). `mirl.target.row_of(tuple)` finds the row whose tuple it is, and `mirl.target.same(a, b)` says whether two targets are one tuple, comparing the architecture and system rows, the convention row and the baseline selection. The verifier's first rule requires the module's tuple to be its target's, whose declarations are all stated (see rule 0 in [the specification](../ir.md)).
 
 ## The record
 
 A target holds
 
-- `name`, its spelling, used for diagnostics and lookup only,
 - `arch` and `system`, the names of its rows in mink's architecture and system catalogs, where the system must run the architecture,
 - `caps`, its capability declarations,
 - `data`, the facts data layout reads,
@@ -122,7 +121,7 @@ mirl.target.offset(?l, ty, i)     # res[u64, Error], member i of a structure or 
 mirl.target.offsets(?l, ty, out)  # err[Error], every member of a structure in one walk
 ```
 
-`of` takes the target a module names (found by `mirl.target.by_name(module.target)`) and the module's type table. The query is for any IR type.
+`of` takes the target a module names (found by `mirl.target.row_of(module.target)`) and the module's type table. The query is for any IR type.
 
 - An integer or float is a row of the target's data layout, one for each legal width and each number format.
 - A pointer is the size and alignment of the pointer row for its address space. A pointer into a logical space has none and is refused as `unsized`.
