@@ -50,7 +50,7 @@ A binding ties a source variable to the code. It holds the variable's source nam
 
 ## Value binding records
 
-A record stands at a point of a block: just before one of its instructions, or at the block's entry, which is the point before its first instruction and how a block parameter gets one. It names a binding and what it reads, which is a location and a salvage expression over what the location holds. A record of the IR holds one of two kinds of location (see [Location kinds](#location-kinds)): `ssa`, an operand that is any value of the function (an instruction result, a block parameter or a constant), or `unavailable`. A body edit refuses a location of any other kind. A binding has to be at a point rather than on a value, since a value has no "from here on". After `x = y`, with `y` defined earlier, a binding on `y` would make `x` read as `y` before the assignment, and a constant has no point of definition at all.
+A record stands at a point of a block: just before one of its instructions, or at the block's entry, which is the point before its first instruction and how a block parameter gets one. It names a binding and what it reads, which is an operand and a salvage expression over it, or `unavailable`. The operand is any value of the function: an instruction result, a block parameter or a constant. A binding has to be at a point rather than on a value, since a value has no "from here on". After `x = y`, with `y` defined earlier, a binding on `y` would make `x` read as `y` before the assignment, and a constant has no point of definition at all.
 
 A record is not an instruction. No instruction walk sees it, and it carries no scheduling, cost or ordering constraint. Reading a value is never a use of it, so a record holds nothing alive for liveness, dead code removal or any pass. Records live in a pool of the body and stand in runs. Each instruction holds the run of records just before it and each block the run at its end, linked through the pool, and each value lists the pool positions of the records that read it. Every body edit keeps each record at its point by moving whole runs, so it costs nothing per record it does not touch.
 
@@ -83,7 +83,7 @@ Every step is one a DWARF location expression can state, so a producer encodes e
 
 ## Location kinds
 
-Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Location`, and every producer reads it.
+Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
 
 | kind | where the value is |
 |---|---|
