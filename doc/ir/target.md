@@ -165,9 +165,22 @@ The integers are signless, so a convention that extends a narrow integer by the 
 
 The call's **statement** says how its language passes aggregates (by the platform's C rules, or each by reference to a copy the caller makes) and how many of its arguments are named. Both have an unstated zero case, which is refused.
 
-The one row is `lp64d`, the RISC-V convention of RV64 with hardware double precision, to the RISC-V ELF psABI 1.0.
+The rows are the six RISC-V conventions of the RISC-V ELF psABI 1.0, rows of one classifier that reads XLEN, the row's `word`, and FLEN, its `floats`, and has no code for any one variant:
 
-lp64d reserves the global and thread pointers and the float control and status register, `fcsr` and its `frm` and `fflags` fields. The psABI gives `fcsr` thread storage duration, so a call neither saves nor clobbers the rounding mode that a dynamic rounding reads or the flags that every float operation accrues.
+| row | word | floats | float ABI |
+|---|---|---|---|
+| `lp64` | 64 | none | soft |
+| `lp64f` | 64 | 32 | single |
+| `lp64d` | 64 | 64 | double |
+| `ilp32` | 32 | none | soft |
+| `ilp32f` | 32 | 32 | single |
+| `ilp32d` | 32 | 64 | double |
+
+A named float no wider than FLEN takes a float register, and a wider one passes as an integer of its width. A named structure or array that flattens to one or two floats, or to one float and one integer no wider than a word, each float no wider than FLEN, takes float and integer registers when enough are free, whatever its size. Anything else wider than two words passes by reference, and the rest takes one or two integer registers, an unnamed value of two-word alignment starting at an even one. A soft float row passes and keeps no float register and reads the integer rule alone.
+
+Every row reserves the global and thread pointers. The rows that pass floats in float registers also reserve the float control and status register, `fcsr` and its `frm` and `fflags` fields. The psABI gives `fcsr` thread storage duration, so a call neither saves nor clobbers the rounding mode that a dynamic rounding reads or the flags that every float operation accrues. A soft float row names no float register, so it resolves on a selection that has none.
+
+`riscv64-linux` and `riscv64-freestanding` call under `lp64d`, and `riscv32-linux` under `ilp32d`.
 
 ## Addresses
 
