@@ -3,9 +3,9 @@
 `mirl.machine.layout` orders the blocks of an allocated and framed function and settles its branches. `mirl.machine.emit` hands the laid out functions of a module to masc, which encodes them into mink's object. This is the last stage of a register machine. mirl never encodes a byte and never writes an object file.
 
 ```
-compile(a, ?module, ?machine, ?target)             # res[object.Object, compile.Error]
+compile(a, ?module, ?build, ?target)               # res[object.Object, compile.Error]
 lay(a, ?function)                                  # res[Laid, lay.Error]
-emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Error]
+emit(a, ?module, ?build, ?target, units)           # res[object.Object, emit.Error]
 ```
 
 `mirl.machine.compile.compile` is the one entry a consumer of the library calls, and it returns the object in memory. `emit` is the hand-over it ends in. The machine form text is the one text hand-over: a function read from it is the same function and emits the same object. masc's listing of the result is for debugging.
@@ -19,11 +19,11 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 
 ## The entry and `mirl emit`
 
-- `mirl.compile.compile(a, ?module, ?target, options)` is the entry mach calls. It opens the build's machine with the extensions `options.added` names, runs the pass schedule at `options.level` and hands the module to the back end the target's declarations choose. A register machine (allocated registers, free control, physical addressing, register evaluation) is compiled by `mirl.machine.compile.compile`. A target no back end serves is refused before anything runs (`Error.unserved`).
+- `mirl.compile.compile(a, ?module, ?target, options)` is the entry mach calls. It takes the one family of `mirl.target.families` that admits the target's declarations, has it open the build with the extensions `options.added` names, runs the neutral prefix and the family's rows over that build at `options.level` and hands the module to the family's back end. The register family (allocated registers, free control, physical addressing, register evaluation) compiles through `mirl.machine.compile.compile`. A target no family admits, or several admit, is refused before anything runs (`Error.unserved`).
 - `options.checked` verifies the module after every pass and every function of the machine form after every stage: selection, allocation, the frame, the lowering of copies, the expansion of loops and layout. The machine form verifier (`mirl.machine.verify`) holds that every instruction a block places is one of the function's own, placed once, and stands against its opcode's row.
 - `options.machine` and `options.listing` name writers for the machine form text of the laid out functions and masc's listing of the object, in the set's default syntax. Both are written only once the object is made, so a refused compilation writes nothing.
 - `mirl.compile.write(a, ?object, ?target, w)` lays the object out in the one object format the target's system states, through mink, and refuses a system that states none or several.
-- `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--extension`, `--checked` and `--body` are read as `mirl opt` reads them, and each `--extension` names one extension the build adds to the target's baseline through `mirl.target.register.machine.build`.
+- `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--extension`, `--checked` and `--body` are read as `mirl opt` reads them, and each `--extension` names one extension the build adds to the target's baseline through the family's `open`.
 - The example programs in `test/example/` (arithmetic, a loop, a call, a global and a recursive function) each carry a start stub that calls `main` and hands its result to `__mirl_exit`. The example lane targets are one table, `mirl.target.lane.lanes`, and `mirl lanes` writes it, one target per line: its derived name, its architecture's and its system's rows in mink's catalog, its baseline as masc's selection, its convention's name and its object format's row in mink's catalog. One test walks every example at every lane target through every kind, checked. Covering a target is adding its row to the table.
 
 ## The example lane
