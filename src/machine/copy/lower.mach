@@ -10,7 +10,12 @@
 # frame code's load or store at the slot's place, and between two memory
 # locations, slots or cells, two moves through a free register of the stack
 # pointer's class. a free location is one the allocator may assign that a
-# call clobbers or the frame saves, so writing it never reaches a caller.
+# call clobbers or the frame saves, so writing it never reaches a caller, and
+# the one taken is the first under which every instruction the moves through
+# it make stands against its row's register constraints, found by making
+# those moves into a function of their own for each in turn. the frame code
+# is offered every free register of the stack pointer's class as its scratch
+# in the same way.
 # every other instruction is copied, and the call frame facts and origins
 # follow the instructions they name.
 #
@@ -41,12 +46,17 @@ use mirl.machine.alloc.live.Segment;
 use mirl.machine.alloc.location;
 use mirl.machine.alloc.location.Locations;
 use mirl.machine.class.Physical;
+use mirl.machine.constraint;
+use mirl.machine.constraint.Breach;
 use mirl.machine.copy.move;
 use mirl.machine.copy.move.Index;
 use mirl.machine.copy.move.Move;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Access;
 use mirl.machine.frame.code.Code;
 use mirl.machine.frame.code.Emit;
 use mirl.machine.frame.code.Refusal;
+use mirl.machine.frame.code.Step;
 use mirl.machine.frame.record;
 use mirl.machine.frame.record.Fact;
 use mirl.machine.frame.record.Framed;
@@ -88,19 +98,22 @@ pub rec Request {
 
 # why a copy was not lowered
 # ---
-# operand:    an operand that is no register, cell or slot, by position
-# label:      a partner names the copy, which may make no instruction
-# implied:    the copy states locations beyond its operands
-# twice:      a second pair writing one location, by its destination's position
-# overlap:    a destination sharing storage with a location of another pair
-#             without being it, by its position
-# unmoved:    a pair the set states no move for, directly or through a
-#             register, by its destination's position
-# scratch:    a pair of memory locations with no free register to go through,
-#             by its destination's position
-# cycle:      a cycle with no free location to break it and no swap
-# dropped:    a slot the frame dropped, by its operand's position
-# unnumbered: a register or cell operand the locations refused, and why
+# operand:     an operand that is no register, cell or slot, by position
+# label:       a partner names the copy, which may make no instruction
+# implied:     the copy states locations beyond its operands
+# twice:       a second pair writing one location, by its destination's position
+# overlap:     a destination sharing storage with a location of another pair
+#              without being it, by its position
+# unmoved:     a pair the set states no move for, directly or through a
+#              register, by its destination's position
+# scratch:     a pair of memory locations with no free register to go through,
+#              by its destination's position
+# cycle:       a cycle with no free location to break it and no swap
+# dropped:     a slot the frame dropped, by its operand's position
+# unnumbered:  a register or cell operand the locations refused, and why
+# constrained: a free location every instruction of the moves through it
+#              does not stand under for each one free, the breach under the
+#              first
 pub tag Reason: u8 {
     operand: u32;
     label;
@@ -110,8 +123,9 @@ pub tag Reason: u8 {
     unmoved: u32;
     scratch: u32;
     cycle;
-    dropped:    u32;
-    unnumbered: Unnumbered;
+    dropped:     u32;
+    unnumbered:  Unnumbered;
+    constrained: Breach;
 }
 
 # an operand the locations refused
@@ -200,6 +214,7 @@ rec Writer {
     ready:   vector.Vector[u32];
     busy:    vector.Vector[u32];
     ops:     vector.Vector[Operand];
+    frees:   vector.Vector[rf.Id];
     held:    u32;
     block:   Block;
     at:      Instruction;
@@ -276,23 +291,122 @@ fun give(w: *Writer, loc: u32) {
     }
 }
 
-# a location of a class that holds no value across the copy and none of the
-# copy's own, none when there is none
-fun spare(w: *Writer, class_key: u32) opt[u32] {
-    if (class_key == NONE) { ret opt[u32].none{}; }
-    if (sel w.window.none) { ret opt[u32].none{}; }
-    var span: [1]Segment = [1]Segment{w.window.some};
-    val list: Slice[u32] = graph.list[u32](?w.spares, class_key);
-    var i:    usize      = 0;
+# the candidates of a class, which a free location is one of
+fun spares_of(w: *Writer, class_key: u32) Slice[u32] {
+    if (class_key == NONE) { ret Slice[u32]{data: nil, size: 0}; }
+    ret graph.list[u32](?w.spares, class_key);
+}
+
+# whether a candidate holds no value across the copy and none of the copy's own
+fun free(w: *Writer, loc: u32) bool {
+    if (sel w.window.none) { ret false; }
+    if (is_busy(w, loc))   { ret false; }
+    var span:    [1]Segment = [1]Segment{w.window.some};
+    val blocked: opt[u32]   = live.blocked_over(w.l, w.r.at, loc, Slice[Segment]{data: ?span[0], size: 1}, Slice[u32]{data: nil, size: 0});
+    ret sel blocked.none;
+}
+
+# what a free location is taken for
+# ---
+# through: the register a move between two memory locations goes through
+# save:    the location a cycle's value is saved into, from this end
+tag Spare: u8 {
+    through: Ends;
+    save:    End;
+}
+
+# the two ends of a move
+rec Ends {
+    to:   End;
+    from: End;
+}
+
+# two moves through a register, into it and out of it
+fun through(w: *Writer, t: u32, to: End, from: End, position: u32) err[Error] {
+    val via:   End              = End.location{t};
+    val first: res[bool, Error] = direct(w, via, from, position);
+    if (sel first.err) { ret err[Error].err{first.err}; }
+    if (!first.ok)     { ret refuse(w, Reason.unmoved{position}); }
+    val second: res[bool, Error] = direct(w, to, via, position);
+    if (sel second.err) { ret err[Error].err{second.err}; }
+    if (!second.ok)     { ret refuse(w, Reason.unmoved{position}); }
+    ret err[Error].ok{};
+}
+
+# the moves a free location is taken for, made through it
+fun use(w: *Writer, t: u32, u: Spare, position: u32) err[Error] {
+    if (sel u.through) { ret through(w, t, u.through.to, u.through.from, position); }
+    val taken: err[Error] = take(w, t);
+    if (sel taken.err) { ret taken; }
+    val made: err[Error] = moved(w, End.location{t}, u.save, position);
+    give(w, t);
+    ret made;
+}
+
+# the first breach of an instruction the moves through a location make,
+# made into a function of their own
+fun trial(w: *Writer, t: u32, u: Spare, position: u32) res[opt[Breach], Error] {
+    var probe: Function = function.init(w.a, w.out.set);
+    fin { function.dnit(?probe); }
+    val b: res[Block, function.Error] = function.block(?probe);
+    if (sel b.err) { ret res[opt[Breach], Error].err{Error.made{b.err}}; }
+    val out:   *Function = w.out;
+    val block: Block     = w.block;
+    w.out   = ?probe;
+    w.block = b.ok;
+    val made: err[Error] = use(w, t, u, position);
+    w.out   = out;
+    w.block = block;
+    if (sel made.err) { ret res[opt[Breach], Error].err{made.err}; }
+    var i: usize = 0;
+    for (i < probe.instructions.len) {
+        val d:   *InstructionData = ?probe.instructions.data[i];
+        val got: opt[Breach]      = constraint.stands(?probe, d.opcode, d.operands);
+        if (sel got.some) { ret res[opt[Breach], Error].ok{got}; }
+        i = i + 1;
+    }
+    ret res[opt[Breach], Error].ok{opt[Breach].none{}};
+}
+
+# the first free location of a class under which every instruction of the
+# moves it is taken for stands, none when none is free
+fun spare(w: *Writer, class_key: u32, u: Spare, position: u32) res[opt[u32], Error] {
+    val list:  Slice[u32] = spares_of(w, class_key);
+    var tried: u32        = 0;
+    var first: Breach;
+    var i:     usize      = 0;
     for (i < list.size) {
         val loc: u32 = list.data[i];
-        if (!is_busy(w, loc)) {
-            val blocked: opt[u32] = live.blocked_over(w.l, w.r.at, loc, Slice[Segment]{data: ?span[0], size: 1}, Slice[u32]{data: nil, size: 0});
-            if (sel blocked.none) { ret opt[u32].some{loc}; }
+        if (free(w, loc)) {
+            val got: res[opt[Breach], Error] = trial(w, loc, u, position);
+            if (sel got.err) { ret res[opt[u32], Error].err{got.err}; }
+            val broke: opt[Breach] = got.ok;
+            if (sel broke.none) { ret res[opt[u32], Error].ok{opt[u32].some{loc}}; }
+            if (tried == 0)     { first = broke.some; }
+            tried = tried + 1;
         }
         i = i + 1;
     }
-    ret opt[u32].none{};
+    if (tried > 0) { ret res[opt[u32], Error].err{refusal(w, Reason.constrained{first})}; }
+    ret res[opt[u32], Error].ok{opt[u32].none{}};
+}
+
+# every free register of the stack pointer's class, the frame code's scratches
+fun scratches(w: *Writer) res[Slice[rf.Id], Error] {
+    vector.clear[rf.Id](?w.frees);
+    val list: Slice[u32] = spares_of(w, w.stack);
+    var i:    usize      = 0;
+    for (i < list.size) {
+        val p: Physical = location.physical(w.r.at, list.data[i]);
+        if (sel p.register) {
+            if (free(w, list.data[i])) {
+                val pushed: res[usize, allocator.Error] = vector.push[rf.Id](?w.frees, p.register);
+                if (sel pushed.err) { ret res[Slice[rf.Id], Error].err{Error.alloc{pushed.err}}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret res[Slice[rf.Id], Error].ok{Slice[rf.Id]{data: w.frees.data, size: w.frees.len}};
 }
 
 # the operand a part of a move takes
@@ -323,17 +437,15 @@ fun access(w: *Writer, loc: u32, s: u32, store: bool, position: u32) res[bool, E
     if (!(sel p.register)) { ret res[bool, Error].ok{false}; }
     val pl: Place = w.src.layout.slots.data[s];
     if (sel pl.dropped) { ret res[bool, Error].err{refusal(w, Reason.dropped{position})}; }
-    val base: rf.Id         = record.base_of(?w.src.layout, pl.at);
-    val size: record.Offset = record.size_of(w.src.function.slots.data[s]);
-    var e:    Emit          = Emit{f: w.out, block: w.block, metadata: w.d.metadata, stack: w.src.layout.stack, scratch: opt[rf.Id].none{}};
-    val t:    opt[u32]      = spare(w, w.stack);
-    if (sel t.some) {
-        val tp: Physical = location.physical(w.r.at, t.some);
-        if (sel tp.register) { e.scratch = opt[rf.Id].some{tp.register}; }
-    }
+    val base: rf.Id                    = record.base_of(?w.src.layout, pl.at);
+    val size: record.Offset            = record.size_of(w.src.function.slots.data[s]);
+    val free: res[Slice[rf.Id], Error] = scratches(w);
+    if (sel free.err) { ret res[bool, Error].err{free.err}; }
+    var e:    Emit         = Emit{f: w.out, block: w.block, metadata: w.d.metadata, stack: w.src.layout.stack, scratches: free.ok, scratch: opt[rf.Id].none{}};
+    val step: Access       = Access{register: p.register, base: base, at: pl.at.offset, size: size};
     var done: err[Refusal] = err[Refusal].ok{};
-    if (store)        { done = w.r.code.store(?e, p.register, base, pl.at.offset, size); }
-    or                { done = w.r.code.load(?e, p.register, base, pl.at.offset, size); }
+    if (store)        { done = code.make(w.r.code, ?e, Step.store{step}); }
+    or                { done = code.make(w.r.code, ?e, Step.load{step}); }
     if (sel done.err) { ret res[bool, Error].err{Error.code{done.err}}; }
     ret res[bool, Error].ok{true};
 }
@@ -362,17 +474,14 @@ fun moved(w: *Writer, to: End, from: End, position: u32) err[Error] {
     if (sel one.err)                        { ret err[Error].err{one.err}; }
     if (one.ok)                             { ret err[Error].ok{}; }
     if (!memory(w, to) || !memory(w, from)) { ret refuse(w, Reason.unmoved{position}); }
-    val t: opt[u32] = spare(w, w.stack);
+    val picked: res[opt[u32], Error] = spare(w, w.stack, Spare.through{Ends{to: to, from: from}}, position);
+    if (sel picked.err) { ret err[Error].err{picked.err}; }
+    val t: opt[u32] = picked.ok;
     if (sel t.none) { ret refuse(w, Reason.scratch{position}); }
     val taken: err[Error] = take(w, t.some);
     if (sel taken.err) { ret taken; }
-    val through: End              = End.location{t.some};
-    val first:   res[bool, Error] = direct(w, through, from, position);
-    if (sel first.err) { ret err[Error].err{first.err}; }
-    if (!first.ok)     { ret refuse(w, Reason.unmoved{position}); }
-    val second: res[bool, Error] = direct(w, to, through, position);
-    if (sel second.err) { ret err[Error].err{second.err}; }
-    if (!second.ok)     { ret refuse(w, Reason.unmoved{position}); }
+    val went: err[Error] = through(w, t.some, to, from, position);
+    if (sel went.err) { ret went; }
     give(w, t.some);
     ret err[Error].ok{};
 }
@@ -428,7 +537,9 @@ fun saved(w: *Writer, i: u32) res[bool, Error] {
     val p:     Pair = w.pairs.data[i];
     var class: u32  = w.stack;
     if (sel p.to.location) { class = location.key_at(w.r.at, p.to.location); }
-    val t: opt[u32] = spare(w, class);
+    val picked: res[opt[u32], Error] = spare(w, class, Spare.save{p.to}, p.position);
+    if (sel picked.err) { ret res[bool, Error].err{picked.err}; }
+    val t: opt[u32] = picked.ok;
     if (sel t.none) { ret res[bool, Error].ok{false}; }
     val taken: err[Error] = take(w, t.some);
     if (sel taken.err) { ret res[bool, Error].err{taken.err}; }
@@ -719,6 +830,7 @@ fun release_writer(w: *Writer) {
     vector.dnit[u32](?w.ready);
     vector.dnit[u32](?w.busy);
     vector.dnit[Operand](?w.ops);
+    vector.dnit[rf.Id](?w.frees);
 }
 
 fun prepare(w: *Writer) err[Error] {
@@ -790,6 +902,7 @@ pub fun lower(a: *allocator.Allocator, x: *Framed, r: *Request) err[Error] {
         ready:   vector.init[u32](a),
         busy:    vector.init[u32](a),
         ops:     vector.init[Operand](a),
+        frees:   vector.init[rf.Id](a),
         held:    NONE,
         block:   Block{index: 0},
         at:      Instruction{index: 0},

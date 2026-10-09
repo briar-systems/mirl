@@ -303,6 +303,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 15 | `call` | every call through the address of a function of the module states the extension of each parameter and result that the function's signature states |
 | 16 | `linkage` | every function with no body and every global with no initial value, which another module defines, has a binding other objects may refer to |
 | 17 | `placement` | every section a global states is thread-local exactly when the global is, writable unless the global is constant, and zero filled only for a global that is not constant and whose initial value is every bit zero |
+| 18 | `thread` | no global's initial value holds the address of a thread-local global, stated in the module or declared, since it has no one static address and is reached only through code by its model |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
