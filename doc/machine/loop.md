@@ -35,7 +35,7 @@ The selection engine refuses a table whose rule emits a loop that breaks the con
 
 The expansion reads nothing but this row, so a target's loops are added as rows and never as code. The families the schema is written against:
 
-- RISC-V without a single instruction: `lr` and `sc` in the body, which repeats while `sc` reports failure, and a compare and exchange leaving to `exit` as soon as the value held is not the one expected.
+- RISC-V without a single instruction: `lr` and `sc` in the body, which repeats while `sc` reports failure, and a compare and exchange leaving to `exit` as soon as the value held is not the one expected. The aq and rl bits of the pair are two parameters, which the rule maps from the ir's ordering, so one loop serves every ordering.
 - RISC-V on a byte or halfword without Zabha: one field loop per operation with the field width and the register width as parameters, its `before` the shared steps that find the field in its aligned word, its `after` the shared steps that give the field back, and a body that merges the new field into the word held. And, or and exclusive or are straight sequences around one word instruction.
 - AArch64 without LSE: `ldaxr` and `stlxr` in the body, `cbnz` back to it, and a compare whose flags the body writes before its `b.ne` to `exit` reads them.
 - x86's nand: the first load of the value in `before`, the body's `lock cmpxchg` repeated while it fails, and the value held left in `rax`, which the steps write and so the loop clobbers.
@@ -55,4 +55,4 @@ Selection admits a rule whose expansion holds a loop only when the target's sele
 
 ## The text form
 
-A loop is spelled `loop <name>` and its operands, a parameter as its number: `loop field_add x10, x11, x12, 8, 64, x5, x6, x7, x28, x29`. The environment of a text holds the loops mirl carries for its set, from `mirl.isa.loops`, indexed by name once. A loop no stage expanded is refused by emission as a pseudo.
+A loop is spelled `loop <name>` and its operands, a parameter as its number: `loop field_add x10, x11, x12, 8, 64, 3, 1, x5, x6, x7, x28, x29`. The environment of a text holds the loops mirl carries for its set, from `mirl.isa.loops`, indexed by name once. A loop no stage expanded is refused by emission as a pseudo.
