@@ -180,7 +180,18 @@ A named float no wider than FLEN takes a float register, and a wider one passes 
 
 Every row reserves the global and thread pointers. The rows that pass floats in float registers also reserve the float control and status register, `fcsr` and its `frm` and `fflags` fields. The psABI gives `fcsr` thread storage duration, so a call neither saves nor clobbers the rounding mode that a dynamic rounding reads or the flags that every float operation accrues. A soft float row names no float register, so it resolves on a selection that has none.
 
-`riscv64-linux` and `riscv64-freestanding` call under `lp64d`, and `riscv32-linux` under `ilp32d`.
+The RISC-V targets and the floor each states:
+
+| target | baseline | convention | floats |
+|---|---|---|---|
+| `riscv64-linux` | `rv64gc` | `lp64d` | F and D |
+| `riscv64-freestanding` | `rv64ifd` | `lp64d` | F and D |
+| `riscv64imac-freestanding` | `rv64imac` | `lp64` | software |
+| `riscv32-linux` | `rv32gc` | `ilp32d` | F and D |
+| `riscv32-freestanding` | `rv32i` | `ilp32` | software |
+| `riscv32imac-freestanding` | `rv32imac` | `ilp32` | software |
+
+A freestanding target's baseline is the least its convention needs, so a build assumes no extension a chip of that target may lack and adds the rest through `open_with`. A chip below a target's floor is a target of its own. A soft float target holds no float format, so every float operation is a helper call.
 
 ## Addresses
 
