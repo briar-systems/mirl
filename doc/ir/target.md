@@ -66,7 +66,24 @@ An integer wider than the widest width in `widths.alu` (`mirl.target.widest`) is
 - An `i1` a store writes or a load reads is held in memory as the integer of its layout size, 0 or 1.
 - A variable bound to no more than the low word reads it from the low word. One bound to more than a word, which no one record can read from two words, is unavailable.
 
-A wide value at a function's entry, a call or a return is the abi legalisation's, which runs before it. A wide division, remainder or conversion to or from a float is left to the checked division and conversion helpers (`mirl.legal.wide.leaves`). A vector of wide lanes and a wide access through a logical address are refused.
+A wide value at a function's entry, a call or a return is the abi legalisation's, which runs before it. A wide division, remainder or conversion to or from a float is the helpers legalisation's, which runs before it too and leaves a call of a helper (`mirl.legal.helper.takes`). A vector of wide lanes and a wide access through a logical address are refused.
+
+### Division, conversion and bulk memory
+
+The `helpers` legalisation (`mirl.legal.HELPERS`) runs after promotion and before the abi legalisation, at the widths the source states, so the calls it makes and the helpers it delivers are lowered and legalised as any other function.
+
+- A division or remainder the target runs, on a target whose division is `quiet` for a zero divisor or a signed overflow, is given the test of each trap its opcode row states and the target does not take: the block is split before it and branches to a block of one `unreachable` where it would trap. The test is made public with `declassify`, since the trap shows it, and the division carries the `checked` flag, so it is never tested twice. x86 traps on both, and AArch64, RISC-V and SPIR-V on neither.
+- A division at a width the target has no division for is given the tests of every trap its row states, since a helper takes none, and calls the helper of its width and operation. Where the divisor's magnitude fits half the word, a chain of the target's divisions at the word runs instead, two to a word of the dividend from the top, each dividing the remainder so far joined with the next half word. A signed division divides the magnitudes and puts the sign back.
+- A conversion between a float and an integer wider than the target's arithmetic calls the helper of its width and format. Where the integer's value fits a word, or the float is no nan and lies within the word's range, the target's conversion at the word runs instead. A target's own conversion that gives something else for a nan or a value out of range is corrected by its selection rules, and the helpers' conversions at the word are always in range.
+- A copy or fill on a target whose `bulk` is `none` calls the helper of the length's width and the address space. A kept fill calls nothing another module could define: it is a loop of kept stores of its byte, one address a step, in its place.
+- The native paths branch on a value, so a function that requires constant time calls the helper whatever the value. Every helper runs in a time that depends on nothing but a length, and a copy or fill whose length is secret in such a function is refused with the one constant time refusal (`Why.timing`).
+
+Each helper is stated once, as ir text in the table of `mirl.legal.helper.table`, with its name built from mirl's own prefix (`__mirl_`), the operation's stem, the width, and the format for a conversion or the address space for a copy or fill: `__mirl_udiv128`, `__mirl_stof256_f64`, `__mirl_fill64`. The text is filled in from the target's declarations and the format's row and read into the module the first time a function there needs it, weak, hidden and constant time, and never twice. A symbol of the module that has a helper's name and is not that helper is refused.
+
+- Unsigned division is restoring shift and subtract over the wide integer, which the wide legalisation splits. Signed division and remainder take the magnitudes, call the unsigned helper and fix the sign.
+- An integer converts to a float by a binary search over its leading zeros, a sticky bit for every bit below the float's precision, the native conversion of the top word and a scale by an exact power of two. Where the precision and its round and sticky bits do not fit a word, two words convert exactly and are summed.
+- A float converts to an integer word by word from the top, each word taken by exact float arithmetic. A value out of range saturates and a nan gives 0.
+- A format the target computes in none of, or whose exponent range a word or two cannot reach, is refused.
 
 ## Asking for layout
 
