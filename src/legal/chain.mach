@@ -1,0 +1,217 @@
+# multi-way branches as compare chains: a branch on a selector's cases
+# becomes a test of each case in turn
+#
+# a row whose rules state a case list over a selector branches to the target
+# after the first whose case the selector's value is, or to the first when
+# none is. the chain tests the cases in their order, each with `eq` and a
+# `cbr` to the case's target or on to the next test, a new block that takes
+# no parameters, and the last test goes on to the first target. a branch with
+# no case is a `br` to the first target. every target keeps the arguments
+# its edge passed, which the block the branch ended dominates, so every new
+# block reads them as they stand.
+#
+# the pass applies where the target's control is free: a structured target
+# keeps the branch whole for its structured multi-way form, as SPIR-V's
+# `OpSwitch` and WebAssembly's `br_table` are. the chain branches on the
+# value the branch already branched on, and on no other, so it keeps
+# constant time as the branch did.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+
+use mirl.build;
+use mirl.fold.word;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Cases;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Row;
+use mirl.ir.opcode.Rule;
+use mirl.ir.opcode.Rules;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.pass.cache;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.target.Target;
+
+# the pass: it adds blocks and edges, so it keeps no analysis
+pub val CHAIN: Pass = Pass{name: "compare chain", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: cache.NONE, time: Time.keeps{}, applies: free};
+
+# whether a target's control is free, so a multi-way branch has no form it keeps
+fun free(t: *Target) bool {
+    ret sel t.caps.control.free;
+}
+
+# the case list rule of a row, none when it states none
+fun cases_of(r: *Row) opt[Cases] {
+    var i: usize = 0;
+    for (i < $length_of(Rules)) {
+        val rl: Rule = r.rules[i];
+        if (sel rl.cases) { ret opt[Cases].some{rl.cases}; }
+        i = i + 1;
+    }
+    ret opt[Cases].none{};
+}
+
+fun failed[T](what: str) res[T, Why] {
+    ret res[T, Why].err{Why.reason{what}};
+}
+
+# one edge of the branch, its arguments copied out of the instruction it
+# replaces
+fun copied(s: *Site, d: *InstructionData, e: usize) res[Branch, Why] {
+    val from: Slice[Value]                 = Slice[Value]{data: d.edges.data[e].arguments.data, size: d.edges.data[e].arguments.len};
+    val room: res[*Value, allocator.Error] = allocator.zallocate[Value](s.scratch, from.size + 1);
+    if (sel room.err) { ret res[Branch, Why].err{Why.alloc{room.err}}; }
+    var j: usize = 0;
+    for (j < from.size) {
+        room.ok[j] = from.data[j];
+        j          = j + 1;
+    }
+    ret res[Branch, Why].ok{Branch{block: d.edges.data[e].block, arguments: Slice[Value]{data: room.ok, size: from.size}}};
+}
+
+fun jump(s: *Site, to: Branch) {
+    var edge: [1]Branch = [1]Branch{to};
+    build.emit(?s.bld, Request{opcode: opcode.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?edge[0], size: 1}});
+}
+
+# one test of the chain: the selector against a case, on to the case's
+# target when it is equal and to the next otherwise
+fun test_case(s: *Site, selector: Value, value: Value, taken: Branch, next: Branch) {
+    val equal: Value     = emit.binary(s, opcode.EQ, selector, value);
+    var cond:  [1]Value  = [1]Value{equal};
+    var sides: [2]Branch = [2]Branch{taken, next};
+    build.emit(?s.bld, Request{opcode: opcode.CBR, operands: Slice[Value]{data: ?cond[0], size: 1}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?sides[0], size: 2}});
+}
+
+# lower the instruction at an index of a block to a compare chain if its row
+# states a case list, answering whether it did
+fun lower(s: *Site, k: Block, n: u32, i: Instruction) res[bool, Why] {
+    val d:   *InstructionData = ?s.b.instructions.data[i.index];
+    val row: opt[Row]         = opcode.row(d.opcode);
+    if (sel row.none) { ret res[bool, Why].ok{false}; }
+    var r:  Row        = row.some;
+    val cs: opt[Cases] = cases_of(?r);
+    if (sel cs.none) { ret res[bool, Why].ok{false}; }
+    val of: opcode.Subject = cs.some.of;
+    if (!(sel of.operand)) { ret failed[bool]("a multi-way branch whose selector is no operand"); }
+    val at: u32 = of.operand;
+    if (at::usize >= d.operands.len)             { ret failed[bool]("a multi-way branch whose selector is no operand"); }
+    if (cs.some.slot::usize >= d.immediates.len) { ret failed[bool]("a multi-way branch with no case list"); }
+    val list: Immediate = d.immediates.data[cs.some.slot];
+    if (!(sel list.cases))                  { ret failed[bool]("a multi-way branch whose case list holds none"); }
+    if (d.edges.len != list.cases.size + 1) { ret failed[bool]("a multi-way branch with not one target per case after the first"); }
+    val count:    usize = list.cases.size;
+    val selector: Value = d.operands.data[at];
+    val ty:       Type  = s.b.values.data[selector.index].type;
+
+    # the edges and the case values are read before the branch is replaced
+    val edges: res[*Branch, allocator.Error] = allocator.zallocate[Branch](s.scratch, count + 1);
+    if (sel edges.err) { ret res[bool, Why].err{Why.alloc{edges.err}}; }
+    val values: res[*Value, allocator.Error] = allocator.zallocate[Value](s.scratch, count + 1);
+    if (sel values.err) { ret res[bool, Why].err{Why.alloc{values.err}}; }
+    var e: usize = 0;
+    for (e <= count) {
+        val got: res[Branch, Why] = copied(s, d, e);
+        if (sel got.err) { ret res[bool, Why].err{got.err}; }
+        edges.ok[e] = got.ok;
+        e           = e + 1;
+    }
+    e = 0;
+    for (e < count) {
+        val made: res[Value, Why] = emit.constant(s, ty, word.small(list.cases.data[e]));
+        if (sel made.err) { ret res[bool, Why].err{made.err}; }
+        values.ok[e] = made.ok;
+        e            = e + 1;
+    }
+
+    emit.open(s, i, k, n);
+    if (count == 0) {
+        emit.close(s, i);
+        jump(s, edges.ok[0]);
+        val ended: err[Why] = emit.done(s);
+        if (sel ended.err) { ret res[bool, Why].err{ended.err}; }
+        ret res[bool, Why].ok{true};
+    }
+    # the tests after the first, each in a block of its own, in case order
+    val tests: res[*Branch, allocator.Error] = allocator.zallocate[Branch](s.scratch, count + 1);
+    if (sel tests.err) { ret res[bool, Why].err{Why.alloc{tests.err}}; }
+    e = 1;
+    for (e < count) {
+        tests.ok[e] = Branch{block: build.block(?s.bld, Slice[Declaration]{data: nil, size: 0}), arguments: Slice[Value]{data: nil, size: 0}};
+        e           = e + 1;
+    }
+    tests.ok[count] = edges.ok[0];
+    e               = 1;
+    for (e < count) {
+        build.at_end(?s.bld, tests.ok[e].block);
+        test_case(s, selector, values.ok[e], edges.ok[e + 1], tests.ok[e + 1]);
+        e = e + 1;
+    }
+    build.at(?s.bld, k, n);
+    s.made = 0;
+    val equal: Value     = emit.binary(s, opcode.EQ, selector, values.ok[0]);
+    var cond:  [1]Value  = [1]Value{equal};
+    var sides: [2]Branch = [2]Branch{edges.ok[1], tests.ok[1]};
+    emit.close(s, i);
+    build.emit(?s.bld, Request{opcode: opcode.CBR, operands: Slice[Value]{data: ?cond[0], size: 1}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?sides[0], size: 2}});
+    val built: err[Why] = emit.done(s);
+    if (sel built.err) { ret res[bool, Why].err{built.err}; }
+    ret res[bool, Why].ok{true};
+}
+
+# lower the multi-way branches of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var s:       Site  = emit.init(c.m, u.f, got.ok, ?scratch);
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < got.ok.blocks.len) {
+        if (!got.ok.blocks.data[k].erased && got.ok.blocks.data[k].instructions.len != 0) {
+            arena.reset(?ar);
+            val last: usize          = got.ok.blocks.data[k].instructions.len - 1;
+            val i:    Instruction    = got.ok.blocks.data[k].instructions.data[last];
+            val done: res[bool, Why] = lower(?s, Block{index: k::u32}, last::u32, i);
+            if (sel done.err) { ret res[bool, Why].err{done.err}; }
+            if (done.ok)      { changed = true; }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{changed};
+}

@@ -209,7 +209,7 @@ functions
   entry       = operand | immediate | target ;
   operand     = local | constant ;
   immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]"
-                     | "all" | places ) ;
+                     | "all" | places | symbol ) ;
   places      = "[" [ place { "," place } ] "]" ;
   place       = ( "register" uint uint | "stack" uint | "operand" uint )
                 ( "fixed" | "scaled" uint ) fill ;
@@ -233,7 +233,8 @@ functions
   named arguments. a place is where its piece travels, how its size scales
   and how the place is filled past the piece. a register place is masc's
   class and number, a stack place a byte offset in the argument area and an
-  operand place a position in the target's own call form.
+  operand place a position in the target's own call form. a function
+  immediate is the symbol of a function of the module.
 
   a function without braces is declared here and defined by another module,
   so its binding is not local. its first block is its entry, whose

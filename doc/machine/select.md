@@ -15,7 +15,7 @@ A table holds
 
 ## Sources
 
-An emitted operand comes from the pattern (a register an operand is in, a constant as an immediate or a symbol), from the expansion (a temporary) or from the table.
+An emitted operand comes from the pattern (a register an operand is in, a constant as an immediate or a symbol), from the expansion (a temporary) or from the table. A symbol is the link-time address a value is: an address constant, or the result of a row whose address formation is a function, which is `func.addr` (`match.address`). A hook reads the address a rule builds, the constant of a materialisation or the first result of the root, through `match.built`, so one hook serves both.
 
 - `fixed` is a register of masc's file for the target, such as a hardwired zero. The row it stands in must admit it, and an instruction that does not is refused as the machine form's error.
 - `scratch` is a temporary of a class of the register file. `fresh` takes its class from a value's type, which a temporary inside a float constant's expansion cannot, since only an integer register can hold the bits.
