@@ -81,6 +81,32 @@ A salvage expression is a list of steps applied in order to the operand, made by
 
 Every step is one a DWARF location expression can state, so a producer encodes each kind as a column of its row.
 
+## Location kinds
+
+Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
+
+| kind | where the value is |
+|---|---|
+| `unavailable` | nowhere, since the value is gone. It is the first case, so a zeroed location names nothing |
+| `register` | in a register, by masc's identity, which names a part of a wider register by the part's own row |
+| `slot` | in memory at an offset (fixed bytes plus bytes per unit of one scale) from the frame base its family states |
+| `local` | in the webassembly local of an index |
+| `global` | in the global of the module a symbol names |
+| `operand` | on the webassembly operand stack, at a depth from the top |
+| `ssa` | the IR value of an id, which a family that keeps SSA ids names by its own |
+| `constant` | a constant of the module |
+| `pieces` | in parts, each a number of bits at its own location, in order from the variable's lowest bit. A piece is never pieces |
+
+Each producer is a row of `mirl.debug.rows` that states the kinds it writes as a set, and `mirl.debug.admit` refuses a location, or a piece of one, of a kind its producer does not state, naming that kind. `unavailable` is not a place but the absence of one, so every producer writes it, as optimised out, and no set states it.
+
+| producer | kinds |
+|---|---|
+| DWARF | `register`, `slot`, `constant`, `pieces`, and the webassembly `local`, `global` and `operand` |
+| CodeView | `register`, `slot` |
+| SPIR-V | `ssa`, and `slot` as the variable an `OpVariable` declares |
+
+A storage binding on an instruction's metadata is the `slot` kind by construction: the variable is in the storage the instruction addresses, which a producer lowers as its family states.
+
 ## On an instruction
 
 An instruction's metadata record names the location it was built for, the site it was inlined through and its list of storage bindings. All three are optional. A copy of an instruction copies the record whole.
