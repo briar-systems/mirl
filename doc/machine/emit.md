@@ -59,6 +59,5 @@ A global is refused, naming it, when its initial value holds an address and the 
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
-- A function aligned after a call pair the linker may shrink is refused by masc, which realigns that padding and takes no fill byte for it (masc#192). The arithmetic, call and recursive examples hit it, and their test asserts that refusal until masc#192 lands, when they compile like the others.
 - The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, mirl's own symbol, which #220 links from a small object masc assembles with the exit `ecall`.
 - `mirl emit` writes to standard output only, the object's bytes included.
