@@ -3,11 +3,18 @@
 `mirl.machine.layout` orders the blocks of an allocated and framed function and settles its branches. `mirl.machine.emit` hands the laid out functions of a module to masc, which encodes them into mink's object. This is the last stage of a register machine. mirl never encodes a byte and never writes an object file.
 
 ```
+compile(a, ?module, ?machine, ?target)             # res[object.Object, compile.Error]
 lay(a, ?function)                                  # res[Laid, lay.Error]
 emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Error]
 ```
 
-`emit` is the one entry a consumer of the library calls, and it returns the object in memory. The machine form text is the one text hand-over: a function read from it is the same function and emits the same object. masc's listing of the result is for debugging.
+`mirl.machine.compile.compile` is the one entry a consumer of the library calls, and it returns the object in memory. `emit` is the hand-over it ends in. The machine form text is the one text hand-over: a function read from it is the same function and emits the same object. masc's listing of the result is for debugging.
+
+## Compilation
+
+- `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. The target reaches its selection table and frame code through its row of `mirl.isa.rows`, so compilation names no set.
+- Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed and laid out. The functions are then emitted into one object.
+- A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
 
 ## Layout
 
