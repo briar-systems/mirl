@@ -31,6 +31,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 
 - It needs mirl built (`mach build . -a cli`), `qemu-riscv64` and `git`. The masc program and mink's `exec` driver are built from the pinned `dep/masc` and `dep/mink`, each as a shadow project whose dependencies are mirl's own pins, once per set of pins into `out/example/tools/`, with the compiler `$MACH` (`mach` by default). `$MASC` and `$EXEC` name built ones instead.
 - The input set is every `test/example/*.mirl`. Each names the target `riscv64-linux` and states the status its program exits with in a line `; exits <n>: ...`. `test/example/exit.s` is `__mirl_exit`, which makes the Linux exit system call with no C library, and masc assembles it.
+- Round trip: `mirl emit --kind listing` writes the builder's listing, which masc assembles under the target's selection and traits. The listing is printed from what mirl asked the builder for, so reassembling it checks the builder's encoding independently. The lane compares the two objects byte for byte. An object keeps an anonymous label as a nameless symbol, which reassembly names `.LtmpN`, so when the bytes differ the lane compares `masc disassemble` of both, which places a label by its offset and not its name, and a mismatch there is shown as the diff of the two disassemblies. The same check runs without any external tool as the `mach test` unit `roundtrip__every_example_listing_assembles_to_its_own_object`, which compares the objects as data, that one symbol by its place.
 - Run: `mirl emit --kind object` writes each example's object, mink's `exec` driver links it with the exit object into a static executable, and the executable exits with the stated status under `qemu-riscv64`.
 
 ## Layout
@@ -67,6 +68,6 @@ A global is refused, naming it, when its initial value holds an address and the 
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
-- The lane does not yet round-trip the listing through masc to mirl's own bytes (#241): masc's builder listing is not a complete source, and `masc disassemble` does not read relocations against unnamed local symbols.
+- The listing is refused, as `Error.listing`, for an object masc cannot state as source: one with line facts, a first section that is not `.text`, or a format with no assembly dialect (COFF, Mach-O). The round trip therefore covers the ELF targets only.
 - The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, which the example lane links from `test/example/exit.s`, assembled by masc.
 - `mirl emit` writes to standard output only, the object's bytes included.

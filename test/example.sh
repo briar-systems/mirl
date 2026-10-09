@@ -15,6 +15,9 @@
 # test/example/exit.s, the __mirl_exit every start stub calls, which masc
 # assembles. for each example the lane checks:
 #   - mirl emit writes its object
+#   - mirl emit writes its listing, which masc assembles to the same bytes as
+#     mirl's own object, compared in the one name an object keeps nameless by
+#     where it is placed. a mismatch shows masc disassemble of both, diffed
 #   - mink's exec driver links the object and the exit object into a static
 #     executable, which exits with the stated status under qemu-riscv64
 #
@@ -92,6 +95,23 @@ for src in "$here"/example/*.mirl; do
     if ! "$mirl" emit "$src" --body --checked --kind object >"$out/$name.o" 2>"$out/$name.emit"; then
         fail "$name" "mirl emit refuses it: $(cat "$out/$name.emit")"
         continue
+    fi
+    if ! "$mirl" emit "$src" --body --checked --kind listing >"$out/$name.s" 2>"$out/$name.emit"; then
+        fail "$name" "mirl emit refuses its listing: $(cat "$out/$name.emit")"
+        continue
+    fi
+    if ! "$masc" assemble "$out/$name.s" $masc_as -o "$out/$name.rt.o" 2>"$out/$name.as"; then
+        fail "$name" "masc refuses the listing: $(cat "$out/$name.as")"
+        continue
+    fi
+    if ! cmp -s "$out/$name.o" "$out/$name.rt.o"; then
+        "$masc" disassemble "$out/$name.o" $masc_as >"$out/$name.dis" 2>&1
+        "$masc" disassemble "$out/$name.rt.o" $masc_as >"$out/$name.rt.dis" 2>&1
+        if ! diff -q "$out/$name.dis" "$out/$name.rt.dis" >/dev/null; then
+            fail "$name" "the listing assembles to other bytes: diff of masc disassemble of mirl's object and of the reassembled one"
+            diff -u "$out/$name.dis" "$out/$name.rt.dis"
+            continue
+        fi
     fi
     if ! "$exec_bin" riscv64 "$out/$name" "$out/$name.o" "$out/exit.o" 2>"$out/$name.link"; then
         fail "$name" "the link is refused: $(cat "$out/$name.link")"
