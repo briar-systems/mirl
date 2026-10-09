@@ -87,6 +87,8 @@ Each helper is stated once, as ir text in the table of `mirl.legal.helper.table`
 - A float converts to an integer word by word from the top, each word taken by exact float arithmetic. A value out of range saturates and a nan gives 0.
 - A format the target computes in none of, or whose exponent range a word or two cannot reach, is refused.
 
+The texts are filled in by substitution, so a test walks every row of the table at every width, format and address space a target row declares, delivers each helper and verifies the module (`mirl.legal.helper.deliver_test`). A text that a fill breaks fails mirl's own tests, never a user's build.
+
 ## Asking for layout
 
 A front end never computes a size, an alignment or an offset. It asks mirl, and so does the backend and every debug producer, through the same routine.
