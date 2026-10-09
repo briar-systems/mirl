@@ -52,7 +52,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 - An instruction another names as a partner (`label n`, `partner n : kind`) is an anonymous label of its own, placed before it, so a pc-relative low part's relocation names its high part. The labels map one to one.
 - A fixup whose relocation covers the instructions after it, as RISC-V's call pair, is written with them as one sequence, as the set's spans state. masc attaches the marker the span states.
 - Alignment and fill come from the target's code declaration: `code.function` aligns each function, `code.text` aligns the section, and `code.fill` is the byte code is padded with. masc takes one byte, so a fill that is not one byte repeated is refused.
-- The traits of the object that the convention owns come from the convention row (`Convention.traits`). lp64d states the float ABI, `riscv-float-abi` as `double`. The builder passes them to the object unchanged, and masc refuses a set whose required axis is not stated.
+- The traits of the object that the convention owns come from the convention row (`Convention.traits`). Each RISC-V row states the float ABI, `riscv-float-abi` as `soft`, `single` or `double`. The builder passes them to the object unchanged, and masc refuses a set whose required axis is not stated.
 - `instruction.fixed` is masc's `emit.fixed`: it states the same fact, a row's fixed register for an operand, so mirl keeps no reading of the effect.
 
 ## Refusals
