@@ -1,0 +1,510 @@
+# emission of the laid out machine form into masc, which encodes it into a
+# mink object
+#
+# this is the last stage of a register machine. a function's blocks and
+# instructions are handed to masc's instruction-level api in memory, one
+# instruction at a time by the row it is and the operands it has, into the
+# text section of one builder, and the builder hands back the object. mirl
+# never encodes a byte and never writes an object file. the machine form text
+# is the one text hand-over: a function read from it is the same function and
+# emits the same object, and masc's listing of the result is for debugging.
+#
+# a block is an anonymous label of the builder, and a function is a named one
+# exposed as a global function symbol. an instruction another names as a
+# partner is a label of its own, so a pc-relative low part's relocation names
+# its high part. an operand that names a symbol or a partner takes the fixup
+# kind the set binds its relocation kind to, and a fixup whose relocation
+# covers the instructions after it is written with them as one sequence, as
+# the set's spans state. alignment and fill come from the target's code
+# declaration.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use arches: mink.catalog.arch;
+use mink.model.object;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.symbol;
+
+use mirl.ir.function.FunctionData;
+use mirl.ir.id;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.machine.class.Physical;
+use mirl.machine.emit.fixup;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.layout.lay.Laid;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.target.abi.call;
+use mirl.target.abi.convention.Convention;
+use mirl.target.abi.convention.Traits;
+use mirl.target.capability.Align;
+use mirl.target.capability.Fill;
+use mirl.target.machine.Machine;
+use mirl.target.record;
+use mirl.target.record.Target;
+
+use masc.build.build;
+use mo: masc.core.operand;
+use masc.core.relax;
+use mset:      masc.core.set;
+use masc_emit: masc.emit.emit;
+
+# one function to hand over
+# ---
+# function: the symbol of the module it is the code of
+# code:     the function, allocated, framed and laid out
+# laid:     the order its blocks are emitted in
+pub rec Unit {
+    function: id.Function;
+    code:     *Function;
+    laid:     *Laid;
+}
+
+# why an instruction was not handed over
+# ---
+# pseudo:    a pseudo-instruction no stage expanded, which encodes to nothing
+# unplaced:  a virtual register or a frame slot, which allocation and the frame replace
+# cell:      a location of a memory-backed class, which no register machine holds in an object
+# shape:     an operand position emission does not give yet: memory, list, id and literal
+# global:    the address of a global, whose data this object does not hold yet
+# unbound:   a relocation kind the set binds no fixup kind to
+# ambiguous: a relocation kind the set binds several fixup kinds to, none the operand's own
+# label:     a label two instructions hold, or inside a sequence, or a partner naming a label no instruction holds
+# span:      a relocation covering more instructions than the block has after it
+pub tag Reason: u8 {
+    pseudo;
+    unplaced;
+    cell;
+    shape;
+    global;
+    unbound;
+    ambiguous;
+    label;
+    span;
+}
+
+# where and why an instruction was refused
+# ---
+# function: the function it is in
+# at:       the instruction
+# operand:  the operand position, NO_OPERAND for the instruction as a whole
+# reason:   why
+pub rec Refused {
+    function: id.Function;
+    at:       Instruction;
+    operand:  u32;
+    reason:   Reason;
+}
+
+# why the object was not made
+# ---
+# alloc:      the allocator refused storage
+# arch:       the target's architecture names no row of mink's catalog
+# function:   a unit names a function the module does not have
+# convention: the target's calling convention is not stated, so the traits it owns are not
+# traits:     the convention states no traits, which is none, or leaves them unstated
+# fill:       the target's code fill is not one byte repeated, which masc's alignment takes, or is none where code is aligned
+# builder:    masc refused
+# refused:    an instruction cannot be handed over
+pub tag Error: u8 {
+    alloc:      allocator.Error;
+    arch:       record.Error;
+    function:   module.Error;
+    convention: call.Error;
+    traits;
+    fill;
+    builder: build.Refusal;
+    refused: Refused;
+}
+
+# the operand an instruction as a whole is refused at
+pub val NO_OPERAND: u32 = instruction.NO_OPERAND;
+
+# what one emission reads and changes
+# ---
+# a:        the allocator
+# m:        the module, whose symbols the operands name
+# mach:     the target's machine
+# b:        the builder
+# x:        the set's fixup kinds by relocation kind
+# symbols:  the label of each function of the module, none until it is named
+# fill:     the byte code is padded with, none when code is not padded
+# function: the alignment of a function's entry, none when it has none
+rec Emitter {
+    a:        *allocator.Allocator;
+    m:        *Module;
+    mach:     *Machine;
+    b:        *build.Builder;
+    x:        *fixup.Index;
+    symbols:  vector.Vector[opt[build.Label]];
+    fill:     opt[u8];
+    function: opt[u64];
+}
+
+# what one function emits against
+# ---
+# e:      the emission
+# u:      the function
+# blocks: the label of each block
+# marks:  the label of each instruction a partner operand names, by the number the function gives it
+rec Body {
+    e:      *Emitter;
+    u:      Unit;
+    blocks: vector.Vector[build.Label];
+    marks:  map.Map[u32, build.Label];
+}
+
+fun refused(b: *Body, at: Instruction, operand: u32, why: Reason) Error {
+    ret Error.refused{Refused{function: b.u.function, at: at, operand: operand, reason: why}};
+}
+
+fun builder(r: err[build.Refusal]) err[Error] {
+    if (sel r.err) { ret err[Error].err{Error.builder{r.err}}; }
+    ret err[Error].ok{};
+}
+
+fun alloc(r: res[usize, allocator.Error]) err[Error] {
+    if (sel r.err) { ret err[Error].err{Error.alloc{r.err}}; }
+    ret err[Error].ok{};
+}
+
+# a label named by bytes that carry no terminator
+fun named(e: *Emitter, v: View) res[build.Label, Error] {
+    val copy: res[*u8, allocator.Error] = allocator.allocate[u8](e.a, v.len + 1);
+    if (sel copy.err) { ret res[build.Label, Error].err{Error.alloc{copy.err}}; }
+    var i: usize = 0;
+    for (i < v.len) {
+        copy.ok[i] = v.data[i];
+        i          = i + 1;
+    }
+    copy.ok[v.len] = 0;
+    val made: res[build.Label, build.Refusal] = build.label(e.b, copy.ok);
+    allocator.deallocate[u8](e.a, copy.ok, v.len + 1);
+    if (sel made.err) { ret res[build.Label, Error].err{Error.builder{made.err}}; }
+    ret res[build.Label, Error].ok{made.ok};
+}
+
+# the label of a function of the module, a global function symbol of the object made when it is first named
+fun symbol_label(e: *Emitter, f: id.Function) res[build.Label, Error] {
+    val held: opt[build.Label] = e.symbols.data[f.index];
+    if (sel held.some) { ret res[build.Label, Error].ok{held.some}; }
+    val data: res[FunctionData, module.Error] = module.function_data(e.m, f);
+    if (sel data.err) { ret res[build.Label, Error].err{Error.function{data.err}}; }
+    val l: res[build.Label, Error] = named(e, data.ok.name);
+    if (sel l.err) { ret l; }
+    val shown: err[build.Refusal] = build.expose(e.b, l.ok, build.Exposure{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.FUNCTION, size: opt[u64].none{}});
+    if (sel shown.err) { ret res[build.Label, Error].err{Error.builder{shown.err}}; }
+    e.symbols.data[f.index] = opt[build.Label].some{l.ok};
+    ret res[build.Label, Error].ok{l.ok};
+}
+
+# the fixup kind a symbol or partner operand is applied as, with the instructions its relocation covers
+fun fixup_of(b: *Body, at: Instruction, k: u32, own: mo.FixupKind, kind: *reloc.Kind) res[mo.FixupKind, Error] {
+    val found: fixup.Found = fixup.find(b.e.x, kind, own);
+    if (sel found.bound)   { ret res[mo.FixupKind, Error].ok{found.bound}; }
+    if (sel found.unbound) { ret res[mo.FixupKind, Error].err{refused(b, at, k, Reason.unbound{})}; }
+    ret res[mo.FixupKind, Error].err{refused(b, at, k, Reason.ambiguous{})};
+}
+
+# the fixup kind an operand position takes by default
+fun own_fixup(o: *mo.Operand) mo.FixupKind {
+    if (sel o.shape.immediate) { ret o.shape.immediate.fixup; }
+    if (sel o.shape.relative)  { ret o.shape.relative.offset.fixup; }
+    ret mo.NO_FIXUP;
+}
+
+# the register a register operand is, none for anything allocation leaves
+fun register_of(o: Operand) opt[Physical] {
+    if (sel o.physical) { ret opt[Physical].some{o.physical}; }
+    if (sel o.tied) {
+        val dest: Register = o.tied.dest;
+        if (sel dest.physical) { ret opt[Physical].some{dest.physical}; }
+    }
+    ret opt[Physical].none{};
+}
+
+# the instructions the relocation of a fixup kind covers, its own included
+fun covered(e: *Emitter, fixup: mo.FixupKind) u32 {
+    val s: opt[*mset.Span] = mset.span_of(e.mach.basis.set.spans, fixup);
+    if (sel s.none) { ret 1; }
+    ret s.some.count;
+}
+
+# operand `k` of an instruction given to masc's, answering how many instructions its relocation covers
+fun give(b: *Body, at: Instruction, ins: *masc_emit.Instruction, k: u32, o: Operand) res[u32, Error] {
+    val e:  *Emitter    = b.e;
+    val ro: *mo.Operand = ?ins.step.row.operands.at[k];
+    if (sel o.virtual || sel o.slot)           { ret res[u32, Error].err{refused(b, at, k, Reason.unplaced{})}; }
+    if (sel o.tied && sel o.tied.dest.virtual) { ret res[u32, Error].err{refused(b, at, k, Reason.unplaced{})}; }
+    if (sel o.physical && sel o.physical.cell) { ret res[u32, Error].err{refused(b, at, k, Reason.cell{})}; }
+    val reg: opt[Physical] = register_of(o);
+    if (sel reg.some) {
+        val place: Physical = reg.some;
+        if (!(sel ro.shape.register)) { ret res[u32, Error].err{refused(b, at, k, Reason.shape{})}; }
+        if (!(sel place.register))    { ret res[u32, Error].err{refused(b, at, k, Reason.shape{})}; }
+        val given: err[Error] = builder(masc_emit.register(e.b, ins, place.register));
+        if (sel given.err) { ret res[u32, Error].err{given.err}; }
+        ret res[u32, Error].ok{1};
+    }
+    if (sel o.immediate) {
+        var given: err[build.Refusal];
+        if (sel ro.shape.immediate) { given = masc_emit.immediate(e.b, ins, o.immediate); }
+        or (sel ro.shape.enumerant) { given = masc_emit.enumerant(e.b, ins, o.immediate::u32); }
+        or (sel ro.shape.condition) { given = masc_emit.condition(e.b, ins, o.immediate::u32); }
+        or                          { ret res[u32, Error].err{refused(b, at, k, Reason.shape{})}; }
+        val done: err[Error] = builder(given);
+        if (sel done.err) { ret res[u32, Error].err{done.err}; }
+        ret res[u32, Error].ok{1};
+    }
+    if (sel o.block) {
+        if (!(sel ro.shape.relative)) { ret res[u32, Error].err{refused(b, at, k, Reason.shape{})}; }
+        val done: err[Error] = builder(masc_emit.symbol(e.b, ins, b.blocks.data[o.block.index], 0, mo.NO_FIXUP));
+        if (sel done.err) { ret res[u32, Error].err{done.err}; }
+        ret res[u32, Error].ok{1};
+    }
+    if (sel o.symbol) {
+        if (!(sel ro.shape.immediate || sel ro.shape.relative)) { ret res[u32, Error].err{refused(b, at, k, Reason.shape{})}; }
+        if (sel o.symbol.symbol.global)                         { ret res[u32, Error].err{refused(b, at, k, Reason.global{})}; }
+        val l: res[build.Label, Error] = symbol_label(e, o.symbol.symbol.function);
+        if (sel l.err) { ret res[u32, Error].err{l.err}; }
+        val f: res[mo.FixupKind, Error] = fixup_of(b, at, k, own_fixup(ro), o.symbol.kind);
+        if (sel f.err) { ret res[u32, Error].err{f.err}; }
+        val done: err[Error] = builder(masc_emit.symbol(e.b, ins, l.ok, o.symbol.addend, f.ok));
+        if (sel done.err) { ret res[u32, Error].err{done.err}; }
+        ret res[u32, Error].ok{covered(e, f.ok)};
+    }
+    if (sel o.partner) {
+        if (!(sel ro.shape.immediate || sel ro.shape.relative)) { ret res[u32, Error].err{refused(b, at, k, Reason.shape{})}; }
+        val mark: opt[*build.Label] = map.get[u32, build.Label](?b.marks, ?o.partner.label);
+        if (sel mark.none) { ret res[u32, Error].err{refused(b, at, k, Reason.label{})}; }
+        val f: res[mo.FixupKind, Error] = fixup_of(b, at, k, own_fixup(ro), o.partner.kind);
+        if (sel f.err) { ret res[u32, Error].err{f.err}; }
+        val done: err[Error] = builder(masc_emit.symbol(e.b, ins, @mark.some, 0, f.ok));
+        if (sel done.err) { ret res[u32, Error].err{done.err}; }
+        ret res[u32, Error].ok{covered(e, f.ok)};
+    }
+    ret res[u32, Error].err{refused(b, at, k, Reason.shape{})};
+}
+
+# an instruction given to masc's, answering how many instructions the relocations of its operands cover
+fun start(b: *Body, at: Instruction, ins: *masc_emit.Instruction) res[u32, Error] {
+    val d:  *InstructionData = function.data(b.u.code, at);
+    val op: Opcode           = d.opcode;
+    if (sel op.pseudo) { ret res[u32, Error].err{refused(b, at, NO_OPERAND, Reason.pseudo{})}; }
+    val started: res[masc_emit.Instruction, build.Refusal] = masc_emit.start(b.e.b, op.row);
+    if (sel started.err) { ret res[u32, Error].err{Error.builder{started.err}}; }
+    @ins = started.ok;
+    var span: u32 = 1;
+    var k:    u32 = 0;
+    for (k::usize < d.operands.size) {
+        val given: res[u32, Error] = give(b, at, ins, k, d.operands.data[k]);
+        if (sel given.err)   { ret given; }
+        if (given.ok > span) { span = given.ok; }
+        k = k + 1;
+    }
+    ret res[u32, Error].ok{span};
+}
+
+# the instructions of a block from position `k`, one instruction or the sequence its relocation covers
+# ---
+# ret: how many instructions were written
+fun write(b: *Body, list: Slice[Instruction], k: usize) res[usize, Error] {
+    val at:    Instruction     = list.data[k];
+    var steps: [relax.MAX_STEPS]masc_emit.Instruction;
+    val span:  res[u32, Error] = start(b, at, ?steps[0]);
+    if (sel span.err) { ret res[usize, Error].err{span.err}; }
+    if (span.ok <= 1) {
+        val put: err[Error] = builder(masc_emit.put(b.e.b, ?steps[0]));
+        if (sel put.err) { ret res[usize, Error].err{put.err}; }
+        ret res[usize, Error].ok{1};
+    }
+    if (span.ok > relax.MAX_STEPS || k + span.ok::usize > list.size) { ret res[usize, Error].err{refused(b, at, NO_OPERAND, Reason.span{})}; }
+    var j: u32 = 1;
+    for (j < span.ok) {
+        val next: Instruction = list.data[k + j::usize];
+        if (function.data(b.u.code, next).label != instruction.NO_LABEL) { ret res[usize, Error].err{refused(b, next, NO_OPERAND, Reason.label{})}; }
+        val covers: res[u32, Error] = start(b, next, ?steps[j]);
+        if (sel covers.err) { ret res[usize, Error].err{covers.err}; }
+        j = j + 1;
+    }
+    val put: err[Error] = builder(masc_emit.sequence(b.e.b, ?steps[0], span.ok));
+    if (sel put.err) { ret res[usize, Error].err{put.err}; }
+    ret res[usize, Error].ok{span.ok::usize};
+}
+
+# the labels of a function's blocks and of the instructions its partner operands name
+fun label_body(b: *Body) err[Error] {
+    val code: *Function = b.u.code;
+    var i:    usize     = 0;
+    for (i < code.blocks.len) {
+        val l: res[build.Label, build.Refusal] = build.anonymous(b.e.b);
+        if (sel l.err) { ret err[Error].err{Error.builder{l.err}}; }
+        val pushed: err[Error] = alloc(vector.push[build.Label](?b.blocks, l.ok));
+        if (sel pushed.err) { ret pushed; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < b.u.laid.order.len) {
+        val list: Slice[Instruction] = function.instructions(code, b.u.laid.order.data[i]);
+        var k:    usize              = 0;
+        for (k < list.size) {
+            val n: u32 = function.data(code, list.data[k]).label;
+            if (n != instruction.NO_LABEL) {
+                if (map.contains[u32, build.Label](?b.marks, ?n)) { ret err[Error].err{refused(b, list.data[k], NO_OPERAND, Reason.label{})}; }
+                val l: res[build.Label, build.Refusal] = build.anonymous(b.e.b);
+                if (sel l.err) { ret err[Error].err{Error.builder{l.err}}; }
+                val stored: res[bool, allocator.Error] = map.insert[u32, build.Label](?b.marks, n, l.ok);
+                if (sel stored.err) { ret err[Error].err{Error.alloc{stored.err}}; }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun emit_body(b: *Body) err[Error] {
+    val code: *Function = b.u.code;
+    var i:    usize     = 0;
+    for (i < b.u.laid.order.len) {
+        val at:     Block              = b.u.laid.order.data[i];
+        val list:   Slice[Instruction] = function.instructions(code, at);
+        val placed: err[Error]         = builder(build.define(b.e.b, b.blocks.data[at.index]));
+        if (sel placed.err) { ret placed; }
+        var k: usize = 0;
+        for (k < list.size) {
+            val n: u32 = function.data(code, list.data[k]).label;
+            if (n != instruction.NO_LABEL) {
+                val mark: opt[*build.Label] = map.get[u32, build.Label](?b.marks, ?n);
+                if (sel mark.none) { ret err[Error].err{refused(b, list.data[k], NO_OPERAND, Reason.label{})}; }
+                val held: err[Error] = builder(build.define(b.e.b, @mark.some));
+                if (sel held.err) { ret held; }
+            }
+            val wrote: res[usize, Error] = write(b, list, k);
+            if (sel wrote.err) { ret err[Error].err{wrote.err}; }
+            k = k + wrote.ok;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# one function: its symbol at its alignment, then its blocks
+fun emit_unit(e: *Emitter, u: Unit) err[Error] {
+    val l: res[build.Label, Error] = symbol_label(e, u.function);
+    if (sel l.err) { ret err[Error].err{l.err}; }
+    if (sel e.function.some) {
+        val aligned: err[Error] = builder(build.align(e.b, build.Align{boundary: e.function.some, fill: e.fill, max: opt[u64].none{}}));
+        if (sel aligned.err) { ret aligned; }
+    }
+    val placed: err[Error] = builder(build.define(e.b, l.ok));
+    if (sel placed.err) { ret placed; }
+    var body: Body = Body{e: e, u: u, blocks: vector.init[build.Label](e.a), marks: map.init[u32, build.Label](e.a)};
+    fin {
+        vector.dnit[build.Label](?body.blocks);
+        map.dnit[u32, build.Label](?body.marks);
+    }
+    val labelled: err[Error] = label_body(?body);
+    if (sel labelled.err) { ret labelled; }
+    ret emit_body(?body);
+}
+
+# the byte code is padded with, from the target's declaration
+fun fill_of(f: Fill) res[opt[u8], Error] {
+    if (sel f.pattern) {
+        if (f.pattern.size == 0) { ret res[opt[u8], Error].err{Error.fill{}}; }
+        var i: usize = 1;
+        for (i < f.pattern.size) {
+            if (f.pattern.data[i] != f.pattern.data[0]) { ret res[opt[u8], Error].err{Error.fill{}}; }
+            i = i + 1;
+        }
+        ret res[opt[u8], Error].ok{opt[u8].some{f.pattern.data[0]}};
+    }
+    ret res[opt[u8], Error].ok{opt[u8].none{}};
+}
+
+# the traits the convention states for the object, which masc's builder passes on to it unchanged
+fun traits_of(c: *Convention) res[mset.Traits, Error] {
+    val stated: Traits = c.traits;
+    if (sel stated.rows) { ret res[mset.Traits, Error].ok{mset.Traits{at: stated.rows.data, len: stated.rows.size::u32}}; }
+    if (sel stated.none) { ret res[mset.Traits, Error].ok{mset.NO_TRAITS}; }
+    ret res[mset.Traits, Error].err{Error.traits{}};
+}
+
+# the alignment a declaration states, none for none
+fun align_of(a: Align) opt[u64] {
+    if (sel a.bytes) { ret opt[u64].some{a.bytes}; }
+    ret opt[u64].none{};
+}
+
+# hand the functions of a module over to masc and take the object it makes
+# ---
+# a:     the allocator the object and everything made on the way take, the object's the caller's
+# m:     the module, whose symbols the functions' operands name
+# mach:  the target's machine
+# t:     the target, whose code declaration the alignment and fill come from
+# units: the functions, each allocated, framed and laid out
+# ret:   mink's object in memory, or why it was not made, leaving nothing
+pub fun emit(a: *allocator.Allocator, m: *Module, mach: *Machine, t: *Target, units: Slice[Unit]) res[object.Object, Error] {
+    val arch: res[*arches.Arch, record.Error] = record.arch(t);
+    if (sel arch.err) { ret res[object.Object, Error].err{Error.arch{arch.err}}; }
+    val row: res[*Convention, call.Error] = call.of(t);
+    if (sel row.err) { ret res[object.Object, Error].err{Error.convention{row.err}}; }
+    val traits: res[mset.Traits, Error] = traits_of(row.ok);
+    if (sel traits.err) { ret res[object.Object, Error].err{traits.err}; }
+    val fill: res[opt[u8], Error] = fill_of(t.caps.code.fill);
+    if (sel fill.err) { ret res[object.Object, Error].err{fill.err}; }
+    val indexed: res[fixup.Index, allocator.Error] = fixup.make(a, mach.basis.set);
+    if (sel indexed.err) { ret res[object.Object, Error].err{Error.alloc{indexed.err}}; }
+    var x: fixup.Index = indexed.ok;
+    fin { fixup.release(?x); }
+    val made: res[build.Builder, build.Refusal] = build.make(a, mach.basis.set, ?mach.registers, arch.ok, traits.ok);
+    if (sel made.err) { ret res[object.Object, Error].err{Error.builder{made.err}}; }
+    var b: build.Builder = made.ok;
+    fin { build.release(?b); }
+    var e: Emitter = Emitter{a: a, m: m, mach: mach, b: ?b, x: ?x, symbols: vector.init[opt[build.Label]](a), fill: fill.ok, function: align_of(t.caps.code.function)};
+    fin { vector.dnit[opt[build.Label]](?e.symbols); }
+    val room: err[Error] = alloc(vector.reserve[opt[build.Label]](?e.symbols, m.functions.len));
+    if (sel room.err) { ret res[object.Object, Error].err{room.err}; }
+    var i: usize = 0;
+    for (i < m.functions.len) {
+        vector.push[opt[build.Label]](?e.symbols, opt[build.Label].none{});
+        i = i + 1;
+    }
+    val text: res[build.Section, build.Refusal] = build.open(?b, build.Spec{name: ".text", kind: ?section.TEXT, flags: section.TEXT.flags, disposition: ?section.WHOLE});
+    if (sel text.err) { ret res[object.Object, Error].err{Error.builder{text.err}}; }
+    val switched: err[Error] = builder(build.switch(?b, text.ok));
+    if (sel switched.err) { ret res[object.Object, Error].err{switched.err}; }
+    val boundary: opt[u64] = align_of(t.caps.code.text);
+    if (sel boundary.some) {
+        val aligned: err[Error] = builder(build.align(?b, build.Align{boundary: boundary.some, fill: opt[u8].none{}, max: opt[u64].none{}}));
+        if (sel aligned.err) { ret res[object.Object, Error].err{aligned.err}; }
+    }
+    i = 0;
+    for (i < units.size) {
+        val done: err[Error] = emit_unit(?e, units.data[i]);
+        if (sel done.err) { ret res[object.Object, Error].err{done.err}; }
+        i = i + 1;
+    }
+    val finished: res[object.Object, build.Refusal] = build.finish(?b);
+    if (sel finished.err) { ret res[object.Object, Error].err{Error.builder{finished.err}}; }
+    ret res[object.Object, Error].ok{finished.ok};
+}
