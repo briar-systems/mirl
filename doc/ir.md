@@ -46,7 +46,7 @@ A float names one row of the number format table and nothing else. A row states 
 
 ### 2.3 Pointers
 
-A pointer is opaque. It names an address space by number, and space 0 is the default. A pointer has no pointee type. What is read or written through it is stated by the instruction that does so. Which spaces exist, and how a pointer into each is held, is declared by the target. A space with no row is refused, and a pointer into a logical space has no representation in memory.
+A pointer is opaque. It names an address space by number, and space 0 is the default. A pointer has no pointee type. What is read or written through it is stated by the instruction that does so. Which spaces exist, how a pointer into each is held and the rules the types in each are laid out by are declared by the target. A space with no row is refused, and a pointer into a logical space has no representation in memory.
 
 ### 2.4 Vectors
 
@@ -54,7 +54,7 @@ A vector has a lane count of at least one and a lane type. Opcodes decide which 
 
 ### 2.5 Arrays, structures and unions
 
-An array has an element count and an element type.
+An array has an element count and an element type, and may state its **stride**, the bytes from one element to the next. An array that states none has its elements placed by the rules of the address space it is laid out in, and the target's layout refuses a stated stride that is shorter than the element or that the array's alignment does not divide.
 
 A structure is an ordered list of member types. It has no layout of its own. The target's data layout places the members. A structure may state the byte offset of every member, all or none, and the target's layout refuses stated offsets that overlap or do not keep a member's alignment.
 
@@ -292,7 +292,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 |---|---|---|
 | 0 | `target` | the module names a target among the rows of `mirl.target` that declares every fact the pipeline reads, and the target's name is the module's |
 | 1 | `width` | every integer type in the type table has a legal width, which is 1 or a power of two from 8 to 512 |
-| 2 | `layout` | every structure that states its offsets states ones the target's data layout keeps, none overlapping and each a multiple of its member's alignment |
+| 2 | `layout` | every structure that states its offsets and every array that states its stride states ones the rules of some address space of the target keep: offsets none overlapping and each a multiple of its member's alignment, and a stride no shorter than the element and a multiple of the array's alignment. A type names no space, so it is not held to the space of each use |
 | 3 | `constant` | every constant is of its type, an aggregate has one element per member and an address names a function or global of the module |
 | 4 | `initial` | every global's initial value is a constant of the global's type |
 | 5 | `attribute` | every attribute on a function or global is one the schema of the target's family defines: of that family, of a name the schema has an entry for, attached to the kind of symbol the entry attaches to, with a datum of the entry's kind, and keeping the entry's rule, which reads the datum beside the symbol's other attributes and the target's declarations. A target that accepts no attribute refuses every one |
