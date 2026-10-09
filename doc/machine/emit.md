@@ -16,6 +16,15 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 - Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md), its loops expanded (doc/machine/loop.md) and laid out. The functions are then emitted into one object.
 - A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
 
+## The entry and `mirl emit`
+
+- `mirl.compile.compile(a, ?module, ?target, options)` is the entry mach calls. It opens the build's machine with the extensions `options.added` names, runs the pass schedule at `options.level` and hands the module to the back end the target's declarations choose. A register machine (allocated registers, free control, physical addressing, register evaluation) is compiled by `mirl.machine.compile.compile`. A target no back end serves is refused before anything runs (`Error.unserved`).
+- `options.checked` verifies the module after every pass and every function of the machine form after every stage: selection, allocation, the frame, the lowering of copies, the expansion of loops and layout. The machine form verifier (`mirl.machine.verify`) holds that every instruction a block places is one of the function's own, placed once, and stands against its opcode's row.
+- `options.machine` and `options.listing` name writers for the machine form text of the laid out functions and masc's listing of the object, in the set's default syntax. Both are written only once the object is made, so a refused compilation writes nothing.
+- `mirl.compile.write(a, ?object, ?target, w)` lays the object out in the one object format the target's system states, through mink, and refuses a system that states none or several.
+- `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--checked` and `--body` are read as `mirl opt` reads them.
+- The example programs in `test/example/` (arithmetic, a loop, a call, a global and a recursive function) each carry a start stub that calls `main` and hands its result to `__mirl_exit`. One test walks every example through every kind, checked.
+
 ## Layout
 
 - A block that only jumps is bypassed: everything that names it names the block its chain of such jumps ends at. The entry stays, so does a jump to itself, a chain that closes on itself and a jump a partner operand labels.
@@ -50,3 +59,5 @@ A global is refused, naming it, when its initial value holds an address and the 
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
+- The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, mirl's own symbol, which #220 links from a small object masc assembles with the exit `ecall`.
+- `mirl emit` writes to standard output only, the object's bytes included.
