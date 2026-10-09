@@ -33,7 +33,7 @@ The capability declarations are
 | `evaluation` | operations take operands from named values, or from an operand stack |
 | `widths` | the address spaces and how a pointer into each is held, the register width, the widths integer arithmetic runs natively at, and the integer widths a value holds natively |
 | `vectors` | none, or a vector unit with a register width, the lane counts allowed and the lane types with how each is carried out (packed or by scalar expansion) |
-| `formats` | the number formats computed natively, each with the not-a-number it returns (`canonical`, `propagate` or `unspecified`), or none |
+| `formats` | the number formats computed natively, each with the not-a-number it returns (`canonical`, `propagate` or `unspecified`), the operations of `OPTIONAL` it computes natively and under which condition, and whether a constant of it is `made` in registers or `loaded` from read-only data, or none |
 | `arithmetic` | the widths with a native multiply of the low half, the multiply forms beyond it (one row per width and sign: the high half or the whole product, as signed, unsigned or mixed operands, or none), how a shift treats a count at or past the width (`wraps`, `undefined` or `saturates`), and the operations on single bits it selects as they stand (`both`, `either`, `differ`, `compare`, or none) |
 | `timing` | the operations that run in constant time, by operation, width and condition, or none |
 | `code` | the alignment of a function entry, a code section and a data section, and the bytes that pad code |
@@ -42,6 +42,16 @@ The capability declarations are
 These describe what the target does. They do not change what an operation means. A shift by the width or more gives 0 or the sign fill on every target whatever `arithmetic.shifts` says, and legalisation bounds the count where the target would not: the shift bounding applies where shifts `wrap` or are `undefined`, and not where they `saturate`.
 
 The ir has no high multiply and no widening multiply. Both are written as a multiply of two extensions, and the high half as that product shifted down by the width and truncated. A target selects the pattern as it stands where it has a form for it: a `high` or `full` row at the width and sign, or a native multiply at twice the width. Where it has none, and multiplies natively at the width, the multiply forms legalisation builds the high half from multiplies at the width. A width the target does not multiply natively is left to the wide integer splitting and the narrow integer widening. A target is a row of each form it has: x86 states `full` rows (a register pair), AArch64 `high` rows at 64 bits and `full` rows at 32, RISC-V `high` rows of all three signs, and a target with none, such as WebAssembly, states none.
+
+### Float operations a format lacks
+
+A held format computes every float operation natively except those of `mirl.target.OPTIONAL`: `fmin`, `fmax`, `fminnum`, `fmaxnum`, `ffloor`, `fceil`, `fint`, `fnearest` and `select`. Its `natives` list the ones it has, each under a condition: `always`, or an extension, such as RISC-V's `zfa`, that holds when the build's machine selects it (`mirl.target.machine.meets`). A build with no machine selects no extension, so only an unconditional row holds there. RISC-V states `fminnum` and `fmaxnum` always, the other minimums and the roundings under `zfa` and no select, AArch64 everything but `fminnum` and `fmaxnum`, whose instructions give a nan for a signalling nan, and x86-64 the roundings under `sse4.1`.
+
+The `floats` legalisation stands in for an operation a format lacks, where the operations its stand in is made of are native, and leaves any other for selection to refuse by name. Every stand in is exact under IEEE 754-2019 for every operand, nans and signed zeros included, under the rounding to nearest even the ir's float arithmetic has, and has no branch, so the pass keeps constant time.
+
+- `fmin` and `fmax` are `fminnum` and `fmaxnum` less the square root of 0 or -1: positive zero where both operands are numbers, which leaves the result as it is, and a nan where either is one.
+- The roundings add and take away T, the power of two from which every number of the format is an integer, with the sign of the operand, where the operand is below T in magnitude. That rounds it to the nearest integer, ties to even, and a step of 1 toward the operand makes `ffloor` and `fceil`. `fint` is `ffloor` of the magnitude. Each result takes the operand's sign, as a zero result of an integral rounding does.
+- A `select` of floats is the select of their bits as integers of the format's width, whatever its condition, so it keeps every bit and adds no branch.
 
 ### Narrow arithmetic
 
@@ -62,6 +72,7 @@ An integer wider than the widest width in `widths.alu` (`mirl.target.widest`) is
 - A product sums the low and high words of the product of every pair of words. The high word is written as the ir's high multiply at twice the word, so a target's `high` or `full` rows select it (`mulhu` on RISC-V) and the multiply forms legalisation builds it where there are none.
 - A shift by a constant moves whole words and then bits across them. A shift by a value does the same through selects on the bits of its count, and a count of the width or more gives 0 or the sign fill.
 - A comparison decides on the top word, read as its opcode reads it, and falls to the words below, read as unsigned, only where those are equal.
+- A `bitcast` between a wide integer and a float, a binary64 on a 32 bit target, goes through a stack slot of the float: the float is stored and its words loaded, or the words stored and the float loaded, each word at its offset in the target's byte order.
 - The counts, the byte swap and the overflow forms are computed over the words. An extension, a truncation, a select, a load, a store and a block parameter are one per word, and an access carries its flags to every word at the word's offset in the target's byte order. A `bitcast` to or from a vector whose lanes fill words whole takes or places each lane at its bits, lane 0 at the low bits, which is how the abi legalisation's rebuilt vectors reach selection.
 - Nothing it builds branches, so the pass keeps constant time, and every word of a secret value is secret.
 - An `i1` a store writes or a load reads is held in memory as the integer of its layout size, 0 or 1.
