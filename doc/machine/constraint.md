@@ -3,14 +3,15 @@
 masc states each row's operand register constraints on `row.Row.constraints`: an output written before every input is read, two operands that must differ, a register group kept apart from another or from a mask register. `mirl.machine.constraint` is the one place mirl asks them, through masc's `constraint.violated`. mirl states no constraint of its own and keeps no list of constrained rows.
 
 ```
-grouping_of(f, d)             # res[Grouping, Breach]
-covers(op, g, at)             # u32
+grouping_of(f, row, state)    # res[Grouping, Breach]
+covers(row, g, at)            # u32
+span_of(f, d, at)             # res[u32, Breach]
 asks(f, d)                    # bool
-ask(f, d, values)             # opt[Breach]
+ask(f, row, state, values)    # opt[Breach]
 stands(f, d)                  # opt[Breach]
 ```
 
-`ask` hands masc the instruction's operand values under its grouping and answers the breach, or none when every constraint stands and the grouping admits every group. The values come from `instruction.values_of`, the one place an operand becomes masc's value, which the instruction's transfer and emission read as well. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as the kind its row position states: an immediate, an enumerant or a condition.
+`ask` hands masc the operand values of an instruction of a row under its grouping and answers the breach, or none when every constraint stands and the grouping admits every group. `asks` and `stands` take an instruction and ask each row its opcode stands for: a row's own instruction, and each step of a loop (doc/machine/loop.md), the step's operands read from the loop's through `instruction.operands_in`, the one place a step's sources become operands, which the loop expansion writes through too. So a loop's operands stand against every row they reach at every choice that asks. `span_of` is how many registers one value of an operand covers, the most any row the opcode stands for covers at a position that takes it. The values come from `instruction.values_of`, the one place an operand becomes masc's value, which the instruction's transfer and emission read as well. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as the kind its row position states: an immediate, an enumerant or a condition.
 
 ## Breaches
 
@@ -36,7 +37,7 @@ How many registers an operand's group covers can depend on state no operand hold
 
 - An instruction whose row has no operand of a vector class answers masc's `UNIT`, where every operand is one register a group and `UNIT` is exact.
 - Any other answers masc's grouping of its row (`vstate.grouping`): `riscv_vtype.grouping(row, vtype)` under the state it states, or `constraint.grouping(operands, count, none)` when it states none. The second forms the groups of a row no state decides, as a whole register load (`vl2re8.v`) or an x86 or AArch64 vector register, and answers `needs` for a row whose spans or element widths turn on a state. masc owns every operand's element width against SEW and LMUL for widened, narrowed, extension, segment and mask operands, and mirl restates none.
-- The instruction checker refuses a state on an instruction whose row needs none, as a scalar row or a whole register load, and an instruction whose row needs a state it does not state. So an instruction states one exactly when masc says its row turns on one.
+- The instruction checker refuses a state on an instruction none of whose rows needs one, as a scalar row or a whole register load, and an instruction a row of which needs a state it does not state. So an instruction states one exactly when masc says a row it stands for turns on one.
 
 `covers` is how many registers of its class one value of an operand covers under a grouping: its fields back to back, each a group of the length the grouping states, one for a group within one register.
 
@@ -48,4 +49,5 @@ A value whose group covers several registers holds all of them. Liveness gives e
 
 - A value of a span past one is never carried in pieces, untied or given a value of its own, since no copy, spill or reload moves a group, so a round that would do so is refused with `scan.Error.grouped`, and such a bundle is never evicted. A pseudo copy of a vector class moves one register.
 - Copy lowering states no move of a vector class, so it cannot save a vector register's value through a free one.
+- `covers` computes a value's register count from the operand's fields and `Grouping.lengths`, a second owner of masc's private `run_of`, kept only until masc exposes a per-operand footprint (#244 removes it). It is not correct for fixed-span pairs once masc 11d0d69's `UNIT` counting is pinned, so mirl's masc pin must not move past 2f07e21 until #244 lands.
 - A destination masc reads as well as writes, as a vector destination under an undisturbed tail, is live before its instruction, so liveness keeps it apart from the sources even where the overlap rules would permit sharing.

@@ -13,8 +13,25 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 ## Compilation
 
 - `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. A machine opened for another target than the one given is refused at entry (`Error.foreign`), before anything is compiled. The target reaches its selection table, frame code and moves through its row of `mirl.isa.rows`, so compilation names no set.
-- Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md) and laid out. The functions are then emitted into one object.
+- Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md), its loops expanded (doc/machine/loop.md) and laid out. The functions are then emitted into one object.
 - A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
+
+## The entry and `mirl emit`
+
+- `mirl.compile.compile(a, ?module, ?target, options)` is the entry mach calls. It opens the build's machine with the extensions `options.added` names, runs the pass schedule at `options.level` and hands the module to the back end the target's declarations choose. A register machine (allocated registers, free control, physical addressing, register evaluation) is compiled by `mirl.machine.compile.compile`. A target no back end serves is refused before anything runs (`Error.unserved`).
+- `options.checked` verifies the module after every pass and every function of the machine form after every stage: selection, allocation, the frame, the lowering of copies, the expansion of loops and layout. The machine form verifier (`mirl.machine.verify`) holds that every instruction a block places is one of the function's own, placed once, and stands against its opcode's row.
+- `options.machine` and `options.listing` name writers for the machine form text of the laid out functions and masc's listing of the object, in the set's default syntax. Both are written only once the object is made, so a refused compilation writes nothing.
+- `mirl.compile.write(a, ?object, ?target, w)` lays the object out in the one object format the target's system states, through mink, and refuses a system that states none or several.
+- `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--checked` and `--body` are read as `mirl opt` reads them.
+- The example programs in `test/example/` (arithmetic, a loop, a call, a global and a recursive function) each carry a start stub that calls `main` and hands its result to `__mirl_exit`. One test walks every example through every kind, checked.
+
+## The example lane
+
+`test/example.sh <run>` runs the example programs. It runs locally and is never part of CI, which builds mirl and runs `mach test` only. It writes into a fresh `out/example/<run>` and exits with the number of checks that failed.
+
+- It needs mirl built (`mach build . -a cli`), `qemu-riscv64` and `git`. The masc program and mink's `exec` driver are built from the pinned `dep/masc` and `dep/mink`, each as a shadow project whose dependencies are mirl's own pins, once per set of pins into `out/example/tools/`, with the compiler `$MACH` (`mach` by default). `$MASC` and `$EXEC` name built ones instead.
+- The input set is every `test/example/*.mirl`. Each names the target `riscv64-linux` and states the status its program exits with in a line `; exits <n>: ...`. `test/example/exit.s` is `__mirl_exit`, which makes the Linux exit system call with no C library, and masc assembles it.
+- Run: `mirl emit --kind object` writes each example's object, mink's `exec` driver links it with the exit object into a static executable, and the executable exits with the stated status under `qemu-riscv64`.
 
 ## Layout
 
@@ -50,3 +67,6 @@ A global is refused, naming it, when its initial value holds an address and the 
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
+- The lane does not yet round-trip the listing through masc to mirl's own bytes (#241): masc's builder listing is not a complete source, and `masc disassemble` does not read relocations against unnamed local symbols.
+- The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, which the example lane links from `test/example/exit.s`, assembled by masc.
+- `mirl emit` writes to standard output only, the object's bytes included.
