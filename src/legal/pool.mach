@@ -1,0 +1,353 @@
+# float constants a target loads from read-only data in place of making them
+#
+# a held format whose row states its constants `loaded` has no rule that
+# builds one in a register, as binary64 has none on a 32 bit RISC-V. every use
+# of a constant of such a format, as an operand or an edge's argument, reads
+# it instead from a global of the module: local, constant and initialised with
+# the constant, one per format and bit pattern, named by mirl's prefix, the
+# format and the bits, so every function of the module reads the same one. the
+# load goes just ahead of the instruction that uses it, which an edge's
+# argument is too, and is reached through the global's address constant, so
+# the target's addressing selects it and the target's placement puts the
+# global in read-only data.
+#
+# the load reads no value of the program and the constant is public, so the
+# pass keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+
+use mirl.build;
+use mirl.ir.body;
+use mirl.ir.constant.Address;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.global.GlobalData;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Global;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.linkage;
+use mirl.ir.linkage.Linkage;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use types: mirl.ir.type;
+use mirl.ir.type.Format;
+use mirl.ir.type.Type;
+use mirl.ir.value.ValueData;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.legal.helper.table.PREFIX;
+use mirl.pass.analysis;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use targets: mirl.target;
+use mirl.target.Held;
+use mirl.target.Layout;
+use mirl.target.Target;
+
+use mink.model.symbol;
+
+# the pass: it adds loads in front of the instructions that use the constants
+# and never touches an edge or a block
+pub val POOL: Pass = Pass{name: "constant pool", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
+
+# a pooled constant is seen by its module alone
+val POOLED: Linkage = Linkage{binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT};
+
+val TAKEN: str = "a symbol of the module has the name of a pooled constant and is not it";
+
+# whether a target loads the constants of some format it holds
+fun wanted(t: *Target) bool {
+    if (!(sel t.caps.formats.held)) { ret false; }
+    var i: usize = 0;
+    for (i < t.caps.formats.held.size) {
+        if (sel t.caps.formats.held.data[i].constants.loaded) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# one visit
+# ---
+# c:       the run
+# site:    where the loads are built
+# layout:  the target's data layout
+# pointer: the type of an address in the space of globals
+# loaded:  for each format row, whether its constants are loaded
+# changed: some use was rewritten
+rec Visit {
+    c:       *Context;
+    site:    Site;
+    layout:  Layout;
+    pointer: Type;
+    loaded:  *bool;
+    changed: bool;
+}
+
+fun typed(e: types.Error) Why {
+    ret Why.ir{module.Error.types{e}};
+}
+
+# the format of a value's type where its constants are loaded
+fun pooled(v: *Visit, ty: Type) res[opt[Format], Why] {
+    val shape: res[types.Shape, types.Error] = types.shape(?v.c.m.types, ty);
+    if (sel shape.err)         { ret res[opt[Format], Why].err{typed(shape.err)}; }
+    if (!(sel shape.ok.float)) { ret res[opt[Format], Why].ok{opt[Format].none{}}; }
+    val f: Format = shape.ok.float.format;
+    if (!v.loaded[f.index]) { ret res[opt[Format], Why].ok{opt[Format].none{}}; }
+    ret res[opt[Format], Why].ok{opt[Format].some{f}};
+}
+
+# a pooled constant an instruction reads
+# ---
+# value:    the value that stands for it
+# constant: the constant
+# format:   its format
+# type:     its type
+rec Pooled {
+    value:    Value;
+    constant: Constant;
+    format:   Format;
+    type:     Type;
+}
+
+# the constant a value stands for, where it is a float constant whose format
+# is loaded
+fun constant_of(v: *Visit, x: Value) res[opt[Pooled], Why] {
+    val d: *ValueData = ?v.site.b.values.data[x.index];
+    if (!(sel d.def.constant)) { ret res[opt[Pooled], Why].ok{opt[Pooled].none{}}; }
+    val f: res[opt[Format], Why] = pooled(v, d.type);
+    if (sel f.err)     { ret res[opt[Pooled], Why].err{f.err}; }
+    if (sel f.ok.none) { ret res[opt[Pooled], Why].ok{opt[Pooled].none{}}; }
+    ret res[opt[Pooled], Why].ok{opt[Pooled].some{Pooled{value: x, constant: d.def.constant, format: f.ok.some, type: d.type}}};
+}
+
+fun digit(n: u64) u8 {
+    if (n < 10) { ret ('0'::u64 + n)::u8; }
+    ret ('a'::u64 + n - 10)::u8;
+}
+
+# the bits of a float constant, its words from the lowest
+fun bits_of(m: *Module, c: Constant) res[Slice[u64], Why] {
+    val got: res[ConstantData, module.Error] = module.constant_data(m, c);
+    if (sel got.err)      { ret res[Slice[u64], Why].err{Why.ir{got.err}}; }
+    if (sel got.ok.float) { ret res[Slice[u64], Why].ok{got.ok.float.words}; }
+    if (sel got.ok.zero)  { ret res[Slice[u64], Why].ok{Slice[u64]{data: nil, size: 0}}; }
+    ret res[Slice[u64], Why].err{Why.reason{"a float constant that is neither bits nor zero"}};
+}
+
+# whether two float constants of one type have the same bits, which two
+# constants of the module may have
+fun same_bits(m: *Module, a: Constant, b: Constant) res[bool, Why] {
+    if (a.index == b.index) { ret res[bool, Why].ok{true}; }
+    val x: res[Slice[u64], Why] = bits_of(m, a);
+    if (sel x.err) { ret res[bool, Why].err{x.err}; }
+    val y: res[Slice[u64], Why] = bits_of(m, b);
+    if (sel y.err) { ret res[bool, Why].err{y.err}; }
+    var n: usize = x.ok.size;
+    if (y.ok.size > n) { n = y.ok.size; }
+    var i: usize = 0;
+    for (i < n) {
+        var p: u64 = 0;
+        var q: u64 = 0;
+        if (i < x.ok.size) { p = x.ok.data[i]; }
+        if (i < y.ok.size) { q = y.ok.data[i]; }
+        if (p != q)        { ret res[bool, Why].ok{false}; }
+        i = i + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
+
+# the name of the global a constant is read from: the prefix, the format's
+# name and the bits in hex from the top
+fun name_of(v: *Visit, f: Format, c: Constant) res[View, Why] {
+    val row: opt[types.Row] = types.row(f);
+    if (sel row.none) { ret res[View, Why].err{Why.reason{"a float constant of a format with no row"}}; }
+    val words: res[Slice[u64], Why] = bits_of(v.c.m, c);
+    if (sel words.err) { ret res[View, Why].err{words.err}; }
+    val digits: usize                     = ((row.some.width + 3) / 4)::usize;
+    val head:   usize                     = str_len(PREFIX);
+    val format: usize                     = str_len(row.some.name);
+    val n:      usize                     = head + format + 1 + digits;
+    val got:    res[*u8, allocator.Error] = allocator.zallocate[u8](v.site.scratch, n);
+    if (sel got.err) { ret res[View, Why].err{Why.alloc{got.err}}; }
+    val out: *u8   = got.ok;
+    var i:   usize = 0;
+    for (i < head) {
+        out[i] = PREFIX[i];
+        i      = i + 1;
+    }
+    var k: usize = 0;
+    for (k < format) {
+        out[head + k] = row.some.name[k];
+        k             = k + 1;
+    }
+    out[head + format] = '_';
+    k                  = 0;
+    for (k < digits) {
+        val at:   usize = digits - 1 - k;
+        var word: u64   = 0;
+        if (at / 16 < words.ok.size) { word = words.ok.data[at / 16]; }
+        out[head + format + 1 + k] = digit((word >> ((at % 16) * 4)::u64) & 0xf);
+        k                          = k + 1;
+    }
+    ret res[View, Why].ok{View{data: out, len: n}};
+}
+
+# the global a constant is read from, added to the module the first time
+fun global_of(v: *Visit, f: Format, c: Constant, ty: Type) res[Global, Why] {
+    val name: res[View, Why] = name_of(v, f, c);
+    if (sel name.err) { ret res[Global, Why].err{name.err}; }
+    val found: opt[Symbol] = module.find(v.c.m, name.ok);
+    if (sel found.some) {
+        if (!(sel found.some.global)) { ret res[Global, Why].err{Why.reason{TAKEN}}; }
+        val g:    Global                        = found.some.global;
+        val data: res[GlobalData, module.Error] = module.global_data(v.c.m, g);
+        if (sel data.err) { ret res[Global, Why].err{Why.ir{data.err}}; }
+        val held: GlobalData = data.ok;
+        val same: bool       = held.constant && types.same(held.type, ty) && linkage.same(held.linkage, POOLED);
+        if (sel held.initial.some) {
+            val equal: res[bool, Why] = same_bits(v.c.m, held.initial.some, c);
+            if (sel equal.err)    { ret res[Global, Why].err{equal.err}; }
+            if (same && equal.ok) { ret res[Global, Why].ok{g}; }
+        }
+        ret res[Global, Why].err{Why.reason{TAKEN}};
+    }
+    val data: GlobalData                = GlobalData{name: name.ok, type: ty, initial: opt[Constant].some{c}, linkage: POOLED, constant: true};
+    val made: res[Global, module.Error] = module.add_global(v.c.m, data);
+    if (sel made.err) { ret res[Global, Why].err{Why.ir{made.err}}; }
+    ret res[Global, Why].ok{made.ok};
+}
+
+# a load of a constant from its global, ahead of the instruction at an index of
+# a block, which then reads the load in place of the constant
+fun read(v: *Visit, k: Block, n: u32, i: Instruction, p: Pooled) res[u32, Why] {
+    val ty: Type             = p.type;
+    val g:  res[Global, Why] = global_of(v, p.format, p.constant, ty);
+    if (sel g.err) { ret res[u32, Why].err{g.err}; }
+    val align: res[u64, targets.Error] = targets.align(?v.layout, ty);
+    if (sel align.err) { ret res[u32, Why].err{Why.reason{"the data layout states no alignment of a float"}}; }
+
+    val s: *Site = ?v.site;
+    emit.open(s, i, k, n);
+    val address: Constant     = build.constant(?s.bld, ConstantData.address{Address{type: v.pointer, symbol: Symbol.global{g.ok}, offset: 0}});
+    var ops:     [1]Value     = [1]Value{build.use_constant(?s.bld, address)};
+    var imm:     [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{align.ok}};
+    val load:    Instruction  = emit.make(s, opcode.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+    val got:     Value        = emit.result(s, load, 0);
+    val built:   err[Why]     = emit.done(s);
+    if (sel built.err) { ret res[u32, Why].err{built.err}; }
+    val swapped: err[Why] = failure.edit(body.substitute(v.c.m, s.f, i, p.value, got));
+    if (sel swapped.err) { ret res[u32, Why].err{swapped.err}; }
+    v.changed = true;
+    ret res[u32, Why].ok{s.made};
+}
+
+# the next pooled constant an instruction reads, as an operand or an edge
+# argument, from a slot on: a rewrite takes every use of it in the
+# instruction, so the walk never meets one twice
+# ---
+# slot: the operands then every edge's arguments, counted in order
+fun next(v: *Visit, i: Instruction, slot: *usize) res[opt[Pooled], Why] {
+    val d:     *InstructionData = ?v.site.b.instructions.data[i.index];
+    var count: usize            = d.operands.len;
+    var e:     usize            = 0;
+    for (e < d.edges.len) {
+        count = count + d.edges.data[e].arguments.len;
+        e     = e + 1;
+    }
+    for (@slot < count) {
+        var x:  Value = Value{index: 0};
+        val at: usize = @slot;
+        if (at < d.operands.len) { x = d.operands.data[at]; }
+        or {
+            var rest: usize = at - d.operands.len;
+            e = 0;
+            for (rest >= d.edges.data[e].arguments.len) {
+                rest = rest - d.edges.data[e].arguments.len;
+                e    = e + 1;
+            }
+            x = d.edges.data[e].arguments.data[rest];
+        }
+        @slot = at + 1;
+        val c: res[opt[Pooled], Why] = constant_of(v, x);
+        if (sel c.err)     { ret c; }
+        if (sel c.ok.some) { ret c; }
+    }
+    ret res[opt[Pooled], Why].ok{opt[Pooled].none{}};
+}
+
+# read every pooled constant one function uses from its global
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val pointer: res[Type, types.Error] = types.intern(?c.m.types, types.Shape.pointer{types.Pointer{space: 0}});
+    if (sel pointer.err) { ret res[bool, Why].err{typed(pointer.err)}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+    val rows:   usize                       = types.rows()::usize;
+    val loaded: res[*bool, allocator.Error] = allocator.zallocate[bool](c.m.a, rows);
+    if (sel loaded.err) { ret res[bool, Why].err{Why.alloc{loaded.err}}; }
+    fin { allocator.deallocate[bool](c.m.a, loaded.ok, rows); }
+    var r: usize = 0;
+    for (r < rows) {
+        val h: opt[*Held] = targets.held(?c.t.caps, Format{index: r::u32});
+        loaded.ok[r] = sel h.some && sel h.some.constants.loaded;
+        r            = r + 1;
+    }
+
+    var v: Visit = Visit{c: c, site: emit.init(c.m, u.f, got.ok, ?scratch), layout: targets.of(c.t, ?c.m.types), pointer: pointer.ok, loaded: loaded.ok, changed: false};
+    val b: *Body = got.ok;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var n: usize = 0;
+            for (n < b.blocks.data[k].instructions.len) {
+                val i:    Instruction = b.blocks.data[k].instructions.data[n];
+                var slot: usize       = 0;
+                for {
+                    arena.reset(?ar);
+                    val x: res[opt[Pooled], Why] = next(?v, i, ?slot);
+                    if (sel x.err)     { ret res[bool, Why].err{x.err}; }
+                    if (sel x.ok.none) { brk; }
+                    val at: res[u32, Why] = read(?v, Block{index: k::u32}, n::u32, i, x.ok.some);
+                    if (sel at.err) { ret res[bool, Why].err{at.err}; }
+                    n = n + at.ok::usize;
+                }
+                n = n + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{v.changed};
+}

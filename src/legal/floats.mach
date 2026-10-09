@@ -1,0 +1,432 @@
+# float forms: the float operations a held format computes no native form of,
+# built from the ones every held format has
+#
+# a target states, for each number format it computes in, which of the
+# operations of `mirl.target.OPTIONAL` it has and under what condition, such
+# as RISC-V's zfa. the pass reads those rows and the build's machine, never a
+# target's name, and stands in for an operation of a format whose row holds no
+# native form of it, when the operations its stand in reads are native. one it
+# has no stand in for is left, and selection refuses it by name. a vector is
+# scalarised before the pass and is left.
+#
+# every stand in below is exact under ieee 754-2019 for every operand, nans and
+# signed zeros included, given the rounding to nearest with ties to even the
+# ir's float arithmetic has, and a nan it gives is a nan of any sign and
+# payload, as the ir states for float arithmetic:
+#
+# - fmin and fmax are fminnum and fmaxnum less a value that is positive zero
+#   where both operands are numbers and a nan where either is not, the square
+#   root of 0 or -1. both orders negative zero below positive zero and agree
+#   where both operands are numbers, and subtracting positive zero leaves every
+#   number as it is, negative zero and the infinities included, so the
+#   difference is fmin, or fmax, or a nan exactly when an operand is one.
+# - the integral roundings start from x rounded to an integer: with T the
+#   power of two at which the format's numbers are all integers, s is T with
+#   the sign of x where |x| < T and a zero with the sign of x otherwise, made as
+#   the product of T and 0 or 1. where |x| < T, x + s lies within T of s, a
+#   binade whose spacing is 1, so the sum rounds x to the nearest integer with
+#   ties to even, T being even, and taking s away again is exact. where |x| is
+#   T or more, an infinity or a nan, adding and taking away a zero of the sign
+#   of x gives x. call that t.
+# - fnearest is t with the sign of x. ffloor takes 1 from t where t > x, fceil
+#   adds 1 where t < x, and fint is ffloor of |x| with the sign of x. each step
+#   of 1 is exact, since t is an integer of at most T. a zero result takes the
+#   sign of x, as the integral roundings give it, and a nonzero one already
+#   has it.
+# - select chooses between the bits of its operands as integers of the
+#   format's width, so no float register needs a select and the choice keeps
+#   every bit.
+#
+# nothing made branches or reads memory, so the pass keeps constant time, and
+# every value made reads as the instruction it stands in for, its secrecy
+# included.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Format;
+use mirl.ir.type.Type;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.pass.analysis;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.target;
+use mirl.target.Capabilities;
+use mirl.target.Condition;
+use mirl.target.Held;
+use mirl.target.Target;
+use mirl.target.machine;
+use mirl.target.machine.Machine;
+
+# the pass: it adds instructions in front of the one it stands in for and
+# never touches an edge or a block
+pub val FLOATS: Pass = Pass{name: "float forms", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
+
+# the stand in for one operation
+# ---
+# opcode: the operation stood in for
+# reads:  an operation of `OPTIONAL` the stand in is made of, which must be
+#         native, none for one made of operations every held format has
+# build:  what makes it
+rec Stand {
+    opcode: Opcode;
+    reads:  opt[Opcode];
+    build:  Build;
+}
+
+# make a stand in for an instruction, the last value made in its place
+def Build: fun(*Work, *Made) err[Why];
+
+def Stands: [7]Stand;
+
+val STANDS: Stands = [7]Stand{
+    Stand{opcode: opcode.FMIN, reads: opt[Opcode].some{opcode.FMINNUM}, build: least},
+    Stand{opcode: opcode.FMAX, reads: opt[Opcode].some{opcode.FMAXNUM}, build: greatest},
+    Stand{opcode: opcode.FFLOOR, reads: opt[Opcode].none{}, build: floor},
+    Stand{opcode: opcode.FCEIL, reads: opt[Opcode].none{}, build: ceiling},
+    Stand{opcode: opcode.FINT, reads: opt[Opcode].none{}, build: truncated},
+    Stand{opcode: opcode.FNEAREST, reads: opt[Opcode].none{}, build: nearest},
+    Stand{opcode: opcode.SELECT, reads: opt[Opcode].none{}, build: chosen},
+};
+
+# whether a format's row has a native form of an operation for every build,
+# with no condition to read
+fun always(h: *Held, op: Opcode) bool {
+    val c: opt[Condition] = target.native(h, op);
+    ret sel c.some && sel c.some.always;
+}
+
+# whether some held format may lack an operation the pass stands in for
+fun wanted(t: *Target) bool {
+    if (!(sel t.caps.formats.held)) { ret false; }
+    var i: usize = 0;
+    for (i < t.caps.formats.held.size) {
+        var k: usize = 0;
+        for (k < $length_of(Stands)) {
+            if (!always(?t.caps.formats.held.data[i], STANDS[k].opcode)) { ret true; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# what the instruction being stood in for is
+# ---
+# origin:   the instruction
+# k:        its block
+# n:        its index in the block
+# operands: its operands
+# type:     the float type it computes in
+# row:      the row of that type's format
+rec Made {
+    origin:   Instruction;
+    k:        Block;
+    n:        u32;
+    operands: [3]Value;
+    type:     Type;
+    row:      types.Row;
+}
+
+# what is undecided, decided to stand in, or decided to leave, of a format
+# and a stand in
+val UNDECIDED: u8 = 0;
+val STAND:     u8 = 1;
+val LEAVE:     u8 = 2;
+
+# one visit
+# ---
+# site:    the function being rewritten
+# caps:    the target's declarations
+# mc:      the build's machine, none when it has none
+# word:    the integer type a condition is widened to before a conversion,
+#          the narrowest width the target's arithmetic runs at
+# decided: per format and stand in, whether to stand in
+# changed: the function was changed
+rec Work {
+    site:    Site;
+    caps:    *Capabilities;
+    mc:      opt[*Machine];
+    word:    Type;
+    decided: *u8;
+    changed: bool;
+}
+
+# whether a held format computes an operation natively for this build
+fun native(w: *Work, h: *Held, op: Opcode) res[bool, Why] {
+    val c: opt[Condition] = target.native(h, op);
+    if (sel c.none) { ret res[bool, Why].ok{false}; }
+    val met: res[bool, machine.Error] = machine.meets(w.mc, c.some);
+    if (sel met.err) { ret res[bool, Why].err{Why.condition{met.err}}; }
+    ret res[bool, Why].ok{met.ok};
+}
+
+# whether to stand in for the operation of a stand in on a format: it has no
+# native form, the format is held and the operation the stand in reads is native
+fun decide(w: *Work, f: Format, at: usize) res[bool, Why] {
+    val slot: usize = f.index::usize * $length_of(Stands) + at;
+    if (w.decided[slot] != UNDECIDED) { ret res[bool, Why].ok{w.decided[slot] == STAND}; }
+    var stand: bool       = false;
+    val h:     opt[*Held] = target.held(w.caps, f);
+    if (sel h.some) {
+        val has: res[bool, Why] = native(w, h.some, STANDS[at].opcode);
+        if (sel has.err) { ret has; }
+        stand = !has.ok;
+        val reads: opt[Opcode] = STANDS[at].reads;
+        if (sel reads.some) {
+            if (stand) {
+                val under: res[bool, Why] = native(w, h.some, reads.some);
+                if (sel under.err) { ret under; }
+                stand = under.ok;
+            }
+        }
+    }
+    w.decided[slot] = LEAVE;
+    if (stand) { w.decided[slot] = STAND; }
+    ret res[bool, Why].ok{stand};
+}
+
+# the stand in for an opcode, by its place in the table
+fun stand_of(op: Opcode) opt[usize] {
+    var k: usize = 0;
+    for (k < $length_of(Stands)) {
+        if (STANDS[k].opcode.index == op.index) { ret opt[usize].some{k}; }
+        k = k + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the scalar float type an instruction computes in, none for any other
+fun float_of(s: *Site, d: *InstructionData) res[opt[Type], Why] {
+    if (d.results.len != 1) { ret res[opt[Type], Why].ok{opt[Type].none{}}; }
+    val ty:    Type                          = s.b.values.data[d.results.data[0].index].type;
+    val shape: res[types.Shape, types.Error] = types.shape(?s.m.types, ty);
+    if (sel shape.err)         { ret res[opt[Type], Why].err{Why.ir{module.Error.types{shape.err}}}; }
+    if (!(sel shape.ok.float)) { ret res[opt[Type], Why].ok{opt[Type].none{}}; }
+    ret res[opt[Type], Why].ok{opt[Type].some{ty}};
+}
+
+# the integer type of a width
+fun integer(m: *module.Module, width: u32) res[Type, Why] {
+    val ty: res[Type, types.Error] = types.intern(?m.types, types.Shape.integer{types.Integer{width: width}});
+    if (sel ty.err) { ret res[Type, Why].err{Why.ir{module.Error.types{ty.err}}}; }
+    ret res[Type, Why].ok{ty.ok};
+}
+
+# the encoding of the power of two from which every number of a format is an
+# integer, two to the bits of its stored significand when its leading bit is
+# implicit
+fun threshold(r: types.Row) res[Wide, Why] {
+    if (!(sel r.encoding.binary))       { ret res[Wide, Why].err{Why.reason{"an integral rounding of a format that is not a binary encoding"}}; }
+    if (!(sel r.rounding.nearest_even)) { ret res[Wide, Why].err{Why.reason{"an integral rounding of a format whose arithmetic does not round to nearest even"}}; }
+    val b: types.Binary = r.encoding.binary;
+    var p: i64          = b.significand::i64;
+    if (!b.implicit) { p = p - 1; }
+    val biased: i64 = b.bias::i64 + p;
+    ret res[Wide, Why].ok{word.shl(word.small(biased::u64), b.significand)};
+}
+
+# 1 where a condition holds and 0 where it does not, as a float of the type
+fun unit_of(w: *Work, c: Value, ty: Type) Value {
+    val s: *Site = ?w.site;
+    ret emit.convert(s, opcode.ITOF_U, emit.convert(s, opcode.EXT_U, c, w.word), ty);
+}
+
+# x rounded to an integer, ties to even, where it is below T in magnitude, and
+# x itself otherwise. x is not negative when positive is set, so the sign
+# copy is left out
+fun rounded(w: *Work, x: Value, ty: Type, t: Value, positive: bool) Value {
+    val s:      *Site = ?w.site;
+    val ax:     Value = emit.unary(s, opcode.FABS, x);
+    val inside: Value = emit.binary(s, opcode.FLT_O, ax, t);
+    var by:     Value = emit.binary(s, opcode.FMUL, unit_of(w, inside, ty), t);
+    if (!positive) { by = emit.binary(s, opcode.FCOPYSIGN, by, x); }
+    ret emit.binary(s, opcode.FSUB, emit.binary(s, opcode.FADD, x, by), by);
+}
+
+# the threshold of a stand in's format as a constant, made before it opens
+fun threshold_of(w: *Work, m: *Made) res[Value, Why] {
+    val bits: res[Wide, Why] = threshold(m.row);
+    if (sel bits.err) { ret res[Value, Why].err{bits.err}; }
+    ret emit.float_constant(?w.site, m.type, bits.ok);
+}
+
+# a minimum or maximum by fminnum or fmaxnum, made a nan where an operand is one
+fun bounded(w: *Work, m: *Made, by: Opcode) err[Why] {
+    val s:   *Site           = ?w.site;
+    val one: res[Value, Why] = emit.constant(s, w.word, word.small(1));
+    if (sel one.err) { ret err[Why].err{one.err}; }
+    emit.open(s, m.origin, m.k, m.n);
+    val a:     Value = m.operands[0];
+    val b:     Value = m.operands[1];
+    val inner: Value = emit.binary(s, by, a, b);
+    val both:  Value = emit.binary(s, opcode.FORD, a, b);
+    val less:  Value = emit.binary(s, opcode.SUB, emit.convert(s, opcode.EXT_U, both, w.word), one.ok);
+    val root:  Value = emit.unary(s, opcode.FSQRT, emit.convert(s, opcode.ITOF_S, less, m.type));
+    emit.close(s, m.origin);
+    emit.binary(s, opcode.FSUB, inner, root);
+    ret emit.done(s);
+}
+
+fun least(w: *Work, m: *Made) err[Why] {
+    ret bounded(w, m, opcode.FMINNUM);
+}
+
+fun greatest(w: *Work, m: *Made) err[Why] {
+    ret bounded(w, m, opcode.FMAXNUM);
+}
+
+# t stepped by 1 toward x where it passed x, which compare reads, by step
+fun stepped(w: *Work, m: *Made, x: Value, compare: Opcode, step: Opcode, positive: bool) err[Why] {
+    val s: *Site           = ?w.site;
+    val t: res[Value, Why] = threshold_of(w, m);
+    if (sel t.err) { ret err[Why].err{t.err}; }
+    emit.open(s, m.origin, m.k, m.n);
+    val near:  Value = rounded(w, x, m.type, t.ok, positive);
+    val past:  Value = emit.binary(s, compare, near, x);
+    val moved: Value = emit.binary(s, step, near, unit_of(w, past, m.type));
+    emit.close(s, m.origin);
+    emit.binary(s, opcode.FCOPYSIGN, moved, m.operands[0]);
+    ret emit.done(s);
+}
+
+fun floor(w: *Work, m: *Made) err[Why] {
+    ret stepped(w, m, m.operands[0], opcode.FGT_O, opcode.FSUB, false);
+}
+
+fun ceiling(w: *Work, m: *Made) err[Why] {
+    ret stepped(w, m, m.operands[0], opcode.FLT_O, opcode.FADD, false);
+}
+
+# ffloor of |x|, which the stepping reads in place of x, with the sign of x
+fun truncated(w: *Work, m: *Made) err[Why] {
+    val s: *Site           = ?w.site;
+    val t: res[Value, Why] = threshold_of(w, m);
+    if (sel t.err) { ret err[Why].err{t.err}; }
+    emit.open(s, m.origin, m.k, m.n);
+    val ax:    Value = emit.unary(s, opcode.FABS, m.operands[0]);
+    val near:  Value = rounded(w, ax, m.type, t.ok, true);
+    val past:  Value = emit.binary(s, opcode.FGT_O, near, ax);
+    val moved: Value = emit.binary(s, opcode.FSUB, near, unit_of(w, past, m.type));
+    emit.close(s, m.origin);
+    emit.binary(s, opcode.FCOPYSIGN, moved, m.operands[0]);
+    ret emit.done(s);
+}
+
+fun nearest(w: *Work, m: *Made) err[Why] {
+    val s: *Site           = ?w.site;
+    val t: res[Value, Why] = threshold_of(w, m);
+    if (sel t.err) { ret err[Why].err{t.err}; }
+    emit.open(s, m.origin, m.k, m.n);
+    val near: Value = rounded(w, m.operands[0], m.type, t.ok, false);
+    emit.close(s, m.origin);
+    emit.binary(s, opcode.FCOPYSIGN, near, m.operands[0]);
+    ret emit.done(s);
+}
+
+# the select of the operands' bits as integers of the format's width
+fun chosen(w: *Work, m: *Made) err[Why] {
+    val s:    *Site          = ?w.site;
+    val bits: res[Type, Why] = integer(s.m, m.row.width);
+    if (sel bits.err) { ret err[Why].err{bits.err}; }
+    emit.open(s, m.origin, m.k, m.n);
+    val a: Value = emit.convert(s, opcode.BITCAST, m.operands[1], bits.ok);
+    val b: Value = emit.convert(s, opcode.BITCAST, m.operands[2], bits.ok);
+    val c: Value = emit.ternary(s, opcode.SELECT, m.operands[0], a, b);
+    emit.close(s, m.origin);
+    emit.convert(s, opcode.BITCAST, c, m.type);
+    ret emit.done(s);
+}
+
+# stand in for the instruction at an index of a block if its format lacks it,
+# answering how many instructions were made ahead of it
+fun rebuild(w: *Work, k: Block, n: u32, i: Instruction) res[u32, Why] {
+    val s:  *Site            = ?w.site;
+    val d:  *InstructionData = ?s.b.instructions.data[i.index];
+    val at: opt[usize]       = stand_of(d.opcode);
+    if (sel at.none) { ret res[u32, Why].ok{0}; }
+    val ty: res[opt[Type], Why] = float_of(s, d);
+    if (sel ty.err)     { ret res[u32, Why].err{ty.err}; }
+    if (sel ty.ok.none) { ret res[u32, Why].ok{0}; }
+    val f: res[Format, types.Error] = types.format(?s.m.types, ty.ok.some);
+    if (sel f.err) { ret res[u32, Why].err{Why.ir{module.Error.types{f.err}}}; }
+    val r: opt[types.Row] = types.row(f.ok);
+    if (sel r.none) { ret res[u32, Why].err{Why.reason{"a float of a format with no row"}}; }
+    val go: res[bool, Why] = decide(w, f.ok, at.some);
+    if (sel go.err) { ret res[u32, Why].err{go.err}; }
+    if (!go.ok)     { ret res[u32, Why].ok{0}; }
+    var m: Made  = Made{origin: i, k: k, n: n, type: ty.ok.some, row: r.some};
+    var j: usize = 0;
+    for (j < d.operands.len && j < 3) {
+        m.operands[j] = d.operands.data[j];
+        j             = j + 1;
+    }
+    val built: err[Why] = STANDS[at.some].build(w, ?m);
+    if (sel built.err) { ret res[u32, Why].err{built.err}; }
+    w.changed = true;
+    ret res[u32, Why].ok{s.made};
+}
+
+# stand in for what one function's formats lack
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val narrow: opt[u32] = target.wider(?c.t.caps, 1);
+    if (sel narrow.none) { ret res[bool, Why].err{Why.reason{"a float stand in on a target whose arithmetic runs at no width"}}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+    val slots:   usize                     = types.rows()::usize * $length_of(Stands);
+    val decided: res[*u8, allocator.Error] = allocator.zallocate[u8](c.m.a, slots);
+    if (sel decided.err) { ret res[bool, Why].err{Why.alloc{decided.err}}; }
+    fin { allocator.deallocate[u8](c.m.a, decided.ok, slots); }
+
+    val word: res[Type, Why] = integer(c.m, narrow.some);
+    if (sel word.err) { ret res[bool, Why].err{word.err}; }
+    var w: Work  = Work{site: emit.init(c.m, u.f, got.ok, ?scratch), caps: ?c.t.caps, mc: c.mc, word: word.ok, decided: decided.ok, changed: false};
+    var k: usize = 0;
+    for (k < got.ok.blocks.len) {
+        if (!got.ok.blocks.data[k].erased) {
+            var n: usize = 0;
+            for (n < got.ok.blocks.data[k].instructions.len) {
+                arena.reset(?ar);
+                val i:  Instruction   = got.ok.blocks.data[k].instructions.data[n];
+                val at: res[u32, Why] = rebuild(?w, Block{index: k::u32}, n::u32, i);
+                if (sel at.err) { ret res[bool, Why].err{at.err}; }
+                n = n + at.ok::usize + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{w.changed};
+}
