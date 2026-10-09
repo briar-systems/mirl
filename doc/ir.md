@@ -306,7 +306,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 
 | id | rule | what it holds |
 |---|---|---|
-| 0 | `target` | the module names a target among the rows of `mirl.target` that declares every fact the pipeline reads, and the target's name is the module's |
+| 0 | `target` | the module's tuple is its target's, and the target declares every fact the pipeline reads |
 | 1 | `width` | every integer type in the type table has a legal width, which is 1 or a power of two from 8 to 512 |
 | 2 | `layout` | every structure that states its offsets and every array that states its stride states ones the rules of some address space of the target keep: offsets none overlapping and each a multiple of its member's alignment, and a stride no shorter than the element and a multiple of the array's alignment. A type names no space, so it is not held to the space of each use |
 | 3 | `constant` | every constant is of its type, an aggregate has one element per member and an address names a function or global of the module |
