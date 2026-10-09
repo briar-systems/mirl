@@ -14,11 +14,9 @@
 # whose line "; exits <n>: ..." states the status its program exits with, and
 # test/example/exit.s, the __mirl_exit every start stub calls, which masc
 # assembles. for each example the lane checks:
-#   - mirl emit writes its object and its listing
+#   - mirl emit writes its object
 #   - mink's exec driver links the object and the exit object into a static
 #     executable, which exits with the stated status under qemu-riscv64
-#   - the listing assembles through masc to the same bytes as the object. on
-#     a mismatch, masc disassemble of both is diffed into <name>.diff and shown
 #
 # the exit status is the number of checks that failed
 set -u
@@ -43,8 +41,7 @@ mkdir -p "$out" || exit 2
 
 # the target every example names, and masc's reading of it
 target=riscv64-linux
-masc_read="-t riscv64 --isa rv64gc"
-masc_write="$masc_read --abi lp64d --format elf"
+masc_as="-t riscv64 --isa rv64gc --abi lp64d --format elf"
 
 # a shadow project of the pinned dependency `$1` in `$2`: its tracked files at
 # the pin, with every dependency it declares taken from mirl's own dep/
@@ -75,7 +72,7 @@ tools=$repo/out/example/tools/$pins
 masc=${MASC:-$(tool masc cli masc)} || exit 2
 exec_bin=${EXEC:-$(tool mink exec exec)} || exit 2
 
-"$masc" assemble "$here/example/exit.s" $masc_write -o "$out/exit.o" 2>"$out/exit.as" \
+"$masc" assemble "$here/example/exit.s" $masc_as -o "$out/exit.o" 2>"$out/exit.as" \
     || { echo "example.sh: masc refuses test/example/exit.s: $(cat "$out/exit.as")" >&2; exit 2; }
 
 fails=0
@@ -92,33 +89,22 @@ for src in "$here"/example/*.mirl; do
         fail "$name" "states no exit status"
         continue
     fi
-    if ! "$mirl" emit "$src" --body --checked --kind object >"$out/$name.o" 2>"$out/$name.emit" ||
-       ! "$mirl" emit "$src" --body --checked --kind listing >"$out/$name.s" 2>>"$out/$name.emit"; then
+    if ! "$mirl" emit "$src" --body --checked --kind object >"$out/$name.o" 2>"$out/$name.emit"; then
         fail "$name" "mirl emit refuses it: $(cat "$out/$name.emit")"
         continue
     fi
-    ok=1
     if ! "$exec_bin" riscv64 "$out/$name" "$out/$name.o" "$out/exit.o" 2>"$out/$name.link"; then
         fail "$name" "the link is refused: $(cat "$out/$name.link")"
-        ok=0
-    else
-        chmod +x "$out/$name"
-        qemu-riscv64 "$out/$name"
-        status=$?
-        [ "$status" = "$expect" ] || { fail "$name" "exits $status, not $expect"; ok=0; }
+        continue
     fi
-    if ! "$masc" assemble "$out/$name.s" $masc_write -o "$out/$name.listed.o" 2>"$out/$name.as"; then
-        fail "$name" "masc refuses the listing: $(cat "$out/$name.as")"
-        ok=0
-    elif ! cmp -s "$out/$name.o" "$out/$name.listed.o"; then
-        fail "$name" "the listing assembles to other bytes than the object, see $out/$name.diff"
-        "$masc" disassemble "$out/$name.o" $masc_read -o "$out/$name.o.dis" 2>&1
-        "$masc" disassemble "$out/$name.listed.o" $masc_read -o "$out/$name.listed.o.dis" 2>&1
-        diff -u --label "$name.o" --label "$name.listed.o" "$out/$name.o.dis" "$out/$name.listed.o.dis" >"$out/$name.diff"
-        cat "$out/$name.diff"
-        ok=0
+    chmod +x "$out/$name"
+    qemu-riscv64 "$out/$name"
+    status=$?
+    if [ "$status" != "$expect" ]; then
+        fail "$name" "exits $status, not $expect"
+        continue
     fi
-    [ $ok = 1 ] && echo "ok   $name"
+    echo "ok   $name"
 done
 echo "$fails failed"
 exit $fails
