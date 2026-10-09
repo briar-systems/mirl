@@ -16,6 +16,8 @@ A target holds
 - `baseline`, the extensions code for it may assume, in masc's spelling, from which `mirl.target.machine.open` makes masc's selection, the registers it gives and the convention resolved through them. A build adds extensions on top of it through `mirl.target.machine.open_with`, which takes extension names as masc's catalog names them and refuses one it does not know by name, `choose` makes the selection alone for a target with no convention yet, and the machine holds the one resolved selection that selection, the convention and the allocator's allowed set read,
 - `addresses`, how code reaches an address (see [Addresses](#addresses)).
 
+A target states a machine when it has both a baseline and a convention row (`mirl.target.machine.stated`). A build opens its one machine through `mirl.target.machine.build`, which gives none for a target that states no machine, and hands it to the pass driver. The driver's context carries it to every pass, no pass opens a machine of its own, and a pass that needs one refuses a run that carries none, so an extension the build adds reaches every consumer and nothing falls back to the baseline.
+
 `mirl.target.declared(t)` says whether a target is complete. Every declaration has an unstated zero case, so a row left zeroed reads as incomplete and never as an answer. A list that may rightly be empty sits under a case of its own, so an empty list is a stated answer.
 
 ## Capabilities
