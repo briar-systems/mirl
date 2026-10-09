@@ -3,12 +3,12 @@
 masc states each row's operand register constraints on `row.Row.constraints`: an output written before every input is read, two operands that must differ, a register group kept apart from another or from a mask register. `mirl.machine.constraint` is the one place mirl asks them, through masc's `constraint.violated`. mirl states no constraint of its own and keeps no list of constrained rows.
 
 ```
-grouping_of(f, op)            # res[Grouping, u32]
-ask(f, op, values)            # opt[Breach]
+grouping_of(f, row)           # res[Grouping, u32]
+ask(f, row, values)           # opt[Breach]
 stands(f, op, operands)       # opt[Breach]
 ```
 
-`ask` hands masc the instruction's operand values under its grouping and answers the breach, or none when every constraint stands. The values come from `instruction.values_of`, the one place an operand becomes masc's value, which the instruction's transfer and emission read as well. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as the kind its row position states: an immediate, an enumerant or a condition.
+`ask` hands masc the operand values of an instruction of a row under its grouping and answers the breach, or none when every constraint stands. `asks` and `stands` take an opcode and ask each row it stands for: a row's own instruction, and each step of a loop (doc/machine/loop.md), the step's operands read from the loop's through `instruction.operands_in`, the one place a step's sources become operands, which the loop expansion writes through too. So a loop's operands stand against every row they reach at every choice that asks. The values come from `instruction.values_of`, the one place an operand becomes masc's value, which the instruction's transfer and emission read as well. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as the kind its row position states: an immediate, an enumerant or a condition.
 
 ## Breaches
 

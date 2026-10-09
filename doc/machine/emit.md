@@ -13,13 +13,13 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 ## Compilation
 
 - `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. A machine opened for another target than the one given is refused at entry (`Error.foreign`), before anything is compiled. The target reaches its selection table, frame code and moves through its row of `mirl.isa.rows`, so compilation names no set.
-- Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md) and laid out. The functions are then emitted into one object.
+- Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md), its loops expanded (doc/machine/loop.md) and laid out. The functions are then emitted into one object.
 - A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
 
 ## The entry and `mirl emit`
 
 - `mirl.compile.compile(a, ?module, ?target, options)` is the entry mach calls. It opens the build's machine with the extensions `options.added` names, runs the pass schedule at `options.level` and hands the module to the back end the target's declarations choose. A register machine (allocated registers, free control, physical addressing, register evaluation) is compiled by `mirl.machine.compile.compile`. A target no back end serves is refused before anything runs (`Error.unserved`).
-- `options.checked` verifies the module after every pass and every function of the machine form after every stage: selection, allocation, the frame, the lowering of copies and layout. The machine form verifier (`mirl.machine.verify`) holds that every instruction a block places is one of the function's own, placed once, and stands against its opcode's row.
+- `options.checked` verifies the module after every pass and every function of the machine form after every stage: selection, allocation, the frame, the lowering of copies, the expansion of loops and layout. The machine form verifier (`mirl.machine.verify`) holds that every instruction a block places is one of the function's own, placed once, and stands against its opcode's row.
 - `options.machine` and `options.listing` name writers for the machine form text of the laid out functions and masc's listing of the object, in the set's default syntax. Both are written only once the object is made, so a refused compilation writes nothing.
 - `mirl.compile.write(a, ?object, ?target, w)` lays the object out in the one object format the target's system states, through mink, and refuses a system that states none or several.
 - `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--checked` and `--body` are read as `mirl opt` reads them.
