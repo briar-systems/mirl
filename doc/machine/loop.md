@@ -21,6 +21,18 @@ A target states each loop as data, a `mirl.machine.loop.Loop`:
 
 A loop with no body is a straight sequence: its `before` and `after` steps expand where it stands, and it names neither block. It is for an operation one instruction does once its operands are prepared by steps the loops on it share, so its preparation is the same data as theirs.
 
+## The constraint
+
+A core guarantees that a reserved pair eventually stores only for a body of a constrained shape, as RISC-V's constrained `lr` and `sc` loop and AArch64's exclusive pair require. Without it a loop can livelock on real cores, which no test of the expansion would show. A set states its constraint as data beside its loops, `Loops.constraint`, a `mirl.machine.loop.Constraint`:
+
+- `limit`, the most instructions a body holds, its jump out counted,
+- `plain`, the extensions a step other than the reserved pair may require,
+- `reserved`, the extensions the pair requires, so a plain load or store is no step of the pair.
+
+`mirl.machine.loop.row.constrained` holds a body to it and refuses by a typed `Breach`: a body past the limit (`long`), one that does not open with the load of the pair (`opened`), a step other than the pair touching memory or a second store (`access`), no store of the pair (`stored`), a step needing an extension past the plain ones or serialising as a fence or a system instruction does (`row`), a step transferring control other than by a conditional branch (`branch`), and a branch back to the start before the store or a second one (`retry`). Rows are admitted by the extensions masc states for them and by their effects, never by a list of opcodes. A straight sequence keeps any constraint.
+
+The selection engine refuses a table whose rule emits a loop that breaks the constraint of its set's loops, as `breached`, or a loop the set's loops do not hold. The text form refuses a set's loops when one breaks it.
+
 The expansion reads nothing but this row, so a target's loops are added as rows and never as code. The families the schema is written against:
 
 - RISC-V without a single instruction: `lr` and `sc` in the body, which repeats while `sc` reports failure, and a compare and exchange leaving to `exit` as soon as the value held is not the one expected.
