@@ -12,7 +12,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 
 ## Compilation
 
-- `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. The target reaches its selection table, frame code and moves through its row of `mirl.isa.rows`, so compilation names no set.
+- `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. A machine opened for another target than the one given is refused at entry (`Error.foreign`), before anything is compiled. The target reaches its selection table, frame code and moves through its row of `mirl.isa.rows`, so compilation names no set.
 - Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md) and laid out. The functions are then emitted into one object.
 - A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
 
