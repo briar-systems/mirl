@@ -2,11 +2,14 @@
 #
 # every fact is read from the operands and from masc's rows: a call or a
 # return is the transfer an instruction's row states under the rules its
-# operands meet, a register is written when an operand writing it, the
-# implicit writes of its row or of a loop's steps' rows, or the allocation
-# name it or storage it shares, and the stack pointer moves when an
-# instruction writes it or its row states a change other than a call's or a
-# return's.
+# operands meet, a register is written when masc's touched of a row the
+# instruction stands for writes it, a pseudo's operand writes it by its role,
+# or the allocation names it, and so is every register sharing its storage,
+# and the stack pointer moves when an instruction writes it or its row states
+# a change other than a call's or a return's. touched is read as liveness
+# reads it, each tie its dest half, so both registers of a pair and every
+# register of a group are written. an instruction whose values or grouping
+# leave touched unanswered refuses the scan.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -23,6 +26,8 @@ use mirl.fail.keep;
 use mirl.machine.alloc.location;
 use mirl.machine.alloc.location.Locations;
 use mirl.machine.class.Physical;
+use mirl.machine.constraint;
+use mirl.machine.constraint.Constrained;
 use mirl.machine.function;
 use mirl.machine.function.Function;
 use mirl.machine.instruction;
@@ -33,19 +38,24 @@ use mirl.machine.operand.Register;
 use mirl.machine.pseudo;
 use mirl.slice;
 
+use mc: masc.core.constraint;
 use masc.core.effect;
-use mo: masc.core.operand;
-use rf: masc.core.register;
+use mo:   masc.core.operand;
+use rf:   masc.core.register;
+use rows: masc.core.row;
 
 # why the facts were not read
 # ---
 # alloc:     the allocator refused storage
 # unlocated: a register an operand writes that the locations refused, and why
-# undecided: an instruction whose transfer turns on an operand that names no register
+# undecided: an instruction whose transfer or touched turns on an operand that
+#            names no register
+# ungrouped: an instruction whose grouping is refused, and why
 pub tag Error: u8 {
     alloc:     allocator.Error;
     unlocated: location.Unlocated;
     undecided: instruction.Undecided;
+    ungrouped: Constrained;
 }
 
 # what a function's instructions show
@@ -99,7 +109,57 @@ fun names(at: *Locations, o: Operand, row: u32) res[bool, Error] {
     ret res[bool, Error].ok{got.ok == row};
 }
 
-fun instruction_facts(x: *Facts, direct: *vector.Vector[bool], at: *Locations, file: *rf.File, stack: u32, d: *InstructionData, id: u32) err[Error] {
+# the scratch sets masc's touched writes, effect.words of the file words each
+rec Scratch {
+    read:    vector.Vector[u64];
+    written: vector.Vector[u64];
+}
+
+# mark every register of `set` written, and whether it writes the stack pointer
+fun mark_set(direct: *vector.Vector[bool], file: *rf.File, stack: u32, set: effect.Set) bool {
+    var moves: bool = false;
+    var w:     u32  = 0;
+    for (w < set.len) {
+        var bits: u64 = set.words[w];
+        var b:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                val row: u32 = w * 64 + b;
+                if (row < file.register_count) { direct.data[row] = true; }
+                if (row == stack)              { moves = true; }
+            }
+            bits = bits >> 1;
+            b    = b + 1;
+        }
+        w = w + 1;
+    }
+    ret moves;
+}
+
+# the registers each row instruction `id` stands for writes, as masc's touched
+# states them under its grouping, and whether one moves the stack pointer
+fun row_facts(f: *Function, direct: *vector.Vector[bool], s: *Scratch, file: *rf.File, stack: u32, d: *InstructionData, id: u32) res[bool, Error] {
+    val op:    instruction.Opcode = d.opcode;
+    var moves: bool               = false;
+    var r:     u32                = 0;
+    for (r < instruction.rows_in(op)) {
+        val row:    *rows.Row                           = instruction.row_in(op, r);
+        var stated: [rows.MAX_OPERANDS]Operand;
+        val given:  Slice[Operand]                      = instruction.operands_in(op, r, d.operands, ?stated[0]);
+        val g:      res[mc.Grouping, constraint.Breach] = constraint.grouping_of(f, row, d.state);
+        if (sel g.err) { ret res[bool, Error].err{Error.ungrouped{Constrained{instruction: Instruction{index: id}, breach: g.err}}}; }
+        val got: effect.Answer[effect.Touched] = constraint.touched(f, row, given, g.ok, instruction.DEST, s.read.data, s.written.data);
+        if (sel got.undecided) { ret res[bool, Error].err{Error.undecided{instruction.Undecided{instruction: Instruction{index: id}, pending: got.undecided}}}; }
+        val touched: effect.Touched = got.decided;
+        if (mark_set(direct, file, stack, touched.written)) { moves = true; }
+        val e: *effect.Effect = row.effect;
+        if (!(sel e.stack.none)) { moves = true; }
+        r = r + 1;
+    }
+    ret res[bool, Error].ok{moves};
+}
+
+fun instruction_facts(x: *Facts, f: *Function, direct: *vector.Vector[bool], s: *Scratch, at: *Locations, file: *rf.File, stack: u32, d: *InstructionData, id: u32) err[Error] {
     val count:  u32                           = d.operands.size::u32;
     val answer: effect.Answer[effect.Control] = instruction.transfer(file, d);
     if (sel answer.undecided) { ret err[Error].err{Error.undecided{instruction.Undecided{instruction: Instruction{index: id}, pending: answer.undecided}}}; }
@@ -112,12 +172,13 @@ fun instruction_facts(x: *Facts, direct: *vector.Vector[bool], at: *Locations, f
     }
     val op: instruction.Opcode = d.opcode;
     if (sel op.pseudo && op.pseudo == pseudo.DYNAMIC) { x.dynamic = true; }
+    val rowed: bool = instruction.rows_in(op) != 0;
     var moves: bool = false;
     var i:     u32  = 0;
     for (i < count) {
         val o: Operand = d.operands.data[i];
         if (sel o.slot) { x.named.data[o.slot.index] = true; }
-        if ((instruction.role(op, count, i) & mo.WRITE) != 0) {
+        if (!rowed && (instruction.role(op, count, i) & mo.WRITE) != 0) {
             var marked: err[Error] = err[Error].ok{};
             if (sel o.physical) { marked = mark(direct, at, o.physical); }
             if (sel o.tied)     { marked = mark_register(direct, at, o.tied.dest); }
@@ -128,30 +189,9 @@ fun instruction_facts(x: *Facts, direct: *vector.Vector[bool], at: *Locations, f
         }
         i = i + 1;
     }
-    var r: u32 = 0;
-    for (r < instruction.rows_in(op)) {
-        val e: *effect.Effect = instruction.row_in(op, r).effect;
-        if (e != nil) {
-            val set: effect.Set = effect.may(e).written;
-            var w:   u32        = 0;
-            for (w < set.len) {
-                var bits: u64 = set.words[w];
-                var b:    u32 = 0;
-                for (bits != 0) {
-                    if ((bits & 1) != 0) {
-                        val row: u32 = w * 64 + b;
-                        if (row < file.register_count) { direct.data[row] = true; }
-                        if (row == stack)              { moves = true; }
-                    }
-                    bits = bits >> 1;
-                    b    = b + 1;
-                }
-                w = w + 1;
-            }
-            if (!(sel e.stack.none)) { moves = true; }
-        }
-        r = r + 1;
-    }
+    val touched: res[bool, Error] = row_facts(f, direct, s, file, stack, d, id);
+    if (sel touched.err)                                                   { ret err[Error].err{touched.err}; }
+    if (touched.ok)                                                        { moves = true; }
     if (moves && c.transfer != effect.CALL && c.transfer != effect.RETURN) { x.moves = true; }
     ret err[Error].ok{};
 }
@@ -169,10 +209,19 @@ pub fun scan(a: *allocator.Allocator, f: *Function, at: *Locations, stack: u32, 
     val file: *rf.File = function.file(f);
     var rows: usize    = 0;
     if (file != nil) { rows = file.register_count::usize; }
+    var words: usize = 0;
+    if (file != nil) { words = effect.words(file)::usize; }
     var direct: vector.Vector[bool] = vector.init[bool](a);
     fin { vector.dnit[bool](?direct); }
+    var s: Scratch = Scratch{read: vector.init[u64](a), written: vector.init[u64](a)};
+    fin {
+        vector.dnit[u64](?s.read);
+        vector.dnit[u64](?s.written);
+    }
     var failed: err[allocator.Error] = slice.fill[bool](?x.written, rows, false);
     keep(?failed, slice.fill[bool](?direct, rows, false));
+    keep(?failed, slice.fill[u64](?s.read, words, 0));
+    keep(?failed, slice.fill[u64](?s.written, words, 0));
     keep(?failed, slice.fill[bool](?x.named, f.slots.len, false));
     keep(?failed, slice.fill[bool](?x.exits, f.instructions.len, false));
     if (sel failed.err) {
@@ -187,7 +236,7 @@ pub fun scan(a: *allocator.Allocator, f: *Function, at: *Locations, stack: u32, 
     var k: usize = 0;
     for (k < f.instructions.len) {
         if (file != nil) {
-            val read: err[Error] = instruction_facts(?x, ?direct, at, file, stack, ?f.instructions.data[k], k::u32);
+            val read: err[Error] = instruction_facts(?x, f, ?direct, ?s, at, file, stack, ?f.instructions.data[k], k::u32);
             if (sel read.err) {
                 release(?x);
                 ret res[Facts, Error].err{read.err};
