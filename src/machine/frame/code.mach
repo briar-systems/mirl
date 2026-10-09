@@ -11,27 +11,53 @@
 # its row's register constraints. it finds it by making the move into a
 # function of its own for each scratch in turn, and makes it for real once
 # one stands.
+#
+# the code states each width it loads and stores a class at as a row of data,
+# and the code bound to a selection admits a width only where the selection
+# admits its row and the register's storage through the selection takes all
+# of it, so a load or store is never a row the selection lacks and never moves
+# fewer bytes than asked. every row the code appends goes through `append`,
+# which refuses one the selection does not admit.
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
+use std.allocator;
 use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
 
+use mirl.fail.keep;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Lists;
 use mirl.ir.metadata.Metadata;
+use mirl.machine.class;
+use mirl.machine.class.Class;
+use mirl.machine.class.Storage;
 use mirl.machine.constraint;
 use mirl.machine.constraint.Breach;
 use mirl.machine.frame.record.Offset;
 use mirl.machine.function;
 use mirl.machine.function.Function;
 use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
 use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.vstate;
 
+use masc.core.extension;
 use rf: masc.core.register;
+use masc.core.row.Row;
 
 # where the code appends and what it may use
 # ---
+# admitted:  the frame code bound to the build's selection
 # f:         the function
 # block:     the block it appends to
 # metadata:  the metadata of the instructions it appends
@@ -41,6 +67,7 @@ use rf: masc.core.register;
 # scratch:   the one of them `make` gives the code for a move, none when
 #            there are none
 pub rec Emit {
+    admitted:  *Admitted;
     f:         *Function;
     block:     Block;
     metadata:  Metadata;
@@ -59,6 +86,8 @@ pub val NO_SCRATCH: Slice[rf.Id] = Slice[rf.Id]{data: nil, size: 0};
 # scaled:      an offset per unit of a scale it cannot form
 # mask:        an alignment it cannot mask to
 # access:      a register of a class or size it has no load or store for
+#              that the selection admits
+# unadmitted:  a row the selection does not admit
 # made:        the function's maker refused an instruction
 # constrained: an instruction of the move does not stand against its row's
 #              register constraints under any scratch offered, the breach
@@ -68,24 +97,259 @@ pub tag Refusal: u8 {
     scaled:      Offset;
     mask:        u64;
     access:      rf.Id;
+    unadmitted:  *Row;
     made:        function.Error;
     constrained: Breach;
 }
 
+# one width the code loads and stores a register of a class at
+# ---
+# class:  the class, by the handle masc publishes for it
+# bits:   the bits it moves, scaled as masc states widths
+# load:   the row loading them into a register
+# store:  the row storing them from a register
+# offset: whether its rows take an offset beside the base register, else the
+#         base register alone holds the address
+pub rec Width {
+    class:  *rf.Class;
+    bits:   rf.Scaled;
+    load:   *Row;
+    store:  *Row;
+    offset: bool;
+}
+
+# widths as a pointer to static widths and a count
+pub rec Widths {
+    at:  *Width;
+    len: u32;
+}
+
 # a target's frame code, each entry appending the instructions of one move
 # ---
-# add:   dest is src plus an offset, dest the scratch it may use when it is
-#        not src
-# mask:  dest is src rounded down to a multiple of a power of two
-# sub:   dest is a minus b
-# store: the bytes of a register stored at a base register plus an offset
-# load:  a register loaded with the bytes at a base register plus an offset
+# add:    dest is src plus an offset, dest the scratch it may use when it is
+#         not src
+# mask:   dest is src rounded down to a multiple of a power of two
+# sub:    dest is a minus b
+# store:  the bytes of a register stored at a base register plus an offset,
+#         by the width chosen for its class and size
+# load:   a register loaded with the bytes at a base register plus an offset,
+#         by the width chosen for its class and size
+# widths: every width it loads and stores a class at
 pub rec Code {
-    add:   fun(*Emit, rf.Id, rf.Id, Offset) err[Refusal];
-    mask:  fun(*Emit, rf.Id, rf.Id, u64) err[Refusal];
-    sub:   fun(*Emit, rf.Id, rf.Id, rf.Id) err[Refusal];
-    store: fun(*Emit, rf.Id, rf.Id, Offset, Offset) err[Refusal];
-    load:  fun(*Emit, rf.Id, rf.Id, Offset, Offset) err[Refusal];
+    add:    fun(*Emit, rf.Id, rf.Id, Offset) err[Refusal];
+    mask:   fun(*Emit, rf.Id, rf.Id, u64) err[Refusal];
+    sub:    fun(*Emit, rf.Id, rf.Id, rf.Id) err[Refusal];
+    store:  fun(*Emit, *Width, rf.Id, rf.Id, Offset) err[Refusal];
+    load:   fun(*Emit, *Width, rf.Id, rf.Id, Offset) err[Refusal];
+    widths: Widths;
+}
+
+# an admitted width, the bits it moves through the selection and its place
+# in the code's widths
+rec Entry {
+    key:   u32;
+    bits:  Storage;
+    width: *Width;
+    at:    u32;
+}
+
+# a target's frame code bound to a selection
+# ---
+# code:      the frame code
+# registers: the registers the selection gives, which admits each row
+# loads:     the widths whose load the selection admits, by the class's row
+#            in the file, each list by the bits it moves
+# stores:    the widths whose store the selection admits, the same way
+pub rec Admitted {
+    code:      *Code;
+    registers: *rf.Available;
+    loads:     Lists[Entry];
+    stores:    Lists[Entry];
+}
+
+# a width the binding refuses
+# ---
+# store: whether it was refused among the stores
+# at:    its place in the code's widths
+pub rec Defect {
+    store: bool;
+    at:    u32;
+}
+
+# why frame code was not bound to a selection
+# ---
+# alloc:   the allocator refused storage
+# foreign: a width naming a class of no row of the selection's file, by its place
+# twice:   a second admitted load or store of one class and one storage
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    foreign: u32;
+    twice:   Defect;
+}
+
+fun by_key(a: *Entry, b: *Entry) i64 {
+    if (a.key < b.key) { ret -1; }
+    if (a.key > b.key) { ret 1; }
+    ret class.order(a.bits, b.bits);
+}
+
+# the widths whose load or store the selection admits, grouped by class
+fun grouped(a: *allocator.Allocator, c: *Code, regs: *rf.Available, store: bool) res[Lists[Entry], Error] {
+    var all: vector.Vector[Entry] = vector.init[Entry](a);
+    fin { vector.dnit[Entry](?all); }
+    var i: u32 = 0;
+    for (i < c.widths.len) {
+        val w: *Width     = ?c.widths.at[i];
+        val k: opt[Class] = class.handled(regs.file, w.class);
+        if (sel k.none) { ret res[Lists[Entry], Error].err{Error.foreign{i}}; }
+        val held: Class = k.some;
+        if (!(sel held.hardware)) { ret res[Lists[Entry], Error].err{Error.foreign{i}}; }
+        var row: *Row = w.load;
+        if (store) { row = w.store; }
+        if (extension.admits(regs.selection, row.requires)) {
+            val pushed: res[usize, allocator.Error] = vector.push[Entry](?all, Entry{key: held.hardware.index::u32, bits: class.through(regs, w.bits), width: w, at: i});
+            if (sel pushed.err) { ret res[Lists[Entry], Error].err{Error.alloc{pushed.err}}; }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Entry](all.data, all.len, by_key);
+    var keys: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?keys); }
+    var n: usize = 0;
+    for (n < all.len) {
+        if (n > 0 && by_key(?all.data[n - 1], ?all.data[n]) == 0) { ret res[Lists[Entry], Error].err{Error.twice{Defect{store: store, at: all.data[n].at}}}; }
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?keys, all.data[n].key);
+        if (sel pushed.err) { ret res[Lists[Entry], Error].err{Error.alloc{pushed.err}}; }
+        n = n + 1;
+    }
+    val made: res[Lists[Entry], allocator.Error] = graph.lists[Entry](a, regs.file.class_count, Slice[u32]{data: keys.data, size: keys.len}, Slice[Entry]{data: all.data, size: all.len});
+    if (sel made.err) { ret res[Lists[Entry], Error].err{Error.alloc{made.err}}; }
+    ret res[Lists[Entry], Error].ok{made.ok};
+}
+
+# bind a target's frame code to a selection
+# ---
+# a:    the allocator the binding takes
+# c:    the frame code
+# regs: the registers the selection gives, which admits each row and fixes
+#       the bits each width moves
+# ret:  the binding, or why it was refused
+pub fun admit(a: *allocator.Allocator, c: *Code, regs: *rf.Available) res[Admitted, Error] {
+    val loads: res[Lists[Entry], Error] = grouped(a, c, regs, false);
+    if (sel loads.err) { ret res[Admitted, Error].err{loads.err}; }
+    var l:      Lists[Entry]             = loads.ok;
+    val stores: res[Lists[Entry], Error] = grouped(a, c, regs, true);
+    if (sel stores.err) {
+        graph.release[Entry](?l);
+        ret res[Admitted, Error].err{stores.err};
+    }
+    ret res[Admitted, Error].ok{Admitted{code: c, registers: regs, loads: l, stores: stores.ok}};
+}
+
+# give back a binding's storage
+pub fun dnit(x: *Admitted) err[allocator.Error] {
+    var failed: err[allocator.Error] = graph.release[Entry](?x.loads);
+    keep(?failed, graph.release[Entry](?x.stores));
+    ret failed;
+}
+
+# the bits of a size in bytes, folded through a selection
+pub fun bits_of(regs: *rf.Available, size: Offset) Storage {
+    ret class.fold(regs, Storage{fixed: size.fixed::u64 * 8, per: size.per::u64 * 8, scale: size.scale});
+}
+
+# the admitted widths of a register's class, loads or stores, empty for a
+# register of no row of the file
+fun listed(x: *Admitted, reg: rf.Id, store: bool) Slice[Entry] {
+    val k: u16 = rf.class_of(reg);
+    if (k::u32 >= x.registers.file.class_count) { ret Slice[Entry]{data: nil, size: 0}; }
+    if (store)                                  { ret graph.list[Entry](?x.stores, k::u32); }
+    ret graph.list[Entry](?x.loads, k::u32);
+}
+
+# whether a register's storage through the selection takes all of some bits
+fun takes(x: *Admitted, reg: rf.Id, bits: Storage) bool {
+    val row: opt[*rf.Register] = rf.row_of(x.registers.file, reg);
+    if (sel row.none) { ret false; }
+    val s: opt[Storage] = class.register_storage(x.registers, row.some);
+    if (sel s.none) { ret false; }
+    ret class.covers(s.some, bits);
+}
+
+# the entry of a list moving exactly some bits, by binary search
+fun exact(list: Slice[Entry], bits: Storage) opt[*Width] {
+    var lo: usize = 0;
+    var hi: usize = list.size;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (class.order(list.data[mid].bits, bits) < 0) { lo = mid + 1; }
+        or                                              { hi = mid; }
+    }
+    if (lo < list.size && class.order(list.data[lo].bits, bits) == 0) { ret opt[*Width].some{list.data[lo].width}; }
+    ret opt[*Width].none{};
+}
+
+# the admitted width moving exactly a size into or out of a register, none
+# when the code states none the selection admits or the register's storage
+# does not take all of it
+# ---
+# x:     the binding
+# reg:   the register
+# size:  the bytes moved
+# store: whether the width stores the register, else loads it
+pub fun width_of(x: *Admitted, reg: rf.Id, size: Offset, store: bool) opt[*Width] {
+    val bits: Storage = bits_of(x.registers, size);
+    if (!takes(x, reg, bits)) { ret opt[*Width].none{}; }
+    ret exact(listed(x, reg, store), bits);
+}
+
+# whether a part of n bytes is aligned at an address of a power of two
+# alignment: the widest power of two n is a multiple of is at most it
+fun aligned(n: u64, align: u64) bool {
+    var p: u64 = 1;
+    for (n % (p * 2) == 0) {
+        p = p * 2;
+    }
+    ret p <= align;
+}
+
+# the most fixed bytes, at most `room`, that the code both loads into and
+# stores from a register at an address of a power of two alignment, 0 when
+# none fits
+# ---
+# x:     the binding
+# reg:   the register
+# room:  the bytes left to move
+# align: the alignment the address has
+pub fun widest(x: *Admitted, reg: rf.Id, room: u64, align: u64) u64 {
+    val list: Slice[Entry] = listed(x, reg, false);
+    var most: u64          = 0;
+    var i:    usize        = 0;
+    for (i < list.size) {
+        val b: Storage = list.data[i].bits;
+        if (b.per == 0 && b.fixed % 8 == 0 && b.fixed > 0) {
+            val n: u64 = b.fixed / 8;
+            if (n <= room && n > most && aligned(n, align)) {
+                val back: opt[*Width] = width_of(x, reg, Offset{fixed: n::i64, per: 0, scale: 0}, true);
+                if (sel back.some) { most = n; }
+            }
+        }
+        i = i + 1;
+    }
+    ret most;
+}
+
+# append one row, refused when the selection does not admit it
+# ---
+# e:   where it appends
+# row: the row
+# ops: its operands
+# ret: ok, or why nothing was appended
+pub fun append(e: *Emit, row: *Row, ops: Slice[Operand]) err[Refusal] {
+    if (!extension.admits(e.admitted.registers.selection, row.requires)) { ret err[Refusal].err{Refusal.unadmitted{row}}; }
+    val made: res[Instruction, function.Error] = function.append(e.f, e.block, Opcode.row{row}, ops, e.metadata, false, vstate.NONE);
+    if (sel made.err) { ret err[Refusal].err{Refusal.made{made.err}}; }
+    ret err[Refusal].ok{};
 }
 
 # dest is src plus an offset
@@ -126,23 +390,32 @@ pub tag Step: u8 {
     load:  Access;
 }
 
-fun run(c: *Code, e: *Emit, s: Step) err[Refusal] {
+# a load or store by the width admitted for its register and size
+fun access(e: *Emit, a: Access, store: bool) err[Refusal] {
+    val w: opt[*Width] = width_of(e.admitted, a.register, a.size, store);
+    if (sel w.none) { ret err[Refusal].err{Refusal.access{a.register}}; }
+    if (store)      { ret e.admitted.code.store(e, w.some, a.register, a.base, a.at); }
+    ret e.admitted.code.load(e, w.some, a.register, a.base, a.at);
+}
+
+fun run(e: *Emit, s: Step) err[Refusal] {
+    val c: *Code = e.admitted.code;
     if (sel s.add)   { ret c.add(e, s.add.dest, s.add.src, s.add.by); }
     or (sel s.mask)  { ret c.mask(e, s.mask.dest, s.mask.src, s.mask.align); }
     or (sel s.sub)   { ret c.sub(e, s.sub.dest, s.sub.a, s.sub.b); }
-    or (sel s.store) { ret c.store(e, s.store.register, s.store.base, s.store.at, s.store.size); }
-    ret c.load(e, s.load.register, s.load.base, s.load.at, s.load.size);
+    or (sel s.store) { ret access(e, s.store, true); }
+    ret access(e, s.load, false);
 }
 
 # the first breach of an instruction a move makes under the emit's scratch,
 # made into a function of its own
-fun trial(c: *Code, e: *Emit, s: Step) res[opt[Breach], Refusal] {
+fun trial(e: *Emit, s: Step) res[opt[Breach], Refusal] {
     var probe: Function = function.init(e.f.a, e.f.set);
     fin { function.dnit(?probe); }
     val b: res[Block, function.Error] = function.block(?probe);
     if (sel b.err) { ret res[opt[Breach], Refusal].err{Refusal.made{b.err}}; }
-    var pe:   Emit         = Emit{f: ?probe, block: b.ok, metadata: e.metadata, stack: e.stack, scratches: e.scratches, scratch: e.scratch};
-    val done: err[Refusal] = run(c, ?pe, s);
+    var pe:   Emit         = Emit{admitted: e.admitted, f: ?probe, block: b.ok, metadata: e.metadata, stack: e.stack, scratches: e.scratches, scratch: e.scratch};
+    val done: err[Refusal] = run(?pe, s);
     if (sel done.err) { ret res[opt[Breach], Refusal].err{done.err}; }
     var i: usize = 0;
     for (i < probe.instructions.len) {
@@ -157,11 +430,11 @@ fun trial(c: *Code, e: *Emit, s: Step) res[opt[Breach], Refusal] {
 # make one move of a target's frame code under the first scratch the emit
 # offers that every instruction of the move stands under
 # ---
-# c:   the frame code
-# e:   where it appends, with the scratches it is offered
+# e:   where it appends, with the bound frame code and the scratches it is
+#      offered
 # s:   the move
 # ret: ok, or why the code made nothing
-pub fun make(c: *Code, e: *Emit, s: Step) err[Refusal] {
+pub fun make(e: *Emit, s: Step) err[Refusal] {
     var n: usize = e.scratches.size;
     if (n == 0) { n = 1; }
     var first: Breach;
@@ -169,13 +442,13 @@ pub fun make(c: *Code, e: *Emit, s: Step) err[Refusal] {
     for (i < n) {
         e.scratch = opt[rf.Id].none{};
         if (e.scratches.size > 0) { e.scratch = opt[rf.Id].some{e.scratches.data[i]}; }
-        val tried: res[opt[Breach], Refusal] = trial(c, e, s);
+        val tried: res[opt[Breach], Refusal] = trial(e, s);
         if (sel tried.err) { ret err[Refusal].err{tried.err}; }
         val got: opt[Breach] = tried.ok;
         if (sel got.some) {
             if (i == 0) { first = got.some; }
         }
-        or { ret run(c, e, s); }
+        or { ret run(e, s); }
         i = i + 1;
     }
     ret err[Refusal].err{Refusal.constrained{first}};
