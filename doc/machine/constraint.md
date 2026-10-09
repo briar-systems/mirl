@@ -17,7 +17,7 @@ stands(f, d)                  # opt[Breach]
 - `broken`: a constraint the values break.
 - `outside`: an operand whose group runs past the last register of its class, or whose first register is off the group's alignment, answered only where the grouping states its length.
 - `inexact`: a constraint whose answer turns on an element width the grouping does not state. The state no operand holds decides whether the form is reserved, so it is never read as clear. The constraint names its sides. A grouping masc forms under a vtype states every width, so only a grouping with no element width meets it.
-- `needs`: an operand whose groups turn on a vtype the instruction does not state. The checker refuses such an instruction when it is made.
+- `needs`: an operand whose groups turn on a vector state the instruction does not state. The checker refuses such an instruction when it is made.
 - `reserved`: an operand whose groups the instruction's vtype cannot form, as a widening destination under LMUL 8.
 - `unencodable`: the instruction's vtype has no encoding.
 
@@ -32,11 +32,11 @@ stands(f, d)                  # opt[Breach]
 
 ## Grouping
 
-How many registers an operand's group covers can depend on state no operand holds, as RISC-V's vtype sets SEW and LMUL. A machine instruction states the vtype it runs under as masc's public record (`masc.riscv_vtype.Vtype`: SEW, LMUL, tail and mask policy), spelled `vtype e32, m2, ta, ma` in the text form and read by masc's vtype reader.
+How many registers an operand's group covers can depend on state no operand holds, as RISC-V's vtype sets SEW and LMUL. A machine instruction states the vector state it runs under, `mirl.machine.vstate.State`, which holds masc's public record (`masc.riscv_vtype.Vtype`: SEW, LMUL, tail and mask policy). It is spelled `vtype e32, m2, ta, ma` in the text form and read by masc's vtype reader. `vstate` is the one module of the machine form that names a set's record.
 
 - An instruction whose row has no operand of a vector class answers masc's `UNIT`, where every operand is one register a group and `UNIT` is exact.
-- Any other answers masc's grouping of its row: `riscv_vtype.grouping(row, vtype)` under the vtype it states, or `constraint.grouping(operands, count, none)` when it states none. The second forms the groups of a row no state decides, as a whole register load (`vl2re8.v`) or an x86 or AArch64 vector register, and answers `needs` for a row whose spans or element widths turn on a state. masc owns every operand's element width against SEW and LMUL for widened, narrowed, extension, segment and mask operands, and mirl restates none.
-- The instruction checker refuses a vtype on an instruction with no operand of a vector class, and an instruction whose row needs a state it does not state.
+- Any other answers masc's grouping of its row (`vstate.grouping`): `riscv_vtype.grouping(row, vtype)` under the state it states, or `constraint.grouping(operands, count, none)` when it states none. The second forms the groups of a row no state decides, as a whole register load (`vl2re8.v`) or an x86 or AArch64 vector register, and answers `needs` for a row whose spans or element widths turn on a state. masc owns every operand's element width against SEW and LMUL for widened, narrowed, extension, segment and mask operands, and mirl restates none.
+- The instruction checker refuses a state on an instruction whose row needs none, as a scalar row or a whole register load, and an instruction whose row needs a state it does not state. So an instruction states one exactly when masc says its row turns on one.
 
 `covers` is how many registers of its class one value of an operand covers under a grouping: its fields back to back, each a group of the length the grouping states, one for a group within one register.
 
