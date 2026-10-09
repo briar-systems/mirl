@@ -40,6 +40,11 @@ The function is made anew through its maker. The prologue opens the entry block,
 
 The instructions come from the target's frame code (`Code`): `add`, `mask`, `sub`, `store` and `load`, each appending rows of masc's catalog. `mirl.isa.riscv.FRAME` is RISC-V's. Every move is made through `code.make`, which gives the code the first scratch it is offered under which every instruction of the move stands against its row's register constraints, trying each by making the move into a function of its own, and refuses with `Refusal.constrained` when none does (doc/machine/constraint.md).
 
+The code states each width it loads and stores a class at as data (`Width`): the class by masc's handle, the bits it moves scaled as masc states widths, the load and store rows, and whether those rows take an offset beside the base register. `code.admit` binds the code to the build's selection once (`Admitted`), indexing by class the widths whose load and whose store the selection admits, each list ordered by the bits it moves through the selection, and refuses a width naming a class of no row of the file or a second width of one class and storage. A load or store of a register at a size is the width that moves exactly that many bytes, found by binary search, where the register's storage through the selection takes all of them, and is refused with `Refusal.access` when there is none, so the code never emits a row the selection lacks and never moves fewer bytes than asked. Every row the code appends goes through `code.append`, which refuses one the selection does not admit (`Refusal.unadmitted`).
+
+- RISC-V states `lb`, `lh`, `lw` and `ld` with their stores for x, `flh`, `flw`, `fld` and `flq` with theirs for f, and `vl1re8.v` and `vs1r.v` for one v register, whose size scales with the vector length. On RV32 no `ld` or `sd` is admitted, and without Zfh no `flh`. The whole register rows take their address in a register alone, so a nonzero offset is added into the scratch first.
+- A set carried later states its widths the same way: x86 `movdqu` and its VEX and EVEX forms for xmm, ymm and zmm, each admitted by the extension that has it, and AArch64 `ldr` and `str` of b, h, s, d and q registers.
+
 ## Call frame rules
 
 `Framed.facts` lists each rule beside the instruction that makes it true, before or after it: the canonical frame address as a register plus an offset (`.cfi_def_cfa`), a register saved at an offset from it (`.cfi_offset`), a register restored (`.cfi_restore`), and the remember and restore pair around each epilogue. Registers are masc's identities, so masc numbers them from its own rows. Offsets may scale, which masc writes as an expression.
@@ -55,5 +60,6 @@ The instructions come from the target's frame code (`Code`): `add`, `mask`, `sub
 ## Limits
 
 - The RISC-V code forms no offset that scales: the vector length is read from a CSR, which the machine form names no operand for. It also refuses an out-of-reach offset where it has no scratch register, as a spill mid-function past 2 KiB from its base.
+- RISC-V states no whole register load or store of a register group, since the register file names no group as one register yet.
 - Slots of more than one scale in one frame are refused.
 - A debug binding or an asm block cannot name a slot yet, so an unnamed slot always leaves the frame.
