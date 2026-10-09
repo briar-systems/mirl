@@ -1,0 +1,1024 @@
+# helpers for division, conversion and bulk memory: what no instruction of the
+# target does is a call of a helper mirl delivers, and what one does with an
+# operand the ir's operation traps on is given the test of that trap
+#
+# - a division or remainder the target runs, on a target whose division gives
+#   a result for a zero divisor or a signed overflow, is given the test the
+#   opcode's row states for each such trap, a branch to an `unreachable` that
+#   is the trap, and the checked mark, so it is never tested twice.
+# - a division at a width the target has no division for, an integer wider
+#   than its arithmetic among them, is given the tests of every trap its row
+#   states, since a helper traps on none, and calls the helper of its width.
+#   where the divisor's magnitude fits half a word, a chain of the target's
+#   divisions runs instead, two a word of the dividend from the top, each
+#   dividing the remainder so far and the next half word, so the common case
+#   never calls.
+# - a conversion between a float and an integer wider than the target's
+#   arithmetic calls the helper of its width and format. where the integer's
+#   value fits a word, or the float's does, the target's own conversion at
+#   the word runs instead.
+# - a copy or fill the target has no instruction for calls the helper of the
+#   length's width. a kept fill never calls anything another module could
+#   define: it is a loop of kept stores of a byte at a time, in place.
+#
+# the helpers are the rows of mirl.legal.helper.table, delivered into the
+# module before the function is rewritten. the tests and the native paths read
+# as the instruction they stand for, its location, site and secrecy, and the
+# call's results are as secret as the instruction's. whether a division traps
+# is public, since the trap shows it, so a test of a secret value is
+# declassified before its branch. the native path branches on the value, so
+# it is left out of a function that requires constant time, which calls the
+# helper whatever the value, and every helper runs in a time that depends on
+# no value but a length. a copy or fill whose length is secret is refused in
+# such a function. so the pass keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build;
+use folder: mirl.fold;
+use mirl.fold.algebra;
+use mirl.fold.algebra.Op;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.constant.Address;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use mirl.ir.opcode.Row;
+use mirl.ir.opcode.Trap;
+use mirl.ir.place.Named;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Declaration;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.legal.emit.Site;
+use mirl.legal.helper.deliver;
+use mirl.legal.helper.deliver.Number;
+use mirl.legal.helper.deliver.Want;
+use mirl.legal.helper.table.Operation;
+use mirl.opt.number;
+use mirl.pass.cache;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use targets: mirl.target;
+use mirl.target.Division;
+use mirl.target.Target;
+
+# the pass: it splits blocks and adds edges, so it keeps no analysis
+pub val HELPERS: Pass = Pass{name: "helpers", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: cache.NONE, time: Time.keeps{}, applies: wanted};
+
+val VECTOR:  str = "a vector division or conversion of integers the target has no instruction for, which is scalarised first";
+val LOGICAL: str = "a copy or fill through memory that cannot be reinterpreted";
+val SPACES:  str = "a copy between two address spaces";
+val SHAPE:   str = "a division, conversion, copy or fill whose operands are not as its row states";
+
+# whether a target's division gives a result for an operand the ir's traps on
+fun quiet(d: *Division) bool {
+    ret sel d.zero.quiet || sel d.overflow.quiet;
+}
+
+# whether the pass rewrites something on a target: a division that does not
+# trap, an integer wider than its arithmetic, a width with no division, or a
+# copy or fill with no instruction
+fun wanted(t: *Target) bool {
+    if (quiet(?t.caps.arithmetic.division))                 { ret true; }
+    if (sel t.caps.bulk.copy.none || sel t.caps.bulk.fill.none) { ret true; }
+    val top: opt[u32] = targets.widest(?t.caps);
+    if (sel top.none) { ret false; }
+    if (top.some < types.WIDTHS[$length_of(types.Widths) - 1]) { ret true; }
+    var i: usize = 0;
+    for (i < $length_of(types.Widths)) {
+        if (types.WIDTHS[i] > 1 && !natively(t, types.WIDTHS[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the width a division at a width runs at once the narrow integers are
+# widened, zero when it is wider than the target's arithmetic
+fun effective(t: *Target, bits: u32) u32 {
+    if (targets.computes(?t.caps, bits)) { ret bits; }
+    val up: opt[u32] = targets.wider(?t.caps, bits);
+    if (sel up.some) { ret up.some; }
+    ret 0;
+}
+
+# whether the target divides at a width with an instruction
+fun natively(t: *Target, bits: u32) bool {
+    val at: u32 = effective(t, bits);
+    ret at != 0 && targets.holds(t.caps.arithmetic.division.widths, at);
+}
+
+# how an instruction is rewritten
+# ---
+# none:      it is left as it is
+# tested:    a division the target runs, given the tests of the traps it
+#            does not take
+# divided:   a division the target has no division for, given the tests of
+#            its traps and a call of its helper
+# converted: a conversion of a wide integer, a call of its helper
+# called:    a copy or fill the target has no instruction for, a call of
+#            its helper
+# kept:      a kept fill the target has no instruction for, a loop of kept
+#            stores
+tag Form: u8 {
+    none;
+    tested;
+    divided;
+    converted;
+    called;
+    kept;
+}
+
+# an instruction to rewrite
+# ---
+# at:        the instruction
+# form:      how
+# operation: the helper's operation, unstated for a form that calls none
+# lane:      the integer lane of a division or conversion
+# row:       the opcode's row
+# widened:   a division the target runs at a width wider than its own
+# helper:    the helper it calls, once delivered
+# signature: the helper's function type, once delivered
+rec Item {
+    at:        Instruction;
+    form:      Form;
+    operation: Operation;
+    lane:      Lane;
+    row:       Row;
+    widened:   bool;
+    helper:    Function;
+    signature: Type;
+}
+
+# one visit
+# ---
+# c:     the run
+# f:     the function
+# t:     the target
+# word:  the widest width the target's arithmetic runs at
+# fast:  the native paths may branch on a value, as they may outside a
+#        function that requires constant time
+# s:     where the rewrite builds, once every helper is delivered
+rec Visit {
+    c:    *Context;
+    f:    Function;
+    t:    *Target;
+    word: u32;
+    fast: bool;
+    s:    Site;
+}
+
+fun type_of(b: *Body, x: Value) Type {
+    ret b.values.data[x.index].type;
+}
+
+fun secret(b: *Body, x: Value) bool {
+    ret b.values.data[x.index].secret;
+}
+
+# the integer lane of a type, refused for any other type
+fun lane(v: *Visit, ty: Type) res[Lane, Why] {
+    val got: res[opt[Lane], Why] = emit.lane_of(v.c.m, ty);
+    if (sel got.err)     { ret res[Lane, Why].err{got.err}; }
+    if (sel got.ok.none) { ret res[Lane, Why].err{Why.reason{SHAPE}}; }
+    ret res[Lane, Why].ok{got.ok.some};
+}
+
+# the helper of a division, by the algebra of its opcode
+fun division_of(code: Opcode) Operation {
+    val a: Op = algebra.algebra(code).op;
+    if (sel a.quotient_u)  { ret Operation.quotient_u{}; }
+    if (sel a.quotient_s)  { ret Operation.quotient_s{}; }
+    if (sel a.remainder_u) { ret Operation.remainder_u{}; }
+    if (sel a.remainder_s) { ret Operation.remainder_s{}; }
+    ret Operation.unstated{};
+}
+
+# whether a trap of a division's row is one the target's division does not
+# take. a division the target runs at a wider width than its own never
+# overflows there, so it takes no overflow
+fun untaken(d: *Division, trap: Trap, widened: bool) bool {
+    if (sel trap.zero)     { ret sel d.zero.quiet; }
+    if (sel trap.overflow) { ret widened || sel d.overflow.quiet; }
+    ret false;
+}
+
+fun tests_wanted(d: *Division, row: *Row, widened: bool) bool {
+    var n: usize = 0;
+    for (n < $length_of(opcode.Traps)) {
+        if (untaken(d, row.effects.traps[n], widened)) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
+fun item(i: Instruction, form: Form, operation: Operation, ln: Lane, row: Row) Item {
+    ret Item{at: i, form: form, operation: operation, lane: ln, row: row, widened: false, helper: Function{index: 0}, signature: Type{index: 0}};
+}
+
+fun nothing() res[opt[Item], Why] {
+    ret res[opt[Item], Why].ok{opt[Item].none{}};
+}
+
+fun planned(it: Item) res[opt[Item], Why] {
+    ret res[opt[Item], Why].ok{opt[Item].some{it}};
+}
+
+fun refused(why: str) res[opt[Item], Why] {
+    ret res[opt[Item], Why].err{Why.reason{why}};
+}
+
+fun classify_division(v: *Visit, b: *Body, i: Instruction, d: *InstructionData, row: Row) res[opt[Item], Why] {
+    if (d.operands.len != 2 || d.results.len != 1) { ret refused(SHAPE); }
+    val got: res[Lane, Why] = lane(v, type_of(b, d.results.data[0]));
+    if (sel got.err) { ret res[opt[Item], Why].err{got.err}; }
+    val ln: Lane = got.ok;
+    if (natively(v.t, ln.bits)) {
+        if (d.metadata.flags.checked)                          { ret nothing(); }
+        val widened: bool = effective(v.t, ln.bits) != ln.bits;
+        if (!tests_wanted(?v.t.caps.arithmetic.division, ?row, widened)) { ret nothing(); }
+        var it: Item = item(i, Form.tested{}, Operation.unstated{}, ln, row);
+        it.widened = widened;
+        ret planned(it);
+    }
+    if (ln.lanes != 0) { ret refused(VECTOR); }
+    val op: Operation = division_of(d.opcode);
+    if (sel op.unstated) { ret refused(SHAPE); }
+    ret planned(item(i, Form.divided{}, op, ln, row));
+}
+
+fun classify_conversion(v: *Visit, b: *Body, i: Instruction, d: *InstructionData, row: Row, e: folder.Entry) res[opt[Item], Why] {
+    if (d.operands.len != 1 || d.results.len != 1) { ret refused(SHAPE); }
+    var integer: Type      = type_of(b, d.results.data[0]);
+    var op:      Operation = Operation.to_integer_u{};
+    if (sel e.to_float) {
+        integer = type_of(b, d.operands.data[0]);
+        op      = Operation.to_float_u{};
+        if (e.to_float) { op = Operation.to_float_s{}; }
+    }
+    if (sel e.to_integer) {
+        if (e.to_integer) { op = Operation.to_integer_s{}; }
+    }
+    val got: res[Lane, Why] = lane(v, integer);
+    if (sel got.err)          { ret res[opt[Item], Why].err{got.err}; }
+    if (got.ok.bits <= v.word) { ret nothing(); }
+    if (got.ok.lanes != 0)    { ret refused(VECTOR); }
+    ret planned(item(i, Form.converted{}, op, got.ok, row));
+}
+
+fun classify_bulk(v: *Visit, b: *Body, i: Instruction, d: *InstructionData, row: Row, fill: bool) res[opt[Item], Why] {
+    if (d.operands.len != 3) { ret refused(SHAPE); }
+    var native: bool = sel v.t.caps.bulk.copy.native;
+    if (fill) { native = sel v.t.caps.bulk.fill.native; }
+    if (native)                                   { ret nothing(); }
+    if (!(sel v.t.caps.addressing.physical))      { ret refused(LOGICAL); }
+    if (!v.fast && secret(b, d.operands.data[2])) { ret res[opt[Item], Why].err{Why.timing{}}; }
+    val none: Lane = Lane{bits: 0, lanes: 0};
+    if (fill && d.metadata.flags.kept) { ret planned(item(i, Form.kept{}, Operation.unstated{}, none, row)); }
+    if (fill)                          { ret planned(item(i, Form.called{}, Operation.fill{}, none, row)); }
+    ret planned(item(i, Form.called{}, Operation.copy{}, none, row));
+}
+
+# the bulk operation a row is by the roles of its operands: a length and two
+# addresses copy, a length, an address and a stored value fill
+fun bulk_of(row: *Row) Operation {
+    var lengths:   u32 = 0;
+    var addresses: u32 = 0;
+    var stored:    u32 = 0;
+    val n:         u32 = opcode.fixed(row);
+    var k:         u32 = 0;
+    for (k < n) {
+        val role: opcode.Role = row.operands[k].role;
+        if (sel role.length)  { lengths = lengths + 1; }
+        if (sel role.address) { addresses = addresses + 1; }
+        if (sel role.stored)  { stored = stored + 1; }
+        k = k + 1;
+    }
+    if (lengths != 1)                 { ret Operation.unstated{}; }
+    if (addresses == 2 && stored == 0) { ret Operation.copy{}; }
+    if (addresses == 1 && stored == 1) { ret Operation.fill{}; }
+    ret Operation.unstated{};
+}
+
+# whether an opcode is one the pass rewrites where the target has no
+# instruction for it: a division, a conversion between a float and an
+# integer, a copy or a fill
+pub fun takes(code: Opcode) bool {
+    val got: opt[Row] = opcode.row(code);
+    if (sel got.none) { ret false; }
+    var row: Row = got.some;
+    if (opcode.divides(?row)) { ret true; }
+    val e: folder.Entry = folder.entry(code);
+    if (sel e.to_float || sel e.to_integer) { ret true; }
+    val bulk: Operation = bulk_of(?row);
+    ret !(sel bulk.unstated);
+}
+
+# how an instruction is rewritten, none when it is left as it is
+fun classify(v: *Visit, b: *Body, i: Instruction) res[opt[Item], Why] {
+    val d:   *InstructionData = ?b.instructions.data[i.index];
+    val got: opt[Row]         = opcode.row(d.opcode);
+    if (sel got.none) { ret nothing(); }
+    val row: Row = got.some;
+    if (opcode.divides(?row)) { ret classify_division(v, b, i, d, row); }
+    val e: folder.Entry = folder.entry(d.opcode);
+    if (sel e.to_float || sel e.to_integer)      { ret classify_conversion(v, b, i, d, row, e); }
+    val op: Operation = bulk_of(?row);
+    if (sel op.fill) { ret classify_bulk(v, b, i, d, row, true); }
+    if (sel op.copy) { ret classify_bulk(v, b, i, d, row, false); }
+    ret nothing();
+}
+
+# every instruction of the function to rewrite, in block order
+fun scan(v: *Visit, b: *Body, items: *vector.Vector[Item]) err[Why] {
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var n: usize = 0;
+            for (n < b.blocks.data[k].instructions.len) {
+                val got: res[opt[Item], Why] = classify(v, b, b.blocks.data[k].instructions.data[n]);
+                if (sel got.err) { ret err[Why].err{got.err}; }
+                if (sel got.ok.some) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Item](items, got.ok.some);
+                    if (sel pushed.err) { ret failure.lost(pushed.err); }
+                }
+                n = n + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun typed(e: types.Error) Why {
+    ret Why.ir{module.Error.types{e}};
+}
+
+# a function type of parameters and results
+fun signature_of(v: *Visit, params: Slice[Type], results: Slice[Type]) res[Type, Why] {
+    val made: res[Type, types.Error] = types.intern(?v.c.m.types, types.Shape.function{types.plain(params, results)});
+    if (sel made.err) { ret res[Type, Why].err{typed(made.err)}; }
+    ret res[Type, Why].ok{made.ok};
+}
+
+# what an item asks of the delivery, and the helper's function type
+fun want_of(v: *Visit, b: *Body, it: *Item, want: *Want) res[Type, Why] {
+    val d:  *InstructionData = ?b.instructions.data[it.at.index];
+    val no: Slice[Type]      = Slice[Type]{data: nil, size: 0};
+    if (sel it.form.divided) {
+        val ty:  Type    = type_of(b, d.results.data[0]);
+        @want = Want{operation: it.operation, bits: it.lane.bits, format: opt[types.Format].none{}, space: 0};
+        var two: [2]Type = [2]Type{ty, ty};
+        var one: [1]Type = [1]Type{ty};
+        ret signature_of(v, Slice[Type]{data: ?two[0], size: 2}, Slice[Type]{data: ?one[0], size: 1});
+    }
+    if (sel it.form.converted) {
+        val from:  Type = type_of(b, d.operands.data[0]);
+        val to:    Type = type_of(b, d.results.data[0]);
+        var float: Type = from;
+        if (sel it.operation.to_float_u || sel it.operation.to_float_s) { float = to; }
+        val fmt: res[types.Format, types.Error] = types.format(?v.c.m.types, float);
+        if (sel fmt.err) { ret res[Type, Why].err{typed(fmt.err)}; }
+        @want = Want{operation: it.operation, bits: it.lane.bits, format: opt[types.Format].some{fmt.ok}, space: 0};
+        var param:  [1]Type = [1]Type{from};
+        var result: [1]Type = [1]Type{to};
+        ret signature_of(v, Slice[Type]{data: ?param[0], size: 1}, Slice[Type]{data: ?result[0], size: 1});
+    }
+    val to:     Type                  = type_of(b, d.operands.data[0]);
+    val second: Type                  = type_of(b, d.operands.data[1]);
+    val length: Type                  = type_of(b, d.operands.data[2]);
+    val space:  res[u32, types.Error] = types.space(?v.c.m.types, to);
+    if (sel space.err) { ret res[Type, Why].err{typed(space.err)}; }
+    if (sel it.operation.copy) {
+        val other: res[u32, types.Error] = types.space(?v.c.m.types, second);
+        if (sel other.err)        { ret res[Type, Why].err{typed(other.err)}; }
+        if (other.ok != space.ok) { ret res[Type, Why].err{Why.reason{SPACES}}; }
+    }
+    val w: res[u32, types.Error] = types.width(?v.c.m.types, length);
+    if (sel w.err) { ret res[Type, Why].err{typed(w.err)}; }
+    @want = Want{operation: it.operation, bits: w.ok, format: opt[types.Format].none{}, space: space.ok};
+    var three: [3]Type = [3]Type{to, second, length};
+    ret signature_of(v, Slice[Type]{data: ?three[0], size: 3}, no);
+}
+
+# deliver the helper of every item that calls one
+fun deliver_all(v: *Visit, items: *vector.Vector[Item], scratch: *allocator.Allocator) err[Why] {
+    var n: usize = 0;
+    for (n < items.len) {
+        val it: *Item = ?items.data[n];
+        if (sel it.form.divided || sel it.form.converted || sel it.form.called) {
+            val got: res[*Body, module.Error] = module.body(v.c.m, v.f);
+            if (sel got.err) { ret err[Why].err{Why.ir{got.err}}; }
+            var want: Want           = Want{operation: Operation.unstated{}, bits: 0, format: opt[types.Format].none{}, space: 0};
+            val sig:  res[Type, Why] = want_of(v, got.ok, it, ?want);
+            if (sel sig.err) { ret err[Why].err{sig.err}; }
+            val helper: res[Function, Why] = deliver.deliver(v.c.m, v.t, scratch, want, sig.ok);
+            if (sel helper.err) { ret err[Why].err{helper.err}; }
+            it.helper    = helper.ok;
+            it.signature = sig.ok;
+        }
+        n = n + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun body_of(v: *Visit) *Body {
+    ret v.s.b;
+}
+
+fun data(v: *Visit, i: Instruction) *InstructionData {
+    ret ?v.s.b.instructions.data[i.index];
+}
+
+# a new block of the function, of no parameter or of one
+fun block(v: *Visit, param: opt[Declaration]) Block {
+    if (sel param.some) {
+        var one: [1]Declaration = [1]Declaration{param.some};
+        ret build.block(?v.s.bld, Slice[Declaration]{data: ?one[0], size: 1});
+    }
+    ret build.block(?v.s.bld, Slice[Declaration]{data: nil, size: 0});
+}
+
+fun joined(ty: Type, hidden: bool) opt[Declaration] {
+    ret opt[Declaration].some{Declaration{type: ty, secret: hidden, name: opt[View].none{}}};
+}
+
+fun bare() opt[Declaration] {
+    ret opt[Declaration].none{};
+}
+
+fun no_values() Slice[Value] {
+    ret Slice[Value]{data: nil, size: 0};
+}
+
+fun no_immediates() Slice[Immediate] {
+    ret Slice[Immediate]{data: nil, size: 0};
+}
+
+fun no_targets() Slice[Branch] {
+    ret Slice[Branch]{data: nil, size: 0};
+}
+
+# end the block the builder is at in a branch to a block, passing arguments
+fun jump(v: *Visit, to: Block, arguments: Slice[Value]) {
+    var targets: [1]Branch = [1]Branch{Branch{block: to, arguments: arguments}};
+    build.emit(?v.s.bld, Request{opcode: opcode.BR, operands: no_values(), immediates: no_immediates(), targets: Slice[Branch]{data: ?targets[0], size: 1}});
+}
+
+# end the block the builder is at in a branch on a condition
+fun fork(v: *Visit, condition: Value, yes: Block, no: Block) {
+    var ops:     [1]Value  = [1]Value{condition};
+    var targets: [2]Branch = [2]Branch{Branch{block: yes, arguments: no_values()}, Branch{block: no, arguments: no_values()}};
+    build.emit(?v.s.bld, Request{opcode: opcode.CBR, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: no_immediates(), targets: Slice[Branch]{data: ?targets[0], size: 2}});
+}
+
+# the trap: a block of one `unreachable`
+fun trap(v: *Visit, k: Block) {
+    build.at_end(?v.s.bld, k);
+    build.emit(?v.s.bld, Request{opcode: opcode.UNREACHABLE, operands: no_values(), immediates: no_immediates(), targets: no_targets()});
+}
+
+# move an instruction and those after it to a block
+fun move(v: *Visit, from: Block, at: u32, to: Block) err[Why] {
+    val built: err[Why] = emit.done(?v.s);
+    if (sel built.err) { ret built; }
+    ret failure.edit(body.move(v.c.m, v.f, from, at, to));
+}
+
+fun note(failed: *opt[Why], why: Why) {
+    val before: opt[Why] = @failed;
+    if (sel before.none) { @failed = opt[Why].some{why}; }
+}
+
+# an integer constant, or a vector of one
+fun integer(v: *Visit, ty: Type, x: Wide, failed: *opt[Why]) Value {
+    val made: res[Value, Why] = emit.constant(?v.s, ty, x);
+    if (sel made.err) {
+        note(failed, made.err);
+        ret Value{index: 0};
+    }
+    ret made.ok;
+}
+
+# a float constant of its encoding's bits
+fun float(v: *Visit, ty: Type, bits: u64, failed: *opt[Why]) Value {
+    var held:  [1]u64          = [1]u64{bits};
+    var lanes: [1]Bits         = [1]Bits{Bits{type: ty, words: Slice[u64]{data: ?held[0], size: 1}}};
+    val made:  res[Value, Why] = number.place(v.c.m, v.f, v.s.scratch, folder.Value{type: ty, lanes: Slice[Bits]{data: ?lanes[0], size: 1}});
+    if (sel made.err) {
+        note(failed, made.err);
+        ret Value{index: 0};
+    }
+    ret made.ok;
+}
+
+fun integer_type(v: *Visit, bits: u32, failed: *opt[Why]) Type {
+    val made: res[Type, types.Error] = types.intern(?v.c.m.types, types.Shape.integer{types.Integer{width: bits}});
+    if (sel made.err) {
+        note(failed, typed(made.err));
+        ret Type{index: 0};
+    }
+    ret made.ok;
+}
+
+# a condition true in any lane of a vector of conditions
+fun any(v: *Visit, x: Value, ln: Lane) Value {
+    if (ln.lanes == 0) { ret x; }
+    ret emit.unary(?v.s, opcode.REDUCE_OR, x);
+}
+
+# a condition made public: whether a division traps is shown by the trap
+fun public(v: *Visit, x: Value) Value {
+    if (build.failed(?v.s.bld))  { ret x; }
+    if (!secret(body_of(v), x)) { ret x; }
+    val was: bool = v.s.bld.secret;
+    build.secret(?v.s.bld, false);
+    val out: Value = emit.unary(?v.s, opcode.DECLASSIFY, x);
+    build.secret(?v.s.bld, was);
+    ret out;
+}
+
+# the condition under which a division of two operands traps, made public:
+# each trap of its row, or only those the target's division does not take
+fun condition(v: *Visit, it: *Item, ops: Slice[Value], ty: Type, every: bool, failed: *opt[Why]) Value {
+    val division: *Division = ?v.t.caps.arithmetic.division;
+    var cond:     Value     = Value{index: 0};
+    var have:     bool      = false;
+    var n:        usize     = 0;
+    for (n < $length_of(opcode.Traps)) {
+        val t:    Trap  = it.row.effects.traps[n];
+        val want: bool  = every || untaken(division, t, it.widened);
+        var made: Value = Value{index: 0};
+        var got:  bool  = false;
+        if (sel t.zero) {
+            if (want) {
+                made = any(v, emit.binary(?v.s, opcode.EQ, ops.data[t.zero], integer(v, ty, word.zero(), failed)), it.lane);
+                got  = true;
+            }
+        }
+        if (sel t.overflow) {
+            if (want) {
+                val low:   Value = emit.binary(?v.s, opcode.EQ, ops.data[t.overflow.dividend], integer(v, ty, word.least(it.lane.bits), failed));
+                val minus: Value = emit.binary(?v.s, opcode.EQ, ops.data[t.overflow.divisor], integer(v, ty, word.ones(it.lane.bits), failed));
+                made = any(v, emit.binary(?v.s, opcode.AND, low, minus), it.lane);
+                got  = true;
+            }
+        }
+        if (got && have) { cond = emit.binary(?v.s, opcode.OR, cond, made); }
+        if (got && !have) {
+            cond = made;
+            have = true;
+        }
+        n = n + 1;
+    }
+    if (!have) { note(failed, Why.reason{"a division tested for no trap"}); }
+    ret public(v, cond);
+}
+
+fun finish(v: *Visit, failed: opt[Why]) err[Why] {
+    if (sel failed.some) { ret err[Why].err{failed.some}; }
+    ret emit.done(?v.s);
+}
+
+# the operands of a division
+fun operands(v: *Visit, i: Instruction) [2]Value {
+    val d: *InstructionData = data(v, i);
+    ret [2]Value{d.operands.data[0], d.operands.data[1]};
+}
+
+# end a block in the test of a division's traps, going on to a block where
+# it does not trap
+fun guard(v: *Visit, it: *Item, k: Block, ops: Slice[Value], ty: Type, every: bool, then: Block, failed: *opt[Why]) {
+    val stop: Block = block(v, bare());
+    build.at_end(?v.s.bld, k);
+    fork(v, condition(v, it, ops, ty, every, failed), stop, then);
+    trap(v, stop);
+}
+
+# a division the target runs: the block is split before it and branches to a
+# trap where it would trap, and it is marked checked
+fun test(v: *Visit, it: *Item, k: Block, p: u32) err[Why] {
+    val i:      Instruction = it.at;
+    var ops:    [2]Value    = operands(v, i);
+    val ty:     Type        = type_of(body_of(v), data(v, i).results.data[0]);
+    var failed: opt[Why]    = opt[Why].none{};
+    build.derive(?v.s.bld, i);
+    val rest:  Block    = block(v, bare());
+    val moved: err[Why] = move(v, k, p, rest);
+    if (sel moved.err) { ret moved; }
+    guard(v, it, k, Slice[Value]{data: ?ops[0], size: 2}, ty, false, rest, ?failed);
+    val done: err[Why] = finish(v, failed);
+    if (sel done.err) { ret done; }
+    var md: Metadata = data(v, i).metadata;
+    md.flags.checked = true;
+    ret failure.edit(body.set_metadata(v.c.m, v.f, i, md));
+}
+
+# a call of a helper with arguments, as secret as the instruction it stands for
+fun call(v: *Visit, it: *Item, arguments: Slice[Value], hidden: bool, failed: *opt[Why]) Instruction {
+    val ptr: res[Type, types.Error] = types.intern(?v.c.m.types, types.Shape.pointer{types.Pointer{space: 0}});
+    if (sel ptr.err) {
+        note(failed, typed(ptr.err));
+        ret Instruction{index: 0};
+    }
+    val c:      Constant = build.constant(?v.s.bld, ConstantData.address{Address{type: ptr.ok, symbol: Symbol.function{it.helper}, offset: 0}});
+    val callee: Value    = build.use_constant(?v.s.bld, c);
+    var ops:    [4]Value = [4]Value{callee, callee, callee, callee};
+    var n:      usize    = 0;
+    for (n < arguments.size) {
+        ops[n + 1] = arguments.data[n];
+        n          = n + 1;
+    }
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{it.signature}, Immediate.named{Named.all{}}};
+    build.secret(?v.s.bld, hidden);
+    ret build.emit(?v.s.bld, Request{opcode: opcode.CALL, operands: Slice[Value]{data: ?ops[0], size: n + 1}, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: no_targets()});
+}
+
+# the magnitude of a signed value, and the fill of its sign
+fun magnitude(v: *Visit, x: Value, ty: Type, bits: u32, fill: *Value, failed: *opt[Why]) Value {
+    @fill = emit.binary(?v.s, opcode.SHR_S, x, integer(v, ty, word.small((bits - 1)::u64), failed));
+    ret signed(v, x, @fill);
+}
+
+# a value negated where a fill is all ones
+fun signed(v: *Visit, x: Value, fill: Value) Value {
+    ret emit.binary(?v.s, opcode.SUB, emit.binary(?v.s, opcode.XOR, x, fill), fill);
+}
+
+# the quotient or remainder of an unsigned wide dividend by a divisor below
+# half a word, by the target's division at the word: two divisions a word from
+# the top, each of the remainder so far joined with the next half word
+fun chain(v: *Visit, n: Value, divisor: Value, ty: Type, bits: u32, remainder: bool, failed: *opt[Why]) Value {
+    val w:     u32   = v.word;
+    val wty:   Type  = integer_type(v, w, failed);
+    val shift: Value = integer(v, wty, word.small((w / 2)::u64), failed);
+    val low:   Value = integer(v, wty, word.ones(w / 2), failed);
+    val dl:    Value = emit.convert(?v.s, opcode.TRUNC, divisor, wty);
+    var r:     Value = integer(v, wty, word.zero(), failed);
+    var q:     Value = integer(v, ty, word.zero(), failed);
+    var j:     u32   = bits / w;
+    for (j > 0) {
+        j = j - 1;
+        var part: Value = n;
+        if (j != 0) { part = emit.binary(?v.s, opcode.SHR_U, n, integer(v, ty, word.small((j * w)::u64), failed)); }
+        val wj:     Value    = emit.convert(?v.s, opcode.TRUNC, part, wty);
+        var digits: [2]Value = [2]Value{emit.binary(?v.s, opcode.SHR_U, wj, shift), emit.binary(?v.s, opcode.AND, wj, low)};
+        var qs:     [2]Value = [2]Value{wj, wj};
+        var h:      usize    = 0;
+        for (h < 2) {
+            val t: Value = emit.binary(?v.s, opcode.OR, emit.binary(?v.s, opcode.SHL, r, shift), digits[h]);
+            emit.flags(?v.s, CHECKED);
+            qs[h] = emit.binary(?v.s, opcode.DIV_U, t, dl);
+            emit.flags(?v.s, NO_FLAGS);
+            r = emit.binary(?v.s, opcode.SUB, t, emit.binary(?v.s, opcode.MUL, qs[h], dl));
+            h = h + 1;
+        }
+        var placed: Value = emit.convert(?v.s, opcode.EXT_U, emit.binary(?v.s, opcode.OR, emit.binary(?v.s, opcode.SHL, qs[0], shift), qs[1]), ty);
+        if (j != 0) { placed = emit.binary(?v.s, opcode.SHL, placed, integer(v, ty, word.small((j * w)::u64), failed)); }
+        q = emit.binary(?v.s, opcode.OR, q, placed);
+    }
+    if (remainder) { ret emit.convert(?v.s, opcode.EXT_U, r, ty); }
+    ret q;
+}
+
+# the flags of a division whose traps are tested before it
+val CHECKED: Flags = Flags{volatile: false, kept: false, bounded: false, checked: true};
+
+# put the parameter of the block that joins two paths in place of the
+# instruction's result, and take the instruction out
+fun join(v: *Visit, i: Instruction, rest: Block, failed: opt[Why]) err[Why] {
+    val done: err[Why] = finish(v, failed);
+    if (sel done.err) { ret done; }
+    val old:      Value    = data(v, i).results.data[0];
+    val new:      Value    = body_of(v).blocks.data[rest.index].parameters.data[0];
+    val replaced: err[Why] = failure.edit(body.replace(v.c.m, v.f, old, new, Records.follow{}));
+    if (sel replaced.err) { ret replaced; }
+    ret failure.edit(body.erase(v.c.m, v.f, i));
+}
+
+# a division the target has no division for: the tests of its traps, then a
+# call of its helper, or the chain of the target's divisions where the
+# divisor's magnitude fits half a word
+fun divide(v: *Visit, it: *Item, k: Block, p: u32) err[Why] {
+    val i:      Instruction = it.at;
+    var ops:    [2]Value    = operands(v, i);
+    val ty:     Type        = type_of(body_of(v), data(v, i).results.data[0]);
+    val hidden: bool        = secret(body_of(v), data(v, i).results.data[0]);
+    val tested: bool        = !data(v, i).metadata.flags.checked;
+    val signs:  bool        = sel it.operation.quotient_s || sel it.operation.remainder_s;
+    val keeps:  bool        = sel it.operation.remainder_u || sel it.operation.remainder_s;
+    val fast:   bool        = v.fast && v.word % 2 == 0 && targets.holds(v.t.caps.arithmetic.division.widths, v.word);
+    var failed: opt[Why]    = opt[Why].none{};
+    val args:   Slice[Value] = Slice[Value]{data: ?ops[0], size: 2};
+    build.derive(?v.s.bld, i);
+
+    if (!fast) {
+        if (tested) {
+            val rest:  Block    = block(v, bare());
+            val moved: err[Why] = move(v, k, p, rest);
+            if (sel moved.err) { ret moved; }
+            guard(v, it, k, Slice[Value]{data: ?ops[0], size: 2}, ty, true, rest, ?failed);
+            build.derive(?v.s.bld, i);
+        }
+        build.replacing(?v.s.bld, i);
+        call(v, it, args, hidden, ?failed);
+        ret finish(v, failed);
+    }
+
+    val rest:  Block    = block(v, joined(ty, hidden));
+    val split: Block    = block(v, bare());
+    val near:  Block    = block(v, bare());
+    val far:   Block    = block(v, bare());
+    val moved: err[Why] = move(v, k, p, rest);
+    if (sel moved.err) { ret moved; }
+    if (tested) { guard(v, it, k, Slice[Value]{data: ?ops[0], size: 2}, ty, true, split, ?failed); }
+    or {
+        build.at_end(?v.s.bld, k);
+        jump(v, split, no_values());
+    }
+
+    build.at_end(?v.s.bld, split);
+    var n:     Value = ops[0];
+    var m:     Value = ops[1];
+    var nfill: Value = ops[0];
+    var mfill: Value = ops[1];
+    if (signs) {
+        n = magnitude(v, ops[0], ty, it.lane.bits, ?nfill, ?failed);
+        m = magnitude(v, ops[1], ty, it.lane.bits, ?mfill, ?failed);
+    }
+    val above: Value = emit.binary(?v.s, opcode.SHR_U, m, integer(v, ty, word.small((v.word / 2)::u64), ?failed));
+    fork(v, emit.binary(?v.s, opcode.EQ, above, integer(v, ty, word.zero(), ?failed)), near, far);
+
+    build.at_end(?v.s.bld, near);
+    var out: Value = chain(v, n, m, ty, it.lane.bits, keeps, ?failed);
+    if (signs && keeps)  { out = signed(v, out, nfill); }
+    if (signs && !keeps) { out = signed(v, out, emit.binary(?v.s, opcode.XOR, nfill, mfill)); }
+    var passed: [1]Value = [1]Value{out};
+    jump(v, rest, Slice[Value]{data: ?passed[0], size: 1});
+
+    build.at_end(?v.s.bld, far);
+    passed[0] = build.result(?v.s.bld, call(v, it, args, hidden, ?failed), 0);
+    build.secret(?v.s.bld, data(v, i).metadata.secret);
+    jump(v, rest, Slice[Value]{data: ?passed[0], size: 1});
+    ret join(v, i, rest, failed);
+}
+
+# the condition that a float converts exactly at the word: it is no nan and
+# lies inside the range of the word, which for an unsigned word starts at 0
+fun inside(v: *Visit, x: Value, ty: Type, signs: bool, failed: *opt[Why]) Value {
+    val fmt: res[types.Format, types.Error] = types.format(?v.c.m.types, ty);
+    if (sel fmt.err) {
+        note(failed, typed(fmt.err));
+        ret x;
+    }
+    val got: res[Number, Why] = deliver.number_of(fmt.ok);
+    if (sel got.err) {
+        note(failed, got.err);
+        ret x;
+    }
+    var num: Number = got.ok;
+    var top: i64    = v.word::i64;
+    if (signs) { top = top - 1; }
+    val bound: u64   = deliver.limit(?num, top);
+    val below: Value = emit.binary(?v.s, opcode.FLT_O, x, float(v, ty, bound, failed));
+    if (signs) { ret emit.binary(?v.s, opcode.AND, emit.binary(?v.s, opcode.FGT_O, x, float(v, ty, bound | (1u64 << (num.width - 1)::u64), failed)), below); }
+    ret emit.binary(?v.s, opcode.AND, emit.binary(?v.s, opcode.FGE_O, x, float(v, ty, 0, failed)), below);
+}
+
+# a conversion of a wide integer: a call of its helper, or the target's own
+# conversion at the word where the value fits one
+fun convert(v: *Visit, it: *Item, k: Block, p: u32) err[Why] {
+    val i:      Instruction  = it.at;
+    val code:   Opcode       = data(v, i).opcode;
+    var args:   [1]Value     = [1]Value{data(v, i).operands.data[0]};
+    val x:      Value        = args[0];
+    val from:   Type         = type_of(body_of(v), x);
+    val to:     Type         = type_of(body_of(v), data(v, i).results.data[0]);
+    val hidden: bool         = secret(body_of(v), data(v, i).results.data[0]);
+    val floats: bool         = sel it.operation.to_float_u || sel it.operation.to_float_s;
+    val signs:  bool         = sel it.operation.to_float_s || sel it.operation.to_integer_s;
+    val arg:    Slice[Value] = Slice[Value]{data: ?args[0], size: 1};
+    var failed: opt[Why]     = opt[Why].none{};
+    build.derive(?v.s.bld, i);
+    if (!v.fast) {
+        build.replacing(?v.s.bld, i);
+        call(v, it, arg, hidden, ?failed);
+        ret finish(v, failed);
+    }
+
+    val rest:  Block    = block(v, joined(to, hidden));
+    val near:  Block    = block(v, bare());
+    val far:   Block    = block(v, bare());
+    val moved: err[Why] = move(v, k, p, rest);
+    if (sel moved.err) { ret moved; }
+    val wty: Type = integer_type(v, v.word, ?failed);
+    build.at_end(?v.s.bld, k);
+    var fits: Value = x;
+    if (floats && signs) { fits = emit.binary(?v.s, opcode.EQ, emit.convert(?v.s, opcode.EXT_S, emit.convert(?v.s, opcode.TRUNC, x, wty), from), x); }
+    if (floats && !signs) {
+        val above: Value = emit.binary(?v.s, opcode.SHR_U, x, integer(v, from, word.small(v.word::u64), ?failed));
+        fits = emit.binary(?v.s, opcode.EQ, above, integer(v, from, word.zero(), ?failed));
+    }
+    if (!floats) { fits = inside(v, x, from, signs, ?failed); }
+    fork(v, fits, near, far);
+
+    build.at_end(?v.s.bld, near);
+    var out: Value = x;
+    if (floats) { out = emit.convert(?v.s, code, emit.convert(?v.s, opcode.TRUNC, x, wty), to); }
+    or {
+        var extend: Opcode = opcode.EXT_U;
+        if (signs) { extend = opcode.EXT_S; }
+        out = emit.convert(?v.s, extend, emit.convert(?v.s, code, x, wty), to);
+    }
+    var passed: [1]Value = [1]Value{out};
+    jump(v, rest, Slice[Value]{data: ?passed[0], size: 1});
+
+    build.at_end(?v.s.bld, far);
+    passed[0] = build.result(?v.s.bld, call(v, it, arg, hidden, ?failed), 0);
+    build.secret(?v.s.bld, data(v, i).metadata.secret);
+    jump(v, rest, Slice[Value]{data: ?passed[0], size: 1});
+    ret join(v, i, rest, failed);
+}
+
+# a copy or fill the target has no instruction for, a call of its helper in its place
+fun bulk(v: *Visit, it: *Item) err[Why] {
+    val d:      *InstructionData = data(v, it.at);
+    var args:   [3]Value         = [3]Value{d.operands.data[0], d.operands.data[1], d.operands.data[2]};
+    var failed: opt[Why]         = opt[Why].none{};
+    build.derive(?v.s.bld, it.at);
+    build.replacing(?v.s.bld, it.at);
+    call(v, it, Slice[Value]{data: ?args[0], size: 3}, false, ?failed);
+    ret finish(v, failed);
+}
+
+# a kept fill as a loop of kept stores of its byte, one address a step, the
+# store in the fill's place
+fun keep(v: *Visit, it: *Item, k: Block, p: u32) err[Why] {
+    val i:      Instruction = it.at;
+    val to:     Value       = data(v, i).operands.data[0];
+    val byte:   Value       = data(v, i).operands.data[1];
+    val count:  Value       = data(v, i).operands.data[2];
+    val lt:     Type        = type_of(body_of(v), count);
+    var failed: opt[Why]    = opt[Why].none{};
+    build.derive(?v.s.bld, i);
+    val head:  Block    = block(v, joined(lt, secret(body_of(v), count)));
+    val step:  Block    = block(v, bare());
+    val rest:  Block    = block(v, bare());
+    val moved: err[Why] = move(v, k, p, step);
+    if (sel moved.err) { ret moved; }
+    val after: err[Why] = move(v, step, 1, rest);
+    if (sel after.err) { ret after; }
+
+    build.at_end(?v.s.bld, k);
+    var start: [1]Value = [1]Value{integer(v, lt, word.zero(), ?failed)};
+    jump(v, head, Slice[Value]{data: ?start[0], size: 1});
+
+    build.at_end(?v.s.bld, head);
+    val at: Value = build.parameter(?v.s.bld, head, 0);
+    fork(v, emit.binary(?v.s, opcode.LT_U, at, count), step, rest);
+
+    build.at(?v.s.bld, step, 0);
+    var ops: [2]Value     = [2]Value{emit.binary(?v.s, opcode.PTR_ADD, to, at), byte};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{1}};
+    build.replacing(?v.s.bld, i);
+    build.flags(?v.s.bld, KEPT);
+    build.emit(?v.s.bld, Request{opcode: opcode.STORE, operands: Slice[Value]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+    build.flags(?v.s.bld, NO_FLAGS);
+    build.at_end(?v.s.bld, step);
+    var next: [1]Value = [1]Value{emit.binary(?v.s, opcode.ADD, at, integer(v, lt, word.small(1), ?failed))};
+    jump(v, head, Slice[Value]{data: ?next[0], size: 1});
+    ret finish(v, failed);
+}
+
+# the flags of a store no pass may drop
+val KEPT: Flags = Flags{volatile: false, kept: true, bounded: false, checked: false};
+
+fun rewrite(v: *Visit, it: *Item, k: Block, p: u32) err[Why] {
+    if (sel it.form.tested)    { ret test(v, it, k, p); }
+    if (sel it.form.divided)   { ret divide(v, it, k, p); }
+    if (sel it.form.converted) { ret convert(v, it, k, p); }
+    if (sel it.form.called)    { ret bulk(v, it); }
+    ret keep(v, it, k, p);
+}
+
+# no item stands at an instruction
+val UNPLANNED: u32 = 0xffffffff;
+
+# rewrite the divisions, conversions, copies and fills of one function
+#
+# every refusal comes before the first edit: the function is read and each
+# helper it needs delivered, and only then rewritten. a rewrite moves the rest
+# of its block to a block added after the others, so the walk reaches it
+# there, and what a rewrite makes is never an item.
+fun visit(u: *Unit) res[bool, Why] {
+    val c:     *Context                 = u.context;
+    val first: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel first.err) { ret res[bool, Why].err{Why.ir{first.err}}; }
+    val top: opt[u32] = targets.widest(?c.t.caps);
+    if (sel top.none) { ret res[bool, Why].err{Why.reason{"a target whose arithmetic runs at no width"}}; }
+
+    var held: arena.Arena;
+    val kept: err[allocator.Error] = arena.init(?held, c.m.a, 0);
+    if (sel kept.err) { ret res[bool, Why].err{Why.alloc{kept.err}}; }
+    fin { arena.dnit(?held); }
+    var lasting: allocator.Allocator;
+    arena.make(?lasting, ?held);
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var v: Visit;
+    v.c    = c;
+    v.f    = u.f;
+    v.t    = c.t;
+    v.word = top.some;
+    v.fast = !c.m.functions.data[u.f.index].data.constant_time;
+
+    var items:   vector.Vector[Item] = vector.init[Item](?lasting);
+    val scanned: err[Why]            = scan(?v, first.ok, ?items);
+    if (sel scanned.err) { ret res[bool, Why].err{scanned.err}; }
+    if (items.len == 0)  { ret res[bool, Why].ok{false}; }
+    val delivered: err[Why] = deliver_all(?v, ?items, ?scratch);
+    if (sel delivered.err) { ret res[bool, Why].err{delivered.err}; }
+
+    # the delivery may have moved the module's functions, so the body is read again
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    val b:     *Body              = got.ok;
+    var index: vector.Vector[u32] = vector.init[u32](?lasting);
+    val room:  res[usize, allocator.Error] = vector.reserve[u32](?index, b.instructions.len);
+    if (sel room.err) { ret res[bool, Why].err{Why.alloc{room.err}}; }
+    var n: usize = 0;
+    for (n < b.instructions.len) {
+        vector.push[u32](?index, UNPLANNED);
+        n = n + 1;
+    }
+    n = 0;
+    for (n < items.len) {
+        index.data[items.data[n].at.index] = n::u32;
+        n                                   = n + 1;
+    }
+
+    v.s = emit.init(c.m, u.f, b, ?scratch);
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var p: usize = 0;
+            for (p < b.blocks.data[k].instructions.len) {
+                val i: Instruction = b.blocks.data[k].instructions.data[p];
+                if (i.index::usize < index.len && index.data[i.index] != UNPLANNED) {
+                    val at: u32 = index.data[i.index];
+                    index.data[i.index] = UNPLANNED;
+                    arena.reset(?ar);
+                    val r: err[Why] = rewrite(?v, ?items.data[at], Block{index: k::u32}, p::u32);
+                    if (sel r.err) { ret res[bool, Why].err{r.err}; }
+                }
+                p = p + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
