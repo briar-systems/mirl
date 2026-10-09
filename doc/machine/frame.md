@@ -14,7 +14,7 @@ keeps_pointer(a, f, request)                                                 # r
 ## What it reads
 
 - From the convention row's `Stack.memory`: the alignment at a call, the red zone, the shadow space, where a call leaves the return address (`link`: pushed one word below the canonical frame address, in a register, or nowhere code reaches) and the frame pointer (`pointer`: its register, whether every function keeps it, and the record it heads, either linked at stated offsets from the canonical frame address or free).
-- From the resolved row: the preserved registers, the link and frame pointer registers, and the registers a call clobbers, from which the prologue's scratch register is the first of the stack pointer's class that carries no argument, result, indirect address, count or return address.
+- From the resolved row: the preserved registers, the link and frame pointer registers, and the registers a call clobbers, from which the prologue's and epilogues' scratch registers are those of the stack pointer's class that carry no argument, result, indirect address, count or return address, in the order the row lists its clobbers.
 - From masc: the stack pointer (the register flagged `STACK` that the selection admits), each saved register's storage through the selection's view, each instruction's transfer under its row's rules, the implicit writes some operand value of its row makes (masc's `may`), and its stack effect.
 - From the function: every slot with its area, size and alignment, and which slots an operand names.
 
@@ -38,7 +38,7 @@ A leaf that keeps no pointer, allocates nothing dynamically, has no scaled area 
 
 The function is made anew through its maker. The prologue opens the entry block, and an epilogue comes before every exit, a return or a jump to a symbol. A `dynamic` pseudo becomes the size rounded up to the alignment taken off the stack pointer, with the block just above the outgoing area. An `address` pseudo becomes the slot's base plus its offset. A `spill` or `reload` becomes the target's store or load of the slot's size. The saves are the same stores and loads at slots the frame adds after the function's own.
 
-The instructions come from the target's frame code (`Code`): `add`, `mask`, `sub`, `store` and `load`, each appending rows of masc's catalog. `mirl.isa.riscv.FRAME` is RISC-V's.
+The instructions come from the target's frame code (`Code`): `add`, `mask`, `sub`, `store` and `load`, each appending rows of masc's catalog. `mirl.isa.riscv.FRAME` is RISC-V's. Every move is made through `code.make`, which gives the code the first scratch it is offered under which every instruction of the move stands against its row's register constraints, trying each by making the move into a function of its own, and refuses with `Refusal.constrained` when none does (doc/machine/constraint.md).
 
 ## Call frame rules
 

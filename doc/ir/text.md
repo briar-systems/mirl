@@ -1,6 +1,6 @@
 # The text form
 
-A module and its text are interchangeable. The text form is the printed form of a module, written for people and for tests, and a front end may write it instead of calling the builder. `mirl.ir.text.print(w, m)` writes a module to any `std.io.writer.Writer`, and `mirl.ir.text.same(a, b)` compares two modules for structural equality. `mirl.ir.text.print` writes the grammar below. `mirl.ir.text.parse.parse(a, text)` reads a text that begins with its version line into a module, and `mirl.ir.text.parse.parse_body(a, text)` reads a text that has no version line, as the IR text files under `test/ir` do. A refusal names the line and the reason, and `mirl.ir.text.describe` spells it.
+A module and its text are interchangeable. The text form is the printed form of a module, written for people and for tests, and a front end may write it instead of calling the builder. `mirl.ir.text.print(w, m)` writes a module to any `std.io.writer.Writer`, and `mirl.ir.text.same(a, b)` compares two modules for structural equality. `mirl.ir.text.print` writes the grammar below. `mirl.ir.text.parse.parse(a, text)` reads a text that begins with its version line into a module, and `mirl.ir.text.parse.parse_body(a, text)` reads a text that has no version line, as the IR text files under `test/ir` do. `mirl.ir.text.parse.parse_into(m, a, text)` reads a text that has neither a version line nor a target line into a module that already holds other items, as the helpers legalisation delivers a helper written in the text form: its names resolve among the module's symbols and its own, and a name the module already holds is refused. A refusal names the line and the reason, and `mirl.ir.text.describe` spells it.
 
 ## Version and stability
 
@@ -54,7 +54,7 @@ function @f.main_1: fun(i32) -> (i32) linkage global visibility default {
 
 ## The grammar
 
-The grammar below is the grammar of the library as built. It is copied from the library's source without change, and it is the single statement of the text form.
+The grammar below is the single statement of the text form. `mirl.ir.text.parse` reads every construct of it but the inline assembly item, which it refuses as not supported yet, and `mirl.ir.text.print` writes nothing outside it.
 
 ```text
 grammar
@@ -66,8 +66,8 @@ written. it is LL(1) over the tokens below.
 tokens
 
   newline  = lf ;
-  word     = ( letter | "_" ) { letter | digit | "_" | "." } ;
   uint     = digit { digit } | "0x" hexdigit { hexdigit } ;
+  word     = plain ;                   ; any plain run that is not a uint
   string   = '"' { char | escape } '"' ;
   char     = any byte from 0x20 to 0x7e but '"' and "\" ;
   escape   = "\\" | '\"' | "\x" hexdigit hexdigit ;
@@ -109,14 +109,22 @@ names
 module
 
   module      = version target { item } ;
+  file        = target { item } ;
+  items       = { item } ;
   version     = "mirl" string newline ;
   target      = "target" string newline ;
   item        = newline | debug | global | function | attribute ;
 
-  the version line is the first line, and a reader refuses a version other
-  than its own. a symbol may be named before its item, so a reader resolves
-  symbols once every item is read. debug entries come first, globals next
-  and functions last, each symbol's attributes just after its item.
+  `parse` reads a module, `parse_body` a file and `parse_into` items. the
+  version line is the first line, and a reader refuses a version other than
+  its own, and refuses a version line in a file. a reader takes items in any
+  order. a symbol, a value or a block may be named before it is defined, and
+  so may a debug entry named from a body or a debug type named from a debug
+  type. any other debug entry is named after its line. a name nothing
+  defines is refused, naming it, and a refusal carries the line and column
+  of the token that caused it. the printer writes the debug entries first,
+  the globals next and the functions last, each symbol's attributes just
+  after its item and a blank line before each function.
 
 types
 
@@ -149,20 +157,21 @@ constants
               | "{" [ constant { "," constant } ] "}"
               | symbol [ ( "+" | "-" ) uint ] ;
 
-  a number of an integer type is its bits read unsigned, and `-` gives the
-  two's complement at the type's width. a number of a float type is the bits
-  of its encoding. the printer writes an integer of at most 64 bits in
-  decimal and any other number in hex. `zero` is every bit zero. braces hold
-  an aggregate's members, elements or lanes in order. a symbol is the
-  address of a function or global plus a byte offset, of a pointer type.
+  a number of an integer type is its bits read unsigned, and a number of a
+  float type is the bits of its encoding. `-` gives the two's complement of
+  those bits at the type's width. the printer writes an integer of at most
+  64 bits in decimal and any other number in hex. `zero` is every bit zero.
+  braces hold an aggregate's members, elements or lanes in order. a symbol
+  is the address of a function or global plus a byte offset, of a pointer
+  type.
 
 globals
 
   global      = [ "export" ] "global" symbol ":" type linkage [ "constant" ]
-                [ "align" uint ] [ "section" string word ] [ "tls" model ]
+                [ "align" uint ] [ "section" string name ] [ "tls" model ]
                 [ "=" constant ] newline ;
   model       = "general_dynamic" | "local_dynamic" | "initial_exec" | "local_exec" ;
-  linkage     = "linkage" word "visibility" word ;
+  linkage     = "linkage" name "visibility" name ;
 
   a function or global states its linkage, its binding and its visibility,
   spelled by the names of mink's symbol rows: local, global, weak, unique,
@@ -184,7 +193,7 @@ attributes
 functions
 
   function    = [ "export" ] "function" symbol ":" type linkage [ "constant_time" ]
-                [ [ "placed" places ] "{" newline { block } "}" ] newline ;
+                [ [ "placed" places ] "{" newline { newline } { block } "}" ] newline ;
   block       = label [ "(" param { "," param } ")" ] ":" newline { line } ;
   param       = local ":" [ "secret" ] type ;
   line        = newline | binding newline | instruction newline ;
@@ -195,9 +204,15 @@ functions
                 [ "volatile" ] [ "kept" ] [ "bounded" ] [ "checked" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
   entry       = operand | immediate | target ;
   operand     = local | constant ;
-  immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]" ) ;
+  immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]"
+                     | "all" | places ) ;
+  places      = "[" [ place { "," place } ] "]" ;
+  place       = ( "register" uint uint | "stack" uint | "operand" uint )
+                ( "fixed" | "scaled" uint ) fill ;
+  fill        = "exact" | "undefined" | "boxed"
+              | ( "sign" | "zero" | "declared" ) uint ;
   ordering    = "relaxed" | "acquire" | "release" | "acq_rel" | "seq_cst" ;
-  target      = label [ "(" operand { "," operand } ")" ] ;
+  target      = label [ "(" [ operand { "," operand } ] ")" ] ;
   assembly    = "asm" ... ;
 
   `kept` marks a store or a fill whose write no pass may take away (see
@@ -207,6 +222,14 @@ functions
 
   `constant_time` marks a function that must run in time independent of its
   secret values.
+
+  `placed` marks a body the abi legalisation has rewritten into pieces: its
+  entry parameters are the pieces, one per place in the list, and a function
+  that states it has a body. a `named` immediate is `all` or the count of
+  named arguments. a place is where its piece travels, how its size scales
+  and how the place is filled past the piece. a register place is masc's
+  class and number, a stack place a byte offset in the argument area and an
+  operand place a position in the target's own call form.
 
   a function without braces is declared here and defined by another module,
   so its binding is not local. its first block is its entry, whose
