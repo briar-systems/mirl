@@ -15,7 +15,7 @@ A set's `Table` lists its moves and its swaps. A `Move` names the class it write
 
 - A move is admitted when the selection admits its row's requirements. It moves a pair only where both locations' storage through the selection is exactly its bits, so a class whose width follows an extension states one move per width and exactly one fits. RISC-V's float registers state `fsgnj.s`, `fsgnj.d` and `fsgnj.q`, and f, d or q picks one.
 - The index groups the admitted moves by the pair of class keys and the swaps by class key, each list ordered by storage, so a pair's move is a binary search. A second admitted move of one pair and one storage is refused, and so is a move naming a class of no register file of the locations.
-- `mirl.isa.riscv.MOVES` is RISC-V's: `addi` by zero for a general register, the sign injection of a float register at its width, and `vmv1r.v` for a vector register. RISC-V has no exchange of two registers and no copy between classes, so it states neither.
+- `mirl.target.register.riscv.isa.MOVES` is RISC-V's: `addi` by zero for a general register, the sign injection of a float register at its width, and `vmv1r.v` for a vector register. RISC-V has no exchange of two registers and no copy between classes, so it states neither.
 
 ## The lowering
 
