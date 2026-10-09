@@ -21,6 +21,8 @@ An emitted operand comes from the pattern (a register an operand is in, a consta
 - `scratch` is a temporary of a class of the register file. `fresh` takes its class from a value's type, which a temporary inside a float constant's expansion cannot, since only an integer register can hold the bits.
 
 - `width` is the bits of a value's integer type and `register` the bits of the target's general register, each as an immediate. A rule passes them to a loop's parameters, so one loop serves every width the rule's guard admits.
+- `ordered` is the immediate a target's `Forms` give the ordering a node states, one immediate per ir ordering, as RISC-V's aq and rl bits. The ordering is the join of every ordering immediate the node's ir row holds, so a compare and exchange's success and failure are read as one, the weakest ordering at least as strong as both (`mirl.ir.opcode.joined`). A node whose row holds no ordering immediate is refused by the table check as `unordered`.
+- `tied` is one register an instruction both reads and writes, the value of an operand in and a result of the root out, at a row position masc states read and written, as `amocas` reads the value expected and gives the value held. The allocator gives both halves one location and copies the value in first when it is read again later.
 
 An emitted instruction is a row, a pseudo or a target's loop (see [loops](loop.md)). A rule whose expansion holds a loop is admitted only when the selection admits every row of the loop's steps, and the table check refuses a loop that breaks the loop schema, one the set's loops do not hold, and, as `breached`, one whose body breaks the constraint of the set's loops.
 
@@ -48,6 +50,8 @@ The other half of the allocator's request is the allowed set. `allowed.of_machin
 A value of an aggregate type has no register and is refused as `aggregate`. The abi legalisation leaves one only where a value is loaded whole from memory, which a later legalisation has to split.
 
 ## Choosing among rules
+
+A rule's guard is its type tests, its `orderings` and its hook. `orderings` is the set of orderings of its root the rule is chosen for, read as an `ordered` source reads them, or nil for a rule that takes any. So a target whose forms differ in their instructions and not only in an immediate, as a RISC-V load is plain when relaxed and fenced when acquire, states one rule per form, and the selection never branches on an ordering. A rule naming orderings of a root whose row holds none is refused as `unordered`.
 
 Of the rules for an instruction whose guard holds, the least cost wins. Of equal cost the earlier row in the target's table wins. This is the whole tie-break. A target that cares about a choice gives its rules different costs, and never relies on a row's place to express a preference it has not costed.
 
