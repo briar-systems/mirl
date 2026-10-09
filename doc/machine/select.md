@@ -24,6 +24,10 @@ A guard's hook reads the matched instructions through `mirl.machine.select.match
 
 Three sources name what only the engine knows. `slot` is the frame slot an `alloca` root asks for, of its type's size at its alignment. `partner` is the address of an earlier instruction of the same expansion under a relocation kind, which labels that instruction, as a pc-relative low part names its high part. `lookup` is the runtime function the target's general dynamic thread-local access calls, which the module declares. An emitted instruction may also state the registers it reads and writes beyond its operands and row, as the call to the lookup reads and writes its argument register.
 
+## Shared nodes
+
+A pattern's node is consumed, and emits nothing, when its parent is consumed and the parent is the only use of its results. A node several patterns read is shared. The engine counts the node slots of chosen patterns that read each instruction, and when that count equals the uses of the instruction's results, every use is a pattern and the instruction is consumed, each pattern repeating its computation. Only an instruction whose opcode row neither reads, writes nor traps is repeated. Any other is selected once, on its own, and the patterns that would read it do not match. This concerns selection of shared nodes and no particular opcode.
+
 ## Calls, entries and returns
 
 The abi legalisation leaves every call, entry and return in piece form, each piece a scalar at the place the convention gave it (see [the ir](../ir.md)). Selection never classifies. It reads the places.
