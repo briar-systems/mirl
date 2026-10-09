@@ -134,7 +134,7 @@ types
   float       = word ;                    ; a number format row's name: binary32
   pointer     = "ptr" [ "<" uint ">" ] ;  ; its address space, 0 when left out
   vector      = "vec" "<" uint "," type ">" ;            ; lanes, lane type
-  array       = "array" "<" uint "," type ">" ;          ; count, element type
+  array       = "array" "<" uint "," type [ "," "stride" uint ] ">" ;  ; count, element type, stated stride
   structure   = "struct" ( "{" [ types ] "}" | "at" "{" [ placed { "," placed } ] "}" ) ;
   placed      = uint ":" type ;           ; a member at its stated byte offset
   union       = "union" "{" [ types ] "}" ;
@@ -144,7 +144,8 @@ types
   types       = type { "," type } ;
 
   `struct at` states every member's offset, and a plain `struct` leaves
-  them to the data layout. the printer spells space 0 as a bare `ptr`.
+  them to the data layout. an array with `stride` states the bytes from one
+  element to the next, and one without leaves them to the data layout. the printer spells space 0 as a bare `ptr`.
 
   a parameter or result of a signature may state how an integer is extended,
   `sext` or `zext`, and states none by leaving the word out. it is part of
