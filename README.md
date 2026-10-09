@@ -19,11 +19,11 @@ mirl never reaches past masc. A front end asks mirl for data layout and calling 
 
 - `mirl.ir` holds the types, values, instructions and modules, and `mirl.ir.text` the text form. The IR is in SSA form with block parameters, and every opcode's typing rule and effects live in one table.
 - `mirl.build` is the builder and `mirl.verify` the verifier.
-- `mirl.target` is the target record. A target declares its capabilities, data layout and calling conventions as data, and the pipeline is chosen from those declarations.
+- `mirl.target` is the target record. A target declares its capabilities, data layout and calling conventions as data, and the pipeline is chosen from those declarations. Each family sits in `mirl.target.<family>`, with the register family's members, such as RISC-V, one level below it.
 - `mirl.pass` holds the pass contract and schedule, `mirl.opt` the optimisation passes and `mirl.legal` legalisation.
 - `mirl.machine` is the machine form below the IR, with selection, register allocation, frames, block layout and emission as its children.
 - `mirl.debug` produces debug information from the IR's debug tables, and `mirl.ct` preserves and validates secrecy and constant time.
-- `mirl.structure` turns any control flow graph into structured regions for the SPIR-V (`mirl.spirv`) and WebAssembly (`mirl.wasm`) families.
+- `mirl.structure` turns any control flow graph into structured regions for the SPIR-V (`mirl.target.spirv`) and WebAssembly (`mirl.target.wasm`) families.
 
 The IR is specified in [doc/ir.md](doc/ir.md).
 

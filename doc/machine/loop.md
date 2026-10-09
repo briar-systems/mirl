@@ -55,4 +55,4 @@ Selection admits a rule whose expansion holds a loop only when the target's sele
 
 ## The text form
 
-A loop is spelled `loop <name>` and its operands, a parameter as its number: `loop field_add x10, x11, x12, 8, 64, 3, 1, x5, x6, x7, x28, x29`. The environment of a text holds the loops mirl carries for its set, from `mirl.isa.loops`, indexed by name once. A loop no stage expanded is refused by emission as a pseudo.
+A loop is spelled `loop <name>` and its operands, a parameter as its number: `loop field_add x10, x11, x12, 8, 64, 3, 1, x5, x6, x7, x28, x29`. The environment of a text holds the loops mirl carries for its set, from `mirl.target.register.isa` (`loops_of`), indexed by name once. A loop no stage expanded is refused by emission as a pseudo.
