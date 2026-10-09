@@ -14,7 +14,8 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 
 - `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. A machine opened for another target than the one given is refused at entry (`Error.foreign`), before anything is compiled. The machine reaches its selection table, frame code and moves through the row of `mirl.isa.rows` carrying the instruction set its basis holds (`rows.of`), which masc found once when the machine was opened, so compilation names no set and looks nothing up by architecture again.
 - Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md), its loops expanded (doc/machine/loop.md) and laid out. The functions are then emitted into one object.
-- A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
+- The steps are stated once, as the rows of `STAGES`, each a name and a run that reads the form the steps before it left (selected, allocated, framed, laid out) and gives the next. `through` runs one function through a sequence of steps, verifies it after each when the compilation is checked and hands it to a `Watch` when one is given. `compile` runs `STAGES` with no watch. The machine corpus walk (`src/machine/corpus.mach`) runs the same `STAGES` through `through`, its clobber and piece checks attached to the steps they name, so a step added to `STAGES` runs there with no edit to the walk.
+- A function refused at a step is `Error.function`, naming the function, the step and what refused it with its own error. A step given a form the steps before it did not leave is `Stage.misplaced`, and a sequence that ends before layout is `Stage.unfinished`. A refusal before any function, or by emission, is its own case.
 
 ## The entry and `mirl emit`
 
@@ -22,7 +23,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 - `options.checked` verifies the module after every pass and every function of the machine form after every stage: selection, allocation, the frame, the lowering of copies, the expansion of loops and layout. The machine form verifier (`mirl.machine.verify`) holds that every instruction a block places is one of the function's own, placed once, and stands against its opcode's row.
 - `options.machine` and `options.listing` name writers for the machine form text of the laid out functions and masc's listing of the object, in the set's default syntax. Both are written only once the object is made, so a refused compilation writes nothing.
 - `mirl.compile.write(a, ?object, ?target, w)` lays the object out in the one object format the target's system states, through mink, and refuses a system that states none or several.
-- `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--checked` and `--body` are read as `mirl opt` reads them.
+- `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--extension`, `--checked` and `--body` are read as `mirl opt` reads them, and each `--extension` names one extension the build adds to the target's baseline through `mirl.target.machine.build`.
 - The example programs in `test/example/` (arithmetic, a loop, a call, a global and a recursive function) each carry a start stub that calls `main` and hands its result to `__mirl_exit`. One test walks every example through every kind, checked.
 
 ## The example lane
@@ -45,6 +46,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 ## Emission
 
 - One builder holds the object's sections. A function is a named label exposed as a function symbol of the binding and visibility its linkage states, placed at the target's function alignment in the text section. A block is an anonymous label.
+- A function symbol's size is its range: its own label and an anonymous label placed after its last instruction, before the alignment padding of whatever follows. masc measures the distance between them once it has laid the section out, so relaxation is counted and padding is not, and mirl never counts a byte. Each unit's end label is made before any function is named, so a symbol is exposed once with its range whether a call or its unit names it first. A function no unit emits states no size. A part of a function placed apart, as a cold part, would be a unit of its own symbol and range. The size is a fact of mink's neutral symbol, and how a container carries it is mink's: ELF states it as `st_size`, COFF in its function table, and Mach-O by the next symbol.
 - Every global the module defines is a named label exposed as a data symbol, or a thread-local one, of its linkage and its type's size, after the functions. It is placed in the section it states, or the one its facts pick (doc/ir.md), at its alignment or its type's. A section is opened once per name, and a global naming a section the code or another global names with another kind is refused. The globals that state no section share one section of each kind. A section is aligned to `code.text` when its kind executes and to `code.data` otherwise.
 - An initial value is its bytes, laid out by the data layout in the architecture's byte order, and a datum for each address in it, an absolute reference of the pointer's width to the symbol plus its offset, which masc relocates as a fixup. One every bit zero is zero fill, which holds no bytes in a zero filled section. A global the module does not define is an undefined symbol, named when an operand or a datum first names it.
 - An operand takes the masc value its row's position reads: a register, an immediate, an enumerant or a condition, or a label with a fixup. A block operand is a label of the operand's own fixup. A symbol operand names the function's or global's label and takes the fixup kind the set binds its relocation kind to, read through an index of the set's bindings built once. Where several fixup kinds are bound to one relocation kind, the operand's own is taken, else the emission is refused.
@@ -63,8 +65,6 @@ A global is refused, naming it, when its initial value holds an address and the 
 ## Limits
 
 - Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (#197, masc#41).
-- The object is checked in memory, structurally. Writing it as ELF and reading it back is #198, which waits for mink#23.
-- Function symbols carry no size, which is unknown until masc lays the section out.
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
