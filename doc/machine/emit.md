@@ -12,7 +12,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 
 ## Compilation
 
-- `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. A machine opened for another target than the one given is refused at entry (`Error.foreign`), before anything is compiled. The target reaches its selection table, frame code and moves through its row of `mirl.isa.rows`, so compilation names no set.
+- `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. A machine opened for another target than the one given is refused at entry (`Error.foreign`), before anything is compiled. The machine reaches its selection table, frame code and moves through the row of `mirl.isa.rows` carrying the instruction set its basis holds (`rows.of`), which masc found once when the machine was opened, so compilation names no set and looks nothing up by architecture again.
 - Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md), its loops expanded (doc/machine/loop.md) and laid out. The functions are then emitted into one object.
 - A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
 
@@ -63,7 +63,6 @@ A global is refused, naming it, when its initial value holds an address and the 
 ## Limits
 
 - Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (#197, masc#41).
-- The object is checked in memory, structurally. Writing it as ELF and reading it back is #198, which waits for mink#23.
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).

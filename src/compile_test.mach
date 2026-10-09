@@ -1,9 +1,10 @@
-# tests of writing an object, machine form in and the object format's bytes read back, on the risc-v rows
+# tests of the object file mirl.compile writes, read back through mink
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -11,21 +12,209 @@ use std.types.string.str_len;
 use std.types.view.View;
 
 use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
 use std.collections.vector;
 use io: std.io.writer;
 
+use mink.catalog.arch;
+use mink.catalog.trait;
+use mink.catalog.trait.Setting;
 use mink.fail.Fail;
 use mink.format.contract;
+use mink.format.contract.Input;
 use mink.format.registry;
+use mink.intern.Name;
 use mink.model.object;
+use mink.model.reloc;
+use mink.model.symbol;
+use mink.store.Bytes;
+use mink.table.Id;
 
 use mirl.compile;
-use mirl.ir.text.parse.refusal.Refusal;
-use fixture: mirl.machine.emit.emit_test;
-use reader:  mirl.machine.text.parse;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use ir_reader: mirl.ir.text.parse;
+use fixture:   mirl.machine.emit.emit_test;
+use reader:    mirl.machine.text.parse;
+use targets:   mirl.target;
+use mirl.target.Target;
+
+# arithmetic, a branch on it and a call to a function another module defines
+val TEXT: str = "target \"riscv64-linux\"\nfunction @callee: fun() -> () linkage global visibility default\nexport function @f: fun() -> () linkage global visibility default {\n^entry:\n    %a = add i64 5, i64 7\n    %b = mul %a, %a\n    %c = lt.s %b, i64 100\n    cbr %c, ^small, ^large\n^small:\n    call ptr @callee, signature fun() -> (), named all\n    ret\n^large:\n    ret\n}\n";
+
+# the name of the section or symbol, compared with `want`
+fun named(o: *object.Object, id: Id[Name], want: str) bool {
+    val n: View = object.name_of(o, id);
+    if (n.len != str_len(want)) { ret false; }
+    var i: usize = 0;
+    for (i < n.len) {
+        if (n.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the little endian word of `n` bytes at `at`
+fun word(p: *u8, at: usize, n: usize) u64 {
+    var v: u64   = 0;
+    var i: usize = n;
+    for (i > 0) {
+        i = i - 1;
+        v = (v << 8) | p[at + i]::u64;
+    }
+    ret v;
+}
+
+# whether `o` states the double float ABI
+fun states_double(o: *object.Object) bool {
+    val s: opt[Setting] = object.stated(o, ?arch.RISCV_FLOAT_ABI);
+    if (sel s.none) { ret false; }
+    val c: Setting = s.some;
+    if (!(sel c.choice)) { ret false; }
+    ret c.choice == ?arch.RISCV_DOUBLE;
+}
+
+# the shape the ir text above compiles to, whichever way it was held: one text
+# section, @f defined at its start, @callee undefined, a call pair and a relax
+# marker at the same offset naming @callee, and the double float ABI
+fun shape(o: *object.Object) i32 {
+    if (o.sections.count != 1) { ret 1; }
+    val text: *object.Section = ?o.sections.items[0];
+    if (!named(o, text.name, ".text")) { ret 2; }
+    var f:      i64   = -1;
+    var callee: i64   = -1;
+    var i:      usize = 0;
+    for (i < o.symbols.count) {
+        if (named(o, o.symbols.items[i].name, "f"))      { f = i::i64; }
+        if (named(o, o.symbols.items[i].name, "callee")) { callee = i::i64; }
+        i = i + 1;
+    }
+    if (f < 0 || callee < 0) { ret 3; }
+    val df: object.Definition = o.symbols.items[f].def;
+    if (!(sel df.placed))                                      { ret 4; }
+    if (df.placed.offset != 0 || df.placed.section.index != 0) { ret 4; }
+    val dc: object.Definition = o.symbols.items[callee].def;
+    if (sel dc.placed || !(sel dc.undefined))                                                              { ret 5; }
+    if (o.symbols.items[f].binding != ?symbol.GLOBAL || o.symbols.items[callee].binding != ?symbol.GLOBAL) { ret 6; }
+    if (o.relocs.count != 2)                                                                               { ret 7; }
+    if (o.relocs.items[0].kind != ?reloc.CALL_PLT_PAIR || o.relocs.items[1].kind != ?reloc.RELAX)          { ret 8; }
+    if (o.relocs.items[0].offset != o.relocs.items[1].offset)                                              { ret 9; }
+    val named_by: object.Target = o.relocs.items[0].target;
+    if (!(sel named_by.symbol))               { ret 10; }
+    if (named_by.symbol.index::i64 != callee) { ret 10; }
+    if (!states_double(o))                    { ret 11; }
+    ret 0;
+}
+
+# whether the object `b` holds the text section of `a` byte for byte, with its
+# alignment and flags, and the relocations of `a` at the same offsets and addends
+fun same_text(a: *object.Object, b: *object.Object) bool {
+    val x: *object.Section = ?a.sections.items[0];
+    val y: *object.Section = ?b.sections.items[0];
+    if (x.align != y.align || x.flags != y.flags || x.entsize != y.entsize) { ret false; }
+    val p: Bytes = object.bytes(a, ?x.contents);
+    val q: Bytes = object.bytes(b, ?y.contents);
+    if (p.len == 0 || p.len != q.len) { ret false; }
+    var i: usize = 0;
+    for (i < p.len) {
+        if (p.data[i] != q.data[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.relocs.count) {
+        if (a.relocs.items[i].offset != b.relocs.items[i].offset || a.relocs.items[i].addend != b.relocs.items[i].addend) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the bytes of an object file read back through mink into the neutral object `got`
+# ---
+# ret: 0, or the step that refused
+fun back(a: *allocator.Allocator, mem: *io.Memory, got: *object.Object) i32 {
+    val formats: res[registry.Registry, Fail] = registry.builtin();
+    if (sel formats.err) { ret 1; }
+    var r:    registry.Registry         = formats.ok;
+    var file: Input                     = Input{file: "f.o", data: mem.buf, len: mem.len};
+    val read: res[contract.Model, Fail] = registry.read(?r, a, ?file);
+    if (sel read.err) { ret 2; }
+    var model: contract.Model = read.ok;
+    fin { contract.release(?model); }
+    val converted: err[Fail] = contract.to_neutral(?model, got);
+    if (sel converted.err) { ret 3; }
+    ret 0;
+}
+
+# an ir text example compiled for riscv64-linux, written as an ELF object and
+# read back through mink states the same sections, symbols, relocations and
+# float ABI, and the file says so in its own header
+test compile__an_rv64_object_reads_back_from_elf {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val read: res[Module, ir_reader.Refusal] = ir_reader.parse_body(?a, View{data: TEXT, len: str_len(TEXT)});
+    if (sel read.err) { ret 1; }
+    var m: Module = read.ok;
+    fin { module.dnit(?m); }
+    val row: opt[*Target] = targets.by_name(module.target(?m));
+    if (sel row.none) { ret 2; }
+    val options: compile.Options                   = compile.Options{level: 0, checked: true, added: Slice[str]{data: nil, size: 0}, machine: opt[*io.Writer].none{}, listing: opt[*io.Writer].none{}};
+    val made:    res[object.Object, compile.Error] = compile.compile(?a, ?m, row.some, options);
+    if (sel made.err) { ret 3; }
+    var o: object.Object = made.ok;
+    fin { object.release(?o); }
+    val before: i32 = shape(?o);
+    if (before != 0) { ret 10 + before; }
+
+    var mem: io.Memory;
+    var out: io.Writer = io.memory_growing(?mem, ?a);
+    fin { io.memory_dnit(?mem); }
+    val wrote: err[compile.Unwritten] = compile.write(?a, ?o, row.some, ?out);
+    if (sel wrote.err) { ret 4; }
+
+    # the header of an ELF64 little endian relocatable file for RISC-V, whose
+    # flags carry the double float ABI (4) and compressed code (1), as the
+    # target's rv64gc baseline states
+    val p: *u8 = mem.buf;
+    if (mem.len < 64)                                              { ret 5; }
+    if (p[0] != 0x7f || p[1] != 'E' || p[2] != 'L' || p[3] != 'F') { ret 6; }
+    if (p[4] != 2 || p[5] != 1)                                    { ret 7; }
+    if (word(p, 16, 2) != 1)                                       { ret 8; }
+    if (word(p, 18, 2) != 243)                                     { ret 9; }
+    if (word(p, 48, 4) != 0x5)                                     { ret 40; }
+
+    var got: object.Object = object.make(?a, o.arch);
+    fin { object.release(?got); }
+    val read_back: i32 = back(?a, ?mem, ?got);
+    if (read_back != 0) { ret 40 + read_back; }
+    val after: i32 = shape(?got);
+    if (after != 0)           { ret 50 + after; }
+    if (!same_text(?o, ?got)) { ret 44; }
+    ret 0;
+}
+
+# an object that states no float ABI is refused by the writer, and nothing is written
+test compile__refuses_to_write_an_object_with_no_float_abi {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val row: opt[*Target] = targets.by_name(View{data: "riscv64-linux", len: 13});
+    if (sel row.none) { ret 1; }
+    var o: object.Object = object.make(?a, ?arch.RISCV64);
+    fin { object.release(?o); }
+    val unstated: opt[Setting] = object.stated(?o, ?arch.RISCV_FLOAT_ABI);
+    if (sel unstated.some) { ret 2; }
+    var mem: io.Memory;
+    var out: io.Writer = io.memory_growing(?mem, ?a);
+    fin { io.memory_dnit(?mem); }
+    val wrote: err[compile.Unwritten] = compile.write(?a, ?o, row.some, ?out);
+    if (!(sel wrote.err)) { ret 3; }
+    val why: compile.Unwritten = wrote.err;
+    if (!(sel why.format)) { ret 4; }
+    if (mem.len != 0)      { ret 5; }
+    ret 0;
+}
 
 # the bytes of `s` appended to `v`
-#[testing]
 fun put(v: *vector.Vector[u8], s: str) bool {
     var i: usize = 0;
     for (i < str_len(s)) {
@@ -37,7 +226,6 @@ fun put(v: *vector.Vector[u8], s: str) bool {
 }
 
 # a function that branches over `adds` four byte adds to its return
-#[testing]
 fun branching(v: *vector.Vector[u8], name: str, adds: usize) bool {
     if (!put(v, "function @") || !put(v, name) || !put(v, " {\n^0:\n    beq x10, x0, ^2\n    jal x0, ^1\n^1:\n")) { ret false; }
     var i: usize = 0;
@@ -63,7 +251,7 @@ test compile__an_elf_function_symbol_is_sized_by_its_laid_out_length {
     if (!branching(?text, "f", 1024)) { ret 3; }
     # g's lands 12 bytes on and stays as it is
     if (!branching(?text, "g", 2)) { ret 4; }
-    val read: res[reader.Unit, Refusal] = reader.parse_body(?x.a, ?x.m, View{data: text.data, len: text.len});
+    val read: res[reader.Unit, ir_reader.Refusal] = reader.parse_body(?x.a, ?x.m, View{data: text.data, len: text.len});
     if (sel read.err) { ret 5; }
     var u: reader.Unit = read.ok;
     fin { reader.dnit(?u); }
@@ -76,18 +264,10 @@ test compile__an_elf_function_symbol_is_sized_by_its_laid_out_length {
     fin { io.memory_dnit(?held); }
     val wrote: err[compile.Unwritten] = compile.write(?x.a, ?o, ?x.t, ?w);
     if (sel wrote.err) { ret 6; }
-    val formats: res[registry.Registry, Fail] = registry.builtin();
-    if (sel formats.err) { ret 7; }
-    var r:    registry.Registry         = formats.ok;
-    var in:   contract.Input            = contract.Input{file: "sized.o", data: held.buf, len: held.len};
-    val back: res[contract.Model, Fail] = registry.read(?r, ?x.a, ?in);
-    if (sel back.err) { ret 8; }
-    var model: contract.Model = back.ok;
-    fin { contract.release(?model); }
-    var again: object.Object = object.make(?x.a, nil);
+    var again: object.Object = object.make(?x.a, o.arch);
     fin { object.release(?again); }
-    val neutral: err[Fail] = contract.to_neutral(?model, ?again);
-    if (sel neutral.err) { ret 9; }
+    val read_back: i32 = back(?x.a, ?held, ?again);
+    if (read_back != 0) { ret 6 + read_back; }
     # f: bne and jal, 8, then 1024 adds of 4 (add x5, x6, x7 has no compressed form), then c.jr, 2: 4106
     # g: beq, 4, then two adds, 8, then c.jr, 2: 14
     if (fixture.size_of(?again, "f") != 4106) { ret 20; }
