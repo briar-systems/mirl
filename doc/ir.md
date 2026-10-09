@@ -89,7 +89,7 @@ A **constant** is typed and owned by its module. It is one of
 - an aggregate of constants, one per member, element or lane, in order,
 - an address, which is a function or global plus a signed byte offset, of a pointer type.
 
-An aggregate holds other constants, so an initial value can hold the addresses of globals and functions at any depth. An instruction uses a constant through a value. A function has one value for each constant it uses, the same one each time. A constant is always public.
+An aggregate holds other constants, so an initial value can hold the addresses of globals and functions at any depth. An instruction uses a constant through a value. In code, an address constant names a global, or names a function only as a call's callee, which is the function the call calls rather than an address value. Code takes a function's address only with `func.addr`, so a target whose function addresses are not data addresses selects them apart. A function has one value for each constant it uses, the same one each time. A constant is always public.
 
 Values and blocks may carry a name for the text form. A name carries no meaning, and the printer makes names unique within a function.
 
@@ -148,7 +148,7 @@ A row's vector class says how it applies to vectors.
 
 ### 5.3 Address formation
 
-A row states how it forms an address. Most form none. `ptr.add`, `ptrtoint` and `inttoptr` form or read one as a number, which only physical addressing gives meaning, so the verifier refuses them past legalisation on a target whose addressing is logical. `ptr.member` and `ptr.index` form one from the type they walk: the address of a member of a structure or of an element of an array, at the address they take. A target whose addressing is physical folds them to a `ptr.add` of the byte offset its data layout gives, and one whose addressing is logical keeps them, as SPIR-V's access chains reach memory.
+A row states how it forms an address. Most form none. `ptr.add`, `ptrtoint` and `inttoptr` form or read one as a number, which only physical addressing gives meaning, so the verifier refuses them past legalisation on a target whose addressing is logical. `ptr.member` and `ptr.index` form one from the type they walk: the address of a member of a structure or of an element of an array, at the address they take. A target whose addressing is physical folds them to a `ptr.add` of the byte offset its data layout gives, and one whose addressing is logical keeps them, as SPIR-V's access chains reach memory. `func.addr` forms the address of the function its immediate names, and is the only way code names one.
 
 ### 5.4 Effects
 
@@ -258,7 +258,9 @@ The reductions take one vector and give a scalar of its lane type. The integer r
 
 ### 6.8 Calls and returns
 
-`call` takes the callee's address, the arguments and an immediate stating the signature called through. Its results are the signature's results. `ret` takes the results of the function it is in. How arguments and results are passed is not in the IR. It is decided from the function type and the target (see [ir/target.md](ir/target.md)).
+`func.addr` gives the address of a function of the module, at the pointer type it states. What that address is comes from the target's `functions` declaration: a location as a data address is, or a slot of an indirect call table that only equality and an indirect call read (see [ir/target.md](ir/target.md)).
+
+`call` takes the callee, the arguments and an immediate stating the signature called through. A direct call names the function it calls as its callee, by the address constant of that function, and an indirect call takes a value, such as one `func.addr` gave. Its results are the signature's results. `ret` takes the results of the function it is in. How arguments and results are passed is not in the IR. It is decided from the function type and the target (see [ir/target.md](ir/target.md)).
 
 
 ## 7. Secrecy
@@ -324,6 +326,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 17 | `placement` | every section a global states is thread-local exactly when the global is, writable unless the global is constant, and zero filled only for a global that is not constant and whose initial value is every bit zero |
 | 18 | `thread` | no global's initial value holds the address of a thread-local global, stated in the module or declared, since it has no one static address and is reached only through code by its model |
 | 19 | `addressing` | past legalisation on a target that declares logical addressing, no instruction forms or reads an address as a number: no row whose address formation is arithmetic, which `ptr.add`, `ptrtoint` and `inttoptr` are |
+| 20 | `functions` | code names a function's address only through `func.addr`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
