@@ -70,6 +70,8 @@ The declared operations are in `declared.mach`, each with the job that closes it
 - `frem`, which no instruction does. The helpers legalisation calls the helper of its format in its place, since the RISC-V rows state no native `frem`, so it is not declared.
 - `mem.copy` and `mem.fill`, which no instruction does. The helpers legalisation turns each into a call of a helper, or a kept fill into a loop of kept stores, before selection (see [target](../ir/target.md)).
 - A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
+- `ptr.member` and `ptr.index`, which the address legalisation folds to a `ptr.add` of a byte offset, and `switch`, which the compare chain legalisation lowers to `eq` and `cbr` (see [target](../ir/target.md)). The rules select what they leave: a store or load at a member's constant offset takes it as its displacement, and a multiply of an index by an element size that is a power of two is a shift.
+- `extract` and `insert`, since the target holds aggregate values in no register. Nothing takes them apart before selection yet, so selection refuses them (#178).
 
 Some operations select only for the operands a base form covers.
 
