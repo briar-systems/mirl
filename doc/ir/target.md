@@ -32,7 +32,8 @@ The capability declarations are
 | `widths` | the address spaces and how a pointer into each is held, the register width, the widths integer arithmetic runs natively at, and the integer widths a value holds natively |
 | `vectors` | none, or a vector unit with a register width, the lane counts allowed and the lane types with how each is carried out (packed or by scalar expansion) |
 | `formats` | the number formats computed natively, each with the not-a-number it returns (`canonical`, `propagate` or `unspecified`), or none |
-| `arithmetic` | the widths with a native multiply of the low half, the multiply forms beyond it (one row per width and sign: the high half or the whole product, as signed, unsigned or mixed operands, or none), how a shift treats a count at or past the width (`wraps`, `undefined` or `saturates`), and the operations on single bits it selects as they stand (`both`, `either`, `differ`, `compare`, or none) |
+| `arithmetic` | the widths with a native multiply of the low half, the multiply forms beyond it (one row per width and sign: the high half or the whole product, as signed, unsigned or mixed operands, or none), how a shift treats a count at or past the width (`wraps`, `undefined` or `saturates`), the operations on single bits it selects as they stand (`both`, `either`, `differ`, `compare`, or none), and the widths of its native division with what it does with a zero divisor and with a signed overflow (`traps` or `quiet`) |
+| `bulk` | whether one instruction copies a run of bytes, and whether one fills it (`native` or `none`) |
 | `timing` | the operations that run in constant time, by operation, width and condition, or none |
 | `code` | the alignment of a function entry, a code section and a data section, and the bytes that pad code |
 | `attributes` | the attribute families the target accepts |
