@@ -34,6 +34,12 @@
 # the def slot and its value is not ended, so no value live across the
 # instruction is assigned it.
 #
+# a value whose group covers several registers, as a vector group under a
+# multiplier of two, covers them all: a virtual register's span is the most
+# registers any operand naming it covers under its instruction's grouping, and
+# a physical operand's group reads or writes every register of it. an
+# instruction whose grouping is refused refuses the liveness.
+#
 # a physical write ends the value of the location it names and no other, since
 # masc states which rows overlap but not which covers another. the value of a
 # register a narrower write overlaps stays live, which holds the allocator off
@@ -70,6 +76,8 @@ use mirl.ir.cfg.loops.Loops;
 use mirl.machine.alloc.location;
 use mirl.machine.alloc.location.Locations;
 use mirl.machine.class.Physical;
+use mirl.machine.constraint;
+use mirl.machine.constraint.Constrained;
 use mirl.machine.function;
 use mirl.machine.function.Function;
 use mirl.machine.instruction;
@@ -173,6 +181,7 @@ pub rec Conflict {
 # refused:   a register or cell of an operand or a stated location that the
 #            locations refused, and why
 # conflict:  two values held in one location at one position
+# ungrouped: an instruction whose grouping is refused, and why
 # size:      the positions do not fit
 pub tag Error: u8 {
     alloc: allocator.Error;
@@ -180,6 +189,7 @@ pub tag Error: u8 {
     unlocated: Site;
     refused:   Refused;
     conflict:  Conflict;
+    ungrouped: Constrained;
     size;
 }
 
@@ -194,6 +204,8 @@ pub tag Error: u8 {
 # uses:     each virtual register's uses, in position order
 # weights:  each virtual register's uses' weights summed
 # holds:    each location's holds, sorted and disjoint
+# spans:    each virtual register's span, the registers of its class its
+#           value covers from its location
 pub rec Live {
     virtuals: u32;
     order:    vector.Vector[u32];
@@ -204,6 +216,7 @@ pub rec Live {
     uses:     Lists[Use];
     weights:  vector.Vector[u64];
     holds:    Lists[Hold];
+    spans:    vector.Vector[u32];
 }
 
 # one read or write an instruction makes
@@ -362,15 +375,39 @@ fun tied_operand(b: *Build, id: Instruction, k: u32, t: Tied, pin: u32) err[Erro
     ret push_event(b, Event{value: d, write: true, kills: true, early: false, operand: k, fixed: dpin, tied: dtied});
 }
 
-# the reads and writes of one instruction: its operands by their roles, its
+# a virtual register's span grown to cover `n` registers
+fun widen(l: *Live, value: u32, n: u32) {
+    if (n > l.spans.data[value]) { l.spans.data[value] = n; }
+}
+
+# the reads and writes of the registers of a physical value's group after its
+# first, `n` registers in all, a write at the use slot when `early`
+fun rest(b: *Build, id: Instruction, k: u32, value: u32, n: u32, write: bool, early: bool) err[Error] {
+    if (is_virtual(b, value)) { ret err[Error].ok{}; }
+    var j: u32 = 1;
+    for (j < n) {
+        val loc: u32 = location.past(b.at, location_of(b, value), j);
+        if (loc == location.NONE) { ret unlocated(id, k); }
+        val pushed: err[Error] = push_event(b, Event{value: b.f.virtuals.len::u32 + loc, write: write, kills: write, early: early, operand: k, fixed: NONE, tied: NONE});
+        if (sel pushed.err) { ret pushed; }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the reads and writes of one instruction: its operands by their roles, each
+# over the registers its group covers under the instruction's grouping, its
 # row's implicit registers and flags, the locations it states it reads and
 # writes, and the clobbers the caller states
-fun gather(b: *Build, id: Instruction) err[Error] {
+fun gather(b: *Build, l: *Live, id: Instruction) err[Error] {
     val d:     *InstructionData = function.data(b.f, id);
     val count: u32              = d.operands.size::u32;
     val early: bool             = instruction.early(d.opcode);
     var k:     u32              = 0;
     for (k < count) {
+        val span: res[u32, constraint.Breach] = constraint.span_of(b.f, d, k);
+        if (sel span.err) { ret err[Error].err{Error.ungrouped{Constrained{instruction: id, breach: span.err}}}; }
+        val n:      u32        = span.ok;
         val o:      Operand    = d.operands.data[k];
         val role:   mo.Role    = instruction.role(d.opcode, count, k);
         val reads:  bool       = (role & mo.READ) != 0;
@@ -383,7 +420,10 @@ fun gather(b: *Build, id: Instruction) err[Error] {
             pin = at.ok;
         }
         var value: u32 = NONE;
-        if (sel o.virtual) { value = o.virtual.index; }
+        if (sel o.virtual) {
+            value = o.virtual.index;
+            widen(l, value, n);
+        }
         or (sel o.physical) {
             val got: res[u32, Error] = value_of(b, id, k, Register.physical{o.physical});
             if (sel got.err) { ret err[Error].err{got.err}; }
@@ -393,14 +433,28 @@ fun gather(b: *Build, id: Instruction) err[Error] {
         or (sel o.tied) {
             val tied: err[Error] = tied_operand(b, id, k, o.tied, pin);
             if (sel tied.err) { ret tied; }
+            val dv: res[u32, Error] = value_of(b, id, k, o.tied.dest);
+            if (sel dv.err) { ret err[Error].err{dv.err}; }
+            val sv: res[u32, Error] = value_of(b, id, k, o.tied.source);
+            if (sel sv.err)           { ret err[Error].err{sv.err}; }
+            if (is_virtual(b, dv.ok)) { widen(l, dv.ok, n); }
+            if (is_virtual(b, sv.ok)) { widen(l, sv.ok, n); }
+            val sr: err[Error] = rest(b, id, k, sv.ok, n, false, false);
+            if (sel sr.err) { ret sr; }
+            val dr: err[Error] = rest(b, id, k, dv.ok, n, true, false);
+            if (sel dr.err) { ret dr; }
         }
         if (value != NONE && reads) {
             val r: err[Error] = push_event(b, Event{value: value, write: false, kills: false, early: false, operand: k, fixed: pin, tied: NONE});
             if (sel r.err) { ret r; }
+            val more: err[Error] = rest(b, id, k, value, n, false, false);
+            if (sel more.err) { ret more; }
         }
         if (value != NONE && writes) {
             val w: err[Error] = push_event(b, Event{value: value, write: true, kills: true, early: early, operand: k, fixed: pin, tied: NONE});
             if (sel w.err) { ret w; }
+            val more: err[Error] = rest(b, id, k, value, n, true, early);
+            if (sel more.err) { ret more; }
         }
         k = k + 1;
     }
@@ -531,12 +585,12 @@ fun group_clobbers(b: *Build, clobbers: Slice[Clobber]) err[Error] {
 }
 
 # every instruction's reads and writes, in linear order
-fun gather_all(b: *Build) err[Error] {
+fun gather_all(b: *Build, l: *Live) err[Error] {
     var n: usize = 0;
     for (n < b.linear.len) {
         val pushed: res[usize, allocator.Error] = vector.push[u32](?b.first, b.events.len::u32);
         if (sel pushed.err) { ret alloc_err(pushed.err); }
-        val got: err[Error] = gather(b, b.linear.data[n]);
+        val got: err[Error] = gather(b, l, b.linear.data[n]);
         if (sel got.err)                { ret got; }
         if (b.events.len >= 0xffffffff) { ret err[Error].err{Error.size{}}; }
         n = n + 1;
@@ -547,7 +601,7 @@ fun gather_all(b: *Build) err[Error] {
 }
 
 # the first linear number of a block's instructions and one past its last
-fun span(l: *Live, k: u32) Segment {
+fun numbers_of(l: *Live, k: u32) Segment {
     ret Segment{from: l.starts.data[k] / 2, to: l.ends.data[k] / 2};
 }
 
@@ -562,7 +616,7 @@ fun local(b: *Build, l: *Live) err[Error] {
     var k: u32 = 0;
     for (k::usize < b.f.blocks.len) {
         val base: usize   = k::usize * b.words::usize;
-        val s:    Segment = span(l, k);
+        val s:    Segment = numbers_of(l, k);
         var n:    u32     = s.from;
         for (n < s.to) {
             val ev: Slice[Event] = events_of(b, n);
@@ -674,7 +728,7 @@ fun walk(b: *Build, l: *Live) err[Error] {
         i = i - 1;
         val k:    u32     = l.order.data[i];
         val base: usize   = k::usize * b.words::usize;
-        val s:    Segment = span(l, k);
+        val s:    Segment = numbers_of(l, k);
         var w:    u32     = 0;
         for (w < b.words) {
             var word: u64 = b.live_out.data[base + w::usize];
@@ -748,9 +802,13 @@ fun record_uses(b: *Build, l: *Live) err[Error] {
                 val item: res[usize, allocator.Error] = vector.push[Use](?b.use_items, Use{position: at, weight: w, write: e.write, instruction: b.linear.data[n], operand: e.operand, fixed: e.fixed, tied: e.tied});
                 if (sel item.err) { ret alloc_err(item.err); }
                 l.weights.data[e.value] = l.weights.data[e.value] + w;
-                if (e.fixed != NONE) {
-                    val held: err[Error] = hold(b, e.fixed, Hold{from: at, to: at + 1, owner: e.value});
+                var g: u32 = 0;
+                for (e.fixed != NONE && g < l.spans.data[e.value]) {
+                    val loc: u32 = location.past(b.at, e.fixed, g);
+                    if (loc == location.NONE) { ret unlocated(b.linear.data[n], e.operand); }
+                    val held: err[Error] = hold(b, loc, Hold{from: at, to: at + 1, owner: e.value});
                     if (sel held.err) { ret held; }
+                    g = g + 1;
                 }
             }
             j = j + 1;
@@ -864,6 +922,7 @@ fun empty(a: *allocator.Allocator) Live {
         uses:     Lists[Use]{first: vector.init[u32](a), items: vector.init[Use](a)},
         weights:  vector.init[u64](a),
         holds:    Lists[Hold]{first: vector.init[u32](a), items: vector.init[Hold](a)},
+        spans:    vector.init[u32](a),
     };
 }
 
@@ -880,7 +939,9 @@ fun run(b: *Build, l: *Live, clobbers: Slice[Clobber]) err[Error] {
     if (sel numbered.err) { ret numbered; }
     val grouped: err[Error] = group_clobbers(b, clobbers);
     if (sel grouped.err) { ret grouped; }
-    val gathered: err[Error] = gather_all(b);
+    val spanned: err[allocator.Error] = slice.fill[u32](?l.spans, b.f.virtuals.len, 1);
+    if (sel spanned.err) { ret alloc_err(spanned.err); }
+    val gathered: err[Error] = gather_all(b, l);
     if (sel gathered.err) { ret gathered; }
     val sets: err[Error] = local(b, l);
     if (sel sets.err) { ret sets; }
@@ -954,6 +1015,7 @@ pub fun dnit(l: *Live) err[allocator.Error] {
     keep(?failed, graph.release[Use](?l.uses));
     keep(?failed, vector.dnit[u64](?l.weights));
     keep(?failed, graph.release[Hold](?l.holds));
+    keep(?failed, vector.dnit[u32](?l.spans));
     ret failed;
 }
 
@@ -999,6 +1061,12 @@ pub fun uses(l: *Live, v: Virtual) Slice[Use] {
 # a virtual register's uses' weights summed
 pub fun weight_of(l: *Live, v: Virtual) u64 {
     ret l.weights.data[v.index];
+}
+
+# a virtual register's span, the registers of its class its value covers from
+# its location, one but for a group of several
+pub fun span(l: *Live, v: Virtual) u32 {
+    ret l.spans.data[v.index];
 }
 
 # a location's holds, sorted and disjoint
