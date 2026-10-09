@@ -47,4 +47,3 @@ An instruction is refused, naming the function, the instruction and the operand,
 - Global data is not emitted, so the address of a global is refused (#196, #181).
 - A `pseudo copy` or `parallel_copy` between registers is refused: no stage turns it into the target's move yet (#195).
 - Memory-shaped operand positions are refused (#43).
-- mirl computes a row's position among the catalog's for `relax.find` until masc keys relaxation by row (#199, masc#139).
