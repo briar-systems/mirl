@@ -89,7 +89,7 @@ A target declares the convention its calls are made under in `convention`: the r
 | `file` | the masc register file its registers are named in, none where there is none |
 | `word` | the bits of one argument word |
 | `floats` | the widest float passed in float registers, or none |
-| `passing`, `returning` | the argument and result registers by masc's names, each class in the order taken |
+| `passing`, `returning` | the argument and result registers by masc's register handles, each class in the order taken |
 | `preserved`, `reserved` | the registers a callee preserves whole, and those no call clobbers and nothing allocates |
 | `stack` | none, or a stack in memory with its alignment at a call, its red zone, its shadow space, where a call leaves the return address (`link`) and its frame pointer with the frame record it heads (`pointer`) |
 | `indirect` | what carries the address of a result passed by reference, and where a callee hands it back |
