@@ -13,7 +13,7 @@ A target holds
 - `caps`, its capability declarations,
 - `data`, the facts data layout reads,
 - `convention`, the calling convention its calls are made under (see [Argument passing](#argument-passing)),
-- `baseline`, the extensions code for it may assume, in masc's spelling, from which `mirl.target.machine.open` makes masc's selection, the registers it gives and the convention resolved through them,
+- `baseline`, the extensions code for it may assume, in masc's spelling, from which `mirl.target.machine.open` makes masc's selection, the registers it gives and the convention resolved through them. A build adds extensions on top of it through `mirl.target.machine.open_with`, which takes extension names as masc's catalog names them and refuses one it does not know by name, `choose` makes the selection alone for a target with no convention yet, and the machine holds the one resolved selection that selection, the convention and the allocator's allowed set read,
 - `addresses`, how code reaches an address (see [Addresses](#addresses)).
 
 `mirl.target.declared(t)` says whether a target is complete. Every declaration has an unstated zero case, so a row left zeroed reads as incomplete and never as an answer. A list that may rightly be empty sits under a case of its own, so an empty list is a stated answer.
@@ -102,7 +102,7 @@ A target declares the convention its calls are made under in `convention`: the r
 | `file` | the masc register file its registers are named in, none where there is none |
 | `word` | the bits of one argument word |
 | `floats` | the widest float passed in float registers, or none |
-| `passing`, `returning` | the argument and result registers by masc's names, each class in the order taken |
+| `passing`, `returning` | the argument and result registers by masc's register handles, each class in the order taken |
 | `preserved`, `reserved` | the registers a callee preserves whole, and those no call clobbers and nothing allocates |
 | `stack` | none, or a stack in memory with its alignment at a call, its red zone, its shadow space, where a call leaves the return address (`link`) and its frame pointer with the frame record it heads (`pointer`) |
 | `indirect` | what carries the address of a result passed by reference, and where a callee hands it back |

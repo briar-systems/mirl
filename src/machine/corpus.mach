@@ -1,0 +1,789 @@
+# the machine pipeline over the corpus: every IR text file under test/ir goes
+# through the schedule, selection, allocation and the frame at every level, on
+# every target that carries a machine, and the result is checked
+#
+# a target takes part when it declares a convention, a baseline and a
+# selection table, so a target added later joins by declaring its rows. a file
+# whose target carries none stays out of the walk, and that is the only reason
+# a file stays out. the checks read liveness of the allocated function, so
+# they do not trust the allocator's own proof:
+#
+# - no clobbered location holds a value across the call that clobbers it,
+# - every piece of an entry arrives in its placed register or incoming slot,
+#   and nothing else a call may clobber is read before it is written.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use ty: mirl.ir.type.table;
+use std.allocator;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+use std.print;
+
+use mirl.ir.function.Body;
+use mirl.ir.function.Entry;
+use mirl.ir.id;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use ir:   mirl.ir.opcode;
+use irow: mirl.ir.opcode.row;
+use mirl.ir.place.Placed;
+use ir_reader: mirl.ir.text.parse;
+use mirl.isa.rows;
+use mirl.isa.rows.Row;
+use mirl.machine.alloc.allocate;
+use mirl.machine.alloc.allocate.Allocation;
+use mirl.machine.alloc.allowed;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.live.Hold;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class.Memory;
+use mirl.machine.class.Physical;
+use mirl.machine.frame;
+use mirl.machine.frame.finish;
+use mirl.machine.frame.lay;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Framed;
+use mirl.machine.function;
+use mirl.machine.function.Area;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.select.engine;
+use mirl.machine.select.engine.Calls;
+use mirl.machine.select.engine.Selected;
+use mirl.machine.select.engine.Selector;
+use mirl.machine.select.engine.Unmatched;
+use mirl.machine.synthetic;
+use reader:    mirl.machine.text.parse;
+use ir_corpus: mirl.pass.corpus;
+use mirl.pass.driver;
+use mirl.pass.driver.Options;
+use mirl.pass.failure.Error;
+use mirl.pass.schedule.Level;
+use mirl.slice;
+use targets: mirl.target;
+use mirl.target.Target;
+use mirl.target.machine;
+use mirl.target.machine.Machine;
+
+use mo: masc.core.operand;
+use rf: masc.core.register;
+
+# a location no number names
+#[testing]
+val NONE: u32 = 0xffffffff;
+
+# a target's machine opened over the locations its registers and memories number
+# ---
+# a:         the allocator everything here takes
+# mc:        the machine, with its selection, registers and convention
+# memories:  the memory classes the target supplies
+# at:        the locations
+# clobbered: by location, whether a call under the convention leaves it undefined
+# link:      the location a call leaves its return address in, NONE when none
+#[testing]
+rec Bench {
+    a:         *allocator.Allocator;
+    mc:        Machine;
+    memories:  vector.Vector[*Memory];
+    at:        Locations;
+    clobbered: vector.Vector[bool];
+    link:      u32;
+}
+
+# mark the locations of some registers
+#[testing]
+fun marks(a: *allocator.Allocator, at: *Locations, ids: Slice[rf.Id]) res[vector.Vector[bool], allocator.Error] {
+    var out:    vector.Vector[bool]  = vector.init[bool](a);
+    val filled: err[allocator.Error] = slice.fill[bool](?out, location.count(at)::usize, false);
+    if (sel filled.err) {
+        vector.dnit[bool](?out);
+        ret res[vector.Vector[bool], allocator.Error].err{filled.err};
+    }
+    var i: usize = 0;
+    for (i < ids.size) {
+        val loc: opt[u32] = location.locate(at, Physical.register{ids.data[i]});
+        if (sel loc.some) { out.data[loc.some] = true; }
+        i = i + 1;
+    }
+    ret res[vector.Vector[bool], allocator.Error].ok{out};
+}
+
+# open a bench over a target, 0 or the step that failed
+#[testing]
+fun open(b: *Bench, a: *allocator.Allocator, t: *Target) u32 {
+    b.a = a;
+    val opened: err[machine.Error] = machine.open(?b.mc, a, t);
+    if (sel opened.err) { ret 1; }
+    b.memories = vector.init[*Memory](a);
+    var i: usize = 0;
+    for (i < t.memories.size) {
+        vector.push[*Memory](?b.memories, ?t.memories.data[i]);
+        i = i + 1;
+    }
+    val made: res[Locations, location.Error] = location.init(a, b.mc.registers.file, Slice[*Memory]{data: b.memories.data, size: b.memories.len});
+    if (sel made.err) {
+        vector.dnit[*Memory](?b.memories);
+        machine.close(?b.mc);
+        ret 2;
+    }
+    b.at = made.ok;
+    val clobbered: res[vector.Vector[bool], allocator.Error] = marks(a, ?b.at, b.mc.convention.clobbered);
+    if (sel clobbered.err) {
+        close_locations(b);
+        ret 3;
+    }
+    b.clobbered = clobbered.ok;
+    b.link      = NONE;
+    val link: opt[rf.Id] = b.mc.convention.link;
+    if (sel link.some) {
+        val at: opt[u32] = location.locate(?b.at, Physical.register{link.some});
+        if (sel at.some) { b.link = at.some; }
+    }
+    ret 0;
+}
+
+#[testing]
+fun close_locations(b: *Bench) {
+    location.dnit(?b.at);
+    vector.dnit[*Memory](?b.memories);
+    machine.close(?b.mc);
+}
+
+#[testing]
+fun close(b: *Bench) {
+    vector.dnit[bool](?b.clobbered);
+    close_locations(b);
+}
+
+# why a pipeline output was refused
+# ---
+# alloc:  the allocator refused storage
+# live:   liveness of the output was refused
+# across: a clobber of a location that holds a value across it
+# unread: a location a call may clobber that is read at the entry and that no
+#         piece of the entry places
+# lost:   a location an entry piece is placed in that nothing reads at the entry
+# slot:   an entry piece placed on the stack at this offset, with no incoming
+#         slot there
+#[testing]
+tag Refusal: u8 {
+    alloc:  allocator.Error;
+    live:   live.Error;
+    across: Clobber;
+    unread: u32;
+    lost:   u32;
+    slot:   u64;
+}
+
+#[testing]
+fun refuse(r: Refusal) err[Refusal] {
+    ret err[Refusal].err{r};
+}
+
+# whether an instruction of an allocated function writes a location, by an
+# operand or by the implicit writes it states, or a location that shares its
+# storage
+#[testing]
+fun writes(f: *Function, at: *Locations, id: Instruction, loc: u32) bool {
+    val d:     *InstructionData = function.data(f, id);
+    val count: u32              = d.operands.size::u32;
+    val alias: Slice[u32]       = location.shares(at, loc);
+    var k:     u32              = 0;
+    for (k < count) {
+        var written: opt[Physical] = opt[Physical].none{};
+        val o:       Operand       = d.operands.data[k];
+        val role:    mo.Role       = instruction.role(d.opcode, count, k);
+        if (sel o.physical) {
+            if ((role & mo.WRITE) != 0) { written = opt[Physical].some{o.physical}; }
+        }
+        if (sel o.tied) {
+            val dest: Register = o.tied.dest;
+            if (sel dest.physical) { written = opt[Physical].some{dest.physical}; }
+        }
+        if (sel written.some) {
+            val at_loc: opt[u32] = location.locate(at, written.some);
+            if (sel at_loc.some && in(alias, at_loc.some)) { ret true; }
+        }
+        k = k + 1;
+    }
+    var m: usize = 0;
+    for (m < d.implicit.size) {
+        if (d.implicit.data[m].write) {
+            val at_loc: opt[u32] = location.locate(at, d.implicit.data[m].location);
+            if (sel at_loc.some && in(alias, at_loc.some)) { ret true; }
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
+#[testing]
+fun in(list: Slice[u32], loc: u32) bool {
+    var i: usize = 0;
+    for (i < list.size) {
+        if (list.data[i] == loc) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# prove that no call leaves a value live in a location it clobbers
+#
+# liveness of the allocated function, with the clobbers left out of it, holds
+# a location from the write of a value to its last read. a clobbered location
+# whose hold spans the call's two positions keeps a value across it, unless the
+# call itself writes the location, which ends that value and starts another,
+# as a result register does.
+# ---
+# a:        the allocator the proof takes
+# f:        the function, allocated or framed
+# at:       the locations of its target
+# clobbers: what its calls leave undefined, by the function's own instructions
+# left:     a location whose clobbers are not held to it, NONE for all. before
+#           the frame this is the link register, which the function receives
+#           and the frame saves and restores around its calls
+# ret:      ok, or the first clobber that destroys a live value
+#[testing]
+fun survives(a: *allocator.Allocator, f: *Function, at: *Locations, clobbers: Slice[Clobber], left: u32) err[Refusal] {
+    val got: res[Live, live.Error] = live.compute(a, f, at, Slice[Clobber]{data: nil, size: 0});
+    if (sel got.err) { ret refuse(Refusal.live{got.err}); }
+    var l: Live = got.ok;
+    fin { live.dnit(?l); }
+    var i: usize = 0;
+    for (i < clobbers.size) {
+        val c: Clobber = clobbers.data[i];
+        val n: u32     = l.numbers.data[c.instruction.index];
+        if (n != live.NONE && c.location != left) {
+            val alias: Slice[u32] = location.shares(at, c.location);
+            var k:     usize      = 0;
+            for (k < alias.size) {
+                val holds: Slice[Hold] = live.holds(?l, alias.data[k]);
+                var j:     usize       = 0;
+                for (j < holds.size) {
+                    if (holds.data[j].from <= 2 * n && holds.data[j].to > 2 * n + 1 && !writes(f, at, c.instruction, alias.data[k])) { ret refuse(Refusal.across{c}); }
+                    j = j + 1;
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+fun by_instruction(a: *Clobber, b: *Clobber) i64 {
+    if (a.instruction.index != b.instruction.index) {
+        if (a.instruction.index < b.instruction.index) { ret -1; }
+        ret 1;
+    }
+    if (a.location < b.location) { ret -1; }
+    if (a.location > b.location) { ret 1; }
+    ret 0;
+}
+
+# the clobbers of a stage's input carried to its output
+# ---
+# a:        the allocator the result takes
+# clobbers: the clobbers, by the input's instructions
+# origins:  each of the output's instructions' instruction of the input, or
+#           NONE for one the stage made
+# ret:      one clobber for each output instruction that stands for an input
+#           instruction with clobbers
+#[testing]
+fun carried(a: *allocator.Allocator, clobbers: Slice[Clobber], origins: Slice[u32]) res[vector.Vector[Clobber], allocator.Error] {
+    var sorted: vector.Vector[Clobber] = vector.init[Clobber](a);
+    fin { vector.dnit[Clobber](?sorted); }
+    var out: vector.Vector[Clobber] = vector.init[Clobber](a);
+    var i:   usize                  = 0;
+    for (i < clobbers.size) {
+        val pushed: res[usize, allocator.Error] = vector.push[Clobber](?sorted, clobbers.data[i]);
+        if (sel pushed.err) {
+            vector.dnit[Clobber](?out);
+            ret res[vector.Vector[Clobber], allocator.Error].err{pushed.err};
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Clobber](sorted.data, sorted.len, by_instruction);
+    var j: usize = 0;
+    for (j < origins.size) {
+        var lo: usize = 0;
+        var hi: usize = sorted.len;
+        for (lo < hi) {
+            val mid: usize = lo + (hi - lo) / 2;
+            if (sorted.data[mid].instruction.index < origins.data[j]) { lo = mid + 1; }
+            or                                                        { hi = mid; }
+        }
+        for (lo < sorted.len && sorted.data[lo].instruction.index == origins.data[j]) {
+            val pushed: res[usize, allocator.Error] = vector.push[Clobber](?out, Clobber{instruction: Instruction{index: j::u32}, location: sorted.data[lo].location});
+            if (sel pushed.err) {
+                vector.dnit[Clobber](?out);
+                ret res[vector.Vector[Clobber], allocator.Error].err{pushed.err};
+            }
+            lo = lo + 1;
+        }
+        j = j + 1;
+    }
+    ret res[vector.Vector[Clobber], allocator.Error].ok{out};
+}
+
+# whether a function has an incoming slot at a stack offset
+#[testing]
+fun has_incoming(f: *Function, offset: u64) bool {
+    var i: usize = 0;
+    for (i < f.slots.len) {
+        val area: Area = f.slots.data[i].area;
+        if (sel area.incoming && area.incoming == offset) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# prove that the pieces of an entry arrive where they are placed
+#
+# a register a piece is placed in is read at the entry, so the function takes
+# the piece from it, an incoming slot is there for a piece placed on the stack,
+# and no other register a call may clobber is read at the entry, since nothing
+# put a value there. the link register is the one input the convention gives
+# beside the pieces.
+# ---
+# a:      the allocator the proof takes
+# f:      the function, allocated or framed
+# b:      the target's bench
+# pieces: the places of the entry's parameters
+# ret:    ok, or the first piece that does not arrive
+#[testing]
+fun arrives(a: *allocator.Allocator, f: *Function, b: *Bench, pieces: Slice[Placed]) err[Refusal] {
+    var expect: vector.Vector[bool] = vector.init[bool](a);
+    fin { vector.dnit[bool](?expect); }
+    val filled: err[allocator.Error] = slice.fill[bool](?expect, location.count(?b.at)::usize, false);
+    if (sel filled.err) { ret refuse(Refusal.alloc{filled.err}); }
+    var i: usize = 0;
+    for (i < pieces.size) {
+        val p: Placed = pieces.data[i];
+        if (sel p.place.register) {
+            val loc: opt[u32] = location.locate(?b.at, Physical.register{p.place.register});
+            if (sel loc.some) { expect.data[loc.some] = true; }
+        }
+        or (sel p.place.stack) {
+            if (!has_incoming(f, p.place.stack)) { ret refuse(Refusal.slot{p.place.stack}); }
+        }
+        i = i + 1;
+    }
+    val got: res[Live, live.Error] = live.compute(a, f, ?b.at, Slice[Clobber]{data: nil, size: 0});
+    if (sel got.err) { ret refuse(Refusal.live{got.err}); }
+    var l: Live = got.ok;
+    fin { live.dnit(?l); }
+    val start: u32 = live.start(?l, Block{index: 0});
+    var loc:   u32 = 0;
+    for (loc < location.count(?b.at)) {
+        val holds: Slice[Hold] = live.holds(?l, loc);
+        val read:  bool        = holds.size > 0 && holds.data[0].from == start;
+        if (read && b.clobbered.data[loc] && loc != b.link && !expect.data[loc]) { ret refuse(Refusal.unread{loc}); }
+        if (expect.data[loc] && !read)                                           { ret refuse(Refusal.lost{loc}); }
+        loc = loc + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+#[testing]
+fun refused(path: str, level: Level, stage: str, f: u32, why: str) {
+    print.eprintlnf("{}: level {}: {} of function {}: {}", path, level::u32, stage, f, why);
+}
+
+# the name of what selection refused
+#[testing]
+fun select_why(e: engine.Error) str {
+    if (sel e.unmatched) { ret "no rule matches an operation"; }
+    if (sel e.aggregate) { ret "an aggregate value, which no register holds"; }
+    if (sel e.placed)    { ret "a piece at a place selection does not carry"; }
+    if (sel e.unplaced)  { ret "an entry whose parameters nothing placed"; }
+    if (sel e.unlocated) { ret "a clobbered register the locations do not number"; }
+    if (sel e.transfer)  { ret "a piece form expansion that neither calls nor returns"; }
+    if (sel e.lookup)    { ret "no thread lookup function"; }
+    if (sel e.unheld)    { ret "no register class holds a type"; }
+    if (sel e.ambiguous) { ret "more than one register class holds a type"; }
+    if (sel e.layout)    { ret "no size for a slot's type"; }
+    if (sel e.machine)   { ret "the machine form refused an instruction"; }
+    if (sel e.alloc)     { ret "out of memory"; }
+    ret "selection refused";
+}
+
+# say which operation no rule matched
+#[testing]
+fun say_unmatched(m: *Module, e: engine.Error) {
+    if (!(sel e.unmatched)) { ret; }
+    val u: Unmatched = e.unmatched;
+    if (sel u.operation.opcode) {
+        val row: opt[irow.Row] = ir.row(u.operation.opcode);
+        if (sel row.some) {
+            print.eprintlnf("    instruction {} is {} of {} operands", u.instruction.index, row.some.name, u.operand_count);
+            val sh: res[ty.Shape, ty.Error] = ty.shape(?m.types, u.operands[0]);
+            if (sel sh.ok) {
+                if (sel sh.ok.integer) { print.eprintlnf("    first operand integer {}", sh.ok.integer.width); }
+                or (sel sh.ok.vector)  { print.eprintlnf("    first operand vector"); }
+                or                     { print.eprintlnf("    first operand other"); }
+            }
+            ret;
+        }
+    }
+    print.eprintlnf("    a constant used by instruction {}", u.instruction.index);
+}
+
+# the name of what allocation refused
+#[testing]
+fun allocate_why(e: allocate.Error) str {
+    if (sel e.check)   { ret "the allocation checker refused the result"; }
+    if (sel e.scan)    { ret "the scan refused"; }
+    if (sel e.live)    { ret "liveness refused"; }
+    if (sel e.form)    { ret "a round's virtual form was refused"; }
+    if (sel e.rewrite) { ret "the rewrite refused"; }
+    if (sel e.allowed) { ret "the allowed locations were refused"; }
+    if (sel e.clobber) { ret "a clobber the function or locations do not have"; }
+    if (sel e.foreign) { ret "locations of another register file"; }
+    ret "out of memory";
+}
+
+# the name of what the frame refused
+#[testing]
+fun frame_why(e: finish.Error) str {
+    if (sel e.lay)     { ret "the layout was refused"; }
+    if (sel e.code)    { ret "the target's frame code refused a move"; }
+    if (sel e.operand) { ret "a slot access whose register is not a register of the file"; }
+    if (sel e.dropped) { ret "an instruction naming a dropped slot"; }
+    ret "the function's maker refused";
+}
+
+# the name of what a proof refused
+#[testing]
+fun proof_why(e: Refusal) str {
+    if (sel e.across) { ret "a clobbered location holds a value across a call"; }
+    if (sel e.unread) { ret "a clobberable location is read at the entry and no piece is placed there"; }
+    if (sel e.lost)   { ret "an entry piece's register is never read at the entry"; }
+    if (sel e.slot)   { ret "an entry piece on the stack has no incoming slot"; }
+    if (sel e.live)   { ret "liveness refused"; }
+    ret "out of memory";
+}
+
+# a function that selection refuses for a stated reason, left out of the stages after it
+# ---
+# file:     the file's path
+# function: the function's name
+# opcode:   the opcode of the ir operation no rule matches
+# first:    the first level it refuses at
+# last:     the last level it refuses at
+# issue:    the issue that closes the gap
+#[testing]
+rec Stated {
+    file:     str;
+    function: str;
+    opcode:   str;
+    first:    Level;
+    last:     Level;
+    issue:    u32;
+}
+
+# every stated refusal of the corpus. a row holds only while the function
+# refuses for its operation at its levels, so a gap that closes fails the test
+# until its row goes, and a new gap fails it until it has a row
+#[testing]
+val STATED: [6]Stated = [6]Stated{
+    Stated{file: "test/ir/algebraic.mirl", function: "identities", opcode: "add", first: 0, last: 0, issue: 52},
+    Stated{file: "test/ir/algebraic.mirl", function: "identities", opcode: "load", first: 1, last: 3, issue: 51},
+    Stated{file: "test/ir/all.mirl", function: "numbers", opcode: "atomic.cmpxchg", first: 0, last: 3, issue: 160},
+    Stated{file: "test/ir/fold.mirl", function: "fold", opcode: "vextract", first: 0, last: 0, issue: 52},
+    Stated{file: "test/ir/kept.mirl", function: "wipe", opcode: "mem.fill", first: 0, last: 3, issue: 54},
+    Stated{file: "test/ir/shift.mirl", function: "counts", opcode: "shr.s", first: 0, last: 0, issue: 191},
+};
+
+# the stated refusal of a function at a level
+#[testing]
+fun stated(path: str, name: View, level: Level) opt[*Stated] {
+    var i: usize = 0;
+    for (i < $length_of(STATED)) {
+        val s: *Stated = ?STATED[i];
+        if (str_equals(s.file, path) && slice.same_view(name, View{data: s.function, len: str_len(s.function)}) && level >= s.first && level <= s.last) { ret opt[*Stated].some{s}; }
+        i = i + 1;
+    }
+    ret opt[*Stated].none{};
+}
+
+# whether selection refused the operation a row states
+#[testing]
+fun refusal_is(s: *Stated, e: engine.Error) bool {
+    if (!(sel e.unmatched)) { ret false; }
+    val u: Unmatched = e.unmatched;
+    if (!(sel u.operation.opcode)) { ret false; }
+    val row: opt[irow.Row] = ir.row(u.operation.opcode);
+    ret sel row.some && str_equals(row.some.name, s.opcode);
+}
+
+# one function of the module through selection, allocation and the frame, 0 or the stage that failed
+#[testing]
+fun through(b: *Bench, row: *Row, s: *Selector, m: *Module, k: u32, path: str, level: Level) u32 {
+    val f:    id.Function              = id.Function{index: k};
+    val body: res[*Body, module.Error] = module.body(m, f);
+    if (sel body.err) { ret 1; }
+    var pieces: Slice[Placed] = Slice[Placed]{data: nil, size: 0};
+    val en:     *Entry        = ?body.ok.entry;
+    if (sel en.placed) {
+        var n: usize = body.ok.blocks.data[0].parameters.len;
+        if (en.placed.len < n) { n = en.placed.len; }
+        pieces = Slice[Placed]{data: en.placed.data, size: n};
+    }
+
+    var calls:  Calls                       = Calls{clobbered: b.mc.convention.clobbered, at: ?b.at};
+    val picked: res[Selected, engine.Error] = engine.select(s, m, f, ?calls);
+    val stands: opt[*Stated]                = stated(path, m.functions.data[k].data.name, level);
+    if (sel picked.err) {
+        if (sel stands.some && refusal_is(stands.some, picked.err)) {
+            refused(path, level, "selection", k, "left out as stated, see the issue the table names");
+            ret 0;
+        }
+        refused(path, level, "selection", k, select_why(picked.err));
+        say_unmatched(m, picked.err);
+        ret 2;
+    }
+    var chosen: Selected = picked.ok;
+    fin { engine.release(?chosen); }
+    if (sel stands.some) {
+        refused(path, level, "selection", k, "selects now, so its row of STATED is stale");
+        ret 2;
+    }
+
+    var lreq:  lay.Request          = lay.Request{convention: ?b.mc.convention, at: ?b.at};
+    val keeps: res[bool, lay.Error] = lay.keeps_pointer(b.a, ?chosen.function, lreq);
+    if (sel keeps.err) {
+        refused(path, level, "allocation", k, "the frame's need of a pointer was not read");
+        ret 3;
+    }
+    val listed: res[vector.Vector[Physical], allowed.Failure] = allowed.of_machine(b.a, ?b.mc, ?b.at, keeps.ok);
+    if (sel listed.err) {
+        refused(path, level, "allocation", k, "the allowed locations were not listed");
+        ret 3;
+    }
+    var given: vector.Vector[Physical] = listed.ok;
+    fin { vector.dnit[Physical](?given); }
+    val clobbers: Slice[Clobber]                  = Slice[Clobber]{data: chosen.clobbers.data, size: chosen.clobbers.len};
+    val request:  allocate.Request                = allocate.Request{at: ?b.at, registers: ?b.mc.registers, allowed: Slice[Physical]{data: given.data, size: given.len}, clobbers: clobbers};
+    val done:     res[Allocation, allocate.Error] = allocate.allocate(b.a, ?chosen.function, request);
+    if (sel done.err) {
+        refused(path, level, "allocation", k, allocate_why(done.err));
+        ret 3;
+    }
+    var allocated: Allocation = done.ok;
+    fin { allocate.release(?allocated); }
+
+    val kept: res[vector.Vector[Clobber], allocator.Error] = carried(b.a, clobbers, Slice[u32]{data: allocated.origins.data, size: allocated.origins.len});
+    if (sel kept.err) {
+        refused(path, level, "clobber check", k, "out of memory");
+        ret 4;
+    }
+    var stated: vector.Vector[Clobber] = kept.ok;
+    fin { vector.dnit[Clobber](?stated); }
+    val held: err[Refusal] = survives(b.a, ?allocated.function, ?b.at, Slice[Clobber]{data: stated.data, size: stated.len}, b.link);
+    if (sel held.err) {
+        refused(path, level, "clobber check", k, proof_why(held.err));
+        ret 4;
+    }
+    val placed: err[Refusal] = arrives(b.a, ?allocated.function, b, pieces);
+    if (sel placed.err) {
+        refused(path, level, "piece check", k, proof_why(placed.err));
+        ret 5;
+    }
+
+    val framed: res[Framed, finish.Error] = frame_of(b, row, ?allocated);
+    if (sel framed.err) {
+        refused(path, level, "frame", k, frame_why(framed.err));
+        ret 6;
+    }
+    var out: Framed = framed.ok;
+    fin { record.release(?out); }
+    val moved: res[vector.Vector[Clobber], allocator.Error] = carried(b.a, Slice[Clobber]{data: stated.data, size: stated.len}, Slice[u32]{data: out.origins.data, size: out.origins.len});
+    if (sel moved.err) {
+        refused(path, level, "clobber check after the frame", k, "out of memory");
+        ret 7;
+    }
+    var final: vector.Vector[Clobber] = moved.ok;
+    fin { vector.dnit[Clobber](?final); }
+    val after: err[Refusal] = survives(b.a, ?out.function, ?b.at, Slice[Clobber]{data: final.data, size: final.len}, NONE);
+    if (sel after.err) {
+        refused(path, level, "clobber check after the frame", k, proof_why(after.err));
+        ret 7;
+    }
+    val arrived: err[Refusal] = arrives(b.a, ?out.function, b, pieces);
+    if (sel arrived.err) {
+        refused(path, level, "piece check after the frame", k, proof_why(arrived.err));
+        ret 8;
+    }
+    ret 0;
+}
+
+#[testing]
+fun frame_of(b: *Bench, row: *Row, x: *Allocation) res[Framed, finish.Error] {
+    ret frame.frame(b.a, x, lay.Request{convention: ?b.mc.convention, at: ?b.at}, row.frame);
+}
+
+# a file at one level on the target it declares, when that target carries a machine
+#[testing]
+fun machine_level(a: *allocator.Allocator, source: View, path: str, level: Level, tally: *usize) u32 {
+    var r: res[Module, ir_reader.Refusal] = ir_reader.parse_body(a, source);
+    if (sel r.err) { ret 1; }
+    var m: Module = r.ok;
+    fin { module.dnit(?m); }
+    val t: opt[*Target] = targets.by_name(module.target(?m));
+    if (sel t.none) {
+        print.eprintlnf("{}: no row of mirl.target is the one the file names", path);
+        ret 2;
+    }
+    val made_index: res[rows.Index, allocator.Error] = rows.index(a);
+    if (sel made_index.err) { ret 6; }
+    var index: rows.Index = made_index.ok;
+    fin { rows.dnit(?index); }
+    val found: res[opt[*Row], rows.Error] = rows.for_target(?index, t.some);
+    if (sel found.err) {
+        print.eprintlnf("{}: the file's target names no architecture of the catalog", path);
+        ret 7;
+    }
+    val carried: opt[*Row] = found.ok;
+    if (sel carried.none) {
+        print.eprintlnf("{}: left out, its target carries no machine", path);
+        ret 0;
+    }
+    val ran: err[Error] = driver.run(?m, t.some, Options{level: level, checked: true});
+    if (sel ran.err) {
+        ir_corpus.report(path, level, ran.err);
+        ret 3;
+    }
+    var b: Bench;
+    if (open(?b, a, t.some) != 0) {
+        print.eprintlnf("{}: level {}: the target's machine was not opened", path, level::u32);
+        ret 4;
+    }
+    fin { close(?b); }
+    val made: res[Selector, engine.Error] = engine.init(a, carried.some.table, t.some, b.mc.basis.set, ?b.mc.basis.selection);
+    if (sel made.err) {
+        print.eprintlnf("{}: level {}: the selection table was refused", path, level::u32);
+        ret 5;
+    }
+    var s: Selector = made.ok;
+    fin { engine.dnit(?s); }
+    var failed: u32 = 0;
+    var k:      u32 = 0;
+    for (k::usize < m.functions.len) {
+        if (m.functions.data[k].body.blocks.len > 0) {
+            val code: u32 = through(?b, carried.some, ?s, ?m, k, path, level);
+            if (code != 0 && failed == 0) { failed = 10 + code; }
+        }
+        k = k + 1;
+    }
+    @tally = @tally + 1;
+    ret failed;
+}
+
+# a file at every level, every level reported
+#[testing]
+fun machine_levels(a: *allocator.Allocator, source: View, path: str, tally: *usize) u32 {
+    var failed: u32   = 0;
+    var level:  Level = 0;
+    for (level <= ir_corpus.TOP) {
+        val code: u32 = machine_level(a, source, path, level, tally);
+        if (code != 0 && failed == 0) { failed = code; }
+        level = level + 1;
+    }
+    ret failed;
+}
+
+#[testing]
+val TOY_MODULE: str = "target \"mtest\"\nfunction @f: fun(i32) -> (i32) {\n^entry(%a: i32):\n    ret %a\n}\n";
+
+#[testing]
+val TOY_MEMORIES: [1]*Memory = [1]*Memory{?function.T_PAGE};
+
+# r0 is written, then read after the second instruction, which a clobber of r0
+# stands on
+#[testing]
+val KEPT_ACROSS: str = "target \"mtest\"\n\nfunction @f {\n    slot [0]: size 4 align 4\n^0:\n    load r0, [0]\n    load r1, [0]\n    add r1 = r1, r0\n}\n";
+
+# the same shape, the second instruction reading r0 and writing it as well, as
+# a call does an argument register that also carries a result
+#[testing]
+val RESULT_IN_PLACE: str = "target \"mtest\"\n\nfunction @f {\n    slot [0]: size 4 align 4\n^0:\n    load r0, [0]\n    add r0 = r0, r0\n    add r1 = r1, r0\n}\n";
+
+# the toy function of a text, checked against a clobber of the second
+# instruction at a register and the register left out of the proof
+#[testing]
+fun toy_survives(text: str, clobbered: u16, left: opt[u16]) u32 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val made: res[Module, ir_reader.Refusal] = ir_reader.parse_body(?a, View{data: TOY_MODULE, len: str_len(TOY_MODULE)});
+    if (sel made.err) { ret 10; }
+    var m: Module = made.ok;
+    fin { module.dnit(?m); }
+    val read: res[reader.Unit, ir_reader.Refusal] = reader.parse_body_in(?a, ?m, ?synthetic.REGISTRY, ?synthetic.ARCH, ?synthetic.TARGET, View{data: text, len: str_len(text)});
+    if (sel read.err) { ret 11; }
+    var u: reader.Unit = read.ok;
+    fin { reader.dnit(?u); }
+    val f:   *Function                      = ?u.items.data[0].function;
+    val got: res[Locations, location.Error] = location.init(?a, function.file(f), Slice[*Memory]{data: ?TOY_MEMORIES[0], size: 1});
+    if (sel got.err) { ret 12; }
+    var at: Locations = got.ok;
+    fin { location.dnit(?at); }
+    val loc: opt[u32] = location.locate(?at, Physical.register{rf.make(0, clobbered)});
+    if (sel loc.none) { ret 13; }
+    var skip: u32 = NONE;
+    if (sel left.some) {
+        val s: opt[u32] = location.locate(?at, Physical.register{rf.make(0, left.some)});
+        if (sel s.none) { ret 13; }
+        skip = s.some;
+    }
+    var one:    [1]Clobber   = [1]Clobber{Clobber{instruction: Instruction{index: 1}, location: loc.some}};
+    val proved: err[Refusal] = survives(?a, f, ?at, Slice[Clobber]{data: ?one[0], size: 1}, skip);
+    if (sel proved.ok)         { ret 0; }
+    if (sel proved.err.across) { ret 1; }
+    ret 2;
+}
+
+# the clobber check refuses a value kept in a clobbered register across the
+# instruction that clobbers it, and passes the same function when the register
+# is not live, when the instruction writes it itself or when the proof leaves
+# it to the frame
+#[testing]
+fun clobbers_bite() u32 {
+    val none: opt[u16] = opt[u16].none{};
+    if (toy_survives(KEPT_ACROSS, 0, none) != 1)             { ret 1; }
+    if (toy_survives(KEPT_ACROSS, 2, none) != 0)             { ret 2; }
+    if (toy_survives(RESULT_IN_PLACE, 0, none) != 0)         { ret 3; }
+    if (toy_survives(KEPT_ACROSS, 0, opt[u16].some{0}) != 0) { ret 4; }
+    ret 0;
+}
+
+# a value kept in a clobbered register across a call fails the clobber check,
+# then every file of test/ir goes through the schedule, selection, allocation
+# and the frame at every level on the targets that carry a machine, each
+# output proven
+test machine__every_ir_text_file_of_a_carried_target_is_selected_allocated_and_framed_at_every_level {
+    val bites: u32 = clobbers_bite();
+    if (bites != 0) { ret 100 + bites::i32; }
+    ret ir_corpus.walk(machine_levels)::i32;
+}
