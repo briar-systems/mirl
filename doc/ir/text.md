@@ -158,8 +158,8 @@ constants
 
 globals
 
-  global      = [ "export" ] "global" symbol ":" type linkage
-                [ "align" uint ] [ "section" string ] [ "tls" model ]
+  global      = [ "export" ] "global" symbol ":" type linkage [ "constant" ]
+                [ "align" uint ] [ "section" string word ] [ "tls" model ]
                 [ "=" constant ] newline ;
   model       = "general_dynamic" | "local_dynamic" | "initial_exec" | "local_exec" ;
   linkage     = "linkage" word "visibility" word ;
@@ -169,6 +169,10 @@ globals
   and default, protected, hidden, internal. a global with no initial value
   is defined by another module, so its binding is one other objects may
   refer to, any but local.
+
+  `constant` states that the program never writes the global. a section is
+  its name and its kind, spelled by the name of a row of mink's section
+  kinds: text, rodata, relro, data, bss, tdata, tbss and the rest.
 
 attributes
 
@@ -188,7 +192,7 @@ functions
   step        = word ( constant | type ) ;
   instruction = [ local { "," local } "=" ] ( operation | assembly ) ;
   operation   = word [ entry { "," entry } ] [ "loc" dref ] [ "site" dref ]
-                [ "volatile" ] [ "kept" ] [ "bounded" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
+                [ "volatile" ] [ "kept" ] [ "bounded" ] [ "checked" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
   entry       = operand | immediate | target ;
   operand     = local | constant ;
   immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]" ) ;
@@ -198,7 +202,8 @@ functions
 
   `kept` marks a store or a fill whose write no pass may take away (see
   the specification's memory section). `bounded` marks a shift whose count is
-  below its operand's width.
+  below its operand's width. `checked` marks a division whose zero divisor
+  and signed overflow are tested before it.
 
   `constant_time` marks a function that must run in time independent of its
   secret values.
