@@ -26,7 +26,7 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 
 ## Emission
 
-- One builder holds one text section. A function is a named label exposed as a global function symbol of default visibility, placed at the target's function alignment. A block is an anonymous label.
+- One builder holds one text section. A function is a named label exposed as a function symbol of the binding and visibility its linkage states, placed at the target's function alignment. A block is an anonymous label.
 - An operand takes the masc value its row's position reads: a register, an immediate, an enumerant or a condition, or a label with a fixup. A block operand is a label of the operand's own fixup. A symbol operand names the function's label and takes the fixup kind the set binds its relocation kind to, read through an index of the set's bindings built once. Where several fixup kinds are bound to one relocation kind, the operand's own is taken, else the emission is refused.
 - An instruction another names as a partner (`label n`, `partner n : kind`) is an anonymous label of its own, placed before it, so a pc-relative low part's relocation names its high part. The labels map one to one.
 - A fixup whose relocation covers the instructions after it, as RISC-V's call pair, is written with them as one sequence, as the set's spans state. masc attaches the marker the span states.
@@ -42,9 +42,9 @@ An instruction is refused, naming the function, the instruction and the operand,
 
 - Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (#197, masc#41).
 - The object is checked in memory, structurally. Writing it as ELF and reading it back is #198, which waits for mink#23.
-- Function symbols are global with default visibility and carry no size, since IR functions state neither linkage nor visibility (#181) and the size is unknown until masc lays the section out.
+- Function symbols carry no size, which is unknown until masc lays the section out.
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
-- Global data is not emitted, so the address of a global is refused (#196, #181).
+- Global data is not emitted, so the address of a global is refused (#196).
 - A `pseudo copy` or `parallel_copy` between registers is refused: no stage turns it into the target's move yet (#195).
 - Memory-shaped operand positions are refused (#43).
 - mirl computes a row's position among the catalog's for `relax.find` until masc keys relaxation by row (#199, masc#139).
