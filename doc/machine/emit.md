@@ -12,8 +12,8 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 
 ## Compilation
 
-- `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. The target reaches its selection table and frame code through its row of `mirl.isa.rows`, so compilation names no set.
-- Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed and laid out. The functions are then emitted into one object.
+- `compile` takes a module the pass schedule has run on, the target's machine opened, the target and the allocator. A machine opened for another target than the one given is refused at entry (`Error.foreign`), before anything is compiled. The target reaches its selection table, frame code and moves through its row of `mirl.isa.rows`, so compilation names no set.
+- Every function with a body is selected with the convention's clobbers, allocated over the locations `allowed.of_machine` lists, framed, its copies lowered to the set's moves (doc/machine/copy.md) and laid out. The functions are then emitted into one object.
 - A function refused at a stage is `Error.function`, naming the function and the stage with that stage's own error. A refusal before any function, or by emission, is its own case.
 
 ## Layout
@@ -45,5 +45,4 @@ An instruction is refused, naming the function, the instruction and the operand,
 - Function symbols are global with default visibility and carry no size, since IR functions state neither linkage nor visibility (#181) and the size is unknown until masc lays the section out.
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Global data is not emitted, so the address of a global is refused (#196, #181).
-- A `pseudo copy` or `parallel_copy` between registers is refused: no stage turns it into the target's move yet (#195).
 - Memory-shaped operand positions are refused (#43).
