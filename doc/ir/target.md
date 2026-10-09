@@ -38,7 +38,7 @@ The capability declarations are
 | `bulk` | whether one instruction copies a run of bytes, and whether one fills it (`native` or `none`) |
 | `timing` | the operations that run in constant time, by operation, width and condition, or none |
 | `code` | the alignment of a function entry, a code section and a data section, and the bytes that pad code |
-| `attributes` | the attribute families the target accepts |
+| `attributes` | the schema of the target's family, whose attributes it accepts, or none |
 
 These describe what the target does. They do not change what an operation means. A shift by the width or more gives 0 or the sign fill on every target whatever `arithmetic.shifts` says, and legalisation bounds the count where the target would not: the shift bounding applies where shifts `wrap` or are `undefined`, and not where they `saturate`.
 
@@ -211,4 +211,15 @@ An attribute holds
 - `name`, its name within that family, such as `stage`,
 - a datum, which is one number, an ordered list of numbers such as a workgroup size, or a name.
 
-`mirl.ir.module.attach(m, symbol, attribute)` attaches an attribute to a function or global. The names and lists are copied. A target states the families it accepts in its `attributes` declaration, either none or a list of family names, and verifier rule 5 refuses an attribute of any other family. The text form spells an attribute as `attribute @symbol "family" "name" = datum`.
+`mirl.ir.module.attach(m, symbol, attribute)` attaches an attribute to a function or global. The names and lists are copied. The text form spells an attribute as `attribute @symbol family name = datum`.
+
+A family defines its attributes in a **schema** (`mirl.target.Schema`): the family's name and its entries, sorted by name with no name twice. An entry states
+
+- `name`, the attribute's name,
+- `datum`, the kind of datum it states (`mirl.ir.attribute.Kind`: an integer, integers or text),
+- `attaches`, whether it attaches to a function or to a global,
+- `check`, the rule its datum keeps. The rule reads the datum, every attribute on the same symbol and the target's declarations, so a rule across attributes, such as a workgroup size stated only on a compute entry point, is the entry's own.
+
+A target's `attributes` declaration is the schema of its family, or none when it accepts no attribute. Verifier rule 5 refuses an attribute whose family word is not the schema's, whose name the schema has no entry for, attached to the other kind of symbol, with a datum of another kind, or that breaks its entry's rule, and `mirl.verify.module.unfit` gives which. The family word is the text spelling only: it is matched against the schema the target names and never looked up.
+
+The register family (`mirl.target.register.schema`) defines no attribute, since no register stage reads a fact only that family needs, so every register target refuses every attribute by name. The SPIR-V target accepts none until its family's schema is written.

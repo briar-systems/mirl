@@ -295,7 +295,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 2 | `layout` | every structure that states its offsets states ones the target's data layout keeps, none overlapping and each a multiple of its member's alignment |
 | 3 | `constant` | every constant is of its type, an aggregate has one element per member and an address names a function or global of the module |
 | 4 | `initial` | every global's initial value is a constant of the global's type |
-| 5 | `attribute` | every attribute on a function or global is of a family the target accepts |
+| 5 | `attribute` | every attribute on a function or global is one the schema of the target's family defines: of that family, of a name the schema has an entry for, attached to the kind of symbol the entry attaches to, with a datum of the entry's kind, and keeping the entry's rule, which reads the datum beside the symbol's other attributes and the target's declarations. A target that accepts no attribute refuses every one |
 | 6 | `reference` | every id a block or instruction names is one its body holds and has not removed, every instruction is listed in exactly one block and placed in it, every operand and branch argument is defined, every result and parameter is defined by the instruction or block that lists it, and every opcode names a row |
 | 7 | `terminator` | every block ends in exactly one terminator, with none before it |
 | 8 | `edge` | every edge passes its target's parameters in count and type, and the entry block takes the signature's parameters, or one parameter per place once the abi legalisation has placed them |
