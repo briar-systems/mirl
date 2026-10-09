@@ -47,6 +47,10 @@ The other half of the allocator's request is the allowed set. `allowed.of_machin
 
 A value of an aggregate type has no register and is refused as `aggregate`. The abi legalisation leaves one only where a value is loaded whole from memory, which a later legalisation has to split.
 
+## Divisions that do not trap
+
+A division whose opcode row states a trap (a zero divisor, a signed overflow, a quotient that does not fit) is selected without the `checked` flag only where the target's division traps for each of them as the ir does. Where `arithmetic.division` declares the division, or the division of a two-word dividend, `quiet` for a trap the row states, a chosen rule that covers a division without the flag is refused as `unchecked`, naming the instruction, since no test of the trap stands before it. The engine reads the opcode row's traps and the target's declared faults, and names no target.
+
 ## Choosing among rules
 
 Of the rules for an instruction whose guard holds, the least cost wins. Of equal cost the earlier row in the target's table wins. This is the whole tie-break. A target that cares about a choice gives its rules different costs, and never relies on a row's place to express a preference it has not costed.
