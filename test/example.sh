@@ -10,10 +10,11 @@
 # dep/mink, once per set of pins into out/example/tools/<pins>, with the
 # compiler $MACH (mach by default). $MASC and $EXEC name built ones instead.
 #
-# the input set is every test/example/*.mirl, each a body for riscv64-linux
-# whose line "; exits <n>: ..." states the status its program exits with, and
-# test/example/exit.s, the __mirl_exit every start stub calls, which masc
-# assembles for each lane target. the lane targets are the rows of LANES. an
+# the input set is every test/example/*.mirl, each a body whose first line is
+# its target line and whose line "; exits <n>: ..." states the status its
+# program exits with, and test/example/exit.s, the __mirl_exit every start stub
+# calls, which masc assembles for each lane target. the lane targets are the
+# lines `mirl lanes` writes, the one table mirl.target.lane holds. an
 # example is built for each by a copy whose target line names that target and
 # is its only change, so an example states nothing a lane target lays out
 # otherwise. for each example and each lane target the lane checks:
@@ -21,8 +22,8 @@
 #   - mirl emit writes its listing, which masc assembles again. a byte
 #     difference from mirl's object shows masc disassemble of both, diffed
 #   - once, the mach test unit roundtrip__every_example_listing_assembles_to_its_own_object
-#     compares the reassembled objects of the examples as written as data,
-#     which is the check that passes or fails
+#     compares the reassembled objects of every example at every lane target
+#     as data, which is the check that passes or fails
 #   - mink's exec driver links the object and the exit object into a static
 #     executable, which exits with the stated status under the lane's qemu
 #
@@ -46,19 +47,14 @@ out=$repo/out/example/$1
 [ -e "$out" ] && { echo "example.sh: $out exists, name a fresh run" >&2; exit 2; }
 mkdir -p "$out" || exit 2
 
-# the target every example names
-home=riscv64-linux
-
-# each lane target: its mirl name, masc's reading of it, mink's architecture
-# and the qemu that runs it
-LANES=(
-    "riscv64-linux|-t riscv64 --isa rv64gc --abi lp64d --format elf|riscv64|qemu-riscv64"
-    "riscv32-linux|-t riscv32 --isa rv32gc --abi ilp32d --format elf|riscv32|qemu-riscv32"
-)
-for lane in "${LANES[@]}"; do
-    IFS='|' read -r _ _ _ qemu <<<"$lane"
-    command -v "$qemu" >/dev/null || { echo "example.sh: $qemu is not on the path" >&2; exit 2; }
-done
+# each lane target: its mirl name, its architecture in mink's catalog, its
+# baseline as masc's selection, its convention and its object format, which
+# masc reads together, mink links for the architecture and qemu-<arch> runs
+lanes=$("$mirl" lanes) || { echo "example.sh: mirl lanes refused" >&2; exit 2; }
+[ -n "$lanes" ] || { echo "example.sh: mirl lanes names no target" >&2; exit 2; }
+while read -r _ arch _ _ _; do
+    command -v "qemu-$arch" >/dev/null || { echo "example.sh: qemu-$arch is not on the path" >&2; exit 2; }
+done <<<"$lanes"
 
 # a shadow project of the pinned dependency `$1` in `$2`: its tracked files at
 # the pin, with every dependency it declares taken from mirl's own dep/
@@ -103,10 +99,8 @@ example() {
         fail "$target $name" "states no exit status"
         return
     fi
-    if [ "$target" != "$home" ]; then
-        sed "s/^target \"$home\"\$/target \"$target\"/" "$src" >"$at.mirl"
-        src=$at.mirl
-    fi
+    sed "1s/^target \".*\"\$/target \"$target\"/" "$src" >"$at.mirl"
+    src=$at.mirl
     if ! "$mirl" emit "$src" --body --checked --kind object >"$at.o" 2>"$at.emit"; then
         fail "$target $name" "mirl emit refuses it: $(cat "$at.emit")"
         return
@@ -139,8 +133,10 @@ example() {
     echo "ok   $target $name"
 }
 
-for lane in "${LANES[@]}"; do
-    IFS='|' read -r target masc_as link qemu <<<"$lane"
+while read -r -u 3 target arch isa abi format; do
+    masc_as="-t $arch --isa $isa --abi $abi --format $format"
+    link=$arch
+    qemu=qemu-$arch
     dir=$out/$target
     mkdir -p "$dir" || exit 2
     if ! "$masc" assemble "$here/example/exit.s" $masc_as -o "$dir/exit.o" 2>"$dir/exit.as"; then
@@ -149,13 +145,13 @@ for lane in "${LANES[@]}"; do
     fi
     for src in "$here"/example/*.mirl; do
         name=$(basename "$src" .mirl)
-        if ! grep -qx "target \"$home\"" "$src"; then
-            fail "$target $name" "names no target $home"
+        if ! head -n 1 "$src" | grep -qx 'target ".*"'; then
+            fail "$target $name" "its first line is no target line"
             continue
         fi
         example "$name" "$src" "$target" "$masc_as" "$link" "$qemu" "$dir"
     done
-done
+done 3<<<"$lanes"
 # the exact comparison is the unit test, which reads both objects as data: every section's bytes, every relocation and
 # every symbol by name, the one nameless symbol by its place. a byte difference above is shown for reading only
 "${MACH:-mach}" test "$repo" -a '*' --filter roundtrip --timeout 5m >"$out/roundtrip.log" 2>&1 \
