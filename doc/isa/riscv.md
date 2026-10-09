@@ -24,7 +24,7 @@ The abi legalisation puts every call, entry and return in piece form before sele
 
 - A call to a symbol is `auipc x1` and `jalr x1, x1, 0` under `call_plt_pair`, which the linker may relax. A call through a register is `jalr x1`. A return is `jalr x0, x1, 0`.
 - An `alloca` is the `address` pseudo of a frame slot of its type.
-- The address of a symbol follows the target's relocation model. Under `static` it is `lui` and `addi` (`hi20`, `lo12_i`). Under `pie` a symbol the module defines is `auipc` and `addi` (`pcrel_hi20`, `pcrel_lo12_i`) and any other is `auipc` and a load from the global offset table (`got_pcrel_hi20`). Under `pic` a symbol whose linkage lets another image preempt it is reached through the table too, and any other symbol the module defines by its distance.
+- The address of a symbol follows the target's relocation model. Under `static` it is `lui` and `addi` (`hi20`, `lo12_i`). Under `pie` and `pic` a symbol that is not preemptible is `auipc` and `addi` (`pcrel_hi20`, `pcrel_lo12_i`), and a preemptible one is `auipc` and a load from the global offset table (`got_pcrel_hi20`), except under `pie` when the module defines it (see [ir/target.md](../ir/target.md)).
 - A thread-local variable follows the access the target declares for its model. Local exec is `lui`, `add` of `tp` and `addi` (`tprel_hi20`, `tprel_lo12_i`). Initial exec is `auipc`, a load (`tls_got_pcrel_hi20`) and `add` of `tp`. General dynamic is `auipc` and `addi` into `a0` (`tls_gd_pcrel_hi20`), a call to the target's lookup function, which reads and writes `a0`, and a copy out of `a0`.
 - Every pc-relative low part names its high part's instruction as its partner (`pcrel_lo12_i`), the label the relocation is applied at.
 
