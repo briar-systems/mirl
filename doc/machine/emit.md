@@ -46,4 +46,3 @@ An instruction is refused, naming the function, the instruction and the operand,
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Global data is not emitted, so the address of a global is refused (#196).
 - Memory-shaped operand positions are refused (#43).
-- mirl computes a row's position among the catalog's for `relax.find` until masc keys relaxation by row (#199, masc#139).

@@ -45,14 +45,15 @@ Where an extension is absent the rule for its row is dropped and a base form sta
 The declared operations are in `declared.mach`, each with the job that closes it. The walk in the table's test checks that every opcode of the ir has a rule or is declared, and not both.
 
 - Vector operations, because the target holds vectors in no register (scalarisation, #52).
-- `frem`, `mem.copy` and `mem.fill`, which no instruction does (helpers, #54).
+- `frem`, which no instruction does (#225).
+- `mem.copy` and `mem.fill`, which no instruction does. The helpers legalisation turns each into a call of a helper, or a kept fill into a loop of kept stores, before selection (see [target](../ir/target.md)).
 - A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
 - `atomic.nand` and `atomic.cmpxchg`, a loop of load reserved and store conditional that an expansion cannot hold.
 
 Some operations select only for the operands a base form covers.
 
 - A shift by a variable count selects only when it carries the bounded mark. RISC-V takes the count modulo the width and the ir gives 0 or the sign fill, so the shift bounding legalisation bounds the count and marks the shift, and the rule then emits `sll`, `srl` or `sra`, with the `w` forms for 32 bits on RV64.
-- Division and remainder select to the instruction, which does not trap. The zero and overflow checks are inserted before selection (#54).
+- Division and remainder select to the instruction, which does not trap. The helpers legalisation tests the zero divisor and the signed overflow before it and marks it `checked`.
 - A multiply of two registers needs M, and without it names `mul`. The high half of a product, which M gives as `mulh`, `mulhu` and `mulhsu`, is selected whole: the truncation of the product of two extensions shifted down by the register width is one `mulh`, `mulhu` or `mulhsu` (M), for operands as signed, unsigned, and one of each in either order. The 32 bit form on RV64 is left to the rules for its pieces.
 - Arithmetic on conditions other than `and`, `or`, `xor` and the unsigned comparisons, which the target declares it selects on single bits, has no rule, and neither has arithmetic at 8 and 16 bits. Both are widened to the target's ALU widths before selection (see [target](../ir/target.md)), except the counts, the byte swap and the overflow forms, which `mirl.legal.LEFT` lists.
 - `fmin`, `fmax`, `ffloor`, `fceil`, `fint` and `fnearest` select to Zfa rows. Without Zfa the float legalisation stands in for them with F and D instructions, which the target's rows state (see [target](../ir/target.md)). A select of floats has no rule and is a select of the bits. A 64 bit float constant is built in a register on RV64, and on RV32 the float constant legalisation loads it from read-only data.
