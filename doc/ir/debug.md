@@ -50,7 +50,7 @@ A binding ties a source variable to the code. It holds the variable's source nam
 
 ## Value binding records
 
-A record stands at a point of a block: just before one of its instructions, or at the block's entry, which is the point before its first instruction and how a block parameter gets one. It names a binding and what it reads, which is an operand and a salvage expression over it, or `unavailable`. The operand is any value of the function: an instruction result, a block parameter or a constant. A binding has to be at a point rather than on a value, since a value has no "from here on". After `x = y`, with `y` defined earlier, a binding on `y` would make `x` read as `y` before the assignment, and a constant has no point of definition at all.
+A record stands at a point of a block: just before one of its instructions, or at the block's entry, which is the point before its first instruction and how a block parameter gets one. It names a binding and what it reads, which is a location and a salvage expression over what the location holds. A record of the IR holds one of two kinds of location (see [Location kinds](#location-kinds)): `ssa`, an operand that is any value of the function (an instruction result, a block parameter or a constant), or `unavailable`. A body edit refuses a location of any other kind. A binding has to be at a point rather than on a value, since a value has no "from here on". After `x = y`, with `y` defined earlier, a binding on `y` would make `x` read as `y` before the assignment, and a constant has no point of definition at all.
 
 A record is not an instruction. No instruction walk sees it, and it carries no scheduling, cost or ordering constraint. Reading a value is never a use of it, so a record holds nothing alive for liveness, dead code removal or any pass. Records live in a pool of the body and stand in runs. Each instruction holds the run of records just before it and each block the run at its end, linked through the pool, and each value lists the pool positions of the records that read it. Every body edit keeps each record at its point by moving whole runs, so it costs nothing per record it does not touch.
 
@@ -80,6 +80,32 @@ A salvage expression is a list of steps applied in order to the operand, made by
 | `trunc` | a narrower integer type | that type, keeping the low bits |
 
 Every step is one a DWARF location expression can state, so a producer encodes each kind as a column of its row.
+
+## Location kinds
+
+Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Location`, and every producer reads it.
+
+| kind | where the value is |
+|---|---|
+| `unavailable` | nowhere, since the value is gone. It is the first case, so a zeroed location names nothing |
+| `register` | in a register, by masc's identity, which names a part of a wider register by the part's own row |
+| `slot` | in memory at an offset (fixed bytes plus bytes per unit of one scale) from the frame base its family states |
+| `local` | in the webassembly local of an index |
+| `global` | in the global of the module a symbol names |
+| `operand` | on the webassembly operand stack, at a depth from the top |
+| `ssa` | the IR value of an id, which a family that keeps SSA ids names by its own |
+| `constant` | a constant of the module |
+| `pieces` | in parts, each a number of bits at its own location, in order from the variable's lowest bit. A piece is never pieces |
+
+Each producer is a row of `mirl.debug.rows` that states the kinds it writes as a set, and `mirl.debug.admit` refuses a location, or a piece of one, of a kind its producer does not state, naming that kind. `unavailable` is not a place but the absence of one, so every producer writes it, as optimised out, and no set states it.
+
+| producer | kinds |
+|---|---|
+| DWARF | `register`, `slot`, `constant`, `pieces`, and the webassembly `local`, `global` and `operand` |
+| CodeView | `register`, `slot` |
+| SPIR-V | `ssa`, and `slot` as the variable an `OpVariable` declares |
+
+A storage binding on an instruction's metadata is the `slot` kind by construction: the variable is in the storage the instruction addresses, which a producer lowers as its family states.
 
 ## On an instruction
 
