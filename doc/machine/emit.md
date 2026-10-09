@@ -50,4 +50,3 @@ A global is refused, naming it, when its initial value holds an address and the 
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
-- mirl computes a row's position among the catalog's for `relax.find` until masc keys relaxation by row (#199, masc#139).
