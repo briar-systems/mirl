@@ -29,6 +29,7 @@ The capability declarations are
 | `registers` | values live in registers the pipeline allocates, or not |
 | `control` | control flow is free, or must be structured |
 | `addressing` | memory is addressed physically, or only by access chains (logical) |
+| `functions` | a function's address, the value `func.addr` gives, is a location as a data address is (`addresses`), or a slot of an indirect call table (`slots`) |
 | `values` | values are untyped, or carry their type into the output |
 | `evaluation` | operations take operands from named values, or from an operand stack |
 | `widths` | the address spaces, how a pointer into each is held and the rules the types in each are laid out by (`c`, `std140`, `std430` or `scalar`), the register width, the widths integer arithmetic runs natively at, and the integer widths a value holds natively |
