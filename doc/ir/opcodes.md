@@ -137,6 +137,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `ctz` | `operand` | none | lanewise | propagates |
 | `call.placed` | `callee`, then any number of argument operands | `signature` a type, `places` a place list | none | declared |
 | `ret.placed` | any number of returned value operands | `places` a place list | none | no results |
+| `div.wide.u` | `high`, `low`, `divisor` | none | lanewise | propagates |
 
 ### `add`
 
@@ -2022,4 +2023,22 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: none
 - secrecy: no results
 - vector: none
+
+### `div.wide.u`
+
+- operands: `high`, `low`, `divisor`
+- immediates: none
+- targets: 0
+- typing:
+  - `high` is an integer
+  - `high` and `low` are the same type
+  - `high` and `divisor` are the same type
+- results:
+  - one result of the type of `divisor`
+  - one result of the type of `divisor`
+- effects: mergeable
+  - traps when `divisor` is zero in any lane
+  - traps when `high` is no less than `divisor` read as unsigned, so the quotient does not fit, in any lane
+- secrecy: propagates
+- vector: lanewise
 

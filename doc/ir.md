@@ -163,6 +163,7 @@ The traps are
 
 - integer division or remainder by zero, in any lane,
 - signed division or remainder of the least value of the type by minus one (all ones), in any lane,
+- a division of a two-word dividend by a word divisor whose quotient does not fit the word, in any lane,
 - a load, store, atomic access, `mem.copy` or `mem.fill` through an address that cannot be accessed,
 - a call whose callee traps,
 - `unreachable`, which traps every time it is executed.
@@ -175,7 +176,9 @@ Integer arithmetic wraps. `add`, `sub` and `mul` give the low bits of the exact 
 
 `div.s` rounds toward zero and `rem.s` has the sign of the dividend. `div.u` and `rem.u` read their operands as unsigned. Division and remainder by zero trap. Signed division and remainder of the least value by minus one trap as well.
 
-A `checked` flag on a division or remainder says its zero divisor and, for a signed one, its least value over minus one are tested before it and trap there, so it never meets them and a machine division that gives a result for them runs it as it stands. Only a row with a zero or overflow trap takes it. The helpers legalisation sets it where it puts the tests, and reads it so it never tests a division twice.
+`div.wide.u` divides a dividend of two words, its `high` and `low` operands, by a `divisor` of the same type, all read as unsigned, and gives two results of that type, the quotient and the remainder. It traps for a zero divisor, and for a high word no less than the divisor, which is exactly when the quotient does not fit the word. It is the division a machine such as x86-64 runs on `rdx:rax`, and a target that has no such instruction at a width has it lowered by the helpers legalisation.
+
+A `checked` flag on a division or remainder says its zero divisor and, for a signed one, its least value over minus one, or for `div.wide.u` its quotient that does not fit, are tested before it and trap there, so it never meets them and a machine division that gives a result for them runs it as it stands. Only a row with a zero, overflow or quotient trap takes it. The helpers legalisation sets it where it puts the tests, and reads it so it never tests a division twice.
 
 A shift takes its count as an unsigned integer of the same type as the shifted operand. A shift by the width or more gives 0 for `shl` and `shr.u`, and for `shr.s` it gives every bit equal to the sign bit of the shifted operand.
 

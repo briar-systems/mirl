@@ -217,8 +217,8 @@ functions
 
   `kept` marks a store or a fill whose write no pass may take away (see
   the specification's memory section). `bounded` marks a shift whose count is
-  below its operand's width. `checked` marks a division whose zero divisor
-  and signed overflow are tested before it.
+  below its operand's width. `checked` marks a division whose zero divisor,
+  signed overflow and quotient that does not fit are tested before it.
 
   `constant_time` marks a function that must run in time independent of its
   secret values.
