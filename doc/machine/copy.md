@@ -7,7 +7,7 @@ index(a, ?table, ?locations, ?registers)          # res[Index, move.Error]
 lower(a, ?framed, ?request)                       # err[lower.Error]
 ```
 
-`index` is built once per target from the set's `Table`, the locations and the registers the selection gives. `lower` replaces the framed function with its copies lowered, or leaves it as it was when refused. `compile` calls it between the frame and layout, and the machine corpus walk checks clobbers and entry pieces after it.
+`index` is built once per target from the set's `Table`, the locations and the registers the selection gives. `lower` replaces the framed function with its copies lowered, or leaves it as it was when refused. `compile` calls it between the frame and the expansion of loops (see [loops](loop.md)), which comes before layout, and the machine corpus walk checks clobbers and entry pieces after it.
 
 ## The set's moves
 

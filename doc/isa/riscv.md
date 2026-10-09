@@ -28,6 +28,15 @@ The abi legalisation puts every call, entry and return in piece form before sele
 - A thread-local variable follows the access the target declares for its model. Local exec is `lui`, `add` of `tp` and `addi` (`tprel_hi20`, `tprel_lo12_i`). Initial exec is `auipc`, a load (`tls_got_pcrel_hi20`) and `add` of `tp`. General dynamic is `auipc` and `addi` into `a0` (`tls_gd_pcrel_hi20`), a call to the target's lookup function, which reads and writes `a0`, and a copy out of `a0`.
 - Every pc-relative low part names its high part's instruction as its partner (`pcrel_lo12_i`), the label the relocation is applied at.
 
+## Atomics
+
+A read-modify-write the A extension has an instruction for selects to it with `.aqrl` ordering, `amoadd.w` and `amoadd.d` for words and doublewords, and with Zabha `amoadd.b` and `amoadd.h` for bytes and halves. A subtraction is the negated operand and an add. An atomic load and store are the plain access between fences. What no instruction does is a loop of `mirl.isa.riscv.loop`, selected as one instruction of the machine form with its operands and scratch registers stated and expanded after allocation (see [loops](../machine/loop.md)).
+
+- `atomic.nand` of a word or doubleword is `lr`, `and`, `xori` and `sc` repeated while the store fails, and `atomic.cmpxchg` is `lr`, a `bne` out of the loop when the value held is not the one expected, and `sc`. The success flag is the comparison of the value held with the one expected after the loop.
+- A byte or halfword with no direct instruction admitted works on the aligned word that holds it. One field loop per operation serves both widths and both register widths, which it takes as parameters: the rule passes the result's width and the target's register width. Each loop shares the steps that find the field (the aligned address, the shift as the byte offset times eight, the mask and the operand shifted and masked) and the steps that give it back (shifted down and sign extended from its width). Exchange, add, subtract, nand, the unsigned and signed minimum and maximum and compare and exchange are loops whose body merges the new field into the word held. And, or and exclusive or are no loop: `amoand.w` with every bit outside the field set, `amoor.w` and `amoxor.w` with the shifted operand, which leave the rest of the word as it was.
+- A field rule's guard holds for a result of a width the target states narrower than the 32 bits `lr.w` reserves, so the widths come from the target's declaration and no rule is written per width. With Zabha its direct rule costs less, so the row's requirement decides and no rule names the extension. Zabha has no nand and no compare and exchange, so those stay loops.
+- A body holds no memory access but its reserved pair and no taken backward branch but its own, and is at most sixteen base instructions, so it keeps the A extension's forward progress rules. The shifts are by register, so a step's row is one row at either register width.
+
 ## Cost
 
 A cost is two for each instruction an expansion emits, with a multiply counting three and a divide twelve. It is one less for each instruction the pattern covers and one less when the rule takes its constant operand as an immediate. So a rule that covers more costs less than the rules for its pieces, and no choice rests on the order of rows.
@@ -47,7 +56,6 @@ The declared operations are in `declared.mach`, each with the job that closes it
 - Vector operations, because the target holds vectors in no register (scalarisation, #52).
 - `frem`, `mem.copy` and `mem.fill`, which no instruction does (helpers, #54).
 - A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
-- `atomic.nand` and `atomic.cmpxchg`, a loop of load reserved and store conditional that an expansion cannot hold.
 
 Some operations select only for the operands a base form covers.
 
