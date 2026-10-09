@@ -138,6 +138,9 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `call.placed` | `callee`, then any number of argument operands | `signature` a type, `places` a place list | none | declared |
 | `ret.placed` | any number of returned value operands | `places` a place list | none | no results |
 | `div.wide.u` | `high`, `low`, `divisor` | none | lanewise | propagates |
+| `mul.high.u` | `lhs`, `rhs` | none | lanewise | propagates |
+| `mul.high.s` | `lhs`, `rhs` | none | lanewise | propagates |
+| `mul.high.su` | `lhs`, `rhs` | none | lanewise | propagates |
 
 ### `add`
 
@@ -2039,6 +2042,48 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: mergeable
   - traps when `divisor` is zero in any lane
   - traps when `high` is no less than `divisor` read as unsigned, so the quotient does not fit, in any lane
+- secrecy: propagates
+- vector: lanewise
+
+### `mul.high.u`
+
+- operands: `lhs`, `rhs`
+- immediates: none
+- targets: 0
+- typing:
+  - `lhs` is an integer
+  - `lhs` and `rhs` are the same type
+- results:
+  - one result of the type of `lhs`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: lanewise
+
+### `mul.high.s`
+
+- operands: `lhs`, `rhs`
+- immediates: none
+- targets: 0
+- typing:
+  - `lhs` is an integer
+  - `lhs` and `rhs` are the same type
+- results:
+  - one result of the type of `lhs`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: lanewise
+
+### `mul.high.su`
+
+- operands: `lhs`, `rhs`
+- immediates: none
+- targets: 0
+- typing:
+  - `lhs` is an integer
+  - `lhs` and `rhs` are the same type
+- results:
+  - one result of the type of `lhs`
+- effects: speculatable, mergeable
 - secrecy: propagates
 - vector: lanewise
 

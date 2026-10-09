@@ -174,6 +174,8 @@ Nothing else traps. In particular integer addition, subtraction, multiplication 
 
 Integer arithmetic wraps. `add`, `sub` and `mul` give the low bits of the exact result, and `mul` gives the low half of the product. `neg` is the two's complement negation and `not` flips every bit.
 
+`mul.high.u`, `mul.high.s` and `mul.high.su` give the high half of the exact product of their two operands, the bits from the width up, which `mul` leaves out. `mul.high.u` reads both operands as unsigned, `mul.high.s` both as signed, and `mul.high.su` its first as signed and its second as unsigned. None traps. A target computes one in one instruction at the widths whose multiply forms it states, `mulhu`, `mulh` and `mulhsu` on RISC-V, and the multiply forms legalisation builds it from the multiplies a target has at the others.
+
 `div.s` rounds toward zero and `rem.s` has the sign of the dividend. `div.u` and `rem.u` read their operands as unsigned. Division and remainder by zero trap. Signed division and remainder of the least value by minus one trap as well.
 
 `div.wide.u` divides a dividend of two words, its `high` and `low` operands, by a `divisor` of the same type, all read as unsigned, and gives two results of that type, the quotient and the remainder. It traps for a zero divisor, and for a high word no less than the divisor, which is exactly when the quotient does not fit the word. It is the division a machine such as x86-64 runs on `rdx:rax`, and a target that has no such instruction at a width has it lowered by the helpers legalisation.
