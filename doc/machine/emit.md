@@ -25,6 +25,14 @@ emit(a, ?module, ?machine, ?target, units)         # res[object.Object, emit.Err
 - `mirl emit <file> --kind machine|listing|object` is a thin wrapper over the two. A kind is a row of the command's own table. `--target`, `--level`, `--checked` and `--body` are read as `mirl opt` reads them.
 - The example programs in `test/example/` (arithmetic, a loop, a call, a global and a recursive function) each carry a start stub that calls `main` and hands its result to `__mirl_exit`. One test walks every example through every kind, checked.
 
+## The example lane
+
+`test/example.sh <run>` runs the example programs. It runs locally and is never part of CI, which builds mirl and runs `mach test` only. It writes into a fresh `out/example/<run>` and exits with the number of checks that failed.
+
+- It needs mirl built (`mach build . -a cli`), `qemu-riscv64` and `git`. The masc program and mink's `exec` driver are built from the pinned `dep/masc` and `dep/mink`, each as a shadow project whose dependencies are mirl's own pins, once per set of pins into `out/example/tools/`, with the compiler `$MACH` (`mach` by default). `$MASC` and `$EXEC` name built ones instead.
+- The input set is every `test/example/*.mirl`. Each names the target `riscv64-linux` and states the status its program exits with in a line `; exits <n>: ...`. `test/example/exit.s` is `__mirl_exit`, which makes the Linux exit system call with no C library, and masc assembles it.
+- Run: `mirl emit --kind object` writes each example's object, mink's `exec` driver links it with the exit object into a static executable, and the executable exits with the stated status under `qemu-riscv64`.
+
 ## Layout
 
 - A block that only jumps is bypassed: everything that names it names the block its chain of such jumps ends at. The entry stays, so does a jump to itself, a chain that closes on itself and a jump a partner operand labels.
@@ -59,5 +67,6 @@ A global is refused, naming it, when its initial value holds an address and the 
 - Debug line and location facts are not carried until masc states its location API (#200, masc#42).
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - Memory-shaped operand positions are refused (#43).
-- The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, mirl's own symbol, which #220 links from a small object masc assembles with the exit `ecall`.
+- The lane does not yet round-trip the listing through masc to mirl's own bytes (#241): masc's builder listing is not a complete source, and `masc disassemble` does not read relocations against unnamed local symbols.
+- The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, which the example lane links from `test/example/exit.s`, assembled by masc.
 - `mirl emit` writes to standard output only, the object's bytes included.
