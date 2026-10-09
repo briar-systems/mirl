@@ -113,7 +113,7 @@ An instruction is an opcode applied to operands, immediates and edges, with resu
 - **immediates** are facts of the instruction that are not values, such as a type, an alignment, a memory ordering or a lane index. A row states one per slot, in order.
 - **edges** pair a target block with its arguments.
 - **results** are the values the instruction defines, in order. A row derives their types.
-- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile`, `kept` and `bounded`), its secrecy mark and the debug bindings of the variables whose storage its result addresses.
+- the **metadata record** holds the source location the instruction was built for, the inlining site it was inlined through, its flags (`volatile`, `kept`, `bounded` and `checked`), its secrecy mark and the debug bindings of the variables whose storage its result addresses.
 
 A variable's value is bound by a **value binding record** at a program point of a block, before an instruction or at the block's entry. A record is not an instruction and no instruction walk sees it. It reads a value and a salvage expression over it, or nothing when what it read is gone, and reading a value is never a use of it (see [ir/debug.md](ir/debug.md)).
 
@@ -174,6 +174,8 @@ Nothing else traps. In particular integer addition, subtraction, multiplication 
 Integer arithmetic wraps. `add`, `sub` and `mul` give the low bits of the exact result, and `mul` gives the low half of the product. `neg` is the two's complement negation and `not` flips every bit.
 
 `div.s` rounds toward zero and `rem.s` has the sign of the dividend. `div.u` and `rem.u` read their operands as unsigned. Division and remainder by zero trap. Signed division and remainder of the least value by minus one trap as well.
+
+A `checked` flag on a division or remainder says its zero divisor and, for a signed one, its least value over minus one are tested before it and trap there, so it never meets them and a machine division that gives a result for them runs it as it stands. Only a row with a zero or overflow trap takes it. The helpers legalisation sets it where it puts the tests, and reads it so it never tests a division twice.
 
 A shift takes its count as an unsigned integer of the same type as the shifted operand. A shift by the width or more gives 0 for `shl` and `shr.u`, and for `shr.s` it gives every bit equal to the sign bit of the shifted operand.
 
