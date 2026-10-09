@@ -8,7 +8,7 @@ ask(f, op, values)            # opt[Breach]
 stands(f, op, operands)       # opt[Breach]
 ```
 
-`ask` hands masc the instruction's operand values under its grouping and answers the breach, or none when every constraint stands. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as its position's kind: an immediate, an enumerant or a condition.
+`ask` hands masc the instruction's operand values under its grouping and answers the breach, or none when every constraint stands. The values come from `instruction.values_of`, the one place an operand becomes masc's value, which the instruction's transfer and emission read as well. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as the kind its row position states: an immediate, an enumerant or a condition.
 
 ## Breaches
 
