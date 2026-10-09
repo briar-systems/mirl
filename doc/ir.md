@@ -258,7 +258,7 @@ The reductions take one vector and give a scalar of its lane type. The integer r
 
 ### 6.8 Calls and returns
 
-`func.addr` gives the address of a function of the module, at the pointer type it states. What that address is comes from the target's `functions` declaration: a location as a data address is, or a slot of an indirect call table that only equality and an indirect call read (see [ir/target.md](ir/target.md)).
+`func.addr` gives the address of a function of the module, at the pointer type it states. What that address is comes from the target's `functions` declaration: a location as a data address is, or a slot of an indirect call table that only equality and an indirect call read. A target whose code has no function addresses, as logical SPIR-V has none, declares `none`, and the verifier refuses `func.addr` there. A direct call is unaffected, since its callee names the function it calls rather than an address value (see [ir/target.md](ir/target.md)).
 
 `call` takes the callee, the arguments and an immediate stating the signature called through. A direct call names the function it calls as its callee, by the address constant of that function, and an indirect call takes a value, such as one `func.addr` gave. Its results are the signature's results. `ret` takes the results of the function it is in. How arguments and results are passed is not in the IR. It is decided from the function type and the target (see [ir/target.md](ir/target.md)).
 
@@ -326,7 +326,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 17 | `placement` | every section a global states is thread-local exactly when the global is, writable unless the global is constant, and zero filled only for a global that is not constant and whose initial value is every bit zero |
 | 18 | `thread` | no global's initial value holds the address of a thread-local global, stated in the module or declared, since it has no one static address and is reached only through code by its model |
 | 19 | `addressing` | past legalisation on a target that declares logical addressing, no instruction forms or reads an address as a number: no row whose address formation is arithmetic, which `ptr.add`, `ptrtoint` and `inttoptr` are |
-| 20 | `functions` | code names a function's address only through `func.addr`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
+| 20 | `functions` | code names a function's address only through `func.addr`, and only on a target whose `functions` declaration is not `none`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
