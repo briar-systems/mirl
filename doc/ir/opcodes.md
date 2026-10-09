@@ -146,6 +146,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `switch` | `selector` | `cases` a case list | none | no results |
 | `extract` | `aggregate` | `member` a member index | none | propagates |
 | `insert` | `aggregate`, `value` | `member` a member index | none | propagates |
+| `func.addr` | none | `function` a function of the module, `pointer` a type | none | propagates |
 
 ### `add`
 
@@ -2168,4 +2169,18 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: none
+
+### `func.addr`
+
+- operands: none
+- immediates: `function` a function of the module, `pointer` a type
+- targets: 0
+- typing:
+  - the type in `pointer` is a pointer
+- results:
+  - one result of the type in `pointer`
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: none
+- address: of the function `function` names, the only way code names a function's address
 
