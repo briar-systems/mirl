@@ -15,6 +15,11 @@
 # test/example/exit.s, the __mirl_exit every start stub calls, which masc
 # assembles. for each example the lane checks:
 #   - mirl emit writes its object
+#   - mirl emit writes its listing, which masc assembles again. a byte
+#     difference from mirl's object shows masc disassemble of both, diffed
+#   - once, the mach test unit roundtrip__every_example_listing_assembles_to_its_own_object
+#     compares the reassembled objects as data, which is the check that passes
+#     or fails
 #   - mink's exec driver links the object and the exit object into a static
 #     executable, which exits with the stated status under qemu-riscv64
 #
@@ -93,6 +98,20 @@ for src in "$here"/example/*.mirl; do
         fail "$name" "mirl emit refuses it: $(cat "$out/$name.emit")"
         continue
     fi
+    if ! "$mirl" emit "$src" --body --checked --kind listing >"$out/$name.s" 2>"$out/$name.emit"; then
+        fail "$name" "mirl emit refuses its listing: $(cat "$out/$name.emit")"
+        continue
+    fi
+    if ! "$masc" assemble "$out/$name.s" $masc_as -o "$out/$name.rt.o" 2>"$out/$name.as"; then
+        fail "$name" "masc refuses the listing: $(cat "$out/$name.as")"
+        continue
+    fi
+    if ! cmp -s "$out/$name.o" "$out/$name.rt.o"; then
+        "$masc" disassemble "$out/$name.o" $masc_as >"$out/$name.dis" 2>&1
+        "$masc" disassemble "$out/$name.rt.o" $masc_as >"$out/$name.rt.dis" 2>&1
+        echo "note $name: the reassembled object differs in bytes, masc disassemble of mirl's and of the reassembled, diffed:"
+        diff -u "$out/$name.dis" "$out/$name.rt.dis"
+            fi
     if ! "$exec_bin" riscv64 "$out/$name" "$out/$name.o" "$out/exit.o" 2>"$out/$name.link"; then
         fail "$name" "the link is refused: $(cat "$out/$name.link")"
         continue
@@ -106,5 +125,9 @@ for src in "$here"/example/*.mirl; do
     fi
     echo "ok   $name"
 done
+# the exact comparison is the unit test, which reads both objects as data: every section's bytes, every relocation and
+# every symbol by name, the one nameless symbol by its place. a byte difference above is shown for reading only
+"${MACH:-mach}" test "$repo" -a '*' --filter roundtrip --timeout 5m >"$out/roundtrip.log" 2>&1 \
+    || { fail "roundtrip" "the listing does not assemble to mirl's objects, see $out/roundtrip.log"; tail -n 20 "$out/roundtrip.log"; }
 echo "$fails failed"
 exit $fails
