@@ -1,0 +1,223 @@
+# typed address folding: an address a row forms from the type it walks
+# becomes the byte offset the target's data layout gives, added to the
+# address it starts at
+#
+# a row that forms the address of a member states the structure and the
+# member, and its offset is the member's offset in the data layout. a row
+# that forms the address of an element states the array, and its offset is
+# the index read as signed at the pointer's width times the element's size.
+# every offset is an integer as wide as the pointer, and the address is a
+# `ptr.add` of it in the slot of the row it replaces. the pass applies where
+# the target's addressing is physical, and a target whose addressing is
+# logical keeps the typed forms, which reach memory through access chains.
+#
+# the folding is an extension or truncation, a multiply and an add, with no
+# branch and no memory access, so it keeps constant time. a result keeps its
+# secrecy by the secrecy of the instructions it is made of.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.allocator.arena;
+
+use mirl.fold.word;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Indexed;
+use mirl.ir.opcode.Member;
+use mirl.ir.opcode.Row;
+use mirl.ir.opcode.Subject;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.pass.analysis;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.target.Target;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use target_record: mirl.target.record;
+
+# the pass: it adds instructions in front of the typed addresses it folds and
+# never touches an edge or a block
+pub val ADDRESS: Pass = Pass{name: "address", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: physical};
+
+# whether a target's addresses are numbers a byte offset is added to
+fun physical(t: *Target) bool {
+    ret sel t.caps.addressing.physical;
+}
+
+# one visit
+# ---
+# site:    the function being rewritten
+# layout:  the target's data layout of the module's types
+# changed: the function was changed
+rec Work {
+    site:    Site;
+    layout:  Layout;
+    changed: bool;
+}
+
+fun types_failed[T](e: types.Error) res[T, Why] {
+    ret res[T, Why].err{Why.ir{module.Error.types{e}}};
+}
+
+fun unlaid[T](what: str) res[T, Why] {
+    ret res[T, Why].err{Why.reason{what}};
+}
+
+# the type a subject of a row names in an instruction: an operand's, or the
+# one a type immediate holds
+fun subject_type(s: *Site, d: *InstructionData, at: Subject) res[Type, Why] {
+    if (sel at.operand) {
+        val n: u32 = at.operand;
+        if (n::usize < d.operands.len) { ret res[Type, Why].ok{s.b.values.data[d.operands.data[n].index].type}; }
+    }
+    if (sel at.immediate) {
+        val n: u32 = at.immediate;
+        if (n::usize < d.immediates.len) {
+            val imm: Immediate = d.immediates.data[n];
+            if (sel imm.ty) { ret res[Type, Why].ok{imm.ty}; }
+        }
+    }
+    ret unlaid[Type]("a typed address whose row names a type the instruction does not hold");
+}
+
+# the integer as wide as a pointer of a type
+fun word_of(w: *Work, pointer: Type) res[Type, Why] {
+    val bytes: res[u64, target_record.Error] = layout.size(?w.layout, pointer);
+    if (sel bytes.err) { ret unlaid[Type]("a typed address of a pointer with no size in memory"); }
+    val made: res[Type, types.Error] = types.intern(?w.site.m.types, types.Shape.integer{types.Integer{width: (bytes.ok * 8)::u32}});
+    if (sel made.err) { ret types_failed[Type](made.err); }
+    ret res[Type, Why].ok{made.ok};
+}
+
+# the byte offset of the member a row names, as a constant of the word
+fun member_offset(w: *Work, d: *InstructionData, mb: Member, word_type: Type) res[Value, Why] {
+    val of: res[Type, Why] = subject_type(?w.site, d, mb.of);
+    if (sel of.err)                         { ret res[Value, Why].err{of.err}; }
+    if (mb.slot::usize >= d.immediates.len) { ret unlaid[Value]("a member address whose row names no member immediate"); }
+    val imm: Immediate = d.immediates.data[mb.slot];
+    if (!(sel imm.member)) { ret unlaid[Value]("a member address whose member immediate holds no index"); }
+    val at: res[u64, target_record.Error] = layout.offset(?w.layout, of.ok, imm.member);
+    if (sel at.err) { ret unlaid[Value]("a member address of a structure the data layout does not place"); }
+    ret emit.constant(?w.site, word_type, word.small(at.ok));
+}
+
+# the size of an element of the array a row names, as a constant of the word
+fun element_stride(w: *Work, d: *InstructionData, ix: Indexed, word_type: Type) res[Value, Why] {
+    val of: res[Type, Why] = subject_type(?w.site, d, ix.of);
+    if (sel of.err) { ret res[Value, Why].err{of.err}; }
+    val shape: res[types.Shape, types.Error] = types.shape(?w.site.m.types, of.ok);
+    if (sel shape.err)         { ret types_failed[Value](shape.err); }
+    if (!(sel shape.ok.array)) { ret unlaid[Value]("an element address of a type that is not an array"); }
+    val size: res[u64, target_record.Error] = layout.size(?w.layout, shape.ok.array.element);
+    if (sel size.err) { ret unlaid[Value]("an element address of an array whose element has no size in memory"); }
+    ret emit.constant(?w.site, word_type, word.small(size.ok));
+}
+
+# the index read as signed at the width of the word
+fun widened(s: *Site, index: Value, word_type: Type, bits: u32) res[Value, Why] {
+    val width: res[u32, types.Error] = types.width(?s.m.types, s.b.values.data[index.index].type);
+    if (sel width.err)   { ret types_failed[Value](width.err); }
+    if (width.ok < bits) { ret res[Value, Why].ok{emit.convert(s, opcode.EXT_S, index, word_type)}; }
+    if (width.ok > bits) { ret res[Value, Why].ok{emit.convert(s, opcode.TRUNC, index, word_type)}; }
+    ret res[Value, Why].ok{index};
+}
+
+# fold the instruction at an index of a block if its row forms a typed
+# address, answering how many instructions it was given ahead of it
+fun fold(w: *Work, k: Block, n: u32, i: Instruction) res[u32, Why] {
+    val s:   *Site            = ?w.site;
+    val d:   *InstructionData = ?s.b.instructions.data[i.index];
+    val row: opt[Row]         = opcode.row(d.opcode);
+    if (sel row.none)                                                { ret res[u32, Why].ok{0}; }
+    if (!(sel row.some.forms.member) && !(sel row.some.forms.index)) { ret res[u32, Why].ok{0}; }
+    var r:     Row      = row.some;
+    val start: opt[u32] = opcode.base(?r);
+    if (sel start.none) { ret unlaid[u32]("a typed address whose row takes no address"); }
+    val at: u32 = start.some;
+    if (at::usize >= d.operands.len) { ret unlaid[u32]("a typed address whose row takes no address"); }
+    val address: Value = d.operands.data[at];
+    val pointer: Type  = s.b.values.data[address.index].type;
+
+    val word_type: res[Type, Why] = word_of(w, pointer);
+    if (sel word_type.err) { ret res[u32, Why].err{word_type.err}; }
+    val bits: res[u32, types.Error] = types.width(?s.m.types, word_type.ok);
+    if (sel bits.err) { ret types_failed[u32](bits.err); }
+
+    if (sel r.forms.member) {
+        val offset: res[Value, Why] = member_offset(w, d, r.forms.member, word_type.ok);
+        if (sel offset.err) { ret res[u32, Why].err{offset.err}; }
+        emit.open(s, i, k, n);
+        emit.close(s, i);
+        emit.binary(s, opcode.PTR_ADD, address, offset.ok);
+    }
+    or (sel r.forms.index) {
+        val ix: Indexed = r.forms.index;
+        if (ix.operand::usize >= d.operands.len) { ret unlaid[u32]("an element address whose row names no index operand"); }
+        val index:  Value           = d.operands.data[ix.operand];
+        val stride: res[Value, Why] = element_stride(w, d, ix, word_type.ok);
+        if (sel stride.err) { ret res[u32, Why].err{stride.err}; }
+        emit.open(s, i, k, n);
+        val wide: res[Value, Why] = widened(s, index, word_type.ok, bits.ok);
+        if (sel wide.err) { ret res[u32, Why].err{wide.err}; }
+        val offset: Value = emit.binary(s, opcode.MUL, wide.ok, stride.ok);
+        emit.close(s, i);
+        emit.binary(s, opcode.PTR_ADD, address, offset);
+    }
+    val built: err[Why] = emit.done(s);
+    if (sel built.err) { ret res[u32, Why].err{built.err}; }
+    w.changed = true;
+    ret res[u32, Why].ok{s.made};
+}
+
+# fold the typed addresses of one function
+fun visit(u: *Unit) res[bool, Why] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, Why].err{Why.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var w: Work  = Work{site: emit.init(c.m, u.f, got.ok, ?scratch), layout: layout.of(c.t, ?c.m.types), changed: false};
+    var k: usize = 0;
+    for (k < got.ok.blocks.len) {
+        if (!got.ok.blocks.data[k].erased) {
+            var n: usize = 0;
+            for (n < got.ok.blocks.data[k].instructions.len) {
+                arena.reset(?ar);
+                val i:  Instruction   = got.ok.blocks.data[k].instructions.data[n];
+                val at: res[u32, Why] = fold(?w, Block{index: k::u32}, n::u32, i);
+                if (sel at.err) { ret res[bool, Why].err{at.err}; }
+                n = n + at.ok::usize + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{w.changed};
+}
