@@ -66,6 +66,8 @@ A function type has a list of parameter types and a list of result types. A func
 
 The integers are signless, but a convention extends a narrow integer by the signedness of the source type. Each parameter and each result of a function type may therefore state an **extension**: `sext` for sign extended, `zext` for zero extended, or none. Only an integer may state one. The extensions are part of the type, so `fun(i8 sext) -> ()` and `fun(i8 zext) -> ()` are different types, and a function and the call that states a signature carry them as data of that one type. The debug information keeps the signedness of its own types and is not derived from the extension.
 
+A function type may also name the **convention** row it is called under, after its results: `fun(i64) -> () convention sve`. A function of that type is entered and returned from under the row, and a call that states the type is made under it. The name is part of the type, so `fun() -> ()` and `fun() -> () convention sve` are different types. A type that names none is under the target's default row, and the verifier refuses a name the target states no row of.
+
 ### 2.7 Target handles
 
 A handle is an opaque value that a target declares, named by a family-qualified kind such as `spirv.image`. The kind is a non-empty name compared by its bytes.
@@ -327,6 +329,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 18 | `thread` | no global's initial value holds the address of a thread-local global, stated in the module or declared, since it has no one static address and is reached only through code by its model |
 | 19 | `addressing` | past legalisation on a target that declares logical addressing, no instruction forms or reads an address as a number: no row whose address formation is arithmetic, which `ptr.add`, `ptrtoint` and `inttoptr` are |
 | 20 | `functions` | code names a function's address only through `func.addr`, and only on a target whose `functions` declaration is not `none`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
+| 21 | `convention` | every function type names no convention row, for its target's default, or one of the convention rows its target states |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
