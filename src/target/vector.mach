@@ -1,0 +1,262 @@
+# the vector unit a build splits a fixed-length vector to
+#
+# a target states its units, each under its condition (`Vectors.units`). a
+# vector of a lane type splits to the widest unit the build meets that packs
+# that lane type, so an extension a build adds that meets a wider unit, or
+# widens a scaled one, changes the pieces. the legalisation reads the split
+# here and never the target's identity.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.collections.slice.Slice;
+
+use masc.core.quantity;
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+
+use mirl.ir.type.format.BINARY32;
+use mirl.ir.type.format.Row;
+use mirl.ir.type.format.row;
+use mirl.target.basis;
+use mirl.target.capability.Capabilities;
+use mirl.target.capability.Condition;
+use mirl.target.capability.Counts;
+use mirl.target.capability.Form;
+use mirl.target.capability.Lane;
+use mirl.target.capability.LaneType;
+use mirl.target.capability.Length;
+use mirl.target.capability.Scaled;
+use mirl.target.capability.Unit;
+use mirl.target.capability.Vectors;
+use mirl.target.capability.Width;
+
+# why a split was not read
+# ---
+# unstated:  the vectors, a unit's width or the lane type are unstated
+# condition: a unit's condition could not be read
+# scaled:    a scaled unit was read with no build, or names a slot the
+#            build's selection binds no quantity to
+pub tag Error: u8 {
+    unstated;
+    condition: basis.Error;
+    scaled;
+}
+
+# the pieces a vector splits into
+# ---
+# unit:  the unit that holds each piece
+# lanes: the lanes of each piece, lane order kept, so piece k holds lanes k
+#        times lanes onward. the last holds what is left, which splits again
+#        by its own count
+pub rec Piece {
+    unit:  *Unit;
+    lanes: u32;
+}
+
+# how a build legalises a vector
+# ---
+# scalar: one lane at a time, as no unit the build meets packs its lane type
+#         in a piece of more than none
+# pieces: in pieces a unit holds, a single one when it holds the vector whole
+pub tag Split: u8 {
+    scalar;
+    pieces: Piece;
+}
+
+# whether a build meets a unit's condition
+# ---
+# ctx: the context the build's selection opened, none when it has none
+# u:   the unit
+# ret: whether it does, or why its condition could not be read
+pub fun meets(ctx: opt[*core_state.Context], u: *Unit) res[bool, Error] {
+    val met: res[bool, basis.Error] = basis.admits(ctx, u.requires);
+    if (sel met.err) { ret res[bool, Error].err{Error.condition{met.err}}; }
+    ret res[bool, Error].ok{met.ok};
+}
+
+fun bits_of(l: LaneType) u32 {
+    if (sel l.integer)  { ret l.integer; }
+    if (!(sel l.float)) { ret 0; }
+    if (l.float == nil) { ret 0; }
+    val r: opt[Row] = row(@l.float);
+    if (sel r.none) { ret 0; }
+    ret r.some.width;
+}
+
+fun same_lane(a: LaneType, b: LaneType) bool {
+    if (sel a.integer) {
+        if (!(sel b.integer)) { ret false; }
+        ret a.integer == b.integer;
+    }
+    if (!(sel a.float))                   { ret false; }
+    if (!(sel b.float))                   { ret false; }
+    if (a.float == nil || b.float == nil) { ret false; }
+    ret a.float.index == b.float.index;
+}
+
+fun packs(u: *Unit, lane: LaneType) bool {
+    var i: usize = 0;
+    for (i < u.lanes.size) {
+        val l: Lane = u.lanes.data[i];
+        if (same_lane(l.lane, lane)) { ret sel l.form.packed; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the least bits of a unit's register the build holds a fixed-length vector
+# in, none where its width bounds no vector and zero where fixed-length
+# vectors never split to it
+fun least_bits(ctx: opt[*core_state.Context], w: Width) res[opt[u64], Error] {
+    if (sel w.none)                   { ret res[opt[u64], Error].ok{opt[u64].none{}}; }
+    if (sel w.fixed)                  { ret res[opt[u64], Error].ok{opt[u64].some{w.fixed::u64}}; }
+    if (!(sel w.scaled))              { ret res[opt[u64], Error].err{Error.unstated{}}; }
+    if (sel w.scaled.length.agnostic) { ret res[opt[u64], Error].ok{opt[u64].some{0}}; }
+    if (!(sel w.scaled.length.least)) { ret res[opt[u64], Error].err{Error.unstated{}}; }
+    if (sel ctx.none)                 { ret res[opt[u64], Error].err{Error.scaled{}}; }
+    val view: *rf.Available = ctx.some.view;
+    if (view == nil) { ret res[opt[u64], Error].err{Error.scaled{}}; }
+    val q: opt[u8] = rf.bound(view, w.scaled.bits.scale);
+    if (sel q.none) { ret res[opt[u64], Error].err{Error.scaled{}}; }
+    val r: quantity.Range = rf.range(view, q.some);
+    ret res[opt[u64], Error].ok{opt[u64].some{quantity.at(w.scaled.bits, r.least::u64)}};
+}
+
+# the most lanes up to `most` that a unit's counts admit, zero for none
+fun fit(c: Counts, most: u32) u32 {
+    if (sel c.any)       { ret most; }
+    if (!(sel c.listed)) { ret 0; }
+    var best: u32   = 0;
+    var i:    usize = 0;
+    for (i < c.listed.size) {
+        val k: u32 = c.listed.data[i];
+        if (k <= most && k > best) { best = k; }
+        i = i + 1;
+    }
+    ret best;
+}
+
+# how a build splits a vector: to the widest unit it meets that packs the
+# lane type, the one holding the most of the vector's lanes in a piece, the
+# first stated on a tie. a unit holds as many lanes as its least width under
+# the build has room for, every count where it has no width, and of those
+# only a count it admits
+# ---
+# ctx:   the context the build's selection opened, none when it has none
+# c:     the target's declarations
+# lane:  the vector's lane type
+# lanes: its lane count
+# ret:   the split, or why it could not be read
+pub fun split(ctx: opt[*core_state.Context], c: *Capabilities, lane: LaneType, lanes: u32) res[Split, Error] {
+    val v: Vectors = c.vectors;
+    if (sel v.none)     { ret res[Split, Error].ok{Split.scalar{}}; }
+    if (!(sel v.units)) { ret res[Split, Error].err{Error.unstated{}}; }
+    val bits: u32 = bits_of(lane);
+    if (bits == 0) { ret res[Split, Error].err{Error.unstated{}}; }
+    var best: Split = Split.scalar{};
+    var most: u32   = 0;
+    var i:    usize = 0;
+    for (i < v.units.size) {
+        val u:   *Unit            = ?v.units.data[i];
+        val met: res[bool, Error] = meets(ctx, u);
+        if (sel met.err) { ret res[Split, Error].err{met.err}; }
+        if (met.ok && packs(u, lane)) {
+            val width: res[opt[u64], Error] = least_bits(ctx, u.width);
+            if (sel width.err) { ret res[Split, Error].err{width.err}; }
+            var room: u32 = lanes;
+            if (sel width.ok.some) {
+                val fits: u64 = width.ok.some / bits::u64;
+                if (fits < room::u64) { room = fits::u32; }
+            }
+            val held: u32 = fit(u.counts, room);
+            if (held > most) {
+                most = held;
+                best = Split.pieces{Piece{unit: u, lanes: held}};
+            }
+        }
+        i = i + 1;
+    }
+    ret res[Split, Error].ok{best};
+}
+
+#[testing]
+val ALL_LANES: [3]Lane = [3]Lane{
+    Lane{lane: LaneType.integer{8}, form: Form.packed{}},
+    Lane{lane: LaneType.integer{32}, form: Form.packed{}},
+    Lane{lane: LaneType.float{?BINARY32}, form: Form.packed{}},
+};
+#[testing]
+val FLOAT_LANES: [2]Lane = [2]Lane{
+    Lane{lane: LaneType.integer{32}, form: Form.scalar{}},
+    Lane{lane: LaneType.float{?BINARY32}, form: Form.packed{}},
+};
+#[testing]
+val COUNTS: [3]u32 = [3]u32{2, 3, 4};
+# a 128-bit unit of every lane, a 256-bit one packing only floats, as sse2
+# and avx, a scaled one under an extension and a scaled one fixed vectors
+# never split to
+#[testing]
+val FIXED: [4]Unit = [4]Unit{
+    Unit{requires: Condition.always{}, width: Width.fixed{128}, counts: Counts.any{}, lanes: Slice[Lane]{data: ?ALL_LANES[0], size: 3}},
+    Unit{requires: Condition.always{}, width: Width.fixed{256}, counts: Counts.any{}, lanes: Slice[Lane]{data: ?FLOAT_LANES[0], size: 2}},
+    Unit{requires: Condition.extension{0}, width: Width.scaled{Scaled{bits: quantity.Scaled{fixed: 0, per: 128, scale: 0}, length: Length.least{}}}, counts: Counts.any{}, lanes: Slice[Lane]{data: ?ALL_LANES[0], size: 3}},
+    Unit{requires: Condition.always{}, width: Width.scaled{Scaled{bits: quantity.Scaled{fixed: 0, per: 128, scale: 0}, length: Length.agnostic{}}}, counts: Counts.any{}, lanes: Slice[Lane]{data: ?ALL_LANES[0], size: 3}},
+};
+# vectors of two, three or four lanes in no register, as SPIR-V's
+#[testing]
+val LISTED: [1]Unit = [1]Unit{
+    Unit{requires: Condition.always{}, width: Width.none{}, counts: Counts.listed{Slice[u32]{data: ?COUNTS[0], size: 3}}, lanes: Slice[Lane]{data: ?ALL_LANES[0], size: 3}},
+};
+
+# the lanes of each piece, zero for a scalar split and 0xffff_ffff for a
+# refusal, with no build
+#[testing]
+fun pieces(units: Slice[Unit], lane: LaneType, lanes: u32) u32 {
+    var c: Capabilities;
+    c.vectors = Vectors.units{units};
+    val got: res[Split, Error] = split(opt[*core_state.Context].none{}, ?c, lane, lanes);
+    if (sel got.err)          { ret 0xffff_ffff; }
+    if (sel got.ok.scalar)    { ret 0; }
+    if (!(sel got.ok.pieces)) { ret 0xffff_ffff; }
+    ret got.ok.pieces.lanes;
+}
+
+# a vector splits to the widest unit the build meets that packs its lane
+# type, as many lanes as the unit's width has room for and its counts admit:
+# i32 to the 128-bit unit, which the float-only 256-bit one does not beat,
+# f32 to the 256-bit one, a vector a narrow unit holds whole to the first
+# stated, and a listed count to the largest that fits. a unit under an
+# extension holds nothing with no build, and a scaled one only fixed vectors
+# never split to reads as no unit there
+test vector__a_vector_splits_to_the_widest_unit_the_build_meets {
+    val fixed: Slice[Unit] = Slice[Unit]{data: ?FIXED[0], size: 4};
+    val i8:    LaneType    = LaneType.integer{8};
+    val i32:   LaneType    = LaneType.integer{32};
+    val f32:   LaneType    = LaneType.float{?BINARY32};
+    if (pieces(fixed, i32, 8) != 4)                  { ret 1; }
+    if (pieces(fixed, f32, 8) != 8)                  { ret 2; }
+    if (pieces(fixed, f32, 16) != 8)                 { ret 3; }
+    if (pieces(fixed, i8, 32) != 16)                 { ret 4; }
+    if (pieces(fixed, i32, 3) != 3)                  { ret 5; }
+    if (pieces(fixed, LaneType.integer{16}, 8) != 0) { ret 6; }
+    val listed: Slice[Unit] = Slice[Unit]{data: ?LISTED[0], size: 1};
+    if (pieces(listed, f32, 3) != 3) { ret 7; }
+    if (pieces(listed, f32, 8) != 4) { ret 8; }
+    if (pieces(listed, f32, 1) != 0) { ret 9; }
+    # a scaled unit fixed vectors split to needs a build to read its width
+    val scaled: Slice[Unit] = Slice[Unit]{data: ?FIXED[2], size: 1};
+    if (pieces(scaled, i32, 8) != 0) { ret 10; }
+    var always: [1]Unit = [1]Unit{FIXED[2]};
+    always[0].requires = Condition.always{};
+    if (pieces(Slice[Unit]{data: ?always[0], size: 1}, i32, 8) != 0xffff_ffff) { ret 11; }
+    var c: Capabilities;
+    c.vectors = Vectors.none{};
+    val none: res[Split, Error] = split(opt[*core_state.Context].none{}, ?c, i32, 8);
+    if (sel none.err)          { ret 12; }
+    if (!(sel none.ok.scalar)) { ret 12; }
+    ret 0;
+}
