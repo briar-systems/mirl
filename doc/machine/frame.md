@@ -14,8 +14,9 @@ keeps_pointer(a, f, request)                                                 # r
 ## What it reads
 
 - From the convention row's `Stack.memory`: the alignment at a call, the red zone, the shadow space, where a call leaves the return address (`link`: pushed one word below the canonical frame address, in a register, or nowhere code reaches) and the frame pointer (`pointer`: its register, whether every function keeps it, and the record it heads, either linked at stated offsets from the canonical frame address or free).
-- From the resolved row: the preserved registers, the link and frame pointer registers, and the registers a call clobbers, from which the prologue's and epilogues' scratch registers are those of the stack pointer's class that carry no argument, result, indirect address, count or return address, in the order the row lists its clobbers.
-- From masc: the stack pointer (the register flagged `STACK` that the selection admits), each saved register's storage through the selection's view, each instruction's transfer under its row's rules, the implicit writes some operand value of its row makes (masc's `may`), and its stack effect.
+- From the resolved row: the preserved registers, each saved whole when the function writes it even where the row keeps only its low part, the link and frame pointer registers, and the registers a call clobbers, from which the prologue's and epilogues' scratch registers are those of the stack pointer's class that carry no argument, result, indirect address, count or return address, in the order the row lists its clobbers.
+- From the resolved row: the stack pointer, the register its `pointer_home` names, which masc must flag `STACK`.
+- From masc: each saved register's storage through the selection's view, each instruction's transfer under its row's rules, the implicit writes some operand value of its row makes (masc's `may`), and its stack effect.
 - From the function: every slot with its area, size and alignment, and which slots an operand names.
 
 ## The layout
