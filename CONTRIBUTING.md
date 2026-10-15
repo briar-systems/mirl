@@ -20,7 +20,10 @@ mach build .
 The library artifact is `mirl`, whose entry is `src/lib/mirl.mach`, and the
 program is `cli`, whose entry is `src/bin/mirl.mach`. `mach build .` builds the
 library, and `mach build . -a cli` writes the program to
-`out/linux-x86_64/debug/bin/mirl` on a Linux x86_64 host.
+`out/linux-x86_64/debug/bin/mirl` on a Linux x86_64 host. The `tests` artifact,
+whose entry is `src/lib/tests.mach`, reaches the test modules no module of the
+library can register without importing itself, since mach refuses a circular
+import.
 
 Dependencies are `[dep.<name>]` tables in `mach.toml`, and the exact commit of
 each is the committed gitlink under `dep/`. There is no lock file.
@@ -30,7 +33,7 @@ each is the committed gitlink under `dep/`. There is no lock file.
 ## Testing and formatting
 
 ```bash
-mach test .
+mach test . -a '*'
 mach fmt --check .
 ```
 
@@ -53,7 +56,7 @@ prints it, parses that text and compares the two modules, so a file added for an
 job is part of the round trip and of the verifier. A file starts with its `target`
 line and has no version line, since the reader puts the library's own before it
 and no release touches the files. `mach test` runs in the directory it was started from and not at the
-project root, so the walk finds `test/ir` only when `mach test .` is run from
+project root, so the walk finds `test/ir` only when `mach test` is run from
 the root, as above.
 
 
