@@ -19,6 +19,16 @@
 # its own. the copies move whole words, and a piece whose size no integer has
 # is read and written in the widest words that fit it.
 #
+# a result returned by reference is built in place where nothing can tell. in
+# the callee, a stack slot every return hands back whole, read just before it,
+# whose address goes nowhere but its own loads and stores, is the memory the
+# carrier addresses, so no return copies it. in the caller, a result whose one
+# use stores it whole is passed that store's destination as its address when
+# the destination is a stack slot whose address goes nowhere but its own loads
+# and stores, which the callee cannot reach. any other keeps its slot and the
+# copy, since the callee may read the destination through an argument, a
+# global or a pointer it holds while it writes the result.
+#
 # a copy by reference is made each time the call or return it serves runs,
 # since a callee may write its copy and a return's path may pass the copy
 # another return makes to the result's slot: an aggregate is copied from the memory it was loaded from,
@@ -67,6 +77,7 @@ use mirl.ir.body;
 use mirl.ir.body.Records;
 use mirl.ir.constant.Bits;
 use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.Binding;
 use mirl.ir.function.Body;
 use mirl.ir.function.FunctionData;
 use mirl.ir.global.Tls;
@@ -81,6 +92,7 @@ use mirl.ir.instruction.InstructionData;
 use Spot: mirl.ir.instruction.Place;
 use mirl.ir.instruction.Request;
 use mirl.ir.linkage.Linkage;
+use mirl.ir.metadata.Bindings;
 use mirl.ir.module;
 use mirl.ir.module.Module;
 use mirl.ir.opcode;
@@ -108,8 +120,10 @@ use mirl.pass.record.Time;
 use mirl.target.abi.call;
 use mirl.target.abi.call.Aggregates;
 use mirl.target.abi.call.Statement;
+use mirl.target.abi.convention.Declared;
 use mirl.target.abi.convention.Registers;
 use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.convention.Stack;
 use mirl.target.abi.convention.held;
 use mirl.target.abi.piece;
 use mirl.target.abi.piece.Assignment;
@@ -148,6 +162,10 @@ fun convened(g: *Ground) bool {
 # ptr:        the pointer type a slot's address has
 # offset:     the integer type an address offset has
 # unused:     aggregate loads the pass read pieces from, which go once unused
+# carrier:    the parameter the caller's result address arrives in, when a
+#             result travels by reference
+# storage:    the instruction that addresses the result's memory through the
+#             carrier, made once a variable is bound to that memory
 rec Work {
     m:          *Module;
     build:      *Build;
@@ -159,6 +177,8 @@ rec Work {
     ptr:        Type;
     offset:     Type;
     unused:     Vector[Instruction];
+    carrier:    opt[Value];
+    storage:    opt[Instruction];
 }
 
 fun body_of(w: *Work) *Body {
@@ -431,8 +451,9 @@ fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u
 }
 
 # copy bytes from one storage to another in the widest words both alignments
-# allow
+# allow, nothing when they are one storage, as a result built in place is
 fun copy(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64) err[Why] {
+    if (from.index == to.index) { ret err[Why].ok{}; }
     var done: u64 = 0;
     var word: u64 = 8;
     for (word > 0) {
@@ -838,24 +859,79 @@ fun home_for(w: *Work, ty: Type, passed: Passed) res[opt[Value], Why] {
     ret res[opt[Value], Why].ok{opt[Value].some{made.ok}};
 }
 
-# the resolved row a signature names, which its call or function is under
-fun under(w: *Work, signature: Type) res[*Resolved, Why] {
-    val s: res[types.Function, Why] = signature_of(w, signature);
-    if (sel s.err) { ret res[*Resolved, Why].err{s.err}; }
-    val row: opt[*Resolved] = build_record.under(w.build, s.ok.convention);
-    if (sel row.none) { ret res[*Resolved, Why].err{Why.reason{"a signature names a convention row the target does not state"}}; }
-    ret res[*Resolved, Why].ok{row.some};
+# where a signature's values travel, as the row it names places them. the
+# abi legalisation lowers every call, entry and return through this query, so
+# a front end that asks it reads the placement the pass makes
+# ---
+# row:        the resolved row the signature names
+# assignment: each argument's and result's passing and pieces, the piece the
+#             address of a result by reference travels in, and the bytes of
+#             the outgoing argument area the arguments take
+# named:      how many of the arguments are named, the rest placed as the
+#             row places unnamed values
+# align:      the stack's alignment at a call, 0 for a row with no stack in
+#             memory
+pub rec Passage {
+    row:        *Resolved;
+    assignment: Assignment;
+    named:      Named;
+    align:      u64;
+}
+
+# why a signature was not placed
+# ---
+# signature: the type is no function type of the layout's table
+# row:       the signature names a convention row the target does not state,
+#            by its name, empty for the default
+# classify:  the row refused to classify it, or the target carries no row
+pub tag Unplaced: u8 {
+    signature: types.Error;
+    row:       View;
+    classify:  call.Error;
+}
+
+# place a signature's arguments and results under the row it names, the one
+# classification of a call, an entry or a return
+# ---
+# a:         the allocator the passage's storage comes from
+# b:         the build, whose resolved rows classify
+# l:         the layout of the module the signature is in
+# signature: the function type
+# named:     how many of its arguments a call names, `all` for an entry
+# ret:       the passage, given back with `release`, or why it was not placed
+pub fun placement(a: *allocator.Allocator, b: *Build, l: *Layout, signature: Type, named: Named) res[Passage, Unplaced] {
+    val s: res[types.Function, types.Error] = types.signature(l.types, signature);
+    if (sel s.err) { ret res[Passage, Unplaced].err{Unplaced.signature{s.err}}; }
+    val d: Declared = b.basis.target.convention;
+    if (sel d.uncarried) { ret res[Passage, Unplaced].err{Unplaced.classify{call.Error.uncarried{}}}; }
+    if (!(sel d.rows))   { ret res[Passage, Unplaced].err{Unplaced.classify{call.Error.unstated{}}}; }
+    val row: opt[*Resolved] = build_record.under(b, s.ok.convention);
+    if (sel row.none) { ret res[Passage, Unplaced].err{Unplaced.row{s.ok.convention}}; }
+    val r: res[Assignment, call.Error] = call.classify(a, l, row.some, signature, Statement{aggregates: Aggregates.platform{}, named: named});
+    if (sel r.err) { ret res[Passage, Unplaced].err{Unplaced.classify{r.err}}; }
+    var align: u64   = 0;
+    val stack: Stack = row.some.row.stack;
+    if (sel stack.memory) { align = stack.memory.align; }
+    ret res[Passage, Unplaced].ok{Passage{row: row.some, assignment: r.ok, named: named, align: align}};
+}
+
+# give back a passage's storage
+pub fun release(p: *Passage) err[allocator.Error] {
+    ret piece.dnit(?p.assignment);
 }
 
 # classify a call or a function through the row its signature names, which
 # the work is under from then on
 fun classify(w: *Work, signature: Type, named: Named) res[Assignment, Why] {
-    val row: res[*Resolved, Why] = under(w, signature);
-    if (sel row.err) { ret res[Assignment, Why].err{row.err}; }
-    w.convention = row.ok;
-    val r: res[Assignment, call.Error] = call.classify(w.m.a, w.l, w.convention, signature, Statement{aggregates: Aggregates.platform{}, named: named});
-    if (sel r.err) { ret res[Assignment, Why].err{Why.convention{r.err}}; }
-    ret res[Assignment, Why].ok{r.ok};
+    val got: res[Passage, Unplaced] = placement(w.m.a, w.build, w.l, signature, named);
+    if (sel got.err) {
+        val e: Unplaced = got.err;
+        if (sel e.signature) { ret res[Assignment, Why].err{Why.ir{module.Error.types{e.signature}}}; }
+        if (sel e.classify)  { ret res[Assignment, Why].err{Why.convention{e.classify}}; }
+        ret res[Assignment, Why].err{Why.reason{"a signature names a convention row the target does not state"}};
+    }
+    w.convention = got.ok.row;
+    ret res[Assignment, Why].ok{got.ok.assignment};
 }
 
 fun signature_of(w: *Work, ty: Type) res[types.Function, Why] {
@@ -1014,6 +1090,153 @@ fun owner_of(asg: *Assignment, addressed: bool, at: usize) opt[usize] {
     ret opt[usize].none{};
 }
 
+# whether an instruction reads or writes memory, as its opcode row states,
+# an opcode with no row taken to do both
+fun touches(w: *Work, i: Instruction) bool {
+    val row: opt[*opcode.Row] = opcode.at(body_of(w).instructions.data[i.index].opcode);
+    if (sel row.none) { ret true; }
+    ret row.some.effects.reads || row.some.effects.writes;
+}
+
+# whether every use of an address reads or writes the memory it addresses, as
+# a load's or a store's address or the base of an address past it that does
+# the same, so the address goes nowhere memory or a call could keep it
+fun contained(w: *Work, v: Value) bool {
+    val b: *Body = body_of(w);
+    var k: usize = 0;
+    for (k < b.values.data[v.index].uses.len) {
+        val u:  Instruction      = b.values.data[v.index].uses.data[k];
+        val d:  *InstructionData = ?b.instructions.data[u.index];
+        val at: bool             = d.operands.len > 0 && d.operands.data[0].index == v.index;
+        if (d.opcode.index == opcode.LOAD.index) {
+            if (!at) { ret false; }
+        }
+        or (d.opcode.index == opcode.STORE.index) {
+            if (!at || d.operands.data[1].index == v.index) { ret false; }
+        }
+        or (d.opcode.index == opcode.PTR_ADD.index) {
+            if (!at || d.operands.data[1].index == v.index || !contained(w, d.results.data[0])) { ret false; }
+        }
+        or { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the instruction a value is the result of, of this opcode, none for another
+fun made_by(w: *Work, v: Value, code: Opcode) opt[Instruction] {
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[v.index].def;
+    if (!(sel def.result))                                                            { ret opt[Instruction].none{}; }
+    if (b.instructions.data[def.result.instruction.index].opcode.index != code.index) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{def.result.instruction};
+}
+
+# whether nothing between two instructions of one block, the first before the
+# second, reads or writes memory
+fun untouched_between(w: *Work, first: Instruction, last: Instruction) bool {
+    val b: *Body = body_of(w);
+    val k: Block = block_of(b, first);
+    if (block_of(b, last).index != k.index) { ret false; }
+    val from: u32 = position(b, k, first);
+    val to:   u32 = position(b, k, last);
+    if (to <= from) { ret false; }
+    var p: u32 = from + 1;
+    for (p < to) {
+        if (touches(w, b.blocks.data[k.index].instructions.data[p])) { ret false; }
+        p = p + 1;
+    }
+    ret true;
+}
+
+# the one result by reference, none when no result or more than one travels
+# by reference
+fun referenced(asg: *Assignment) opt[usize] {
+    var count: usize = 0;
+    var at:    usize = 0;
+    var i:     usize = 0;
+    for (i < asg.results.len) {
+        if (sel asg.results.data[i].passing.reference) {
+            count = count + 1;
+            at    = i;
+        }
+        i = i + 1;
+    }
+    if (count != 1) { ret opt[usize].none{}; }
+    ret opt[usize].some{at};
+}
+
+# build a result returned by reference in place: a stack slot every return
+# hands back whole, read just before it with nothing touching memory in
+# between, and whose address goes nowhere else, is the memory the carrier
+# addresses, so no return copies it there
+fun in_place(w: *Work, asg: *Assignment, carrier: opt[Value], rets: *Vector[Instruction]) err[Why] {
+    if (sel carrier.none) { ret err[Why].ok{}; }
+    if (rets.len == 0)    { ret err[Why].ok{}; }
+    val k: opt[usize] = referenced(asg);
+    if (sel k.none) { ret err[Why].ok{}; }
+    var home: opt[Value] = opt[Value].none{};
+    var ty:   Type       = w.ptr;
+    var i:    usize      = 0;
+    for (i < rets.len) {
+        val r:  Instruction      = rets.data[i];
+        val rd: *InstructionData = ?body_of(w).instructions.data[r.index];
+        if (k.some >= rd.operands.len) { ret err[Why].ok{}; }
+        val l: opt[Instruction] = loaded(w, rd.operands.data[k.some]);
+        if (sel l.none)                       { ret err[Why].ok{}; }
+        if (!untouched_between(w, l.some, r)) { ret err[Why].ok{}; }
+        val at: Value = body_of(w).instructions.data[l.some.index].operands.data[0];
+        if (sel home.some) {
+            if (home.some.index != at.index) { ret err[Why].ok{}; }
+        }
+        home = opt[Value].some{at};
+        ty   = body_of(w).values.data[rd.operands.data[k.some].index].type;
+        i    = i + 1;
+    }
+    if (sel home.none) { ret err[Why].ok{}; }
+    val slot: opt[Instruction] = made_by(w, home.some, opcode.ALLOCA);
+    if (sel slot.none) { ret err[Why].ok{}; }
+    val sd: *InstructionData = ?body_of(w).instructions.data[slot.some.index];
+    if (sd.immediates.len == 0 || sd.metadata.flags.kept) { ret err[Why].ok{}; }
+    val held: Immediate = sd.immediates.data[0];
+    if (!(sel held.ty))           { ret err[Why].ok{}; }
+    if (!types.same(held.ty, ty)) { ret err[Why].ok{}; }
+    if (!contained(w, home.some)) { ret err[Why].ok{}; }
+    val bindings: Bindings                          = sd.metadata.bindings;
+    val bound:    res[Slice[Binding], module.Error] = module.bound(w.m, bindings);
+    if (sel bound.err) { ret ir(err[module.Error].err{bound.err}); }
+    if (bound.ok.size > 0) {
+        val at: res[Instruction, Why] = storage_of(w);
+        if (sel at.err) { ret err[Why].err{at.err}; }
+        body_of(w).instructions.data[at.ok.index].metadata.bindings = bindings;
+    }
+    val replaced: err[Why] = ir(body.replace(w.m, w.f, home.some, carrier.some, Records.follow{}));
+    if (sel replaced.err) { ret replaced; }
+    ret ir(body.erase(w.m, w.f, slot.some));
+}
+
+# the instruction that addresses the result's memory through the carrier, at
+# the entry after the stack slots, which a variable bound to that memory is
+# bound on, made the first time one is
+fun storage_of(w: *Work) res[Instruction, Why] {
+    val had: opt[Instruction] = w.storage;
+    if (sel had.some) { ret res[Instruction, Why].ok{had.some}; }
+    val carrier: opt[Value] = w.carrier;
+    if (sel carrier.none) { ret res[Instruction, Why].err{Why.reason{"storage of a result by reference with no carrier"}}; }
+    val zero: res[Value, Why] = integer(w, w.offset, 0);
+    if (sel zero.err) { ret res[Instruction, Why].err{zero.err}; }
+    var bld: Builder = build.init(w.m);
+    build.enter(?bld, w.f);
+    build.at(?bld, w.entry, w.slots);
+    val v:    Value    = binary(?bld, opcode.PTR_ADD, carrier.some, zero.ok);
+    val done: err[Why] = built(?bld);
+    if (sel done.err) { ret res[Instruction, Why].err{done.err}; }
+    val made: Def = body_of(w).values.data[v.index].def;
+    if (!(sel made.result)) { ret res[Instruction, Why].err{Why.reason{"storage of a result by reference no instruction makes"}}; }
+    w.storage = opt[Instruction].some{made.result.instruction};
+    ret res[Instruction, Why].ok{made.result.instruction};
+}
+
 # one return, rewritten into the pieces of its values
 fun lower_return(w: *Work, asg: *Assignment, r: Instruction, carrier: opt[Value]) err[Why] {
     val b:     *Body = body_of(w);
@@ -1090,6 +1313,68 @@ fun lower_return(w: *Work, asg: *Assignment, r: Instruction, carrier: opt[Value]
     ret built(?bld);
 }
 
+# the address an address is past, through every pointer add
+fun root_of(w: *Work, v: Value) Value {
+    var at: Value = v;
+    for {
+        val added: opt[Instruction] = made_by(w, at, opcode.PTR_ADD);
+        if (sel added.none) { brk; }
+        at = body_of(w).instructions.data[added.some.index].operands.data[0];
+    }
+    ret at;
+}
+
+# whether a value stands before an instruction it is used at in that
+# instruction's block: a parameter or constant, a result of another block,
+# which dominates every use there, or one earlier in the block
+fun stands_before(w: *Work, v: Value, at: Instruction) bool {
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[v.index].def;
+    if (!(sel def.result)) { ret true; }
+    val i: Instruction = def.result.instruction;
+    val k: Block       = block_of(b, at);
+    if (block_of(b, i).index != k.index) { ret true; }
+    ret position(b, k, i) < position(b, k, at);
+}
+
+# the store a call's result by reference is passed the destination of: its
+# one use, a store of it whole into memory aligned as its copy is, with
+# nothing touching memory between the call and the store, an address that
+# stands before the call, and a destination in a stack slot of the function's
+# whose address goes nowhere but its own loads and stores, so the callee
+# reaches it neither through an argument, nor a global, nor a pointer it
+# holds. none keeps the copy
+fun destination(w: *Work, c: Instruction, asg: *Assignment, olds: *Vector[Value]) opt[Instruction] {
+    val k: opt[usize] = referenced(asg);
+    if (sel k.none) { ret opt[Instruction].none{}; }
+    val b:   *Body = body_of(w);
+    val old: Value = olds.data[k.some];
+    if (b.values.data[old.index].uses.len != 1 || b.values.data[old.index].bound.len != 0) { ret opt[Instruction].none{}; }
+    val s:  Instruction      = b.values.data[old.index].uses.data[0];
+    val sd: *InstructionData = ?b.instructions.data[s.index];
+    if (sd.opcode.index != opcode.STORE.index || sd.operands.len != 2)                    { ret opt[Instruction].none{}; }
+    if (sd.operands.data[1].index != old.index || sd.operands.data[0].index == old.index) { ret opt[Instruction].none{}; }
+    if (sd.metadata.flags.volatile || sd.metadata.flags.kept)                             { ret opt[Instruction].none{}; }
+    var align: u64   = 0;
+    var i:     usize = 0;
+    for (i < sd.immediates.len) {
+        val imm: Immediate = sd.immediates.data[i];
+        if (sel imm.alignment) { align = imm.alignment; }
+        i = i + 1;
+    }
+    val passing: piece.Passing = asg.results.data[k.some].passing;
+    if (!(sel passing.reference))        { ret opt[Instruction].none{}; }
+    if (align < passing.reference.align) { ret opt[Instruction].none{}; }
+    if (!untouched_between(w, c, s))     { ret opt[Instruction].none{}; }
+    val dest: Value = sd.operands.data[0];
+    if (!stands_before(w, dest, c)) { ret opt[Instruction].none{}; }
+    val root:  Value            = root_of(w, dest);
+    val local: opt[Instruction] = made_by(w, root, opcode.ALLOCA);
+    if (sel local.none)      { ret opt[Instruction].none{}; }
+    if (!contained(w, root)) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{s};
+}
+
 # one call, rewritten into the pieces of its arguments and results
 fun lower_call(w: *Work, c: Instruction) err[Why] {
     val b: *Body            = body_of(w);
@@ -1138,8 +1423,10 @@ fun lower_call(w: *Work, c: Instruction) err[Why] {
         i = i + 1;
     }
     if (given.len != asg.arguments.len || olds.len != asg.results.len) { ret err[Why].err{Why.reason{"a call whose operands are not its signature's"}}; }
-    var address: opt[Value] = opt[Value].none{};
-    if (sel asg.address.some) {
+    var address: opt[Value]       = opt[Value].none{};
+    val into:    opt[Instruction] = destination(w, c, ?asg, ?olds);
+    if (sel into.some) { address = opt[Value].some{body_of(w).instructions.data[into.some.index].operands.data[0]}; }
+    or (sel asg.address.some) {
         var ty:    Type = w.ptr;
         var align: u64  = 1;
         i = 0;
@@ -1246,34 +1533,43 @@ fun lower_call(w: *Work, c: Instruction) err[Why] {
     val made:   err[Why]     = built(?bld);
     if (sel made.err) { ret made; }
 
+    if (sel into.some) {
+        val stored: err[Why] = ir(body.erase(w.m, w.f, into.some));
+        if (sel stored.err) { ret stored; }
+    }
     var at: u32 = 0;
     i = 0;
     for (i < olds.len) {
-        val passed: Passed        = asg.results.data[i];
-        val old:    Value         = olds.data[i];
-        val ty:     Type          = body_of(w).values.data[old.index].type;
-        var pieces: Vector[Value] = vector.init[Value](w.m.a);
-        fin { vector.dnit[Value](?pieces); }
-        if (sel passed.passing.reference) {
-            if (sel address.none) { ret err[Why].err{Why.reason{"a result by reference with no address"}}; }
-            val pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, address.some);
-            if (sel pushed.err) { ret failure.lost(pushed.err); }
-        }
-        or {
-            var n: u32 = 0;
-            for (n < passed.count) {
-                val pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, build.result(?bld, placed, at + n));
+        val passed:       Passed = asg.results.data[i];
+        val old:          Value  = olds.data[i];
+        var placed_whole: bool   = false;
+        if (sel into.some && sel passed.passing.reference) { placed_whole = true; }
+        # a result built in its destination is never loaded
+        if (!placed_whole) {
+            val ty:     Type          = body_of(w).values.data[old.index].type;
+            var pieces: Vector[Value] = vector.init[Value](w.m.a);
+            fin { vector.dnit[Value](?pieces); }
+            if (sel passed.passing.reference) {
+                if (sel address.none) { ret err[Why].err{Why.reason{"a result by reference with no address"}}; }
+                val pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, address.some);
                 if (sel pushed.err) { ret failure.lost(pushed.err); }
-                n = n + 1;
             }
-            at = at + passed.count;
+            or {
+                var n: u32 = 0;
+                for (n < passed.count) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, build.result(?bld, placed, at + n));
+                    if (sel pushed.err) { ret failure.lost(pushed.err); }
+                    n = n + 1;
+                }
+                at = at + passed.count;
+            }
+            val got: res[Value, Why] = rebuild(w, ?bld, ty, passed, ?asg, homes.data[i], Slice[Value]{data: pieces.data, size: pieces.len});
+            if (sel got.err) { ret err[Why].err{got.err}; }
+            val done: err[Why] = built(?bld);
+            if (sel done.err) { ret done; }
+            val moved: err[Why] = ir(body.replace(w.m, w.f, old, got.ok, Records.follow{}));
+            if (sel moved.err) { ret moved; }
         }
-        val got: res[Value, Why] = rebuild(w, ?bld, ty, passed, ?asg, homes.data[i], Slice[Value]{data: pieces.data, size: pieces.len});
-        if (sel got.err) { ret err[Why].err{got.err}; }
-        val done: err[Why] = built(?bld);
-        if (sel done.err) { ret done; }
-        val moved: err[Why] = ir(body.replace(w.m, w.f, old, got.ok, Records.follow{}));
-        if (sel moved.err) { ret moved; }
         i = i + 1;
     }
     ret ir(body.erase(w.m, w.f, c));
@@ -1317,13 +1613,22 @@ fun retire(w: *Work, l: Instruction) err[Why] {
     if (!(sel d.place.placed)) { ret err[Why].ok{}; }
     val v: Value = d.results.data[0];
     if (b.values.data[v.index].uses.len != 0) { ret err[Why].ok{}; }
-    val base: Def = b.values.data[d.operands.data[0].index].def;
-    if (b.values.data[v.index].bound.len != 0 && !(sel base.result)) { ret err[Why].err{Why.reason{"a bound aggregate loaded through an address no instruction makes"}}; }
-    if (sel base.result) {
-        val owner: Instruction = base.result.instruction;
+    val address: Value            = d.operands.data[0];
+    val base:    Def              = b.values.data[address.index].def;
+    var owner:   opt[Instruction] = opt[Instruction].none{};
+    if (sel base.result) { owner = opt[Instruction].some{base.result.instruction}; }
+    if (b.values.data[v.index].bound.len != 0 && sel owner.none) {
+        var carried: bool = false;
+        if (sel w.carrier.some) { carried = w.carrier.some.index == address.index; }
+        if (!carried)           { ret err[Why].err{Why.reason{"a bound aggregate loaded through an address no instruction makes"}}; }
+        val at: res[Instruction, Why] = storage_of(w);
+        if (sel at.err) { ret err[Why].err{at.err}; }
+        owner = opt[Instruction].some{at.ok};
+    }
+    if (sel owner.some) {
         for (body_of(w).values.data[v.index].bound.len > 0) {
             val r:  u32      = body_of(w).values.data[v.index].bound.data[0];
-            val ok: err[Why] = ir(body.store_binding(w.m, w.f, r, owner));
+            val ok: err[Why] = ir(body.store_binding(w.m, w.f, r, owner.some));
             if (sel ok.err) { ret ok; }
         }
     }
@@ -1366,6 +1671,9 @@ fun lower(w: *Work) err[Why] {
     fin { piece.dnit(?asg); }
     val entered: res[opt[Value], Why] = lower_entry(w, ?asg);
     if (sel entered.err) { ret err[Why].err{entered.err}; }
+    w.carrier = entered.ok;
+    val built_in: err[Why] = in_place(w, ?asg, entered.ok, ?rets);
+    if (sel built_in.err) { ret built_in; }
     var i: usize = 0;
     for (i < rets.len) {
         val ok: err[Why] = lower_return(w, ?asg, rets.data[i], entered.ok);
@@ -1432,7 +1740,7 @@ fun run(c: *Context, b: *Build) res[bool, Why] {
     for (i < c.m.functions.len) {
         val f: Function = Function{index: i::u32};
         if (record.touches(c, f)) {
-            var w:  Work     = Work{m: c.m, build: b, convention: build_record.default_row(b), l: ?l, f: f, entry: Block{index: 0}, slots: 0, ptr: ptr.ok, offset: word.ok, unused: vector.init[Instruction](c.m.a)};
+            var w:  Work     = Work{m: c.m, build: b, convention: build_record.default_row(b), l: ?l, f: f, entry: Block{index: 0}, slots: 0, ptr: ptr.ok, offset: word.ok, unused: vector.init[Instruction](c.m.a), carrier: opt[Value].none{}, storage: opt[Instruction].none{}};
             val ok: err[Why] = lower(?w);
             vector.dnit[Instruction](?w.unused);
             if (sel ok.err) { ret res[bool, Why].err{ok.err}; }
