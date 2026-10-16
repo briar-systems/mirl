@@ -5,13 +5,14 @@
 ## The operation
 
 ```
-fold(a: *Allocator, t: *types.Table, req: Request) Outcome
+fold(a: *Allocator, t: *types.Table, nans: Slice[Nans], req: Request) Outcome
 ```
 
 `fold` evaluates one operation and gives a result or a refusal.
 
 - `a` is the allocator the results are taken from.
 - `t` is the type table the request's types are in. The folder may intern a mask type in it.
+- `nans` is the not-a-number the target's float operations return in each format, the rule at a format's index its own, as `mirl.target.basis.nans` reads it for the build. A front end folding for a target passes that target's rules, and the folding passes read them once a function.
 - `req` is the operation, a `Request`.
 
 A **request** holds the opcode, its operands in order (the fixed ones and then the tail) and one immediate per slot of the row. Lists are borrowed for the call. An **operand** is a constant `Value` and a flag saying whether it is secret. A **value** is a type, which is an integer, a float or a vector of either, and one `Bits` per lane of the lane type, a scalar being one lane. Each `Bits` holds the type and the bits in 64-bit words, low word first.
@@ -31,6 +32,7 @@ The **outcome** is one of two cases.
 | `operand` | the operand at this position does not hold one lane of bits per lane of its type |
 | `types` | the type table refused a read |
 | `alloc` | the allocator refused storage for a result |
+| `nan` | a float result is a not-a-number whose bits the target leaves unspecified or does not state for its format |
 
 An operation that would trap is refused by the trap and never answered. A fold gives exactly what the operation gives when it runs, or it refuses.
 
@@ -46,7 +48,13 @@ An operand carries a flag saying whether it is secret, and `folded` says whether
 
 ## Not-a-number results
 
-A float operation that gives a not-a-number gives one with a sign and payload that the IR leaves unspecified. The folder gives one valid choice. A not-a-number operand gives itself quieted, the first such operand when there are several, and an invalid operation gives the format's canonical quiet not-a-number. A caller compares the folder's result as a not-a-number and never by its bits.
+A float operation that gives a not-a-number gives one with a sign and payload that the IR leaves unspecified, and the target states which one it returns for each format it holds (`Nans`). The folder computes one: a not-a-number operand gives itself quieted, the first such operand when there are several, and an invalid operation gives the format's canonical quiet not-a-number. The result's format's rule then decides what the fold gives, in one place for every float operation, `fpromote` and `fdemote` among them.
+
+- `canonical`: the format's canonical quiet not-a-number, as RISC-V returns.
+- `propagate`: the computed one, its operand's payload quieted, as x86-64 returns.
+- `unspecified`, or a format the target states no rule for: no fold, refused as `nan`, so the operation runs and gives what the target gives.
+
+`fneg`, `fabs` and `fcopysign` work on the sign bit alone and keep every other bit, a not-a-number's included, so the rule does not touch them, and nor does `bitcast`, `select` or any other operation that moves bits unchanged.
 
 ## Floats
 
