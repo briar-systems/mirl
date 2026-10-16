@@ -45,10 +45,13 @@
 # registers masc's footprint covers gives any operand naming it under its
 # instruction's configuration.
 #
-# a physical write ends the value of the location it names and no other, since
-# masc states which rows overlap but not which covers another. the value of a
-# register a narrower write overlaps stays live, which holds the allocator off
-# it longer than needed and never too briefly.
+# a physical write ends the value of the location it names and of every
+# location sharing its storage that the write leaves no bit of, by the storage
+# model's kills over masc's footprint: a write of a low part that zeroes the
+# rest ends the whole's value, and one that keeps the rest keeps it, which
+# masc states as a read as well. a write through a view of a virtual register, an operand naming it at
+# a position of a class viewed within its own, ends its value only where the
+# view's write kills the whole, and is a read of it otherwise.
 #
 # with b blocks, n instructions, e operand and effect events, v virtual
 # registers and l locations, liveness takes O(b) passes of O(b (v + l) / 64)
@@ -91,12 +94,14 @@ use mirl.machine.instruction;
 use mirl.machine.instruction.InstructionData;
 use mirl.machine.instruction.Opcode;
 use mirl.machine.instruction.Undecided;
+use mirl.machine.operand;
 use mirl.machine.operand.Block;
 use mirl.machine.operand.Instruction;
 use mirl.machine.operand.Operand;
 use mirl.machine.operand.Register;
 use mirl.machine.operand.Tied;
 use mirl.machine.operand.Virtual;
+use mirl.machine.storage;
 use mirl.machine.vstate;
 
 use core_config: masc.core.config;
@@ -403,6 +408,30 @@ fun tied_operand(b: *Build, id: Instruction, k: u32, t: Tied, pin: u32) err[Erro
     ret err[Error].ok{};
 }
 
+# the virtual registers of an address an operand names: each read, and its
+# base written as well where the address writes it back. its registers
+# assigned already are masc's footprint's, as any operand's are
+fun address_operand(b: *Build, id: Instruction, k: u32, a: operand.Address, early: bool) err[Error] {
+    var names: [operand.MOST_NAMED]Register;
+    val n:     u32 = operand.named(Operand.address{a}, ?names[0]);
+    var i:     u32 = 0;
+    for (i < n) {
+        val r: Register = names[i];
+        if (sel r.virtual) {
+            val read: err[Error] = push_event(b, Event{value: r.virtual.index, write: false, early: false, operand: k, fixed: NONE, tied: NONE});
+            if (sel read.err) { ret read; }
+        }
+        i = i + 1;
+    }
+    if (!operand.writes_back(a)) { ret err[Error].ok{}; }
+    val base: opt[Register] = a.base;
+    if (sel base.some) {
+        val r: Register = base.some;
+        if (sel r.virtual) { ret push_event(b, Event{value: r.virtual.index, write: true, early: early, operand: k, fixed: NONE, tied: NONE}); }
+    }
+    ret err[Error].ok{};
+}
+
 # a virtual register's span grown to cover `n` registers
 fun widen(l: *Live, value: u32, n: u32) {
     if (n > l.spans.data[value]) { l.spans.data[value] = n; }
@@ -460,8 +489,8 @@ fun split(given: Slice[Operand]) bool {
 # when it is not NONE and its writes, the flags it leaves unspecified among
 # them, into scratch set `written` when it is not NONE
 fun touch(b: *Build, id: Instruction, r: *rows.Row, given: Slice[Operand], cfg: core_config.Configured, half: instruction.Half, read: u32, written: u32) err[Error] {
-    var values: [rows.MAX_OPERANDS]mo.Value;
-    val got:    res[effect.Answer[*footprint.Footprint], allocator.Error] = footprint.of(b.fp, r, instruction.halves_of(r, given, half, ?values[0]), b.ctx, cfg);
+    var values: [instruction.VALUES]mo.Value;
+    val got:    res[effect.Answer[*footprint.Footprint], allocator.Error] = footprint.of(b.fp, r, instruction.halves_of(b.file, r, given, half, ?values[0]), b.ctx, cfg);
     if (sel got.err) { ret alloc_err(got.err); }
     val answer: effect.Answer[*footprint.Footprint] = got.ok;
     if (sel answer.undecided) { ret err[Error].err{Error.undecided{Undecided{instruction: id, why: answer.undecided}}}; }
@@ -472,7 +501,35 @@ fun touch(b: *Build, id: Instruction, r: *rows.Row, given: Slice[Operand], cfg: 
         if (written != NONE) { scratch(b, written)[w] = fp.written.data[w] | fp.clobbers.data[w]; }
         w = w + 1;
     }
+    if (written != NONE) { killed(b, fp, scratch(b, written)); }
     ret err[Error].ok{};
+}
+
+# every row sharing storage with a row the footprint writes that the write
+# leaves no bit of, by the storage model's kills, set in the words `into`, as
+# a zeroing write of a low part ends the value held in the whole and a keeping
+# one does not
+fun killed(b: *Build, fp: *footprint.Footprint, into: *u64) {
+    val rows: u32 = b.file.register_count;
+    var w:    u32 = 0;
+    for (w < b.fw) {
+        val word: u64 = fp.written.data[w];
+        var k:    u32 = 0;
+        for (word != 0 && k < 64) {
+            val row: u32 = w * 64 + k;
+            if (((word >> k::u64) & 1) != 0 && row < rows) {
+                val alias: Slice[u32] = location.shares(b.at, row);
+                var n:     usize      = 0;
+                for (n < alias.size) {
+                    val other: u32 = alias.data[n];
+                    if (other < rows && ((into[other / 64] >> (other % 64)::u64) & 1) == 0 && storage.kills(fp, rf.id_of(?b.file.registers[other]))) { into[other / 64] = into[other / 64] | ((1::u64) << (other % 64)::u64); }
+                    n = n + 1;
+                }
+            }
+            k = k + 1;
+        }
+        w = w + 1;
+    }
 }
 
 # the registers and flags row `r` of instruction `id` reads and writes
@@ -512,6 +569,17 @@ fun touches(b: *Build, id: Instruction, r: *rows.Row, given: Slice[Operand], cfg
     ret err[Error].ok{};
 }
 
+# whether a write of virtual register `v` at operand `k` of an instruction of
+# opcode `op` goes through a view of its class that leaves some bit of its
+# value, so the write reads it as well
+fun partly(b: *Build, op: Opcode, k: u32, v: Virtual) bool {
+    val w: opt[instruction.Viewing] = instruction.viewing(b.file, op, k, function.class_of(b.f, v));
+    if (sel w.none)    { ret false; }
+    if (!(sel op.row)) { ret false; }
+    val r: *rows.Row = op.row;
+    ret !storage.view_kills(b.file, w.some.view, r.operands.at[k].write.extend);
+}
+
 # the reads and writes of one instruction: its virtual operands by their
 # roles, a pseudo's physical operands by theirs, the registers each row it
 # stands for touches and its flags, the locations it states it reads and
@@ -526,7 +594,7 @@ fun gather(b: *Build, l: *Live, id: Instruction) err[Error] {
     for (k < count) {
         val o:      Operand    = d.operands.data[k];
         val role:   mo.Role    = instruction.role(op, count, k);
-        val reads:  bool       = (role & mo.READ) != 0;
+        var reads:  bool       = (role & mo.READ) != 0;
         val writes: bool       = (role & mo.WRITE) != 0;
         var pin:    u32        = NONE;
         val fixed:  opt[rf.Id] = instruction.fixed(b.f.set, op, k);
@@ -536,7 +604,10 @@ fun gather(b: *Build, l: *Live, id: Instruction) err[Error] {
             pin = at.ok;
         }
         var value: u32 = NONE;
-        if (sel o.virtual) { value = o.virtual.index; }
+        if (sel o.virtual) {
+            value = o.virtual.index;
+            if (writes && !reads && partly(b, op, k, o.virtual)) { reads = true; }
+        }
         or (sel o.physical) {
             if (rowed == 0) {
                 val got: res[u32, Error] = value_of(b, id, k, Register.physical{o.physical});
@@ -548,6 +619,17 @@ fun gather(b: *Build, l: *Live, id: Instruction) err[Error] {
         or (sel o.tied) {
             val tied: err[Error] = tied_operand(b, id, k, o.tied, pin);
             if (sel tied.err) { ret tied; }
+        }
+        or (sel o.list) {
+            val first: Register = o.list.first;
+            if (sel first.virtual) {
+                value = first.virtual.index;
+                widen(l, value, o.list.count::u32);
+            }
+        }
+        or (sel o.address) {
+            val addressed: err[Error] = address_operand(b, id, k, o.address, early);
+            if (sel addressed.err) { ret addressed; }
         }
         if (value != NONE && reads) {
             val r: err[Error] = push_event(b, Event{value: value, write: false, early: false, operand: k, fixed: pin, tied: NONE});

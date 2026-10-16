@@ -46,7 +46,6 @@ use mirl.machine.alloc.plan;
 use mirl.machine.alloc.plan.Plan;
 use mirl.machine.class;
 use mirl.machine.class.Class;
-use mirl.machine.class.Storage;
 use mirl.machine.function;
 use mirl.machine.function.Area;
 use mirl.machine.function.Function;
@@ -54,8 +53,11 @@ use mirl.machine.function.SlotData;
 use mirl.machine.instruction;
 use mirl.machine.instruction.InstructionData;
 use mirl.machine.instruction.Opcode;
+use mirl.machine.operand;
+use mirl.machine.operand.Address;
 use mirl.machine.operand.Block;
 use mirl.machine.operand.Instruction;
+use mirl.machine.operand.List;
 use mirl.machine.operand.Operand;
 use mirl.machine.operand.Register;
 use mirl.machine.operand.Slot;
@@ -63,6 +65,8 @@ use mirl.machine.operand.Tied;
 use mirl.machine.operand.Virtual;
 use mirl.machine.pseudo;
 use mirl.machine.pseudo.Pseudo;
+use mirl.machine.storage;
+use mirl.machine.storage.Storage;
 use mirl.machine.vstate;
 
 use mo: masc.core.operand;
@@ -185,6 +189,13 @@ fun slot_for(s: opt[Storage]) opt[SlotData] {
     ret opt[SlotData].some{slot_of(s.some)};
 }
 
+# the slot a group of `span` registers of a class spills to, the class's
+# storage once per register and scaled where the class scales, so a group of
+# a scalable vector class spills at the vector length the target runs at
+pub fun group_slot(regs: *rf.Available, c: Class, span: u32) opt[SlotData] {
+    ret slot_for(storage.of_group(regs, c, span));
+}
+
 # the slot each class of a target's locations needs, read from masc's class
 # widths and the pieces of their rows through the selection's view, so a
 # scale the selection fixes is a fixed size, in O(c r) once per target
@@ -195,13 +206,13 @@ pub fun sizes(a: *allocator.Allocator, at: *Locations, regs: *rf.Available) res[
     var k: u32 = 0;
     if (at.file != nil) {
         for (k < at.file.class_count) {
-            vector.push[opt[SlotData]](?s.slots, slot_for(class.storage(regs, class.hardware(at.file, k::u16))));
+            vector.push[opt[SlotData]](?s.slots, group_slot(regs, class.hardware(at.file, k::u16), 1));
             k = k + 1;
         }
     }
     var m: usize = 0;
     for (m < at.memories.len) {
-        vector.push[opt[SlotData]](?s.slots, slot_for(class.storage(regs, Class.memory{at.memories.data[m]})));
+        vector.push[opt[SlotData]](?s.slots, group_slot(regs, Class.memory{at.memories.data[m]}, 1));
         m = m + 1;
     }
     ret res[Sizes, allocator.Error].ok{s};
@@ -351,16 +362,21 @@ fun both(b: *Build, i: Instruction, k: u32, v: u32) res[u32, Error] {
     ret t;
 }
 
+# the value an input virtual register named at operand `k` of `i` under
+# `role` is in the form
+fun virtual_of(b: *Build, i: Instruction, k: u32, v: u32, role: mo.Role) res[u32, Error] {
+    val reads:  bool = (role & mo.READ) != 0;
+    val writes: bool = (role & mo.WRITE) != 0;
+    if (reads && writes) { ret both(b, i, k, v); }
+    if (reads)           { ret read(b, i, k, v, false); }
+    if (writes)          { ret write(b, i, k, v); }
+    ret res[u32, Error].ok{v};
+}
+
 fun operand_of(b: *Build, i: Instruction, k: u32, o: Operand, role: mo.Role) res[Operand, Error] {
     if (sel o.virtual) {
-        val v:      u32             = o.virtual.index;
-        val reads:  bool            = (role & mo.READ) != 0;
-        val writes: bool            = (role & mo.WRITE) != 0;
-        var got:    res[u32, Error] = res[u32, Error].ok{v};
-        if (reads && writes) { got = both(b, i, k, v); }
-        or (reads)           { got = read(b, i, k, v, false); }
-        or (writes)          { got = write(b, i, k, v); }
-        if (sel got.err)     { ret res[Operand, Error].err{got.err}; }
+        val got: res[u32, Error] = virtual_of(b, i, k, o.virtual.index, role);
+        if (sel got.err) { ret res[Operand, Error].err{got.err}; }
         ret res[Operand, Error].ok{virtual_operand(got.ok)};
     }
     if (sel o.tied) {
@@ -378,7 +394,38 @@ fun operand_of(b: *Build, i: Instruction, k: u32, o: Operand, role: mo.Role) res
         }
         ret res[Operand, Error].ok{Operand.tied{Tied{dest: dest, source: source}}};
     }
+    if (sel o.list) {
+        val first: Register = o.list.first;
+        if (!(sel first.virtual)) { ret res[Operand, Error].ok{o}; }
+        val got: res[u32, Error] = virtual_of(b, i, k, first.virtual.index, role);
+        if (sel got.err) { ret res[Operand, Error].err{got.err}; }
+        ret res[Operand, Error].ok{Operand.list{List{first: Register.virtual{Virtual{index: got.ok}}, count: o.list.count}}};
+    }
+    if (sel o.address) { ret addressed(b, i, k, o.address); }
     ret res[Operand, Error].ok{o};
+}
+
+# an address with each virtual register it names read in the form, and its
+# base written back as well where the address writes it back
+fun addressed(b: *Build, i: Instruction, k: u32, a: Address) res[Operand, Error] {
+    var names: [operand.MOST_NAMED]Register;
+    val n:     u32 = operand.named(Operand.address{a}, ?names[0]);
+    var at:    u32 = 0;
+    for (at < n) {
+        val r: Register = names[at];
+        if (sel r.virtual) {
+            var role: mo.Role = mo.READ;
+            if (at == 0 && operand.writes_back(a)) {
+                if (sel a.base.some) { role = mo.READ_WRITE; }
+            }
+            val got: res[u32, Error] = virtual_of(b, i, k, r.virtual.index, role);
+            if (sel got.err) { ret res[Operand, Error].err{got.err}; }
+            names[at] = Register.virtual{Virtual{index: got.ok}};
+        }
+        at = at + 1;
+    }
+    if (n == 0) { ret res[Operand, Error].ok{Operand.address{a}}; }
+    ret res[Operand, Error].ok{operand.renamed(Operand.address{a}, ?names[0])};
 }
 
 fun served(src: Metadata, secret: bool) Metadata {
@@ -456,6 +503,21 @@ fun secrecy(b: *Build) {
                 if (sel o.tied) {
                     val dest: Register = o.tied.dest;
                     if (sel dest.virtual) { b.secret.data[dest.virtual.index] = true; }
+                }
+                if (sel o.list) {
+                    val first: Register = o.list.first;
+                    if (sel first.virtual) {
+                        if (writes) { b.secret.data[first.virtual.index] = true; }
+                    }
+                }
+                if (sel o.address) {
+                    val base: opt[Register] = o.address.base;
+                    if (sel base.some) {
+                        val r: Register = base.some;
+                        if (sel r.virtual) {
+                            if (operand.writes_back(o.address)) { b.secret.data[r.virtual.index] = true; }
+                        }
+                    }
                 }
                 n = n + 1;
             }
