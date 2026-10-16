@@ -49,6 +49,10 @@ A rule's instruction states the configuration state its register groups run unde
 
 The `configure` step of `STAGES`, after the lowering of copies, inserts the set's establishing instruction before each instruction whose state differs from the one in force (`mirl.machine.configure`). The state in force is unknown at a block's start and after a call. An instruction masc's hooks say sets a state leaves that one in force, and one whose state its operands decide leaves it unknown. The set states how it establishes a state as data, `StateRules{row, parts}`, each part a scratch register, a fixed register or the state as an immediate. A scratch is an allowed register the convention clobbers or the frame saves that holds no value into or across the instruction, and an instruction before which none is free is refused (`Reason.scratch`). RISC-V states `vsetvli <scratch>, x0, <vtype>`.
 
+## Calls
+
+A call leaves undefined what the convention row it runs under states for its callee. The selection is handed every row of the build (`engine.Calls.rows`, the default first), and a placed call runs under the row its signature names, any other call an expansion makes under the default row. Its callee (`Emit.callee`) is a function, which leaves the row's clobbered registers undefined, or a thread-local descriptor's resolver, as AArch64's TLSDESC call, which leaves only the registers the row states for it (`Convention.descriptor`) and keeps every other. A descriptor call under a row that states none is refused (`UNDESCRIBED`), as is a call under a row the target does not state (`UNROWED`). The link, argument and result registers an expansion names come from the same row.
+
 ## Limits
 
 - A view is total or none: a class some registers of which lie in another and some do not is no view.
@@ -57,3 +61,6 @@ The `configure` step of `STAGES`, after the lowering of copies, inserts the set'
 - The vector length a RISC-V `vsetvli` sets is VLMAX for the vtype, as the IR states no vector length yet (#72).
 - A literal is printed but not read back from the machine text.
 - No rule source makes an address, a list or a literal yet. A member whose selection emits one builds that source.
+- A call clobbers a register it keeps only in part, as lp64f's fs0 on a 64-bit float file, whole. A value whose view lies within the kept bits could stay there across the call, which needs liveness to read a clobber per view.
+- No RISC-V row states descriptor clobbers, since its table makes no TLSDESC call. The RISC-V test of a descriptor row is a row of its own.
+- A function under a row other than the default is refused, since the frame reads the default row.

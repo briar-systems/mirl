@@ -4,16 +4,17 @@
 
 ## What it reads
 
-- The register width comes from the target's `widths.register` declaration. A rule that differs by width carries a hook that reads it. No rule reads an architecture's name.
+- The register width comes from the target's `widths.register` declaration. A rule's type tests state the width against it (`register`, or `part{2}` for a 32-bit operation on RV64), so one rule serves both register widths. Only the rules a row pins to one width, and the constant and address forms whose sequences differ, keep a hook that reads it. No rule reads an architecture's name.
 - The extensions come from the target's selection, which masc closes over implied extensions once. A rule emits rows, and the engine drops a rule whose row masc does not admit. So M, A (Zaamo, with Zabha for bytes and halves), F and D, Zfh, Zfa, Zicond and the Zba, Zbb and Zbs bit manipulation extensions are each a row's requirement and never a branch in the table.
 - A catalog row that exists once per width (`slli`, `rori`, `ld`) is two named rows, and the one the selection admits is the one the rule takes.
 - A rule names each row and each scratch or holding class by the handle masc generates for it (`gen_row.ADD`, `register.X`), so no file here holds a position in masc's catalog or register file. A regenerated catalog that renames a row is a compile error here and never a different instruction.
 
 ## Values
 
-An integer narrower than the register is held sign extended to the register, as the psABI holds it, and a condition (`i1`) is held as 0 or 1. Integers and pointers live in the general registers and floats in the float registers.
+An integer narrower than the register is held sign extended to the register, as the psABI holds it, and a condition (`i1`) is held as 0 or 1. Integers and pointers live in the general registers. A float lives in the float registers where its format's extension gives them (F for binary16 and binary32, D for binary64), and in the general registers under Zhinx, Zfinx or Zdinx, which conflict with F. Each is a hold row with its condition, so a build meets one row per format. Vectors live in the vector registers under V.
 
 - A 32 bit operation on RV64 takes the word forms (`addw`, `slliw`, `divw`), which keep the result sign extended. On RV32 the same operation takes the plain forms.
+- A vector instruction states its vtype (`Emit.state`), and the configure step establishes it with `vsetvli` (`mirl.target.register.riscv.vtype.STATE`): a scratch general register takes the vector length, `x0` the requested length for VLMAX, and the vtype is the immediate.
 - A comparison whose only use is a conditional branch selects with it as one `beq`, `bne`, `blt`, `bge`, `bltu` or `bgeu` and a jump, and no register holds the condition. Any other comparison gives 0 or 1 with `slt`, `sltu`, `xori` or `sltiu`.
 - Constants: `addi` from x0 builds 12 signed bits, `lui` alone builds a value whose low 12 bits are zero, `lui` and `addiw` (`addi` on RV32) build 32 bits, and six instructions build any 64 bit value. Their costs are 2, 2, 4 and 12, which constant hoisting reads. A float constant is built in an integer register and moved.
 - A kept store selects to a store row that carries the mark. The instructions around it, such as a constant's materialisation, do not.
