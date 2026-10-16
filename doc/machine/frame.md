@@ -1,6 +1,6 @@
 # Frames
 
-`mirl.machine.frame` lays out the stack frame of an allocated register machine function, saves the callee-saved registers it writes, writes its prologue and epilogues, and states its call frame information as data for masc's CFI calls. It reads every frame fact from the target's convention row and from masc's rows, and names no architecture.
+`mirl.machine.frame` lays out the stack frame of an allocated register machine function, saves the callee-saved registers it writes, writes its prologue and epilogues in the shape the convention row states, and states its call frame information as mink's frame records, the rules masc's CFI calls take. It reads every frame fact from the target's convention row and from masc's rows, and names no architecture.
 
 ```
 frame(a, ?allocation, Request{convention: ?resolved, at: ?locations}, ?code)   # res[Framed, Error]
@@ -13,7 +13,7 @@ keeps_pointer(a, f, request)                                                 # r
 
 ## What it reads
 
-- From the convention row's `Stack.memory`: the alignment at a call, the red zone, the shadow space, where a call leaves the return address (`link`: pushed one word below the canonical frame address, in a register, or nowhere code reaches) and the frame pointer (`pointer`: its register, whether every function keeps it, and the record it heads, either linked at stated offsets from the canonical frame address or free).
+- From the convention row's `Stack.memory`: the alignment at a call, the red zone, the shadow space, where a call leaves the return address (`link`: pushed one word below the canonical frame address, in a register, or nowhere code reaches), the frame pointer (`pointer`: its register, whether every function keeps it, and the record it heads, either linked at stated offsets from the canonical frame address or free), where the stack pointer lives (`pointer_home`), and the prologue's shape (`prologue`, below).
 - From the resolved row: the preserved registers, each saved whole when the function writes it even where the row keeps only its low part, the link and frame pointer registers, and the registers a call clobbers, from which the prologue's and epilogues' scratch registers are those of the stack pointer's class that carry no argument, result, indirect address, count or return address, in the order the row lists its clobbers.
 - From the resolved row: the stack pointer, the register its `pointer_home` names, which masc must flag `STACK`.
 - From masc: each saved register's storage through the selection's view, each instruction's transfer under its row's rules, the implicit writes some operand value of its row makes (masc's `may`), and its stack effect.
@@ -35,6 +35,20 @@ The frame keeps its pointer when the row always keeps it, or when the function a
 
 A leaf that keeps no pointer, allocates nothing dynamically, has no scaled area and fits the red zone never moves its stack pointer, and its saves and slots are below it.
 
+## The prologue's shape
+
+```
+Prologue { probe: none | page{bytes, helper}, pair_saves: bool, unwind: none | dwarf | seh | compact }
+```
+
+The shape lives on the convention row beside the red zone and the shadow space, since it differs between rows of one instruction set, as Windows x64 and System V x86-64 do.
+
+- `probe`: `none` moves the stack pointer by the whole frame at once. `page` touches each page of a frame that moves the stack pointer more than `bytes`, through `helper` (Windows' `__chkstk`) or inline where there is none (Linux's stack clash probes).
+- `pair_saves`: registers are saved and restored in pairs, as AArch64's `stp` and `ldp`.
+- `unwind`: the encoding the shape must suit. `dwarf` states any shape. `seh` states only saves and one stack and frame pointer move in a fixed order before the body. `compact` states a frame whose record is the first pair saved, as darwin's arm64 `stp fp, lr`. `none` is a row whose call stack no unwinder walks, as wasm's, and its frames state no call frame rule.
+
+The frame writes the RISC-V shape, `probe: none`, `pair_saves: false`, `unwind: dwarf`, and the `none` unwind. `lay` refuses a frame whose row asks for more than that: `probe` for a frame that moves its stack pointer past a page, by a scaled or a dynamic amount, `pairs` for a frame that saves a register in pairs, and `unwind` for a frame that moves or saves under `seh` or `compact`. A frame the shape asks nothing of is laid out as it would be unprobed.
+
 ## The written function
 
 The function is made anew through its maker. The prologue opens the entry block, and an epilogue comes before every exit, a return or a jump to a symbol. A `dynamic` pseudo becomes the size rounded up to the alignment taken off the stack pointer, with the block just above the outgoing area. An `address` pseudo becomes the slot's base plus its offset. A `spill` or `reload` becomes the target's store or load of the slot's size. The saves are the same stores and loads at slots the frame adds after the function's own.
@@ -46,21 +60,33 @@ The code states each width it loads and stores a class at as data (`Width`): the
 - RISC-V states `lb`, `lh`, `lw` and `ld` with their stores for x, `flh`, `flw`, `fld` and `flq` with theirs for f, and `vl1re8.v` and `vs1r.v` for one v register, whose size scales with the vector length. On RV32 no `ld` or `sd` is admitted, and without Zfh no `flh`. The whole register rows take their address in a register alone, so a nonzero offset is added into the scratch first.
 - A set carried later states its widths the same way: x86 `movdqu` and its VEX and EVEX forms for xmm, ymm and zmm, each admitted by the extension that has it, and AArch64 `ldr` and `str` of b, h, s, d and q registers.
 
+### Scaled steps
+
+An offset that scales is bytes fixed plus bytes per unit of one scale's multiplier. `Code.scaled` states, for such an offset, how the code forms it (`Steps`):
+
+- `native`: instructions that add or address a multiple of the scale's unit themselves, as SVE's `addvl`, `addpl` and `mul vl` addressing, and SME's `addsvl` under the streaming scale. The offset's scale picks between the two.
+- `measured`: the register that measures the scale's quantity is read into a register, multiplied by the bytes per unit and added to the fixed part, as RVV's `vlenb`. The measuring register is masc's to name, as the scale's quantity's `register`.
+- `none`: the code forms none. `make` refuses a move at such an offset with `Refusal.scaled` before the code is asked.
+
+RISC-V states `measured` for the v registers' scale and `none` for the others, which a selection fixes.
+
 ## Call frame rules
 
-`Framed.facts` lists each rule beside the instruction that makes it true, before or after it: the canonical frame address as a register plus an offset (`.cfi_def_cfa`), a register saved at an offset from it (`.cfi_offset`), a register restored (`.cfi_restore`), and the remember and restore pair around each epilogue. Registers are masc's identities, so masc numbers them from its own rows. Offsets may scale, which masc writes as an expression.
+`Framed.facts` lists each rule beside the instruction that makes it true, before or after it, as mink's frame record (`mink.model.frame.Rule`), the value masc's builder takes through `cfi`: the canonical frame address as a register plus an offset (`def_cfa`, `.cfi_def_cfa`), a register saved at an offset from it (`offset`, `.cfi_offset`), a register restored (`restore`, `.cfi_restore`), and the `remember` and `restore_state` pair around each epilogue. Each register is numbered by masc's DWARF column under the build's context, and a register the column does not number is refused (`unnumbered`). mirl spells no CFI byte: mink owns the bytes of every encoding.
 
 ## How the other rows fit
 
-- System V x86-64: `link` is `stack`, the red zone is 128 bytes, and the record is linked at -16 with the return address at -8, where the call pushed it.
-- Windows x64: the shadow space reserves 32 bytes at every call, and the record is `free`, so the frame pointer points at the bottom of the saves. Unwind codes are written from the same rules.
-- AAPCS64: `link` is x30 and the record is linked at -16 and -8, and darwin keeps the pointer always. SVE callee-saved registers and spills are slots per unit of the vector length scale, in the scaled area.
-- wasm: a memory stack whose `link` is `none` and whose `pointer` is `none`, so a frame that needs a pointer is refused until its row and code state one.
+- System V x86-64: `link` is `stack`, the red zone is 128 bytes, and the record is linked at -16 with the return address at -8, where the call pushed it. Under Linux's stack clash protection the prologue probes every 4096 bytes inline, `page{4096, none}`.
+- Windows x64: the shadow space reserves 32 bytes at every call, and the record is `free`, so the frame pointer points at the bottom of the saves. The prologue probes through `__chkstk`, `page{4096, "__chkstk"}`, and its shape is `seh`, whose unwind codes mink writes from the same rules.
+- AAPCS64: `link` is x30 and the record is linked at -16 and -8, and darwin keeps the pointer always. Saves are paired, and darwin's shape is `compact`, its record the `stp fp, lr` saved first. SVE callee-saved registers and spills are slots per unit of the vector length scale, in the scaled area, formed `native` by `addvl` and `addpl`.
+- wasm: a memory stack in linear memory, its stack pointer homed in the `__stack_pointer` global, whose `link` is `none`, whose `pointer` is `none` and whose `unwind` is `none`, so a frame that needs a pointer is refused until its row and code state one, and no frame states a call frame rule.
 - SPIR-V: `Stack.none`, so a function with a slot is refused and any other has an empty frame.
 
 ## Limits
 
-- The RISC-V code forms no offset that scales: the vector length is read from a CSR, which the machine form names no operand for. It also refuses an out-of-reach offset where it has no scratch register, as a spill mid-function past 2 KiB from its base.
+- The RISC-V code forms no offset that scales: it states `measured` through `vlenb`, but masc's `vlen` quantity names no register that measures it and the machine form names no operand for a CSR. It also refuses an out-of-reach offset where it has no scratch register, as a spill mid-function past 2 KiB from its base.
+- A call frame rule at an offset that scales is refused (`finish.Error.scaled`): mink's frame records state a scaled save only as one offset times a measuring register's value, and a scaled canonical frame address only as expression bytes, which mirl does not spell.
+- An offset scales by one scale, so a frame with slots of two scales, as SME's vector length and streaming vector length, is refused (`scales`).
+- The frame writes no probe, no paired save and no `seh` or `compact` shape. `lay` refuses each where the frame would need it.
 - RISC-V states no whole register load or store of a register group, since the register file names no group as one register yet.
-- Slots of more than one scale in one frame are refused.
 - A debug binding or an asm block cannot name a slot yet, so an unnamed slot always leaves the frame.
