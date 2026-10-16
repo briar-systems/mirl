@@ -6,7 +6,9 @@
 # each dynamic allocation, slot address, spill and reload is expanded through
 # the target's frame code, and every other instruction is copied. each move of
 # the stack or frame pointer and each save and restore states its call frame
-# rule beside the instruction that makes it true. the input is never changed.
+# rule beside the instruction that makes it true, as mink's frame record with
+# each register numbered by masc's dwarf column under the build's context. a
+# row whose code no unwinder walks states none. the input is never changed.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -36,14 +38,11 @@ use mirl.machine.frame.lay.Plan;
 use mirl.machine.frame.lay.Spot;
 use mirl.machine.frame.record;
 use mirl.machine.frame.record.Address;
-use mirl.machine.frame.record.Cfa;
 use mirl.machine.frame.record.Fact;
 use mirl.machine.frame.record.Framed;
 use mirl.machine.frame.record.Layout;
 use mirl.machine.frame.record.Offset;
 use mirl.machine.frame.record.Place;
-use mirl.machine.frame.record.Rule;
-use mirl.machine.frame.record.Saved;
 use mirl.machine.function;
 use mirl.machine.function.Function;
 use mirl.machine.instruction.InstructionData;
@@ -55,22 +54,30 @@ use mirl.machine.operand.Slot;
 use mirl.machine.operand.Virtual;
 use mirl.machine.pseudo;
 
-use rf: masc.core.register;
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+use mink.model.frame;
 
 # why a frame was not written
 # ---
-# lay:     the layout was refused
-# code:    the target's frame code refused a move
-# made:    the function's maker refused a virtual register, slot or block
-# operand: a spill, reload, address or dynamic allocation whose register is
-#          not a register of the file, at this instruction
-# dropped: an instruction naming a slot the layout dropped
+# lay:        the layout was refused
+# code:       the target's frame code refused a move
+# made:       the function's maker refused a virtual register, slot or block
+# operand:    a spill, reload, address or dynamic allocation whose register is
+#             not a register of the file, at this instruction
+# dropped:    an instruction naming a slot the layout dropped
+# unnumbered: a register a call frame rule names that masc's dwarf column
+#             does not number under the build's context
+# scaled:     a call frame rule at an offset that scales, which mink's frame
+#             records state no rule for but by expression bytes
 pub tag Error: u8 {
-    lay:     lay.Error;
-    code:    Refusal;
-    made:    function.Error;
-    operand: Instruction;
-    dropped: Instruction;
+    lay:        lay.Error;
+    code:       Refusal;
+    made:       function.Error;
+    operand:    Instruction;
+    dropped:    Instruction;
+    unnumbered: rf.Id;
+    scaled:     Offset;
 }
 
 # what the writing of one frame shares
@@ -105,20 +112,44 @@ fun last(w: *Writer) Instruction {
     ret Instruction{index: (w.out.function.instructions.len - 1)::u32};
 }
 
-fun fact(w: *Writer, at: Instruction, after: bool, rule: Rule) err[Error] {
+# the rule of a frame that states call frame rules, none for one that does not
+fun fact(w: *Writer, at: Instruction, after: bool, rule: frame.Rule) err[Error] {
+    if (!w.p.unwound) { ret err[Error].ok{}; }
     val pushed: res[usize, allocator.Error] = vector.push[Fact](?w.out.facts, Fact{at: at, after: after, rule: rule});
     if (sel pushed.err) { ret alloc_err(pushed.err); }
     ret err[Error].ok{};
 }
 
 # a rule after the last instruction, when the move made one
-fun after(w: *Writer, from: usize, rule: Rule) err[Error] {
+fun after(w: *Writer, from: usize, rule: frame.Rule) err[Error] {
     if (w.out.function.instructions.len == from) { ret err[Error].ok{}; }
     ret fact(w, last(w), true, rule);
 }
 
+# a register's number in mink's frame records, masc's dwarf number for it
+fun numbered(w: *Writer, reg: rf.Id) res[u16, Error] {
+    val ctx: *core_state.Context = w.code.context;
+    val n:   opt[u32]            = core_state.debug_number(ctx.view.file, reg, rf.DWARF, ctx);
+    if (sel n.none) { ret res[u16, Error].err{Error.unnumbered{reg}}; }
+    val got: u32 = n.some;
+    if (got > 0xffff) { ret res[u16, Error].err{Error.unnumbered{reg}}; }
+    ret res[u16, Error].ok{got::u16};
+}
+
+# a register and a fixed offset as mink's frame records state them
+fun at_register(w: *Writer, reg: rf.Id, o: Offset) res[frame.Offset, Error] {
+    if (o.per != 0) { ret res[frame.Offset, Error].err{Error.scaled{o}}; }
+    val n: res[u16, Error] = numbered(w, reg);
+    if (sel n.err) { ret res[frame.Offset, Error].err{n.err}; }
+    ret res[frame.Offset, Error].ok{frame.Offset{reg: n.ok, offset: o.fixed}};
+}
+
+# the canonical frame address is now a register plus an offset, .cfi_def_cfa
 fun cfa(w: *Writer, from: usize, reg: rf.Id, o: Offset) err[Error] {
-    ret after(w, from, Rule.cfa{Cfa{register: reg, offset: o}});
+    if (!w.p.unwound) { ret err[Error].ok{}; }
+    val r: res[frame.Offset, Error] = at_register(w, reg, o);
+    if (sel r.err) { ret err[Error].err{r.err}; }
+    ret after(w, from, frame.Rule.def_cfa{r.ok});
 }
 
 fun nonzero(o: Offset) bool {
@@ -150,20 +181,28 @@ fun at_depth(w: *Writer, s: Spot, above: i64, per: i64) Offset {
     ret Offset{fixed: above - d, per: per, scale: w.p.scale};
 }
 
+# a register saved at an offset from the canonical frame address, .cfi_offset
 fun save(w: *Writer, e: *Emit, s: Spot, above: i64, per: i64, cfa_offset: Offset) err[Error] {
     val from: usize      = w.out.function.instructions.len;
     val size: Offset     = record.size_of(w.p.added.data[s.slot]);
     val done: err[Error] = refused(code.make(e, Step.store{Access{register: s.register, base: w.out.layout.stack, at: at_depth(w, s, above, per), size: size}}));
     if (sel done.err) { ret done; }
-    ret after(w, from, Rule.saved{Saved{register: s.register, offset: cfa_offset}});
+    if (!w.p.unwound) { ret err[Error].ok{}; }
+    val r: res[frame.Offset, Error] = at_register(w, s.register, cfa_offset);
+    if (sel r.err) { ret err[Error].err{r.err}; }
+    ret after(w, from, frame.Rule.offset{r.ok});
 }
 
+# a register holds its value at the call again, .cfi_restore
 fun restore(w: *Writer, e: *Emit, s: Spot, base: rf.Id, o: Offset) err[Error] {
     val from: usize      = w.out.function.instructions.len;
     val size: Offset     = record.size_of(w.p.added.data[s.slot]);
     val done: err[Error] = refused(code.make(e, Step.load{Access{register: s.register, base: base, at: o, size: size}}));
     if (sel done.err) { ret done; }
-    ret after(w, from, Rule.restored{s.register});
+    if (!w.p.unwound) { ret err[Error].ok{}; }
+    val n: res[u16, Error] = numbered(w, s.register);
+    if (sel n.err) { ret err[Error].err{n.err}; }
+    ret after(w, from, frame.Rule.restore{n.ok});
 }
 
 fun prologue(w: *Writer, e: *Emit) err[Error] {
@@ -263,7 +302,7 @@ fun epilogue(w: *Writer, e: *Emit) err[Error] {
     val total: i64     = top + p.locals::i64;
     val per:   i64     = p.per::i64;
     if (p.empty) { ret err[Error].ok{}; }
-    val kept: err[Error] = fact(w, Instruction{index: w.out.function.instructions.len::u32}, false, Rule.remember{});
+    val kept: err[Error] = fact(w, Instruction{index: w.out.function.instructions.len::u32}, false, frame.Rule.remember{});
     if (sel kept.err) { ret kept; }
     if (l.red != 0) {
         val done: err[Error] = restores(w, e, false, sp, entry, 0);
@@ -348,7 +387,7 @@ fun instruction(w: *Writer, b: Block, id: Instruction) err[Error] {
         val oc: err[Error] = origins(w, mid, id.index);
         if (sel oc.err) { ret oc; }
         if (w.p.empty)  { ret err[Error].ok{}; }
-        ret fact(w, last(w), true, Rule.restore{});
+        ret fact(w, last(w), true, frame.Rule.restore_state{});
     }
     val from:    usize         = w.out.function.instructions.len;
     var done:    err[Error]    = err[Error].ok{};
