@@ -63,6 +63,8 @@ An instruction is refused, naming the function, the instruction and the operand,
 
 A global is refused, naming it, when its initial value holds an address and the target states no address model, it names a section another names with another kind, the data layout gives its type no extent, or an address in its initial value is wider than a datum masc relocates.
 
+The object is refused as `Error.unmapped` when masc finishes it with a relocation whose kind the object's format does not map for the architecture (masc's `build.NO_RELOCATION`). It names the function or global the relocation aims at, none for a block or a marker, and keeps masc's refusal, whose mink failure names the kind and the format. `mirl emit` reports it as refused input. Any other refusal of masc's is `Error.builder`.
+
 ## Limits
 
 - Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (#197, masc#41).
