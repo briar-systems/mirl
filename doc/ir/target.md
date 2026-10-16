@@ -148,6 +148,8 @@ mirl.target.stride(?l, ty, space)        # res[u64, Error], the bytes from one e
 - A function type or a target handle has no size and is refused as `unsized`.
 - A union is as large as its largest member rounded up to the largest member alignment, with every member at offset 0. Only `c` lays one out, and the other rules refuse it as `ruled`.
 
+A front end lowers a tag to `struct{disc, union{...}}` and reads its layout through the same queries: `offset(l, tag, 0, 0)` is the discriminant's offset and `offset(l, tag, 0, 1)` the payload's, the union placed at the next multiple of its strictest member's alignment. On `riscv64-linux`, `struct{i32, union{i64, i8}}` has its payload at 8 and is 16 bytes at 8, and a vector of four `binary32` is 16 bytes at 16, as wide as the narrowest vector register the row's vector rule states. No second table of sizes exists: mach, mach-std and every pass ask this one.
+
 These are Vulkan's extended alignment (`std140`), base alignment (`std430`) and scalar alignment (`scalar`), with the stride an array leaves unstated placed as tightly as they allow. Under `c` an array's stride is its element's size and every type's size is a multiple of its alignment, so the rules are those of the target's C compiler.
 
 A request that cannot be answered is refused with a reason. The reasons are an unstated fact (the target leaves it out), an address space the target has no row for, an unsized type, a stated offset that is misaligned or overlaps the member before it, a stated stride the rules refuse, a type the space's rules do not lay out, a member index past the type's members, an offset asked of a type that is not a structure or union or a stride of one that is not an array, and a size that does not fit in 64 bits.
@@ -187,6 +189,28 @@ mirl.target.abi.tail(?r, ?assignment)                                           
 ```
 
 `classify` describes each argument and result type through the **type view**, a tree of nodes whose every size, alignment and offset was asked of the data layout, and runs the row's result classifier and then its argument classifier over it. It is the only caller of a row's classifiers, as `tail` is of its tail rule. The **assignment** it returns states, for each argument and result, whether it travels by value or by reference to a copy the caller makes and owns, and its **pieces**: for each piece a place (a register by masc's identity, a stack offset that is fixed or scales, or an operand of the target's own call form), the offset and size of the bytes it carries, how the offset and size scale, and how the rest of its place is filled.
+
+### The placement query
+
+A front end, or a checker such as mach-std's assembly wipe check, reads where a signature's values travel through `mirl.legal.abi.placement`, the one classification the abi legalisation lowers every call, entry and return through. It is never restated elsewhere, so what the query states is what the pass places.
+
+```
+val p: Passage = mirl.legal.abi.placement(a, ?build, ?layout, signature, named)   # res[Passage, Unplaced]
+mirl.legal.abi.release(?p)                                                         # err[allocator.Error]
+```
+
+It takes the build a family opened for the target, whose resolved rows classify, the layout of the module the signature is in, the function type and how many of its arguments a call names (`all` for an entry). The **passage** holds
+
+- `row`, the resolved row the signature names,
+- `assignment`, for each argument and result in order its passing (by value, or by reference to a copy of a stated size and alignment) and its pieces, each a place (a register by masc's identity, a stack offset that is fixed or scales, or an operand of the target's call form), the bytes it carries, how they scale and how its place is filled; the piece the address of a result by reference travels in (`address`, the first argument's place where the row's `indirect` carrier is `first`, or a register of its own such as aapcs64's x8); and `stack`, the bytes of the outgoing argument area the arguments take, packed as the row's `packing` says,
+- `named`, the named count, the unnamed arguments placed as the row's `variadic` places them,
+- `align`, the stack's alignment at a call, 0 for a row with no stack in memory.
+
+Hidden references (win64 passes an aggregate wider than 8 bytes, or of an odd size, by reference), homogeneous float and vector aggregates in their lane registers, split pairs (an aggregate across an integer and a float register, a two-word scalar across a register pair, a value split between the last register and the stack) and darwin arm64's packed stack are each pieces of the one assignment as their rows state them, so a row added later fills the contract and never reshapes it. A placement the row cannot state is refused with a typed reason (`Unplaced`): `signature` for a type that is no function type, `row` naming a convention row the target does not state, and `classify` for the row's own refusal or a target whose convention is uncarried.
+
+On `riscv64-linux` under lp64d, `fun(struct{i64, binary64}) -> (struct{i64, i64, i64})` passes its result by reference to a 24 byte copy at 8 whose address travels in a0, its argument in a1 (the integer, bytes 0 to 8) and fa0 (the double, bytes 8 to 16), and nothing on the stack.
+
+The abi legalisation builds a result returned by reference in place wherever nothing can tell. In the callee, a stack slot every return hands back whole, read just before the return with nothing touching memory in between, and whose address is only ever a load's or a store's, is the memory the carrier addresses, so no return copies into it, and a variable bound to it is bound to that memory. In the caller, a result whose one use stores it whole, right after the call, to memory aligned as the copy is, is passed that destination as its address when nothing shows the destination is reachable from the call's arguments: the destination is a stack slot whose address goes nowhere else, or no argument holds a pointer. Otherwise the call keeps its own slot and the copy. A large `err[Fail]` a sink call returns is built straight into the variable it is stored to.
 
 The integers are signless, so a convention that extends a narrow integer by the source type's signedness leaves the piece **declared**, and `classify` fills it from the extension the signature states for that parameter or result: sign or zero extended. A declared piece whose parameter or result states none is refused, naming it, and is never guessed.
 
