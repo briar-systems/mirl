@@ -161,7 +161,7 @@ A target declares the conventions its calls are made under in `convention`: its 
 | field | what it states |
 |---|---|
 | `name` | its spelling, which a function type names it by |
-| `abi` | the psABI row of mink's catalog it is, by its name, which must be a row mink states for the target's architecture, so `lp64e` is admitted on `riscv64e` alone, or none for a family that names no psABI rows |
+| `abi` | the psABI row of mink's catalog it is, mink's own row (`mink.catalog.arch.riscv.RISCV_LP64D`), which must be one mink states for the target's architecture, so `RISCV_LP64E` is admitted on `riscv64e` alone and refused elsewhere naming `riscv64e`, or none for a family that names no psABI rows |
 | `file` | the masc register file its registers are named in, none where there is none, as on wasm and SPIR-V |
 | `classifiers` | the result classifier and the argument classifier |
 | `word` | the bits of one argument word |
