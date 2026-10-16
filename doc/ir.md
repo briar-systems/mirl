@@ -287,13 +287,19 @@ The verifier states the same facts as a rule (see section 8). Every result must 
 
 ### 7.1 Constant time
 
-A function that is constant time must have no secret-dependent branch, no secret-dependent address, and no operation whose latency depends on its operands. The IR carries what that check needs, which is the secrecy of every value and the metadata of every instruction. The target states which operations are constant time through its timing declaration. A row of it names an operation (`multiply`, `multiply_high`, `divide` or `shift`), an operand width and a condition, which is either always or the presence of a named extension such as RISC-V's `zkt`. A target that states no row for an operation does not guarantee it.
+A function that is constant time must have no secret-dependent branch, no secret-dependent address, and no operation whose latency depends on its operands. The IR carries what that check needs, which is the secrecy of every value and the metadata of every instruction. Which instructions run in constant time is masc's to state, and mirl states none of it. Each row of masc's instruction set has a constant-time class, which says the inputs its timing depends on, under a condition over the selection and the state axes such as RISC-V's `zkt`, and each set states whether it classifies its rows' timing at all.
 
 A function requires constant time when its declaration says so. `FunctionData` has a `constant_time` flag, set when the function is declared and read by every pass. The text form writes it as `constant_time` after the function's type (see [ir/text.md](ir/text.md)).
 
 Every pass declares whether it keeps the requirement. A pass that may branch on a value or otherwise change how long the code takes declares that it breaks it, and that is the default. The pass driver in `mirl.pass` never gives such a pass a function that requires constant time, so the pass needs no check of its own. A module pass asks the driver's `touches` before it rewrites a function.
 
-The check itself belongs to `mirl.ct`. This version of the library does not implement it, so it does not yet refuse a function or a target that cannot meet the requirement.
+The check asks masc through `mirl.ct`. The machine form's question of an instruction is `latency`, the refusal of a secret in one of its inputs, read from its row's class under the context the function runs under. `check` walks a function's encoded bytes with masc's walk (`masc.walk.walk.check`) under that context, from the secrets the caller seeds it with, and answers by the set's timing through `masc.core.ct.required`:
+
+- A set that classifies its rows, as RISC-V, holds the requirement for code its walk clears, and refuses a secret the walk finds where the code may hold none.
+- A set whose timing is not guaranteed, as wasm, compiles the code with masc's one warning (`masc.core.ct.UNGUARANTEED`), which states no guarantee. Its walk still refuses a secret that decides a branch or forms an address. Until masc walks wasm code (masc#348) a walk of it answers unread, and the code compiles with the warning as not verified, its discipline kept by mirl's own passes.
+- A set that classifies no timing, as SPIR-V, refuses the requirement with masc's one refusal record and wording.
+
+Emission does not call the check yet and the walk's seeds are not made yet, so this version does not yet refuse a function or a target that cannot meet the requirement.
 
 
 ## 8. The verifier
