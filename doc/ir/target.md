@@ -38,7 +38,6 @@ The capability declarations are
 | `formats` | the number formats computed natively, each under the condition the build must meet to compute in it, with the not-a-number it returns (`canonical`, `propagate` or `unspecified`), the operations of `OPTIONAL` it computes natively and under which condition, and whether a constant of it is `made` in registers or `loaded` from read-only data, or none |
 | `arithmetic` | the widths with a native multiply of the low half and the condition it holds under, the multiply forms beyond it (one row per width and sign: the high half or the whole product, as signed, unsigned or mixed operands, or none), how a shift treats a count at or past the width (`wraps`, `undefined` or `saturates`), the operations on single bits it selects as they stand (`both`, `either`, `differ`, `compare`, or none), the widths of its native division, the condition they hold under and what it does with a zero divisor and with a signed overflow (`traps` or `quiet`), and its division of a two-word dividend by a word divisor: none, or the word widths it runs at and what it does with a zero divisor and with a quotient that does not fit the word |
 | `bulk` | whether one instruction copies a run of bytes, and whether one fills it (`native` or `none`) |
-| `timing` | the operations that run in constant time, by operation, width and condition, or none |
 | `code` | the alignment of a function entry, a code section and a data section, and the bytes that pad code |
 | `attributes` | the schema of the target's family, whose attributes it accepts, or none |
 
