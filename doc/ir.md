@@ -66,7 +66,7 @@ A function type has a list of parameter types and a list of result types. A func
 
 The integers are signless, but a convention extends a narrow integer by the signedness of the source type. Each parameter and each result of a function type may therefore state an **extension**: `sext` for sign extended, `zext` for zero extended, or none. Only an integer may state one. The extensions are part of the type, so `fun(i8 sext) -> ()` and `fun(i8 zext) -> ()` are different types, and a function and the call that states a signature carry them as data of that one type. The debug information keeps the signedness of its own types and is not derived from the extension.
 
-A function type may also name the **convention** row it is called under, after its results: `fun(i64) -> () convention sve`. A function of that type is entered and returned from under the row, and a call that states the type is made under it. The name is part of the type, so `fun() -> ()` and `fun() -> () convention sve` are different types. A type that names none is under the target's default row, and the verifier refuses a name the target states no row of.
+A function type may also name the **convention** row it is called under, after its results: `fun(i64) -> () convention sve`. A function of that type is entered and returned from under the row, and a call that states the type is made under it. The name is part of the type, so `fun() -> ()` and `fun() -> () convention sve` are different types. A type that names none is under the row of the convention its target's tuple names, which is the target's own and not a default of mirl's. A type may name any other convention of the architecture whose row's requirements hold over the baseline, and the verifier refuses a name the target states no row of.
 
 ### 2.7 Target handles
 
@@ -304,7 +304,7 @@ Emission does not call the check yet and the walk's seeds are not made yet, so t
 
 ## 8. The verifier
 
-The verifier checks a module against the target it names. `mirl.verify.check(m)` finds the target among the target rows by the module's target name and checks the module as it stands before legalisation, and `mirl.verify.against(m, t, stage)` checks against a given target at a given stage. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
+The verifier checks a module against the target it names. `mirl.verify.check(m)` assembles the target from the module's tuple, refused by the rule of assembly it breaks, and checks the module as it stands before legalisation, and `mirl.verify.against(m, t, stage)` checks against a given target at a given stage. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
 
 The stage says how far the module has come through its schedule. `open` is any module before legalisation, so no rule that holds only of legal code applies to it. `legal` is a module past every legalisation, and carries a lookup of the region tree each function's structure analysis holds. The pass driver verifies a run as `open` until it reaches the last legalisation of its plan, and as `legal` from that pass's own verification on.
 
@@ -335,7 +335,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 18 | `thread` | no global's initial value holds the address of a thread-local global, stated in the module or declared, since it has no one static address and is reached only through code by its model |
 | 19 | `addressing` | past legalisation on a target that declares logical addressing, no instruction forms or reads an address as a number: no row whose address formation is arithmetic, which `ptr.add`, `ptrtoint` and `inttoptr` are |
 | 20 | `functions` | code names a function's address only through `func.addr`, and only on a target whose `functions` declaration is not `none`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
-| 21 | `convention` | every function type names no convention row, for its target's default, or one of the convention rows its target states |
+| 21 | `convention` | every function type names no convention row, for the one its target's tuple names, or one of the convention rows its target states: its own and every other of its architecture whose requirements hold over its baseline |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
