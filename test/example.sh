@@ -14,7 +14,7 @@
 # its target line and whose line "; exits <n>: ..." states the status its
 # program exits with, and test/example/exit.s, the __mirl_exit every start stub
 # calls, which masc assembles for each lane target. the lane targets are the
-# lines `mirl lanes` writes, the one table mirl.target.lane holds. an
+# lines `mirl lanes` writes, the one list of tuples mirl.target.lane holds. an
 # example is built for each by a copy whose target line spells that target's
 # tuple and is its only change, so an example states nothing a lane target lays out
 # otherwise. for each example and each lane target the lane checks:
@@ -47,13 +47,13 @@ out=$repo/out/example/$1
 [ -e "$out" ] && { echo "example.sh: $out exists, name a fresh run" >&2; exit 2; }
 mkdir -p "$out" || exit 2
 
-# each lane target: its derived name, its architecture and system in mink's
-# catalog, its baseline as masc's selection, its convention and its object
-# format, which masc reads together, mink links for the architecture, system
-# and format and qemu-<arch> runs
+# each lane target: its derived name, its architecture, system and
+# environment in mink's catalog, its baseline as masc's selection, its
+# convention and its object format, which masc reads together, mink links
+# for the architecture, system, environment and format and qemu-<arch> runs
 lanes=$("$mirl" lanes) || { echo "example.sh: mirl lanes refused" >&2; exit 2; }
 [ -n "$lanes" ] || { echo "example.sh: mirl lanes names no target" >&2; exit 2; }
-while read -r _ arch _ _ _ _; do
+while read -r _ arch _ _ _ _ _; do
     command -v "qemu-$arch" >/dev/null || { echo "example.sh: qemu-$arch is not on the path" >&2; exit 2; }
 done <<<"$lanes"
 
@@ -135,10 +135,10 @@ example() {
     echo "ok   $target $name"
 }
 
-while read -r -u 3 target arch system isa abi format; do
-    line="target \"$arch\" \"$system\" \"$abi\" \"$isa\""
+while read -r -u 3 target arch system env isa abi format; do
+    line="target \"$arch\" \"$system\" \"$env\" \"$abi\" \"$isa\""
     masc_as="-t $arch --isa $isa --abi $abi --format $format"
-    link="--kind static --format $format --arch $arch --system $system --env gnu"
+    link="--kind static --format $format --arch $arch --system $system --env $env"
     qemu=qemu-$arch
     dir=$out/$target
     mkdir -p "$dir" || exit 2
@@ -148,7 +148,7 @@ while read -r -u 3 target arch system isa abi format; do
     fi
     for src in "$here"/example/*.mirl; do
         name=$(basename "$src" .mirl)
-        if ! head -n 1 "$src" | grep -qx 'target "[^"]*" "[^"]*" "[^"]*" "[^"]*"'; then
+        if ! head -n 1 "$src" | grep -qx 'target "[^"]*" "[^"]*" "[^"]*" "[^"]*" "[^"]*"'; then
             fail "$target $name" "its first line is no target line"
             continue
         fi
