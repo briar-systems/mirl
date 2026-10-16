@@ -11,20 +11,21 @@ A table holds
 - `holds`, which register class holds a value of each type,
 - `jump`, an unconditional jump to edge 0's block.
 
-`mirl.machine.select.init` checks a table once against the schema and against the target it is made ready for. A table that breaks either is refused with a typed error and nothing is built.
+`mirl.machine.select.init` takes the record of the target's instruction set, a `mirl.machine.isa.Isa` the caller hands in with its table, masc's set and its loops, and the registers of the target's default convention row. It checks the table once against the schema and against the target it is made ready for. A table that breaks either is refused with a typed error and nothing is built.
 
 ## Sources
 
 An emitted operand comes from the pattern (a register an operand is in, a constant as an immediate or a symbol), from the expansion (a temporary) or from the table. A symbol is the link-time address a value is: an address constant, or the result of a row whose address formation is a function, which is `func.addr` (`match.address`). A hook reads the address a rule builds, the constant of a materialisation or the first result of the root, through `match.built`, so one hook serves both.
 
-- `fixed` is a register of masc's file for the target, such as a hardwired zero. The row it stands in must admit it, and an instruction that does not is refused as the machine form's error.
+- `fixed` is a register of masc's file for the target, such as a hardwired zero or the thread pointer. The row it stands in must admit it, and an instruction that does not is refused as the machine form's error. A register the calling convention names is never `fixed`.
+- `link` is the register a call leaves its return address in, and `argument` and `returned` an argument or result register by its bank's kind and its place there, each read from the target's default convention row the selector is made ready with. So a call, a return and the runtime call of a general dynamic thread-local access hold under any row the target states. The table check refuses a rule naming one the row does not as a defect of the table, and a selection made ready with no row refuses such a rule when it emits. An implied register, which an instruction reads or writes beyond its operands, is named the same way, by a `fixed`, `link`, `argument` or `returned` source.
 - `scratch` is a temporary of a class of the register file. `fresh` takes its class from a value's type, which a temporary inside a float constant's expansion cannot, since only an integer register can hold the bits.
 
 - `width` is the bits of a value's integer type and `register` the bits of the target's general register, each as an immediate. A rule passes them to a loop's parameters, so one loop serves every width the rule's guard admits.
 - `ordered` is the immediate a target's `Forms` give the ordering a node states, one immediate per ir ordering, as RISC-V's aq and rl bits. The ordering is the join of every ordering immediate the node's ir row holds, so a compare and exchange's success and failure are read as one, the weakest ordering at least as strong as both (`mirl.ir.opcode.joined`). A node whose row holds no ordering immediate is refused by the table check as `unordered`.
 - `tied` is one register an instruction both reads and writes, the value of an operand in and a result of the root out, at a row position masc states read and written, as `amocas` reads the value expected and gives the value held. The allocator gives both halves one location and copies the value in first when it is read again later.
 
-An emitted instruction is a row, a pseudo or a target's loop (see [loops](loop.md)). A rule whose expansion holds a loop is admitted only when the selection admits every row of the loop's steps, and the table check refuses a loop that breaks the loop schema, one the set's loops do not hold, and, as `breached`, one whose body breaks the constraint of the set's loops.
+An emitted instruction is a row, a pseudo or a target's loop (see [loops](loop.md)). A rule whose expansion holds a loop is admitted only when the selection admits every row of the loop's steps, and the table check refuses a loop that breaks the loop schema, one the set's loops do not hold, and, as `breached`, one whose body breaks its constraint.
 
 A guard's hook reads the matched instructions through `mirl.machine.select.match`, the one reader the engine also uses, so a hook never repeats how the engine finds an operand or a constant.
 
