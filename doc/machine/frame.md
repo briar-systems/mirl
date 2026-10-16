@@ -88,5 +88,6 @@ RISC-V states `measured` for the v registers' scale and `none` for the others, w
 - A call frame rule at an offset that scales is refused (`finish.Error.scaled`): mink's frame records state a scaled save only as one offset times a measuring register's value, and a scaled canonical frame address only as expression bytes, which mirl does not spell.
 - An offset scales by one scale, so a frame with slots of two scales, as SME's vector length and streaming vector length, is refused (`scales`).
 - The frame writes no probe, no paired save and no `seh` or `compact` shape. `lay` refuses each where the frame would need it.
+- An incoming argument slot at an offset that scales is placed at the canonical frame address plus that offset. An outgoing one, or an outgoing slot whose size scales, is refused (`argument`): the frame lays its scaled area above the fixed locals and the outgoing area, and has no scaled area below them for a call's scaled stack arguments yet.
 - RISC-V states no whole register load or store of a register group, since the register file names no group as one register yet.
 - A debug binding or an asm block cannot name a slot yet, so an unnamed slot always leaves the frame.

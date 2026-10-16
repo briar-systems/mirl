@@ -38,10 +38,12 @@ A pattern's node is consumed, and emits nothing, when its parent is consumed and
 
 The abi legalisation leaves every call, entry and return in piece form, each piece a scalar at the place the convention gave it (see [the ir](../ir.md)). Selection never classifies. It reads the places.
 
-- An entry copies each parameter out of its register, or reloads it from an incoming slot at its offset.
+- An entry copies each parameter out of its register, or reloads it from an incoming slot at its offset. An entry's parameter at an operand place is refused as `placed`, since no call form gives it.
 - An entry with parameters that nothing placed is refused as `unplaced`, naming its function, since nothing says where they arrive.
-- A call or a return materialises its constant pieces first, then copies each piece into its register or spills it to an outgoing slot at its offset. The rule for `call.placed` or `ret.placed` supplies the call or return form. The instruction of that form that calls or returns reads the pieces' registers and writes the results' registers, and the results are copied out of theirs.
-- A piece at an operand place, a stack piece whose size scales, and a result on the stack are refused as `placed`.
+- A call or a return materialises its constant pieces first, then copies each piece into its register or spills it to its stack slot: a call's to the caller's outgoing area and a return's to the incoming area its caller passed. The rule for `call.placed` or `ret.placed` supplies the call or return form. The instruction of that form that calls or returns reads the pieces' registers and writes the results' registers, and the results are copied out of theirs, or reloaded from the outgoing area where the convention returns one on the stack.
+- A piece at an operand place is never moved. The rule's call or return form reads it as its operand, by its position among the root's operands, and defines a result at an operand place itself, as wasm's `call` takes its arguments and SPIR-V's `OpFunctionCall` its operands.
+- A stack piece whose size scales takes a slot of its type's bytes per unit of the scale's multiplier, and one whose offset scales a slot at that many bytes per unit into its area (`Argued`), the slot's scale the piece's. A piece whose size and offset scale by two scales is refused as `placed`.
+- The instruction that makes the call states its pieces' places, the arguments' and then the results', as the legalisation stored them, and the machine function states where its parameters arrive (`Function.entry`). Every stage that rebuilds the function keeps both, so the machine text prints them from that stored result and never classifies.
 
 Selection is the one place the convention's clobbers reach the register allocator. `select(s, m, f, ?calls)` takes the registers a call leaves undefined (`Resolved.clobbered`) and the allocator's locations, and gives the machine function with one `live.Clobber` per clobbered register at every instruction it emits that calls, the table's call forms and the lookup alike.
 
