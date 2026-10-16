@@ -5,10 +5,10 @@
 #
 # <run> names a fresh directory out/example/<run>, which must not exist. mirl
 # must be built: mach build . -a cli. the qemu user emulator of every lane
-# target and git must be on the path. the masc program and mink's exec driver
-# are built from the pinned dep/masc and dep/mink, over the pinned dep/std and
-# dep/mink, once per set of pins into out/example/tools/<pins>, with the
-# compiler $MACH (mach by default). $MASC and $EXEC name built ones instead.
+# target and git must be on the path. the masc and mink programs are built
+# from the pinned dep/masc and dep/mink, over the pinned dep/std and dep/mink,
+# once per set of pins into out/example/tools/<pins>, with the compiler $MACH
+# (mach by default). $MASC and $MINK name built ones instead.
 #
 # the input set is every test/example/*.mirl, each a body whose first line is
 # its target line and whose line "; exits <n>: ..." states the status its
@@ -24,7 +24,7 @@
 #   - once, the mach test unit roundtrip__every_example_listing_assembles_to_its_own_object
 #     compares the reassembled objects of every example at every lane target
 #     as data, which is the check that passes or fails
-#   - mink's exec driver links the object and the exit object into a static
+#   - mink link links the object and the exit object into a static linux gnu
 #     executable, which exits with the stated status under the lane's qemu
 #
 # the exit status is the number of checks that failed
@@ -49,8 +49,8 @@ mkdir -p "$out" || exit 2
 
 # each lane target: its derived name, its architecture and system in mink's
 # catalog, its baseline as masc's selection, its convention and its object
-# format, which masc reads together, mink links for the architecture and
-# qemu-<arch> runs
+# format, which masc reads together, mink links for the architecture, system
+# and format and qemu-<arch> runs
 lanes=$("$mirl" lanes) || { echo "example.sh: mirl lanes refused" >&2; exit 2; }
 [ -n "$lanes" ] || { echo "example.sh: mirl lanes names no target" >&2; exit 2; }
 while read -r _ arch _ _ _ _; do
@@ -84,14 +84,14 @@ tool() {
 pins=$(git -C "$repo" submodule status dep | awk '{ sub(/^[-+ U]/, "", $1); printf "%s", substr($1, 1, 12) }')
 tools=$repo/out/example/tools/$pins
 masc=${MASC:-$(tool masc cli masc)} || exit 2
-exec_bin=${EXEC:-$(tool mink exec exec)} || exit 2
+mink=${MINK:-$(tool mink cli mink)} || exit 2
 
 fails=0
 fail() { echo "FAIL $1: $2"; fails=$((fails + 1)); }
 
 # build and run the example `$1` at `$2` for the lane target `$3`, which masc
-# reads as `$4`, mink links as `$5` and `$6` runs, into `$7`, its target line
-# `$8`
+# reads as `$4`, mink link links under the flags `$5` and `$6` runs, into
+# `$7`, its target line `$8`
 example() {
     local name=$1 src=$2 target=$3 masc_as=$4 link=$5 qemu=$6 dir=$7 line=$8
     local at="$dir/$name"
@@ -121,7 +121,7 @@ example() {
         echo "note $target $name: the reassembled object differs in bytes, masc disassemble of mirl's and of the reassembled, diffed:"
         diff -u "$at.dis" "$at.rt.dis"
     fi
-    if ! "$exec_bin" "$link" "$at" "$at.o" "$dir/exit.o" 2>"$at.link"; then
+    if ! "$mink" link "$at.o" "$dir/exit.o" -o "$at" $link 2>"$at.link"; then
         fail "$target $name" "the link is refused: $(cat "$at.link")"
         return
     fi
@@ -138,7 +138,7 @@ example() {
 while read -r -u 3 target arch system isa abi format; do
     line="target \"$arch\" \"$system\" \"$abi\" \"$isa\""
     masc_as="-t $arch --isa $isa --abi $abi --format $format"
-    link=$arch
+    link="--kind static --format $format --arch $arch --system $system --env gnu"
     qemu=qemu-$arch
     dir=$out/$target
     mkdir -p "$dir" || exit 2
