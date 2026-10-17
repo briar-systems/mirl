@@ -1,0 +1,729 @@
+# where each source variable is over the code of a framed machine function
+#
+# the value binding records of the function state where a variable's value is
+# from a point on. a location holds from its record until a later record of
+# the variable gives the same bits again, or an instruction writes the
+# register it is in, or a call clobbers it, or its block ends. at the head of
+# a block a variable is where every predecessor leaves it, and nowhere when
+# two leave it in different places, a forward walk over the blocks to a fixed
+# point. a slot and a constant hold until a record replaces them. a piece
+# holds its bits alone, and the pieces of a variable at a point are composed
+# in bit order, a gap between two an unavailable piece of its own.
+#
+# the walk runs on the framed function before layout, where every successor
+# of a block is a block operand, and states each range within one block from
+# the instruction it begins before to the one it ends before or the block's
+# end, so layout's order does not change what a range covers. a slot is read
+# as an offset from the canonical frame address through the frame's layout.
+# a register holds a variable by masc's identity, so a register of a wider
+# one's storage is its own row.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.debug.location.Piece;
+use mirl.debug.location.Where;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.debug.Binding;
+use mirl.ir.point;
+use mirl.ir.point.Bits;
+use mirl.ir.point.Expression;
+use mirl.ir.type.Type;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class.Physical;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Layout;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.frame.record.Place;
+use mirl.machine.frame.scan;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Register;
+use mirl.machine.operand.Slot;
+use mirl.machine.point.Point;
+use mirl.machine.point.Reading;
+
+use masc.core.effect;
+use masc.core.footprint;
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+
+# no row, no instruction
+val NONE: u32 = 0xffffffff;
+
+# where one variable is over part of one block
+# ---
+# binding:    the variable
+# block:      the block
+# from:       the instruction it begins before
+# to:         the instruction it ends before, none for the block's end
+# where:      where the variable is, its pieces valid as long as the ranges
+# expression: the salvage steps over what a location that is not pieces holds
+# type:       the ir type of what that location holds, which the steps start from
+pub rec Range {
+    binding:    Binding;
+    block:      Block;
+    from:       Instruction;
+    to:         opt[Instruction];
+    where:      Where;
+    expression: Expression;
+    type:       Type;
+}
+
+# the ranges of one function
+# ---
+# list:   the ranges, those of one block in code order
+# pieces: the pieces the ranges in pieces hold
+pub rec Ranges {
+    list:   vector.Vector[Range];
+    pieces: vector.Vector[Piece];
+}
+
+# why the ranges were not read
+# ---
+# alloc:  the allocator refused storage
+# writes: the registers an instruction writes were not read
+# graph:  the function's blocks have no graph
+pub tag Error: u8 {
+    alloc:  allocator.Error;
+    writes: scan.Error;
+    graph;
+}
+
+# what the walk reads beside the function
+# ---
+# at:        the locations of the target's registers
+# context:   the context masc's footprints are asked under
+# layout:    the frame's layout, which places every slot
+# clobbered: the registers a call clobbers
+pub rec Request {
+    at:        *Locations;
+    context:   *core_state.Context;
+    layout:    *Layout;
+    clobbered: Slice[rf.Id];
+}
+
+# no ranges at all
+pub fun none(a: *allocator.Allocator) Ranges {
+    ret Ranges{list: vector.init[Range](a), pieces: vector.init[Piece](a)};
+}
+
+# give back the storage of a function's ranges
+pub fun release(r: *Ranges) err[allocator.Error] {
+    var failed: err[allocator.Error] = vector.dnit[Range](?r.list);
+    keep(?failed, vector.dnit[Piece](?r.pieces));
+    ret failed;
+}
+
+# where one piece of a variable is
+# ---
+# binding:    the variable
+# piece:      its bits
+# where:      where they are, never pieces
+# row:        the register row it is in, NONE for no register
+# expression: the salvage steps over what is there
+# type:       the ir type of what is there
+rec Entry {
+    binding:    Binding;
+    piece:      Bits;
+    where:      Where;
+    row:        u32;
+    expression: Expression;
+    type:       Type;
+}
+
+def Entries: vector.Vector[Entry];
+
+fun same_where(x: Where, y: Where) bool {
+    if (sel x.register) { ret sel y.register && x.register == y.register; }
+    if (sel x.slot) {
+        if (!(sel y.slot)) { ret false; }
+        ret x.slot.fixed == y.slot.fixed && x.slot.per == y.slot.per && x.slot.scale == y.slot.scale;
+    }
+    if (sel x.constant) { ret sel y.constant && x.constant.index == y.constant.index; }
+    ret false;
+}
+
+fun same_entry(x: *Entry, y: *Entry) bool {
+    if (x.binding.index != y.binding.index)                               { ret false; }
+    if (x.piece.offset != y.piece.offset || x.piece.size != y.piece.size) { ret false; }
+    if (x.expression.index != y.expression.index)                         { ret false; }
+    if (x.type.index != y.type.index)                                     { ret false; }
+    ret same_where(x.where, y.where);
+}
+
+fun holds(set: *Entries, e: *Entry) bool {
+    var i: usize = 0;
+    for (i < set.len) {
+        if (same_entry(?set.data[i], e)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun same_set(x: *Entries, y: *Entries) bool {
+    if (x.len != y.len) { ret false; }
+    var i: usize = 0;
+    for (i < x.len) {
+        if (!holds(y, ?x.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun lost(e: allocator.Error) Error {
+    ret Error.alloc{e};
+}
+
+fun copy_set(from: *Entries, to: *Entries) err[Error] {
+    to.len = 0;
+    val room: res[usize, allocator.Error] = vector.reserve[Entry](to, from.len);
+    if (sel room.err) { ret err[Error].err{lost(room.err)}; }
+    var i: usize = 0;
+    for (i < from.len) {
+        vector.push[Entry](to, from.data[i]);
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# keep only the entries both sets hold
+fun meet(into: *Entries, other: *Entries) {
+    var kept: usize = 0;
+    var i:    usize = 0;
+    for (i < into.len) {
+        if (holds(other, ?into.data[i])) {
+            into.data[kept] = into.data[i];
+            kept            = kept + 1;
+        }
+        i = i + 1;
+    }
+    into.len = kept;
+}
+
+# what the walk shares
+# ---
+# a:      the allocator
+# f:      the function
+# r:      what it reads beside
+# fp:     masc's footprint over the register file
+# direct: per register row, whether the instruction at hand writes it
+# calls:  per register row, whether a call clobbers it
+# at:     per instruction, the first of its records, NONE for none
+# next:   per record, the next record before the same instruction, NONE after the last
+# out:    the ranges made
+# starts: per range, its first piece in out's pieces, NONE for one not in pieces
+rec Walk {
+    a:      *allocator.Allocator;
+    f:      *Function;
+    r:      Request;
+    fp:     *footprint.Footprint;
+    direct: vector.Vector[bool];
+    calls:  vector.Vector[bool];
+    at:     vector.Vector[u32];
+    next:   vector.Vector[u32];
+    out:    *Ranges;
+    starts: vector.Vector[u32];
+}
+
+# the row of a register, NONE for one the locations do not hold
+fun row_of(w: *Walk, id: rf.Id) u32 {
+    val got: res[u32, location.Unlocated] = location.locate(w.r.at, Physical.register{id});
+    if (sel got.err) { ret NONE; }
+    ret got.ok;
+}
+
+# a slot as an offset from the canonical frame address, none for a slot the
+# frame dropped, below a stack pointer realigned at run time or among a
+# call's outgoing arguments
+fun slot_where(w: *Walk, s: Slot) opt[Offset] {
+    val l: *Layout = w.r.layout;
+    if (s.index::usize >= l.slots.len) { ret opt[Offset].none{}; }
+    val place: Place = l.slots.data[s.index];
+    if (!(sel place.at)) { ret opt[Offset].none{}; }
+    if (s.index::usize < w.f.slots.len) {
+        val area: function.Area = w.f.slots.data[s.index].area;
+        if (sel area.outgoing) { ret opt[Offset].none{}; }
+    }
+    val off: Offset = place.at.offset;
+    if (sel place.at.base.frame) { ret opt[Offset].some{Offset{fixed: off.fixed + l.at, per: off.per, scale: off.scale}}; }
+    if (l.realign != 0)          { ret opt[Offset].none{}; }
+    var scale: u8 = off.scale;
+    if (off.per == 0) { scale = l.size.scale; }
+    ret opt[Offset].some{Offset{fixed: off.fixed - l.size.fixed, per: off.per - l.size.per, scale: scale}};
+}
+
+# the entry a record gives, none when what it reads has no place
+fun entry_of(w: *Walk, pt: *Point) opt[Entry] {
+    var e:     Entry   = Entry{binding: pt.binding, piece: pt.piece, where: Where.unavailable{}, row: NONE, expression: pt.expression, type: pt.from};
+    val reads: Reading = pt.reads;
+    if (sel reads.register) {
+        val reg: Register = reads.register;
+        if (!(sel reg.physical)) { ret opt[Entry].none{}; }
+        val p: Physical = reg.physical;
+        if (!(sel p.register)) { ret opt[Entry].none{}; }
+        e.where = Where.register{p.register};
+        e.row   = row_of(w, p.register);
+        ret opt[Entry].some{e};
+    }
+    if (sel reads.slot) {
+        val off: opt[Offset] = slot_where(w, reads.slot);
+        if (sel off.none) { ret opt[Entry].none{}; }
+        e.where = Where.slot{off.some};
+        ret opt[Entry].some{e};
+    }
+    if (sel reads.constant) {
+        e.where = Where.constant{reads.constant};
+        ret opt[Entry].some{e};
+    }
+    ret opt[Entry].none{};
+}
+
+# the records before an instruction applied to a state, in their order
+fun apply(w: *Walk, state: *Entries, i: Instruction) err[Error] {
+    var r: u32 = w.at.data[i.index];
+    for (r != NONE) {
+        val pt:   *Point = ?w.f.points.data[r];
+        var kept: usize  = 0;
+        var k:    usize  = 0;
+        for (k < state.len) {
+            val e: *Entry = ?state.data[k];
+            if (e.binding.index != pt.binding.index || !point.overlap(e.piece, pt.piece)) {
+                state.data[kept] = state.data[k];
+                kept             = kept + 1;
+            }
+            k = k + 1;
+        }
+        state.len = kept;
+        val made: opt[Entry] = entry_of(w, pt);
+        if (sel made.some) {
+            val pushed: res[usize, allocator.Error] = vector.push[Entry](state, made.some);
+            if (sel pushed.err) { ret err[Error].err{lost(pushed.err)}; }
+        }
+        r = w.next.data[r];
+    }
+    ret err[Error].ok{};
+}
+
+# whether a write to the rows marked reaches a register row
+fun written(w: *Walk, marks: *vector.Vector[bool], row: u32) bool {
+    val shared: Slice[u32] = location.shares(w.r.at, row);
+    var s:      usize      = 0;
+    for (s < shared.size) {
+        val other: u32 = shared.data[s];
+        if (other::usize < marks.len && marks.data[other]) { ret true; }
+        s = s + 1;
+    }
+    ret row::usize < marks.len && marks.data[row];
+}
+
+# the entries an instruction leaves standing: those in a register it writes,
+# or a call it makes clobbers, go
+fun kill(w: *Walk, state: *Entries, i: Instruction) err[Error] {
+    var k:   usize = 0;
+    var any: bool  = false;
+    for (k < state.len) {
+        if (state.data[k].row != NONE) { any = true; }
+        k = k + 1;
+    }
+    if (!any) { ret err[Error].ok{}; }
+    k = 0;
+    for (k < w.direct.len) {
+        w.direct.data[k] = false;
+        k                = k + 1;
+    }
+    val read: err[scan.Error] = scan.writes(w.f, w.r.context, w.r.at, w.fp, i, ?w.direct);
+    if (sel read.err) { ret err[Error].err{Error.writes{read.err}}; }
+    var call: bool                          = false;
+    val c:    effect.Answer[effect.Control] = instruction.transfer(function.file(w.f), function.data(w.f, i));
+    if (sel c.decided) { call = c.decided.transfer == effect.CALL; }
+    var kept: usize = 0;
+    k = 0;
+    for (k < state.len) {
+        val row:  u32  = state.data[k].row;
+        var gone: bool = false;
+        if (row != NONE) {
+            gone = written(w, ?w.direct, row);
+            if (call && !gone) { gone = written(w, ?w.calls, row); }
+        }
+        if (!gone) {
+            state.data[kept] = state.data[k];
+            kept             = kept + 1;
+        }
+        k = k + 1;
+    }
+    state.len = kept;
+    ret err[Error].ok{};
+}
+
+# a block's state after its instructions, from the state at its head
+fun through(w: *Walk, b: Block, state: *Entries) err[Error] {
+    val list: Slice[Instruction] = function.instructions(w.f, b);
+    var i:    usize              = 0;
+    for (i < list.size) {
+        val applied: err[Error] = apply(w, state, list.data[i]);
+        if (sel applied.err) { ret applied; }
+        val killed: err[Error] = kill(w, state, list.data[i]);
+        if (sel killed.err) { ret killed; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the state at each block's head, every predecessor's leaving met, to a fixed point
+fun heads(w: *Walk, g: *Graph, ins: *vector.Vector[Entries]) err[Error] {
+    val n:     usize                  = w.f.blocks.len;
+    var outs:  vector.Vector[Entries] = vector.init[Entries](w.a);
+    var known: vector.Vector[bool]    = vector.init[bool](w.a);
+    var work:  Entries                = vector.init[Entry](w.a);
+    fin {
+        var j: usize = 0;
+        for (j < outs.len) {
+            vector.dnit[Entry](?outs.data[j]);
+            j = j + 1;
+        }
+        vector.dnit[Entries](?outs);
+        vector.dnit[bool](?known);
+        vector.dnit[Entry](?work);
+    }
+    val room: res[usize, allocator.Error] = vector.reserve[Entries](?outs, n);
+    if (sel room.err) { ret err[Error].err{lost(room.err)}; }
+    val inroom: res[usize, allocator.Error] = vector.reserve[Entries](ins, n);
+    if (sel inroom.err) { ret err[Error].err{lost(inroom.err)}; }
+    var k: usize = 0;
+    for (k < n) {
+        vector.push[Entries](?outs, vector.init[Entry](w.a));
+        vector.push[Entries](ins, vector.init[Entry](w.a));
+        k = k + 1;
+    }
+    val filled: err[allocator.Error] = slice.fill[bool](?known, n, false);
+    if (sel filled.err) { ret err[Error].err{lost(filled.err)}; }
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        k       = 0;
+        for (k < n) {
+            work.len = 0;
+            if (k != graph.entry(g)::usize) {
+                val preds: Slice[u32] = graph.predecessors(g, k::u32);
+                var first: bool       = true;
+                var p:     usize      = 0;
+                for (p < preds.size) {
+                    val from: usize = preds.data[p]::usize;
+                    if (known.data[from]) {
+                        if (first) {
+                            val c: err[Error] = copy_set(?outs.data[from], ?work);
+                            if (sel c.err) { ret c; }
+                            first = false;
+                        }
+                        or { meet(?work, ?outs.data[from]); }
+                    }
+                    p = p + 1;
+                }
+            }
+            val headed: err[Error] = copy_set(?work, ?ins.data[k]);
+            if (sel headed.err) { ret headed; }
+            val walked: err[Error] = through(w, Block{index: k::u32}, ?work);
+            if (sel walked.err) { ret walked; }
+            if (!known.data[k] || !same_set(?work, ?outs.data[k])) {
+                val c: err[Error] = copy_set(?work, ?outs.data[k]);
+                if (sel c.err) { ret c; }
+                known.data[k] = true;
+                changed       = true;
+            }
+            k = k + 1;
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# whether two states place a variable alike
+fun same_variable(x: *Entries, y: *Entries, b: Binding) bool {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < x.len) {
+        if (x.data[i].binding.index == b.index) {
+            if (!holds(y, ?x.data[i])) { ret false; }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    var m: usize = 0;
+    i = 0;
+    for (i < y.len) {
+        if (y.data[i].binding.index == b.index) { m = m + 1; }
+        i = i + 1;
+    }
+    ret n == m;
+}
+
+fun before(x: *Entry, y: *Entry) bool {
+    ret x.piece.offset < y.piece.offset;
+}
+
+# the range of a variable from one instruction of a block, composed from its
+# entries in a state: one location when the whole of it is in one place, its
+# pieces in bit order otherwise, and nothing when no entry places any of it
+fun open_range(w: *Walk, state: *Entries, b: Binding, block: Block, from: Instruction) err[Error] {
+    var mine: Entries = vector.init[Entry](w.a);
+    fin { vector.dnit[Entry](?mine); }
+    var i: usize = 0;
+    for (i < state.len) {
+        if (state.data[i].binding.index == b.index) {
+            val pushed: res[usize, allocator.Error] = vector.push[Entry](?mine, state.data[i]);
+            if (sel pushed.err) { ret err[Error].err{lost(pushed.err)}; }
+        }
+        i = i + 1;
+    }
+    if (mine.len == 0) { ret err[Error].ok{}; }
+    var r:     Range = Range{binding: b, block: block, from: from, to: opt[Instruction].none{}, where: Where.unavailable{}, expression: point.PLAIN, type: Type{index: 0}};
+    var start: u32   = NONE;
+    if (mine.len == 1 && point.whole(mine.data[0].piece)) {
+        r.where      = mine.data[0].where;
+        r.expression = mine.data[0].expression;
+        r.type       = mine.data[0].type;
+    }
+    or {
+        # insertion order by first bit, the pieces never sharing one
+        var j: usize = 1;
+        for (j < mine.len) {
+            var q: usize = j;
+            for (q > 0 && before(?mine.data[q], ?mine.data[q - 1])) {
+                val t: Entry = mine.data[q];
+                mine.data[q]     = mine.data[q - 1];
+                mine.data[q - 1] = t;
+                q                = q - 1;
+            }
+            j = j + 1;
+        }
+        start = w.out.pieces.len::u32;
+        var bit: u32 = 0;
+        j = 0;
+        for (j < mine.len) {
+            val e: *Entry = ?mine.data[j];
+            if (point.whole(e.piece)) { brk; }
+            if (e.piece.offset > bit) {
+                val gap: res[usize, allocator.Error] = vector.push[Piece](?w.out.pieces, Piece{location: Where.unavailable{}, bits: (e.piece.offset - bit)::u64, expression: point.PLAIN, from: Type{index: 0}});
+                if (sel gap.err) { ret err[Error].err{lost(gap.err)}; }
+            }
+            val held: res[usize, allocator.Error] = vector.push[Piece](?w.out.pieces, Piece{location: e.where, bits: e.piece.size::u64, expression: e.expression, from: e.type});
+            if (sel held.err) { ret err[Error].err{lost(held.err)}; }
+            bit = e.piece.offset + e.piece.size;
+            j   = j + 1;
+        }
+        r.where = Where.pieces{Slice[Piece]{data: nil, size: w.out.pieces.len - start::usize}};
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Range](?w.out.list, r);
+    if (sel pushed.err) { ret err[Error].err{lost(pushed.err)}; }
+    val noted: res[usize, allocator.Error] = vector.push[u32](?w.starts, start);
+    if (sel noted.err) { ret err[Error].err{lost(noted.err)}; }
+    ret err[Error].ok{};
+}
+
+# the open range of a variable in a block, NONE for none
+fun open_of(w: *Walk, from: usize, b: Binding) u32 {
+    var i: usize = w.out.list.len;
+    for (i > from) {
+        i = i - 1;
+        val r: *Range = ?w.out.list.data[i];
+        if (r.binding.index == b.index && sel r.to.none) { ret i::u32; }
+    }
+    ret NONE;
+}
+
+# every variable a state change moves: its open range ended at `at`, none for
+# the block's end, and the one it has from there opened
+fun moved(w: *Walk, old: *Entries, now: *Entries, block: Block, first: usize, at: opt[Instruction], closing: bool) err[Error] {
+    var seen: vector.Vector[u32] = vector.init[u32](w.a);
+    fin { vector.dnit[u32](?seen); }
+    var side: usize = 0;
+    for (side < 2) {
+        var set: *Entries = old;
+        if (side == 1) { set = now; }
+        var i: usize = 0;
+        for (i < set.len) {
+            val b:    Binding = set.data[i].binding;
+            var done: bool    = false;
+            var s:    usize   = 0;
+            for (s < seen.len) {
+                if (seen.data[s] == b.index) { done = true; }
+                s = s + 1;
+            }
+            if (!done) {
+                val noted: res[usize, allocator.Error] = vector.push[u32](?seen, b.index);
+                if (sel noted.err) { ret err[Error].err{lost(noted.err)}; }
+                if (closing || !same_variable(old, now, b)) {
+                    val open: u32 = open_of(w, first, b);
+                    if (open != NONE) { w.out.list.data[open].to = at; }
+                    if (sel at.some) {
+                        if (!closing) {
+                            val opened: err[Error] = open_range(w, now, b, block, at.some);
+                            if (sel opened.err) { ret opened; }
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        side = side + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the ranges of one block, from the state at its head
+fun ranges_of(w: *Walk, b: Block, head: *Entries) err[Error] {
+    val list: Slice[Instruction] = function.instructions(w.f, b);
+    if (list.size == 0) { ret err[Error].ok{}; }
+    val first: usize   = w.out.list.len;
+    var state: Entries = vector.init[Entry](w.a);
+    var prior: Entries = vector.init[Entry](w.a);
+    fin {
+        vector.dnit[Entry](?state);
+        vector.dnit[Entry](?prior);
+    }
+    val c: err[Error] = copy_set(head, ?state);
+    if (sel c.err) { ret c; }
+    var empty:  Entries    = vector.init[Entry](w.a);
+    val opened: err[Error] = moved(w, ?empty, ?state, b, first, opt[Instruction].some{list.data[0]}, false);
+    if (sel opened.err) { ret opened; }
+    var i: usize = 0;
+    for (i < list.size) {
+        val at: Instruction = list.data[i];
+        val p0: err[Error]  = copy_set(?state, ?prior);
+        if (sel p0.err) { ret p0; }
+        val applied: err[Error] = apply(w, ?state, at);
+        if (sel applied.err) { ret applied; }
+        val before_it: err[Error] = moved(w, ?prior, ?state, b, first, opt[Instruction].some{at}, false);
+        if (sel before_it.err) { ret before_it; }
+        val p1: err[Error] = copy_set(?state, ?prior);
+        if (sel p1.err) { ret p1; }
+        val killed: err[Error] = kill(w, ?state, at);
+        if (sel killed.err) { ret killed; }
+        if (i + 1 < list.size) {
+            val after_it: err[Error] = moved(w, ?prior, ?state, b, first, opt[Instruction].some{list.data[i + 1]}, false);
+            if (sel after_it.err) { ret after_it; }
+        }
+        i = i + 1;
+    }
+    ret moved(w, ?state, ?state, b, first, opt[Instruction].none{}, true);
+}
+
+# index each instruction's records, in their order
+fun index(w: *Walk) err[Error] {
+    var failed: err[allocator.Error] = slice.fill[u32](?w.at, w.f.instructions.len, NONE);
+    keep(?failed, slice.fill[u32](?w.next, w.f.points.len, NONE));
+    if (sel failed.err) { ret err[Error].err{lost(failed.err)}; }
+    var i: usize = w.f.points.len;
+    for (i > 0) {
+        i = i - 1;
+        val at: u32 = w.f.points.data[i].at.index;
+        if (at::usize < w.at.len) {
+            w.next.data[i] = w.at.data[at];
+            w.at.data[at]  = i::u32;
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# mark the rows a call clobbers
+fun clobbers(w: *Walk) err[Error] {
+    val file: *rf.File = function.file(w.f);
+    var rows: usize    = 0;
+    if (file != nil) { rows = file.register_count::usize; }
+    var failed: err[allocator.Error] = slice.fill[bool](?w.direct, rows, false);
+    keep(?failed, slice.fill[bool](?w.calls, rows, false));
+    if (sel failed.err) { ret err[Error].err{lost(failed.err)}; }
+    var i: usize = 0;
+    for (i < w.r.clobbered.size) {
+        val row: u32 = row_of(w, w.r.clobbered.data[i]);
+        if (row != NONE && row::usize < rows) { w.calls.data[row] = true; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the ranges of every variable of a framed function, before layout
+# ---
+# a:   the allocator the ranges take
+# f:   the function, framed, every operand a location
+# r:   the locations, the context, the frame and the clobbers
+# ret: the ranges, the caller's to release, or why they were not read
+pub fun ranges(a: *allocator.Allocator, f: *Function, r: Request) res[Ranges, Error] {
+    var out: Ranges = none(a);
+    if (f.points.len == 0) { ret res[Ranges, Error].ok{out}; }
+    val file: *rf.File = function.file(f);
+    if (file == nil) { ret res[Ranges, Error].ok{out}; }
+    val printed: res[footprint.Footprint, allocator.Error] = footprint.make(a, file);
+    if (sel printed.err) { ret res[Ranges, Error].err{lost(printed.err)}; }
+    var fp: footprint.Footprint = printed.ok;
+    var w:  Walk                = Walk{a: a, f: f, r: r, fp: ?fp, direct: vector.init[bool](a), calls: vector.init[bool](a), at: vector.init[u32](a), next: vector.init[u32](a), out: ?out, starts: vector.init[u32](a)};
+    fin {
+        footprint.release(?fp);
+        vector.dnit[bool](?w.direct);
+        vector.dnit[bool](?w.calls);
+        vector.dnit[u32](?w.at);
+        vector.dnit[u32](?w.next);
+        vector.dnit[u32](?w.starts);
+    }
+    val done: err[Error] = walk(?w);
+    if (sel done.err) {
+        release(?out);
+        ret res[Ranges, Error].err{done.err};
+    }
+    # the pieces no longer move, so each range in pieces names its own
+    var i: usize = 0;
+    for (i < out.list.len) {
+        val start: u32 = w.starts.data[i];
+        if (start != NONE) {
+            val held: Where = out.list.data[i].where;
+            if (sel held.pieces) { out.list.data[i].where = Where.pieces{Slice[Piece]{data: ?out.pieces.data[start], size: held.pieces.size}}; }
+        }
+        i = i + 1;
+    }
+    ret res[Ranges, Error].ok{out};
+}
+
+fun walk(w: *Walk) err[Error] {
+    val indexed: err[Error] = index(w);
+    if (sel indexed.err) { ret indexed; }
+    val marked: err[Error] = clobbers(w);
+    if (sel marked.err) { ret marked; }
+    val g: res[Graph, allocator.Error] = function.graph_of(w.f);
+    if (sel g.err) { ret err[Error].err{lost(g.err)}; }
+    var shape: Graph = g.ok;
+    fin { graph.dnit(?shape); }
+    var ins: vector.Vector[Entries] = vector.init[Entries](w.a);
+    fin {
+        var j: usize = 0;
+        for (j < ins.len) {
+            vector.dnit[Entry](?ins.data[j]);
+            j = j + 1;
+        }
+        vector.dnit[Entries](?ins);
+    }
+    val headed: err[Error] = heads(w, ?shape, ?ins);
+    if (sel headed.err) { ret headed; }
+    var k: usize = 0;
+    for (k < w.f.blocks.len) {
+        val made: err[Error] = ranges_of(w, Block{index: k::u32}, ?ins.data[k]);
+        if (sel made.err) { ret made; }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
