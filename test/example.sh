@@ -12,8 +12,9 @@
 #
 # the input set is every test/example/*.mirl, each a body whose first line is
 # its target line and whose line "; exits <n>: ..." states the status its
-# program exits with, and test/example/exit.s, the __mirl_exit every start stub
-# calls, which masc assembles for each lane target. the lane targets are the
+# program exits with, and test/example/exit/<family>-<system>.s, the
+# __mirl_exit every start stub calls on a lane target's architecture family
+# and system, which masc assembles for each lane target. the lane targets are the
 # lines `mirl lanes` writes, the one list of tuples mirl.target.lane holds. an
 # example is built for each by a copy whose target line spells that target's
 # tuple and is its only change, so an example states nothing a lane target lays out
@@ -142,8 +143,18 @@ while read -r -u 3 target arch system env isa abi format; do
     qemu=qemu-$arch
     dir=$out/$target
     mkdir -p "$dir" || exit 2
-    if ! "$masc" assemble "$here/example/exit.s" $masc_as -o "$dir/exit.o" 2>"$dir/exit.as"; then
-        fail "$target exit" "masc refuses test/example/exit.s: $(cat "$dir/exit.as")"
+    case "$arch" in
+        riscv*)          family=riscv ;;
+        aarch64|arm64*)  family=aarch64 ;;
+        *)               family=$arch ;;
+    esac
+    stub=$here/example/exit/$family-$system.s
+    if [ ! -f "$stub" ]; then
+        fail "$target exit" "test/example/exit has no $family-$system.s"
+        continue
+    fi
+    if ! "$masc" assemble "$stub" $masc_as -o "$dir/exit.o" 2>"$dir/exit.as"; then
+        fail "$target exit" "masc refuses $stub: $(cat "$dir/exit.as")"
         continue
     fi
     for src in "$here"/example/*.mirl; do
