@@ -31,6 +31,7 @@ use mirl.machine.frame.code.Add;
 use mirl.machine.frame.code.Admitted;
 use mirl.machine.frame.code.Emit;
 use mirl.machine.frame.code.Mask;
+use mirl.machine.frame.code.Paired;
 use mirl.machine.frame.code.Refusal;
 use mirl.machine.frame.code.Step;
 use mirl.machine.frame.code.Sub;
@@ -194,6 +195,99 @@ fun save(w: *Writer, e: *Emit, s: Spot, above: i64, per: i64, cfa_offset: Offset
     ret after(w, from, frame.Rule.offset{r.ok});
 }
 
+# whether two saves are a pair the prologue may store in one instruction:
+# both fixed, of one size, at adjacent slots
+fun pairs(w: *Writer, a: Spot, b: Spot) bool {
+    if (!w.p.paired || a.scaled || b.scaled) { ret false; }
+    val sa: Offset = record.size_of(w.p.added.data[a.slot]);
+    val sb: Offset = record.size_of(w.p.added.data[b.slot]);
+    if (sa.per != 0 || sb.per != 0 || sa.fixed != sb.fixed) { ret false; }
+    ret a.depth == b.depth + sa.fixed::u64 || b.depth == a.depth + sa.fixed::u64;
+}
+
+# the pair of two adjacent saves, the deeper one at the lower address
+fun paired_of(w: *Writer, a: Spot, b: Spot, base: rf.Id, above: i64) Paired {
+    var lower: Spot = a;
+    var upper: Spot = b;
+    if (b.depth > a.depth) {
+        lower = b;
+        upper = a;
+    }
+    ret Paired{lower: lower.register, upper: upper.register, base: base, at: at_depth(w, lower, above, 0), size: record.size_of(w.p.added.data[a.slot])};
+}
+
+# saves k and k + 1 stored in one instruction, false when the code has none for them
+fun save_pair(w: *Writer, e: *Emit, k: usize, above: i64) res[bool, Error] {
+    val a:    Spot         = w.p.spots.data[k];
+    val b:    Spot         = w.p.spots.data[k + 1];
+    val from: usize        = w.out.function.instructions.len;
+    val done: err[Refusal] = code.make(e, Step.store_pair{paired_of(w, a, b, w.out.layout.stack, above)});
+    if (sel done.err) {
+        val r: Refusal = done.err;
+        if (sel r.unpaired) { ret res[bool, Error].ok{false}; }
+        ret res[bool, Error].err{Error.code{r}};
+    }
+    if (!w.p.unwound) { ret res[bool, Error].ok{true}; }
+    val l: *Layout = ?w.out.layout;
+    var i: usize   = k;
+    for (i < k + 2) {
+        val s: Spot                     = w.p.spots.data[i];
+        val r: res[frame.Offset, Error] = at_register(w, s.register, l.saves.data[i].offset);
+        if (sel r.err) { ret res[bool, Error].err{r.err}; }
+        val noted: err[Error] = after(w, from, frame.Rule.offset{r.ok});
+        if (sel noted.err) { ret res[bool, Error].err{noted.err}; }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{true};
+}
+
+# the fixed saves in order, two at a time where they pair
+fun save_fixed(w: *Writer, e: *Emit, above: i64) err[Error] {
+    val l: *Layout = ?w.out.layout;
+    var k: usize   = 0;
+    for (k < w.p.spots.len) {
+        val s: Spot = w.p.spots.data[k];
+        if (!s.scaled) {
+            var two: bool = false;
+            if (k + 1 < w.p.spots.len && pairs(w, s, w.p.spots.data[k + 1])) {
+                val tried: res[bool, Error] = save_pair(w, e, k, above);
+                if (sel tried.err) { ret err[Error].err{tried.err}; }
+                two = tried.ok;
+            }
+            if (two) { k = k + 1; }
+            or {
+                val done: err[Error] = save(w, e, s, above, 0, l.saves.data[k].offset);
+                if (sel done.err) { ret done; }
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# saves k - 1 and k loaded in one instruction, false when the code has none for them
+fun restore_pair(w: *Writer, e: *Emit, k: usize, base: rf.Id, above: i64) res[bool, Error] {
+    val a:    Spot         = w.p.spots.data[k - 1];
+    val b:    Spot         = w.p.spots.data[k];
+    val from: usize        = w.out.function.instructions.len;
+    val done: err[Refusal] = code.make(e, Step.load_pair{paired_of(w, a, b, base, above)});
+    if (sel done.err) {
+        val r: Refusal = done.err;
+        if (sel r.unpaired) { ret res[bool, Error].ok{false}; }
+        ret res[bool, Error].err{Error.code{r}};
+    }
+    if (!w.p.unwound) { ret res[bool, Error].ok{true}; }
+    var i: usize = k + 1;
+    for (i > k - 1) {
+        i = i - 1;
+        val n: res[u16, Error] = numbered(w, w.p.spots.data[i].register);
+        if (sel n.err) { ret res[bool, Error].err{n.err}; }
+        val noted: err[Error] = after(w, from, frame.Rule.restore{n.ok});
+        if (sel noted.err) { ret res[bool, Error].err{noted.err}; }
+    }
+    ret res[bool, Error].ok{true};
+}
+
 # a register holds its value at the call again, .cfi_restore
 fun restore(w: *Writer, e: *Emit, s: Spot, base: rf.Id, o: Offset) err[Error] {
     val from: usize      = w.out.function.instructions.len;
@@ -215,17 +309,8 @@ fun prologue(w: *Writer, e: *Emit) err[Error] {
     val top:   i64     = p.top::i64;
     val total: i64     = top + p.locals::i64;
     val per:   i64     = p.per::i64;
-    if (p.empty) { ret err[Error].ok{}; }
-    if (l.red != 0) {
-        var k: usize = 0;
-        for (k < p.spots.len) {
-            val s:    Spot       = p.spots.data[k];
-            val done: err[Error] = save(w, e, s, entry, 0, l.saves.data[k].offset);
-            if (sel done.err) { ret done; }
-            k = k + 1;
-        }
-        ret err[Error].ok{};
-    }
+    if (p.empty)    { ret err[Error].ok{}; }
+    if (l.red != 0) { ret save_fixed(w, e, entry); }
     # the first move takes the saves, and every fixed part too when nothing scales
     var above: i64 = top;
     if (per == 0) { above = total; }
@@ -237,15 +322,8 @@ fun prologue(w: *Writer, e: *Emit) err[Error] {
     if (sel moved.err)  { ret moved; }
     val framed: err[Error] = cfa(w, from, sp, fixed(above));
     if (sel framed.err) { ret framed; }
-    var k: usize = 0;
-    for (k < p.spots.len) {
-        val s: Spot = p.spots.data[k];
-        if (!s.scaled) {
-            val done: err[Error] = save(w, e, s, above, 0, l.saves.data[k].offset);
-            if (sel done.err) { ret done; }
-        }
-        k = k + 1;
-    }
+    val fixed_saves: err[Error] = save_fixed(w, e, above);
+    if (sel fixed_saves.err) { ret fixed_saves; }
     if (fp != rf.NONE) {
         val at:  usize      = w.out.function.instructions.len;
         val set: err[Error] = add(w, e, fp, sp, fixed(above + l.at));
@@ -261,7 +339,7 @@ fun prologue(w: *Writer, e: *Emit) err[Error] {
             val rule: err[Error] = cfa(w, at, sp, Offset{fixed: top, per: per, scale: p.scale});
             if (sel rule.err) { ret rule; }
         }
-        k = 0;
+        var k: usize = 0;
         for (k < p.spots.len) {
             val s: Spot = p.spots.data[k];
             if (s.scaled) {
@@ -287,8 +365,15 @@ fun restores(w: *Writer, e: *Emit, scaled: bool, base: rf.Id, above: i64, per: i
     var k: usize = w.p.spots.len;
     for (k > 0) {
         k = k - 1;
-        val s: Spot = w.p.spots.data[k];
-        if (s.scaled == scaled) {
+        val s:   Spot = w.p.spots.data[k];
+        var two: bool = false;
+        if (s.scaled == scaled && k > 0 && pairs(w, w.p.spots.data[k - 1], s)) {
+            val tried: res[bool, Error] = restore_pair(w, e, k, base, above);
+            if (sel tried.err) { ret err[Error].err{tried.err}; }
+            two = tried.ok;
+        }
+        if (two) { k = k - 1; }
+        or (s.scaled == scaled) {
             val done: err[Error] = restore(w, e, s, base, at_depth(w, s, above, per));
             if (sel done.err) { ret done; }
         }

@@ -1,0 +1,308 @@
+# the aarch64 frame code: the instructions of each move the frame makes
+#
+# an offset of twelve unsigned bits, or of twelve shifted up by twelve, is an
+# add's or a sub's immediate, and one of both halves is two of them. a larger
+# one is built with movz and movk in the scratch register, or in the
+# destination when it is neither the source nor the stack pointer, and added
+# by the extended register form, which takes the stack pointer at either
+# end. an offset that scales with the vector length is added by addvl, in
+# bytes of a z register, or addpl, in bytes of a p register, which step by
+# the vector length themselves.
+#
+# two saves of one width at adjacent slots move by stp and ldp, the frame
+# record's first, as darwin's compact unwind reads it.
+#
+# a load or store is the row of the width the frame code's binding chose for
+# the register and the slot's size: the base loads and stores of x at each
+# size, of v at each scalar size and whole, and sve's whole z and p register
+# forms, whose offset counts registers of the vector length. a register is
+# named through the view of its class the row takes, a word or byte of an x
+# register, an s or d of a v register, as masc's file places it. an offset
+# the row's unsigned immediate cannot hold is added into the scratch first.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.collections.slice.Slice;
+
+use mo: masc.core.operand;
+use masc.core.quantity;
+use rf: masc.core.register;
+use masc.core.row.Row;
+use masc.isa.aarch64.gen_register;
+use masc.isa.aarch64.gen_row;
+use mirl.machine.class.Physical;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Code;
+use mirl.machine.frame.code.Emit;
+use mirl.machine.frame.code.Pairs;
+use mirl.machine.frame.code.Refusal;
+use mirl.machine.frame.code.Steps;
+use mirl.machine.frame.code.Width;
+use mirl.machine.frame.code.Widths;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.function;
+use mirl.machine.operand.Operand;
+use mirl.machine.storage;
+use mirl.machine.storage.View;
+
+fun reg(r: rf.Id) Operand {
+    ret Operand.physical{Physical.register{r}};
+}
+
+fun imm(v: i64) Operand {
+    ret Operand.immediate{v};
+}
+
+fun emit(e: *Emit, row: *Row, ops: *Operand, n: usize) err[Refusal] {
+    ret code.append(e, row, Slice[Operand]{data: ops, size: n});
+}
+
+fun two(e: *Emit, row: *Row, a: Operand, b: Operand) err[Refusal] {
+    var ops: [2]Operand = [2]Operand{a, b};
+    ret emit(e, row, ?ops[0], 2);
+}
+
+fun three(e: *Emit, row: *Row, a: Operand, b: Operand, c: Operand) err[Refusal] {
+    var ops: [3]Operand = [3]Operand{a, b, c};
+    ret emit(e, row, ?ops[0], 3);
+}
+
+fun four(e: *Emit, row: *Row, a: Operand, b: Operand, c: Operand, d: Operand) err[Refusal] {
+    var ops: [4]Operand = [4]Operand{a, b, c, d};
+    ret emit(e, row, ?ops[0], 4);
+}
+
+fun five(e: *Emit, row: *Row, a: Operand, b: Operand, c: Operand, d: Operand, f: Operand) err[Refusal] {
+    var ops: [5]Operand = [5]Operand{a, b, c, d, f};
+    ret emit(e, row, ?ops[0], 5);
+}
+
+# a register named as the class `part` its row takes, through the view of its own class masc's file places
+fun as_class(e: *Emit, r: rf.Id, part: u16) opt[rf.Id] {
+    val whole: u16 = rf.class_of(r);
+    if (whole == part) { ret opt[rf.Id].some{r}; }
+    val file: *rf.File  = function.file(e.f);
+    val v:    opt[View] = storage.view(file, part, whole);
+    if (sel v.none) { ret opt[rf.Id].none{}; }
+    ret storage.viewed(file, r, part, v.some);
+}
+
+# the class a row's register position takes first
+fun taken(row: *Row, at: u32) u16 {
+    val o: *mo.Operand = ?row.operands.at[at];
+    if (!(sel o.shape.register)) { ret 0; }
+    ret o.shape.register.classes.at[0];
+}
+
+# the register a large constant is built in
+fun temporary(e: *Emit, dest: rf.Id, src: rf.Id) opt[rf.Id] {
+    if (sel e.scratch.some)             { ret e.scratch; }
+    if (dest != src && dest != e.stack) { ret opt[rf.Id].some{dest}; }
+    ret opt[rf.Id].none{};
+}
+
+# a value movz and movk build in a register, four chunks of sixteen bits
+fun build(e: *Emit, t: rf.Id, v: i64) err[Refusal] {
+    val first: err[Refusal] = three(e, gen_row.MOVZ_64_MOVEWIDE, reg(t), imm(v & 0xffff), imm(0));
+    if (sel first.err) { ret first; }
+    var k: i64 = 1;
+    for (k < 4) {
+        val chunk: i64 = (v >> (16 * k)::u64) & 0xffff;
+        if (chunk != 0) {
+            val more: err[Refusal] = three(e, gen_row.MOVK_64_MOVEWIDE, reg(t), imm(chunk), imm(16 * k));
+            if (sel more.err) { ret more; }
+        }
+        k = k + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# dest is src plus a fixed number of bytes, the stack pointer allowed at either end
+fun add_fixed(e: *Emit, dest: rf.Id, src: rf.Id, n: i64) err[Refusal] {
+    var row: *Row = gen_row.ADD_64_ADDSUB_IMM;
+    var m:   i64  = n;
+    if (n < 0) {
+        row = gen_row.SUB_64_ADDSUB_IMM;
+        m   = 0 - n;
+    }
+    if (m < 0x1000) { ret four(e, row, reg(dest), reg(src), imm(m), imm(0)); }
+    if (m < 0x100_0000) {
+        val high: err[Refusal] = four(e, row, reg(dest), reg(src), imm(m >> 12), imm(1));
+        if (sel high.err)     { ret high; }
+        if ((m & 0xfff) == 0) { ret high; }
+        ret four(e, row, reg(dest), reg(dest), imm(m & 0xfff), imm(0));
+    }
+    val t: opt[rf.Id] = temporary(e, dest, src);
+    if (sel t.none) { ret err[Refusal].err{Refusal.reach{Offset{fixed: n, per: 0, scale: 0}}}; }
+    val built: err[Refusal] = build(e, t.some, n);
+    if (sel built.err) { ret built; }
+    ret five(e, gen_row.ADD_64_ADDSUB_EXT_X, reg(dest), reg(src), reg(t.some), imm(0), imm(0));
+}
+
+# the bytes per unit of the vector length a z register and a p register hold
+val Z_BYTES: i64 = 16;
+val P_BYTES: i64 = 2;
+
+fun fits6(v: i64) bool {
+    ret v >= -32 && v <= 31;
+}
+
+fun add(e: *Emit, dest: rf.Id, src: rf.Id, by: Offset) err[Refusal] {
+    var from: rf.Id = src;
+    if (by.per != 0) {
+        val steps: Steps = scaled(by);
+        if (!(sel steps.native)) { ret err[Refusal].err{Refusal.scaled{by}}; }
+        var row:  *Row = gen_row.ADDVL_R_RI_;
+        var step: i64  = by.per / Z_BYTES;
+        if (by.per % Z_BYTES != 0 || !fits6(step)) {
+            row  = gen_row.ADDPL_R_RI_;
+            step = by.per / P_BYTES;
+            if (by.per % P_BYTES != 0 || !fits6(step)) { ret err[Refusal].err{Refusal.scaled{by}}; }
+        }
+        val stepped: err[Refusal] = three(e, row, reg(dest), reg(src), imm(step));
+        if (sel stepped.err) { ret stepped; }
+        from = dest;
+        if (by.fixed == 0) { ret stepped; }
+    }
+    ret add_fixed(e, dest, from, by.fixed);
+}
+
+fun mask(e: *Emit, dest: rf.Id, src: rf.Id, align: u64) err[Refusal] {
+    if (align == 0 || (align & (align - 1)) != 0 || align > 0x4000_0000) { ret err[Refusal].err{Refusal.mask{align}}; }
+    val m: i64 = 0 - align::i64;
+    # the and reads no stack pointer, so the stack pointer is moved out first
+    var from: rf.Id = src;
+    if (src == e.stack) {
+        val t: opt[rf.Id] = temporary(e, dest, src);
+        if (sel t.none) { ret err[Refusal].err{Refusal.mask{align}}; }
+        val moved: err[Refusal] = add_fixed(e, t.some, src, 0);
+        if (sel moved.err) { ret moved; }
+        from = t.some;
+    }
+    ret three(e, gen_row.AND_64_LOG_IMM, reg(dest), reg(from), imm(m));
+}
+
+fun sub(e: *Emit, dest: rf.Id, a: rf.Id, b: rf.Id) err[Refusal] {
+    ret five(e, gen_row.SUB_64_ADDSUB_EXT_X, reg(dest), reg(a), reg(b), imm(0), imm(0));
+}
+
+# the bytes a width moves, fixed or per unit of the vector length
+fun bytes_of(w: *Width) i64 {
+    if (w.bits.per != 0) { ret w.bits.per::i64 / 8; }
+    ret w.bits.fixed::i64 / 8;
+}
+
+# the immediate a width's row takes for an offset, none when it holds none:
+# an unsigned multiple of the bytes for a fixed width, and a signed count of
+# registers for a scaled one
+fun offset_of(w: *Width, at: Offset) opt[i64] {
+    val size: i64 = bytes_of(w);
+    if (w.bits.per != 0) {
+        if (at.fixed != 0 || at.per % size != 0) { ret opt[i64].none{}; }
+        val count: i64 = at.per / size;
+        if (count < -256 || count > 255) { ret opt[i64].none{}; }
+        ret opt[i64].some{count};
+    }
+    if (at.per != 0 || at.fixed < 0 || at.fixed % size != 0 || at.fixed / size > 0xfff) { ret opt[i64].none{}; }
+    ret opt[i64].some{at.fixed};
+}
+
+# the base and immediate an access reaches, the offset added into a temporary where its row holds none
+fun reach(e: *Emit, w: *Width, base: rf.Id, at: Offset, temp: opt[rf.Id], low: *i64) res[rf.Id, Refusal] {
+    val direct: opt[i64] = offset_of(w, at);
+    if (sel direct.some) {
+        @low = direct.some;
+        ret res[rf.Id, Refusal].ok{base};
+    }
+    if (sel temp.none) { ret res[rf.Id, Refusal].err{Refusal.reach{at}}; }
+    val added: err[Refusal] = add(e, temp.some, base, at);
+    if (sel added.err) { ret res[rf.Id, Refusal].err{added.err}; }
+    @low = 0;
+    ret res[rf.Id, Refusal].ok{temp.some};
+}
+
+fun store(e: *Emit, w: *Width, value: rf.Id, base: rf.Id, at: Offset) err[Refusal] {
+    val v: opt[rf.Id] = as_class(e, value, taken(w.store, 0));
+    if (sel v.none) { ret err[Refusal].err{Refusal.access{value}}; }
+    var low: i64                 = 0;
+    val b:   res[rf.Id, Refusal] = reach(e, w, base, at, e.scratch, ?low);
+    if (sel b.err) { ret err[Refusal].err{b.err}; }
+    ret three(e, w.store, reg(v.some), reg(b.ok), imm(low));
+}
+
+fun load(e: *Emit, w: *Width, dest: rf.Id, base: rf.Id, at: Offset) err[Refusal] {
+    val d: opt[rf.Id] = as_class(e, dest, taken(w.load, 0));
+    if (sel d.none) { ret err[Refusal].err{Refusal.access{dest}}; }
+    # a general destination is written anyway, so it can hold the address
+    var temp: opt[rf.Id] = e.scratch;
+    if (sel temp.none && function.file(e.f).classes[rf.class_of(dest)].kind == rf.GENERAL && dest != base) { temp = opt[rf.Id].some{dest}; }
+    var low: i64                 = 0;
+    val b:   res[rf.Id, Refusal] = reach(e, w, base, at, temp, ?low);
+    if (sel b.err) { ret err[Refusal].err{b.err}; }
+    ret three(e, w.load, reg(d.some), reg(b.ok), imm(low));
+}
+
+val WIDTHS: [11]Width = [11]Width{
+    Width{class: ?gen_register.CLASSES[gen_register.X_CLASS], bits: quantity.Scaled{fixed: 8, per: 0, scale: 0}, load: gen_row.LDRB_32_LDST_POS, store: gen_row.STRB_32_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.X_CLASS], bits: quantity.Scaled{fixed: 16, per: 0, scale: 0}, load: gen_row.LDRH_32_LDST_POS, store: gen_row.STRH_32_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.X_CLASS], bits: quantity.Scaled{fixed: 32, per: 0, scale: 0}, load: gen_row.LDR_32_LDST_POS, store: gen_row.STR_32_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.X_CLASS], bits: quantity.Scaled{fixed: 64, per: 0, scale: 0}, load: gen_row.LDR_64_LDST_POS, store: gen_row.STR_64_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.V_CLASS], bits: quantity.Scaled{fixed: 8, per: 0, scale: 0}, load: gen_row.LDR_B_LDST_POS, store: gen_row.STR_B_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.V_CLASS], bits: quantity.Scaled{fixed: 16, per: 0, scale: 0}, load: gen_row.LDR_H_LDST_POS, store: gen_row.STR_H_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.V_CLASS], bits: quantity.Scaled{fixed: 32, per: 0, scale: 0}, load: gen_row.LDR_S_LDST_POS, store: gen_row.STR_S_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.V_CLASS], bits: quantity.Scaled{fixed: 64, per: 0, scale: 0}, load: gen_row.LDR_D_LDST_POS, store: gen_row.STR_D_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.V_CLASS], bits: quantity.Scaled{fixed: 128, per: 0, scale: 0}, load: gen_row.LDR_Q_LDST_POS, store: gen_row.STR_Q_LDST_POS, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.Z_CLASS], bits: quantity.Scaled{fixed: 0, per: 128, scale: 0}, load: gen_row.LDR_Z_BI_, store: gen_row.STR_Z_BI_, offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.P_CLASS], bits: quantity.Scaled{fixed: 0, per: 16, scale: 0}, load: gen_row.LDR_P_BI_, store: gen_row.STR_P_BI_, offset: true},
+};
+
+# the pair rows of a width: an x register's doubleword, and a v register's d and q views
+fun pair_rows(w: *Width, store: bool) opt[*Row] {
+    val x: *rf.Class = ?gen_register.CLASSES[gen_register.X_CLASS];
+    val v: *rf.Class = ?gen_register.CLASSES[gen_register.V_CLASS];
+    if (w.bits.per != 0) { ret opt[*Row].none{}; }
+    if (w.class == x && w.bits.fixed == 64) {
+        if (store) { ret opt[*Row].some{gen_row.STP_64_LDSTPAIR_OFF}; }
+        ret opt[*Row].some{gen_row.LDP_64_LDSTPAIR_OFF};
+    }
+    if (w.class == v && w.bits.fixed == 64) {
+        if (store) { ret opt[*Row].some{gen_row.STP_D_LDSTPAIR_OFF}; }
+        ret opt[*Row].some{gen_row.LDP_D_LDSTPAIR_OFF};
+    }
+    if (w.class == v && w.bits.fixed == 128) {
+        if (store) { ret opt[*Row].some{gen_row.STP_Q_LDSTPAIR_OFF}; }
+        ret opt[*Row].some{gen_row.LDP_Q_LDSTPAIR_OFF};
+    }
+    ret opt[*Row].none{};
+}
+
+# two registers at adjacent addresses by stp or ldp, whose seven signed bits
+# count units of the width from the base
+fun pair(e: *Emit, w: *Width, lower: rf.Id, upper: rf.Id, base: rf.Id, at: Offset, store: bool) err[Refusal] {
+    val row: opt[*Row] = pair_rows(w, store);
+    if (sel row.none) { ret err[Refusal].err{Refusal.unpaired{lower}}; }
+    val size: i64 = bytes_of(w);
+    if (at.per != 0 || at.fixed % size != 0 || at.fixed / size < -64 || at.fixed / size > 63) { ret err[Refusal].err{Refusal.unpaired{lower}}; }
+    val a: opt[rf.Id] = as_class(e, lower, taken(row.some, 0));
+    val b: opt[rf.Id] = as_class(e, upper, taken(row.some, 1));
+    if (sel a.none) { ret err[Refusal].err{Refusal.access{lower}}; }
+    if (sel b.none) { ret err[Refusal].err{Refusal.access{upper}}; }
+    ret four(e, row.some, reg(a.some), reg(b.some), reg(base), imm(at.fixed));
+}
+
+# an offset of the vector length's scale, the one z and p state, is stepped
+# by addvl and addpl and addressed in registers of the vector length. the
+# streaming scale of za has no frame code yet
+fun scaled(o: Offset) Steps {
+    val z: *rf.Class = ?gen_register.CLASSES[gen_register.Z_CLASS];
+    if (o.scale == z.width.scale) { ret Steps.native{}; }
+    ret Steps.none{};
+}
+
+# the aarch64 frame code
+pub val FRAME: Code = Code{add: add, mask: mask, sub: sub, store: store, load: load, widths: Widths{at: ?WIDTHS[0], len: 11}, scaled: scaled, pairs: Pairs.code{pair}};

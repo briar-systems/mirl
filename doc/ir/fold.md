@@ -48,10 +48,10 @@ An operand carries a flag saying whether it is secret, and `folded` says whether
 
 ## Not-a-number results
 
-A float operation that gives a not-a-number gives one with a sign and payload that the IR leaves unspecified, and the target states which one it returns for each format it holds (`Nans`). The folder computes one: a not-a-number operand gives itself quieted, the first such operand when there are several, and an invalid operation gives the format's canonical quiet not-a-number. The result's format's rule then decides what the fold gives, in one place for every float operation, `fpromote` and `fdemote` among them.
+A float operation that gives a not-a-number gives one with a sign and payload that the IR leaves unspecified, and the target states which one it returns for each format it holds (`Nans`). The folder computes one: a not-a-number operand gives itself quieted, the first such operand when there are several, or the first signalling one where the target's priority puts those first, and an invalid operation gives the target's default not-a-number. The result's format's rule then decides what the fold gives, in one place for every float operation, `fpromote` and `fdemote` among them.
 
 - `canonical`: the format's canonical quiet not-a-number, as RISC-V returns.
-- `propagate`: the computed one, its operand's payload quieted, as x86-64 returns.
+- `propagate`: the computed one, its operand's payload quieted. Its `Propagation` states the default not-a-number's sign and the priority among operands: `first`, the first not-a-number operand, as x86-64 returns, or `signalling`, the first signalling one and otherwise the first quiet one, as AArch64's FPProcessNaNs chooses. Its `fused` states the order an `fma`'s operands are taken in: `operands`, the IR's, `addend`, the addend first, as AArch64's FPMulAdd calls FPProcessNaNs3, or `unordered`, as x86's FMA forms, which take the IR's operands in whichever order the selection chose, so an `fma` with two or more not-a-number operands is refused as `nan` there.
 - `unspecified`, or a format the target states no rule for: no fold, refused as `nan`, so the operation runs and gives what the target gives.
 
 `fneg`, `fabs` and `fcopysign` work on the sign bit alone and keep every other bit, a not-a-number's included, so the rule does not touch them, and nor does `bitcast`, `select` or any other operation that moves bits unchanged.

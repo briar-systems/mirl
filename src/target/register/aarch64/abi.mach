@@ -1,0 +1,625 @@
+# the aarch64 calling conventions: aapcs64 and apple's darwinpcs
+#
+# implemented to the procedure call standard for the arm 64-bit architecture,
+# "parameter passing" (aapcs64 2024q3, stages a to c), as clang 19 lowers it,
+# and to apple's "writing arm64 code for apple platforms", which darwinpcs
+# states as differences from it. the one classifier reads both rows: the
+# registers, the word, the pairing and the packing are the row's, and the
+# unnamed rule is its variadic model, so no row has code of its own.
+#
+# a value is placed by the first rule that takes it:
+# - a value the call passes by reference takes a general register or a slot
+#   for its copy's address
+# - a float or a short vector of 8 or 16 bytes takes the next vector register
+#   (c.1), and with none left goes on the stack (c.4 to c.6)
+# - a homogeneous aggregate, of one to four members of one float format or of
+#   one short vector size, takes as many consecutive vector registers when
+#   they are all free (c.2), and otherwise none is left (c.3) and it goes on
+#   the stack whole
+# - a composite wider than 16 bytes travels by reference (b.4)
+# - an integer, a pointer or a composite of up to 16 bytes takes one or two
+#   general registers, the second starting at an even register when the
+#   value's alignment is 16 and the row pairs even (c.8 to c.10). with too few
+#   left, none is left (c.11) and it goes on the stack whole
+# - on the stack a value starts at its alignment, at least 8 where the row
+#   packs by slot (c.12, c.14), and a composite's size is rounded up to 8 (b.5)
+# - under darwinpcs an unnamed value goes on the stack in 8 byte slots
+# results are placed as a first named argument would be, in the result
+# registers, and a result that would travel by reference makes its address
+# travel in x8, which is no argument register. a call may be a tail call when
+# it passes nothing on the stack and no result by reference.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use std.collections.slice.Slice;
+
+use rf: masc.core.register;
+use masc.core.requirement;
+use aarch64_extension: masc.isa.aarch64.gen_extension;
+use masc.isa.aarch64.gen_register;
+use arch_aarch64: mink.catalog.arch.aarch64;
+
+use mirl.ir.place.Fill;
+use mirl.ir.place.Place;
+use mirl.ir.place.Scale;
+use mirl.ir.place.stacked;
+use mirl.target.abi.convention.Abi;
+use mirl.target.abi.convention.Call;
+use mirl.target.abi.convention.Carrier;
+use mirl.target.abi.convention.Classifiers;
+use mirl.target.abi.convention.Convention;
+use mirl.target.abi.convention.Count;
+use mirl.target.abi.convention.Floats;
+use mirl.target.abi.convention.Frame;
+use mirl.target.abi.convention.Half;
+use mirl.target.abi.convention.Home;
+use mirl.target.abi.convention.Indirect;
+use mirl.target.abi.convention.Keeper;
+use mirl.target.abi.convention.Kept;
+use mirl.target.abi.convention.Link;
+use mirl.target.abi.convention.Linked;
+use mirl.target.abi.convention.List;
+use mirl.target.abi.convention.Narrow;
+use mirl.target.abi.convention.Packing;
+use mirl.target.abi.convention.Pairs;
+use mirl.target.abi.convention.Part;
+use mirl.target.abi.convention.Pointer;
+use mirl.target.abi.convention.Probe;
+use mirl.target.abi.convention.Prologue;
+use mirl.target.abi.convention.Record;
+use mirl.target.abi.convention.Registers;
+use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.convention.Returned;
+use mirl.target.abi.convention.Stack;
+use mirl.target.abi.convention.Unnamed;
+use mirl.target.abi.convention.Unwind;
+use mirl.target.abi.convention.Value;
+use mirl.target.abi.convention.Variadic;
+use mirl.target.abi.convention.bank;
+use mirl.target.abi.convention.held;
+use mirl.target.abi.piece;
+use mirl.target.abi.piece.Assignment;
+use mirl.target.abi.piece.Copy;
+use mirl.target.abi.piece.Passing;
+use mirl.target.abi.piece.Piece;
+use mirl.target.abi.piece.Refusal;
+use mirl.target.abi.view;
+use mirl.target.abi.view.Node;
+use mirl.target.abi.view.View;
+use mirl.target.capability.Bits;
+
+# the registers one placement draws from, and how far it has drawn
+# ---
+# integers: the general registers in order
+# vectors:  the vector registers in order
+# integer:  the next general register
+# vector:   the next vector register
+# stack:    the next free byte of the stack area
+# spill:    whether anything may go on the stack, which no result may
+# align:    the stack's alignment at a call
+# even:     whether a value of 16 byte alignment starts at an even register
+# natural:  whether stack arguments pack at their own size and alignment
+# unnamed:  where an unnamed value travels
+# extended: whether an integer narrower than 32 bits is extended by its
+#           signedness, as darwinpcs has the caller extend it to 32 bits
+rec State {
+    integers: Slice[rf.Id];
+    vectors:  Slice[rf.Id];
+    integer:  usize;
+    vector:   usize;
+    stack:    u64;
+    spill:    bool;
+    align:    u64;
+    even:     bool;
+    natural:  bool;
+    unnamed:  Unnamed;
+    extended: bool;
+}
+
+# what a homogeneous aggregate is made of
+# ---
+# size:  the bytes of one member
+# float: whether the members are floats, else short vectors
+# width: the bits of the members' float format, 0 for vectors
+# count: how many members it has
+rec Base {
+    size:  u64;
+    float: bool;
+    width: u32;
+    count: u32;
+}
+
+# one member of a homogeneous aggregate, at its offset
+rec Member {
+    offset: u64;
+}
+
+fun state(r: *Resolved, results: bool) State {
+    var s: State;
+    s.integer  = 0;
+    s.vector   = 0;
+    s.stack    = 0;
+    s.align    = 0;
+    s.spill    = !results;
+    s.even     = sel r.row.pairs.even;
+    s.natural  = sel r.row.packing.natural;
+    s.unnamed  = r.row.variadic.unnamed;
+    s.extended = sel r.row.narrow.declared;
+    if (sel r.row.stack.memory) { s.align = r.row.stack.memory.align; }
+    s.integers = Slice[rf.Id]{data: nil, size: 0};
+    s.vectors  = s.integers;
+    val regs: *Registers = held(r);
+    if (regs == nil) { ret s; }
+    if (results) {
+        s.integers = bank(?regs.returning, rf.GENERAL);
+        s.vectors  = bank(?regs.returning, rf.VECTOR);
+    }
+    or {
+        s.integers = bank(?regs.passing, rf.GENERAL);
+        s.vectors  = bank(?regs.passing, rf.VECTOR);
+    }
+    ret s;
+}
+
+fun round(v: u64, to: u64) u64 {
+    ret (v + to - 1) / to * to;
+}
+
+fun laid(n: *Node) u64 {
+    if (sel n.room.laid) { ret n.room.laid.size; }
+    ret 0;
+}
+
+fun alignment(n: *Node) u64 {
+    if (sel n.room.laid) { ret n.room.laid.align; }
+    ret 1;
+}
+
+fun at(place: Place, offset: u64, size: u64, fill: Fill) Piece {
+    ret Piece{place: place, offset: offset, size: size, scale: Scale.fixed{}, fill: fill};
+}
+
+# a short vector, of 8 or 16 bytes, which a vector register takes whole
+fun short(n: *Node) bool {
+    ret sel n.shape.vector && (laid(n) == 8 || laid(n) == 16);
+}
+
+# a float or a short vector, which a vector register takes
+fun real(n: *Node) bool {
+    ret sel n.shape.float || short(n);
+}
+
+# the fill of an integer in a general register or a slot: a condition is a
+# byte of 0 or 1 above which nothing is stated, and under darwinpcs an integer
+# narrower than 32 bits is extended to 32. a pointer and a 64 bit integer fill
+# the register, and nothing else is stated
+fun fill_integer(s: *State, n: *Node, size: u64) Fill {
+    if (sel n.shape.integer) {
+        val w: u32 = n.shape.integer;
+        if (s.extended && w < 32) { ret Fill.declared{w}; }
+    }
+    if (size >= 8) { ret Fill.exact{}; }
+    ret Fill.undefined{};
+}
+
+# a slot on the stack for `size` bytes at `align`, taking it from the state:
+# at its own size and alignment where the row packs naturally, and in 8 byte
+# slots otherwise, never aligned past the stack
+fun slot(s: *State, size: u64, align: u64, natural: bool) u64 {
+    var to:   u64 = align;
+    var used: u64 = size;
+    if (!natural) {
+        if (to < 8) { to = 8; }
+        used = round(size, 8);
+    }
+    if (to > s.align) { to = s.align; }
+    val off: u64 = round(s.stack, to);
+    s.stack = off + used;
+    ret off;
+}
+
+# the base of a homogeneous aggregate a node is, by aapcs64's definition
+# (section "homogeneous aggregates"): every leaf is a float of one format or a
+# short vector of one size, a union counting its largest member, with no
+# padding, one to four members. false when it is none
+fun homogeneous(v: *View, at_node: u32, base: *Base) bool {
+    val n: *Node = view.node(v, at_node);
+    if (sel n.shape.float) {
+        if (base.count == 0) {
+            base.size  = laid(n);
+            base.float = true;
+            base.width = n.shape.float.width;
+        }
+        or (!base.float || base.width != n.shape.float.width) {
+            ret false;
+        }
+        base.count = base.count + 1;
+        ret true;
+    }
+    if (short(n)) {
+        if (base.count == 0) {
+            base.size  = laid(n);
+            base.float = false;
+            base.width = 0;
+        }
+        or (base.float || base.size != laid(n)) {
+            ret false;
+        }
+        base.count = base.count + 1;
+        ret true;
+    }
+    if (sel n.shape.structure) {
+        var k: u32 = 0;
+        for (k < n.count) {
+            if (!homogeneous(v, view.child(v, at_node, k), base)) { ret false; }
+            k = k + 1;
+        }
+        ret true;
+    }
+    if (sel n.shape.array) {
+        val e: u32 = view.child(v, at_node, 0);
+        var i: u64 = 0;
+        for (i < n.shape.array.count) {
+            if (!homogeneous(v, e, base)) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    if (sel n.shape.union) {
+        var most: u32 = 0;
+        var k:    u32 = 0;
+        for (k < n.count) {
+            val before: u32 = base.count;
+            if (!homogeneous(v, view.child(v, at_node, k), base)) { ret false; }
+            val took: u32 = base.count - before;
+            base.count = before;
+            if (took > most) { most = took; }
+            k = k + 1;
+        }
+        base.count = base.count + most;
+        ret true;
+    }
+    ret false;
+}
+
+# the base of a node that is a homogeneous aggregate, none when it is not one
+fun aggregate_base(v: *View, at_node: u32) opt[Base] {
+    val n: *Node = view.node(v, at_node);
+    if (!view.aggregate(n)) { ret opt[Base].none{}; }
+    var b: Base = Base{size: 0, float: false, width: 0, count: 0};
+    if (!homogeneous(v, at_node, ?b))     { ret opt[Base].none{}; }
+    if (b.count == 0 || b.count > 4)      { ret opt[Base].none{}; }
+    if (b.size * b.count::u64 != laid(n)) { ret opt[Base].none{}; }
+    ret opt[Base].some{b};
+}
+
+# the offsets of a homogeneous aggregate's members, in order
+fun members(v: *View, at_node: u32, base: u64, out: *Member, count: *u32) {
+    val n: *Node = view.node(v, at_node);
+    if (sel n.shape.float || short(n)) {
+        out[@count] = Member{offset: base};
+        @count      = @count + 1;
+        ret;
+    }
+    if (sel n.shape.structure) {
+        var k: u32 = 0;
+        for (k < n.count) {
+            val c: u32 = view.child(v, at_node, k);
+            members(v, c, base + view.node(v, c).offset, out, count);
+            k = k + 1;
+        }
+        ret;
+    }
+    if (sel n.shape.array) {
+        val e: u32 = view.child(v, at_node, 0);
+        var i: u64 = 0;
+        for (i < n.shape.array.count) {
+            members(v, e, base + i * n.shape.array.stride, out, count);
+            i = i + 1;
+        }
+        ret;
+    }
+    if (sel n.shape.union) {
+        # the largest member, which every other overlays at offset 0
+        var best: u32 = 0;
+        var most: u32 = 0;
+        var k:    u32 = 0;
+        for (k < n.count) {
+            var b: Base = Base{size: 0, float: false, width: 0, count: 0};
+            val c: u32  = view.child(v, at_node, k);
+            if (homogeneous(v, c, ?b) && b.count > most) {
+                most = b.count;
+                best = c;
+            }
+            k = k + 1;
+        }
+        if (most > 0) { members(v, best, base, out, count); }
+    }
+}
+
+# place a value on the stack whole, at its alignment, a composite rounded to 8
+fun stacked_value(s: *State, asg: *Assignment, n: *Node, natural: bool) err[Refusal] {
+    var size: u64 = laid(n);
+    if (view.aggregate(n)) { size = round(size, 8); }
+    val off: u64 = slot(s, size, alignment(n), natural);
+    if (view.aggregate(n) || laid(n) > 8) { ret piece.add(asg, at(stacked(off), 0, laid(n), Fill.exact{})); }
+    ret piece.add(asg, at(stacked(off), 0, laid(n), fill_integer(s, n, laid(n))));
+}
+
+# the address of a copy, in a general register or a slot
+fun address(s: *State) Piece {
+    if (s.integer < s.integers.size) {
+        s.integer = s.integer + 1;
+        ret at(Place.register{s.integers.data[s.integer - 1]}, 0, 8, Fill.exact{});
+    }
+    ret at(stacked(slot(s, 8, 8, false)), 0, 8, Fill.exact{});
+}
+
+# pass a value by reference to a copy, its address taking a word where it may spill
+fun copied(s: *State, asg: *Assignment, n: *Node, passing: *Passing) err[Refusal] {
+    @passing = Passing.reference{Copy{size: laid(n), align: alignment(n)}};
+    if (!s.spill) { ret err[Refusal].ok{}; }
+    ret piece.add(asg, address(s));
+}
+
+# a homogeneous aggregate in consecutive vector registers, true when they were free
+fun vectors(s: *State, asg: *Assignment, v: *View, at_node: u32, b: Base, out: *bool) err[Refusal] {
+    @out = false;
+    if (s.vector + b.count::usize > s.vectors.size) {
+        s.vector = s.vectors.size;
+        ret err[Refusal].ok{};
+    }
+    var list:  [4]Member;
+    var count: u32 = 0;
+    members(v, at_node, 0, ?list[0], ?count);
+    var i: u32 = 0;
+    for (i < count) {
+        val added: err[Refusal] = piece.add(asg, at(Place.register{s.vectors.data[s.vector]}, list[i].offset, b.size, Fill.undefined{}));
+        if (sel added.err) { ret added; }
+        s.vector = s.vector + 1;
+        i        = i + 1;
+    }
+    @out = true;
+    ret err[Refusal].ok{};
+}
+
+# an integer, a pointer or a composite of up to 16 bytes in general registers
+fun integer(s: *State, asg: *Assignment, n: *Node, at_node: u32) err[Refusal] {
+    val size:  u64 = laid(n);
+    val words: u64 = round(size, 8) / 8;
+    if (size <= 8 && s.integer < s.integers.size) {
+        var fill: Fill = fill_integer(s, n, size);
+        if (view.aggregate(n)) { fill = Fill.undefined{}; }
+        if (size == 8)         { fill = Fill.exact{}; }
+        s.integer = s.integer + 1;
+        ret piece.add(asg, at(Place.register{s.integers.data[s.integer - 1]}, 0, size, fill));
+    }
+    if (s.even && alignment(n) == 16 && s.integer % 2 == 1) { s.integer = s.integer + 1; }
+    if (words == 2 && s.integer + 2 <= s.integers.size) {
+        val low: err[Refusal] = piece.add(asg, at(Place.register{s.integers.data[s.integer]}, 0, 8, Fill.exact{}));
+        if (sel low.err) { ret low; }
+        s.integer = s.integer + 2;
+        var fill: Fill = Fill.undefined{};
+        if (size == 16) { fill = Fill.exact{}; }
+        ret piece.add(asg, at(Place.register{s.integers.data[s.integer - 1]}, 8, size - 8, fill));
+    }
+    if (!s.spill) { ret err[Refusal].err{Refusal.room{at_node}}; }
+    s.integer = s.integers.size;
+    ret stacked_value(s, asg, n, s.natural);
+}
+
+# place one value, as an argument or a result, and say how it travels
+fun place(s: *State, asg: *Assignment, v: *View, value: Value, passing: *Passing) err[Refusal] {
+    val n: *Node = view.node(v, value.node);
+    if (sel n.room.unsized) { ret err[Refusal].err{Refusal.unsized{value.node}}; }
+    val size: u64 = laid(n);
+    @passing = Passing.value{};
+    if (sel value.by.reference) { ret copied(s, asg, n, passing); }
+    if (size == 0)              { ret err[Refusal].ok{}; }
+    if (!value.named && sel s.unnamed.stack) {
+        val whole: opt[Base] = aggregate_base(v, value.node);
+        if (view.aggregate(n) && size > 16 && sel whole.none) { ret copied(s, asg, n, passing); }
+        ret stacked_value(s, asg, n, false);
+    }
+    if (real(n)) {
+        if (s.vector < s.vectors.size) {
+            s.vector = s.vector + 1;
+            ret piece.add(asg, at(Place.register{s.vectors.data[s.vector - 1]}, 0, size, Fill.undefined{}));
+        }
+        if (!s.spill) { ret err[Refusal].err{Refusal.room{value.node}}; }
+        ret stacked_value(s, asg, n, s.natural);
+    }
+    val b: opt[Base] = aggregate_base(v, value.node);
+    if (sel b.some) {
+        var done: bool         = false;
+        val regs: err[Refusal] = vectors(s, asg, v, value.node, b.some, ?done);
+        if (sel regs.err) { ret regs; }
+        if (done)         { ret regs; }
+        if (!s.spill)     { ret err[Refusal].err{Refusal.room{value.node}}; }
+        ret stacked_value(s, asg, n, s.natural);
+    }
+    if (size > 16) { ret copied(s, asg, n, passing); }
+    ret integer(s, asg, n, value.node);
+}
+
+# the result classifier of both rows
+fun results(r: *Resolved, call: *Call, asg: *Assignment) err[Refusal] {
+    if (call.results.size > 1) { ret err[Refusal].err{Refusal.results{call.results.size::u32}}; }
+    var s: State = state(r, true);
+    var i: usize = 0;
+    for (i < call.results.size) {
+        val first:   u32          = piece.open(asg);
+        var passing: Passing;
+        val placed:  err[Refusal] = place(?s, asg, call.view, call.results.data[i], ?passing);
+        if (sel placed.err) { ret placed; }
+        val closed: err[Refusal] = piece.close(asg, true, passing, first);
+        if (sel closed.err) { ret closed; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the argument classifier of both rows. a result by reference has its address
+# in the row's indirect register, which takes no argument register
+fun arguments(r: *Resolved, call: *Call, asg: *Assignment) err[Refusal] {
+    var s:       State   = state(r, false);
+    val carrier: Carrier = r.row.indirect.carrier;
+    var i:       usize   = 0;
+    for (i < asg.results.len) {
+        if (sel asg.results.data[i].passing.reference) {
+            if (sel carrier.register) { asg.address = opt[Piece].some{at(Place.register{carrier.register}, 0, 8, Fill.exact{})}; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < call.arguments.size) {
+        val first:   u32          = piece.open(asg);
+        var passing: Passing;
+        val placed:  err[Refusal] = place(?s, asg, call.view, call.arguments.data[i], ?passing);
+        if (sel placed.err) { ret placed; }
+        val closed: err[Refusal] = piece.close(asg, false, passing, first);
+        if (sel closed.err) { ret closed; }
+        i = i + 1;
+    }
+    asg.stack = round(s.stack, 8);
+    ret err[Refusal].ok{};
+}
+
+# the tail rule of both rows: nothing on the stack and no result by reference
+fun tail(r: *Resolved, asg: *Assignment) bool {
+    ret asg.stack == 0 && sel asg.address.none;
+}
+
+val CLASSIFIERS: Classifiers = Classifiers{results: results, arguments: arguments};
+
+# x0 to x7 and v0 to v7, for arguments and results alike
+val PASSING: [16]rf.Id = [16]rf.Id{
+    gen_register.X0, gen_register.X1, gen_register.X2, gen_register.X3, gen_register.X4, gen_register.X5, gen_register.X6, gen_register.X7,
+    gen_register.V0, gen_register.V1, gen_register.V2, gen_register.V3, gen_register.V4, gen_register.V5, gen_register.V6, gen_register.V7,
+};
+
+# the stack pointer, x19 to x29 and the w view of each, kept whole, and the
+# low 64 bits of v8 to v15, which a callee keeps (aapcs64 "simd and
+# floating-point registers"). a view sharing a kept register's storage is
+# kept too, since a call cannot clobber one without the other
+val PRESERVED: [32]Kept = [32]Kept{
+    Kept{register: gen_register.SP, bits: Part.whole{}}, Kept{register: gen_register.WSP, bits: Part.whole{}},
+    Kept{register: gen_register.X19, bits: Part.whole{}}, Kept{register: gen_register.X20, bits: Part.whole{}}, Kept{register: gen_register.X21, bits: Part.whole{}},
+    Kept{register: gen_register.X22, bits: Part.whole{}}, Kept{register: gen_register.X23, bits: Part.whole{}}, Kept{register: gen_register.X24, bits: Part.whole{}},
+    Kept{register: gen_register.X25, bits: Part.whole{}}, Kept{register: gen_register.X26, bits: Part.whole{}}, Kept{register: gen_register.X27, bits: Part.whole{}},
+    Kept{register: gen_register.X28, bits: Part.whole{}}, Kept{register: gen_register.X29, bits: Part.whole{}},
+    Kept{register: gen_register.W19, bits: Part.whole{}}, Kept{register: gen_register.W20, bits: Part.whole{}}, Kept{register: gen_register.W21, bits: Part.whole{}},
+    Kept{register: gen_register.W22, bits: Part.whole{}}, Kept{register: gen_register.W23, bits: Part.whole{}}, Kept{register: gen_register.W24, bits: Part.whole{}},
+    Kept{register: gen_register.W25, bits: Part.whole{}}, Kept{register: gen_register.W26, bits: Part.whole{}}, Kept{register: gen_register.W27, bits: Part.whole{}},
+    Kept{register: gen_register.W28, bits: Part.whole{}}, Kept{register: gen_register.W29, bits: Part.whole{}},
+    Kept{register: gen_register.V8, bits: Part.low{64}}, Kept{register: gen_register.V9, bits: Part.low{64}}, Kept{register: gen_register.V10, bits: Part.low{64}},
+    Kept{register: gen_register.V11, bits: Part.low{64}}, Kept{register: gen_register.V12, bits: Part.low{64}}, Kept{register: gen_register.V13, bits: Part.low{64}},
+    Kept{register: gen_register.V14, bits: Part.low{64}}, Kept{register: gen_register.V15, bits: Part.low{64}},
+};
+
+# the float control and status registers, whose modes and accrued flags have
+# thread storage duration, and the thread pointer, which no call changes.
+# darwinpcs reserves the platform register x18 as well
+val RESERVED: [5]rf.Id = [5]rf.Id{gen_register.FPCR, gen_register.FPSR, gen_register.TPIDR_EL0, gen_register.X18, gen_register.W18};
+
+# what a call to a thread-local descriptor's resolver leaves undefined. the
+# elf tlsdesc resolver keeps every register but x0, the link register and the
+# flags (aaelf64, "tls descriptor"), and darwin's thread-local variable thunk
+# also x9 to x17 (llvm CSR_Darwin_AArch64_TLS)
+val ELF_DESCRIPTOR:    [5]rf.Id  = [5]rf.Id{gen_register.X0, gen_register.W0, gen_register.X30, gen_register.W30, gen_register.NZCV_FLAGS};
+val DARWIN_DESCRIPTOR: [23]rf.Id = [23]rf.Id{
+    gen_register.X0, gen_register.W0, gen_register.X9, gen_register.W9, gen_register.X10, gen_register.W10, gen_register.X11, gen_register.W11, gen_register.X12, gen_register.W12, gen_register.X13, gen_register.W13,
+    gen_register.X14, gen_register.W14, gen_register.X15, gen_register.W15, gen_register.X16, gen_register.W16, gen_register.X17, gen_register.W17, gen_register.X30, gen_register.W30, gen_register.NZCV_FLAGS,
+};
+
+# x29 heads a record of the caller's frame pointer and the return address,
+# 16 bytes below the canonical frame address, and the link register is x30.
+# saves are paired, the record first. darwin keeps the frame pointer in every
+# function and describes its frames by compact unwind, and leaves 128 bytes
+# below the stack pointer to a leaf
+val AAPCS64_FRAME: Stack = Stack.memory{Frame{
+    align:        16,
+    red:          0,
+    shadow:       0,
+    link:         Link.register{gen_register.X30},
+    pointer:      Pointer.register{Keeper{register: gen_register.X29, record: Record.linked{Linked{pointer: -16, previous: -16, link: -8}}, always: false}},
+    pointer_home: Home.register{gen_register.SP},
+    prologue:     Prologue{probe: Probe.none{}, pair_saves: true, unwind: Unwind.dwarf{}},
+}};
+val DARWIN_FRAME: Stack = Stack.memory{Frame{
+    align:        16,
+    red:          128,
+    shadow:       0,
+    link:         Link.register{gen_register.X30},
+    pointer:      Pointer.register{Keeper{register: gen_register.X29, record: Record.linked{Linked{pointer: -16, previous: -16, link: -8}}, always: true}},
+    pointer_home: Home.register{gen_register.SP},
+    prologue:     Prologue{probe: Probe.none{}, pair_saves: true, unwind: Unwind.compact{}},
+}};
+
+# a result too wide for registers travels by reference, its address in x8
+val INDIRECT: Indirect = Indirect{carrier: Carrier.register{gen_register.X8}, returned: Returned.none{}};
+
+# aapcs64 passes an unnamed value as a named one and its va_list holds a save
+# area per register class. darwinpcs passes every unnamed value on the stack
+# and walks it with one pointer
+val AAPCS64_VARIADIC: Variadic = Variadic{unnamed: Unnamed.named{}, count: Count.none{}, list: List.areas{}};
+val DARWIN_VARIADIC:  Variadic = Variadic{unnamed: Unnamed.stack{}, count: Count.none{}, list: List.pointer{}};
+
+# both rows need the floating-point and advanced simd registers they pass in,
+# which every aarch64 linux and darwin baseline holds
+val FP_ATOMS: [2]requirement.Id          = [2]requirement.Id{aarch64_extension.FP, aarch64_extension.SIMD};
+val NEEDS:    [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?FP_ATOMS[0], len: 2}, none: requirement.NO_IDS}};
+val NEEDS_FP: requirement.Requirement    = requirement.Requirement{at: ?NEEDS[0], len: 1};
+
+# aapcs64, linux's and freestanding's
+pub val AAPCS64: Convention = Convention{
+    name:        "aapcs64",
+    abi:         Abi.row{?arch_aarch64.AARCH64_AAPCS64},
+    requires:    NEEDS_FP,
+    file:        opt[*rf.File].some{?gen_register.FILE},
+    classifiers: CLASSIFIERS,
+    word:        Bits.bits{64},
+    floats:      Floats.widest{128},
+    passing:     Slice[rf.Id]{data: ?PASSING[0], size: 16},
+    returning:   Slice[rf.Id]{data: ?PASSING[0], size: 16},
+    preserved:   Slice[Kept]{data: ?PRESERVED[0], size: 32},
+    reserved:    Slice[rf.Id]{data: ?RESERVED[0], size: 3},
+    stack:       AAPCS64_FRAME,
+    indirect:    INDIRECT,
+    variadic:    AAPCS64_VARIADIC,
+    half:        Half.float{},
+    narrow:      Narrow.undefined{},
+    pairs:       Pairs.even{},
+    packing:     Packing.slot{},
+    tail:        tail,
+    descriptor:  opt[Slice[rf.Id]].some{Slice[rf.Id]{data: ?ELF_DESCRIPTOR[0], size: 5}},
+};
+
+# darwinpcs, apple's arm64 abi
+pub val DARWINPCS: Convention = Convention{
+    name:        "darwinpcs",
+    abi:         Abi.row{?arch_aarch64.AARCH64_DARWINPCS},
+    requires:    NEEDS_FP,
+    file:        opt[*rf.File].some{?gen_register.FILE},
+    classifiers: CLASSIFIERS,
+    word:        Bits.bits{64},
+    floats:      Floats.widest{128},
+    passing:     Slice[rf.Id]{data: ?PASSING[0], size: 16},
+    returning:   Slice[rf.Id]{data: ?PASSING[0], size: 16},
+    preserved:   Slice[Kept]{data: ?PRESERVED[0], size: 32},
+    reserved:    Slice[rf.Id]{data: ?RESERVED[0], size: 5},
+    stack:       DARWIN_FRAME,
+    indirect:    INDIRECT,
+    variadic:    DARWIN_VARIADIC,
+    half:        Half.float{},
+    narrow:      Narrow.declared{},
+    pairs:       Pairs.even{},
+    packing:     Packing.natural{},
+    tail:        tail,
+    descriptor:  opt[Slice[rf.Id]].some{Slice[rf.Id]{data: ?DARWIN_DESCRIPTOR[0], size: 23}},
+};
