@@ -1,0 +1,1648 @@
+# the dwarf 5 producer: a module's debug table and its functions' variable
+# ranges as the debug sections of an object, see doc/ir/debug.md
+#
+# the producer reads only its request: the module, whose debug table it
+# describes, the layout every size and member offset is asked of, the builder
+# the sections are written into and, per function, the labels its code lies
+# between, where each variable is over which labels and the runs of code
+# inlined at each site. it writes `.debug_info`, `.debug_abbrev`, `.debug_str`,
+# `.debug_str_offsets`, `.debug_addr`, `.debug_loclists` and
+# `.debug_rnglists` as section contents through masc's builder, every
+# address a datum masc relocates and every reference between sections a datum
+# on a label at the start of the section it names. `.debug_line` is mink's,
+# lowered from the line records masc states, and so is the call frame
+# information, from the frame records.
+#
+# one compile unit holds the module, of dwarf 5 forms throughout: a string by
+# its index into the string offsets (`DW_FORM_strx`), an address by its index
+# into the address table (`DW_FORM_addrx`) and a location or range list by its
+# index (`DW_FORM_loclistx`, `DW_FORM_rnglistx`). a variable's location list
+# has an entry per range, its expression the location's kind as dwarf states
+# it and the salvage steps over it, and a range where the variable is nowhere
+# is absent from the list, so a debugger shows it optimised out. a type is a
+# debug information entry per entry of the debug table, its byte size and
+# member offsets asked of the layout routine, and a tagged union a structure
+# holding a variant part whose discriminant is its member. code inlined at a
+# site is an inlined subroutine whose abstract origin is the callee's abstract
+# entry, at the call's file and line.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use masc.build.build;
+use core_fixup: masc.core.fixup;
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+use mink.model.section;
+
+use mirl.base.slice;
+use mirl.debug.location;
+use mirl.debug.location.Piece;
+use mirl.debug.location.Where;
+use mirl.debug.producer;
+use mirl.debug.rows;
+use mirl.ir.constant.ConstantData;
+use ir_debug: mirl.ir.debug;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.id;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.point;
+use mirl.ir.point.Expression;
+use mirl.ir.point.Step;
+use types: mirl.ir.type;
+use mirl.ir.type.DEFAULT_SPACE;
+use mirl.ir.type.Type;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record;
+
+# the names of the debug sections in one object format
+# ---
+# info:      the debug information entries
+# abbrev:    their abbreviations
+# strings:   the strings
+# offsets:   the string offsets
+# addresses: the address table
+# locations: the location lists
+# ranges:    the range lists
+pub rec Names {
+    info:      str;
+    abbrev:    str;
+    strings:   str;
+    offsets:   str;
+    addresses: str;
+    locations: str;
+    ranges:    str;
+}
+
+# the names ELF and COFF give the sections
+pub val ELF_NAMES: Names = Names{
+    info:      ".debug_info",
+    abbrev:    ".debug_abbrev",
+    strings:   ".debug_str",
+    offsets:   ".debug_str_offsets",
+    addresses: ".debug_addr",
+    locations: ".debug_loclists",
+    ranges:    ".debug_rnglists",
+};
+
+# the names Mach-O gives the sections, each in the __DWARF segment
+pub val MACHO_NAMES: Names = Names{
+    info:      "__DWARF,__debug_info",
+    abbrev:    "__DWARF,__debug_abbrev",
+    strings:   "__DWARF,__debug_str",
+    offsets:   "__DWARF,__debug_str_offs",
+    addresses: "__DWARF,__debug_addr",
+    locations: "__DWARF,__debug_loclists",
+    ranges:    "__DWARF,__debug_rnglists",
+};
+
+# where a variable is over part of a function's code
+# ---
+# binding:    the variable
+# start:      the label its range begins at
+# end:        the label its range ends at
+# where:      where it is, never unavailable
+# expression: the salvage steps over a location that is not pieces
+# type:       the ir type of what that location holds
+pub rec Span {
+    binding:    ir_debug.Binding;
+    start:      build.Label;
+    end:        build.Label;
+    where:      Where;
+    expression: Expression;
+    type:       Type;
+}
+
+# a run of code inlined at a site, which every site it was inlined through holds too
+# ---
+# site:  the innermost site the code was inlined at
+# start: the label the run begins at
+# end:   the label it ends at
+pub rec Run {
+    site:  ir_debug.Site;
+    start: build.Label;
+    end:   build.Label;
+}
+
+# one function's code
+# ---
+# function: the function of the module
+# start:    the label of its first instruction
+# end:      the label after its last
+# spans:    where its variables are
+# runs:     its code inlined at sites
+pub rec Subprogram {
+    function: id.Function;
+    start:    build.Label;
+    end:      build.Label;
+    spans:    Slice[Span];
+    runs:     Slice[Run];
+}
+
+# everything the producer reads
+# ---
+# a:         the allocator its scratch takes
+# m:         the module, whose debug table is finished
+# l:         the layout every size and offset is asked of
+# b:         the builder the sections are written into, every label of the request its own
+# context:   the object's context, under which masc numbers a register's dwarf column
+# address:   the bytes of an address
+# names:     the section names of the object's format
+# lines:     whether the object states line records, which `DW_AT_stmt_list` and a declaration's file name
+# functions: the functions, in code order
+pub rec Request {
+    a:         *allocator.Allocator;
+    m:         *Module;
+    l:         *Layout;
+    b:         *build.Builder;
+    context:   *core_state.Context;
+    address:   u8;
+    names:     *Names;
+    lines:     bool;
+    functions: Slice[Subprogram];
+}
+
+# why the sections were not written
+# ---
+# alloc:   the allocator refused storage
+# builder: masc refused a section, a label or a datum
+# table:   the debug table refused a read
+# module:  the module refused a read
+# layout:  the layout gave a type no size or offset
+# refused: a location the dwarf producer row does not write
+# number:  a register masc's dwarf column numbers none
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    builder: build.Refusal;
+    table:   ir_debug.Error;
+    module:  module.Error;
+    layout:  record.Error;
+    refused: producer.Refusal;
+    number:  rf.Id;
+}
+
+val TAG_ARRAY:        u16 = 0x01;
+val TAG_ENUMERATION:  u16 = 0x04;
+val TAG_PARAMETER:    u16 = 0x05;
+val TAG_MEMBER:       u16 = 0x0d;
+val TAG_POINTER:      u16 = 0x0f;
+val TAG_COMPILE_UNIT: u16 = 0x11;
+val TAG_STRUCTURE:    u16 = 0x13;
+val TAG_SUBROUTINE:   u16 = 0x15;
+val TAG_UNION:        u16 = 0x17;
+val TAG_VARIANT:      u16 = 0x19;
+val TAG_INLINED:      u16 = 0x1d;
+val TAG_SUBRANGE:     u16 = 0x21;
+val TAG_BASE:         u16 = 0x24;
+val TAG_ENUMERATOR:   u16 = 0x28;
+val TAG_SUBPROGRAM:   u16 = 0x2e;
+val TAG_VARIANT_PART: u16 = 0x33;
+val TAG_VARIABLE:     u16 = 0x34;
+
+val AT_LOCATION:      u16 = 0x02;
+val AT_NAME:          u16 = 0x03;
+val AT_BYTE_SIZE:     u16 = 0x0b;
+val AT_BIT_SIZE:      u16 = 0x0d;
+val AT_STMT_LIST:     u16 = 0x10;
+val AT_LOW_PC:        u16 = 0x11;
+val AT_HIGH_PC:       u16 = 0x12;
+val AT_LANGUAGE:      u16 = 0x13;
+val AT_DISCR:         u16 = 0x15;
+val AT_DISCR_VALUE:   u16 = 0x16;
+val AT_COMP_DIR:      u16 = 0x1b;
+val AT_CONST_VALUE:   u16 = 0x1c;
+val AT_INLINE:        u16 = 0x20;
+val AT_PRODUCER:      u16 = 0x25;
+val AT_PROTOTYPED:    u16 = 0x27;
+val AT_ABSTRACT:      u16 = 0x31;
+val AT_COUNT:         u16 = 0x37;
+val AT_MEMBER_AT:     u16 = 0x38;
+val AT_DECL_FILE:     u16 = 0x3a;
+val AT_DECL_LINE:     u16 = 0x3b;
+val AT_ENCODING:      u16 = 0x3e;
+val AT_FRAME_BASE:    u16 = 0x40;
+val AT_TYPE:          u16 = 0x49;
+val AT_RANGES:        u16 = 0x55;
+val AT_CALL_COLUMN:   u16 = 0x57;
+val AT_CALL_FILE:     u16 = 0x58;
+val AT_CALL_LINE:     u16 = 0x59;
+val AT_STR_OFFSETS:   u16 = 0x72;
+val AT_ADDR_BASE:     u16 = 0x73;
+val AT_RNGLISTS_BASE: u16 = 0x74;
+val AT_LOCLISTS_BASE: u16 = 0x8c;
+
+val FORM_ADDR:     u8 = 0x01;
+val FORM_DATA2:    u8 = 0x05;
+val FORM_DATA4:    u8 = 0x06;
+val FORM_DATA1:    u8 = 0x0b;
+val FORM_SDATA:    u8 = 0x0d;
+val FORM_UDATA:    u8 = 0x0f;
+val FORM_REF4:     u8 = 0x13;
+val FORM_SEC:      u8 = 0x17;
+val FORM_EXPRLOC:  u8 = 0x18;
+val FORM_PRESENT:  u8 = 0x19;
+val FORM_STRX:     u8 = 0x1a;
+val FORM_ADDRX:    u8 = 0x1b;
+val FORM_LOCLISTX: u8 = 0x22;
+val FORM_RNGLISTX: u8 = 0x23;
+
+val OP_DEREF:       u8 = 0x06;
+val OP_CONSTU:      u8 = 0x10;
+val OP_MINUS:       u8 = 0x1c;
+val OP_AND:         u8 = 0x1a;
+val OP_PLUS:        u8 = 0x22;
+val OP_SHL:         u8 = 0x24;
+val OP_SHRA:        u8 = 0x26;
+val OP_REG0:        u8 = 0x50;
+val OP_BREG0:       u8 = 0x70;
+val OP_REGX:        u8 = 0x90;
+val OP_FBREG:       u8 = 0x91;
+val OP_BREGX:       u8 = 0x92;
+val OP_PIECE:       u8 = 0x93;
+val OP_CFA:         u8 = 0x9c;
+val OP_BIT_PIECE:   u8 = 0x9d;
+val OP_IMPLICIT:    u8 = 0x9e;
+val OP_STACK_VALUE: u8 = 0x9f;
+
+val LLE_END:         u8 = 0x00;
+val LLE_STARTX_ENDX: u8 = 0x02;
+val RLE_END:         u8 = 0x00;
+val RLE_STARTX_ENDX: u8 = 0x02;
+
+val UT_COMPILE: u8  = 0x01;
+val VERSION:    u16 = 5;
+val INLINED:    u8  = 0x01;
+# the ir names no source language, so the unit states c11's
+val LANGUAGE: u16 = 0x1d;
+val PRODUCER: str = "mirl";
+
+# an attribute of an abbreviation and the form its value takes
+# ---
+# at:   the attribute
+# form: its form
+rec Spec {
+    at:   u16;
+    form: u8;
+}
+
+# an abbreviation, whose code is its row's position plus one
+# ---
+# tag:      the tag of the entries it abbreviates
+# children: whether they have children
+# specs:    their attributes, in the order each entry writes them
+rec Abbrev {
+    tag:      u16;
+    children: bool;
+    specs:    Slice[Spec];
+}
+
+val UNIT_SPECS: [9]Spec = [9]Spec{
+    Spec{at: AT_PRODUCER, form: FORM_STRX}, Spec{at: AT_LANGUAGE, form: FORM_DATA2}, Spec{at: AT_NAME, form: FORM_STRX},
+    Spec{at: AT_COMP_DIR, form: FORM_STRX}, Spec{at: AT_LOW_PC, form: FORM_ADDR}, Spec{at: AT_RANGES, form: FORM_RNGLISTX},
+    Spec{at: AT_STR_OFFSETS, form: FORM_SEC}, Spec{at: AT_ADDR_BASE, form: FORM_SEC}, Spec{at: AT_RNGLISTS_BASE, form: FORM_SEC},
+};
+val UNIT_LINE_SPECS: [11]Spec = [11]Spec{
+    Spec{at: AT_PRODUCER, form: FORM_STRX}, Spec{at: AT_LANGUAGE, form: FORM_DATA2}, Spec{at: AT_NAME, form: FORM_STRX},
+    Spec{at: AT_COMP_DIR, form: FORM_STRX}, Spec{at: AT_LOW_PC, form: FORM_ADDR}, Spec{at: AT_RANGES, form: FORM_RNGLISTX},
+    Spec{at: AT_STR_OFFSETS, form: FORM_SEC}, Spec{at: AT_ADDR_BASE, form: FORM_SEC}, Spec{at: AT_RNGLISTS_BASE, form: FORM_SEC},
+    Spec{at: AT_LOCLISTS_BASE, form: FORM_SEC}, Spec{at: AT_STMT_LIST, form: FORM_SEC},
+};
+val UNIT_LOC_SPECS: [10]Spec = [10]Spec{
+    Spec{at: AT_PRODUCER, form: FORM_STRX}, Spec{at: AT_LANGUAGE, form: FORM_DATA2}, Spec{at: AT_NAME, form: FORM_STRX},
+    Spec{at: AT_COMP_DIR, form: FORM_STRX}, Spec{at: AT_LOW_PC, form: FORM_ADDR}, Spec{at: AT_RANGES, form: FORM_RNGLISTX},
+    Spec{at: AT_STR_OFFSETS, form: FORM_SEC}, Spec{at: AT_ADDR_BASE, form: FORM_SEC}, Spec{at: AT_RNGLISTS_BASE, form: FORM_SEC},
+    Spec{at: AT_LOCLISTS_BASE, form: FORM_SEC},
+};
+val SUBPROGRAM_SPECS: [4]Spec = [4]Spec{
+    Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_LOW_PC, form: FORM_ADDRX}, Spec{at: AT_HIGH_PC, form: FORM_DATA4},
+    Spec{at: AT_FRAME_BASE, form: FORM_EXPRLOC},
+};
+val NAMED_SPECS:    [2]Spec = [2]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_TYPE, form: FORM_REF4}};
+val LOCATED_SPECS:  [3]Spec = [3]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_TYPE, form: FORM_REF4}, Spec{at: AT_LOCATION, form: FORM_LOCLISTX}};
+val DECLARED_SPECS: [4]Spec = [4]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_TYPE, form: FORM_REF4}, Spec{at: AT_DECL_FILE, form: FORM_DATA4}, Spec{at: AT_DECL_LINE, form: FORM_UDATA}};
+val PLACED_SPECS:   [5]Spec = [5]Spec{
+    Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_TYPE, form: FORM_REF4}, Spec{at: AT_DECL_FILE, form: FORM_DATA4},
+    Spec{at: AT_DECL_LINE, form: FORM_UDATA}, Spec{at: AT_LOCATION, form: FORM_LOCLISTX},
+};
+val BASE_SPECS:       [3]Spec = [3]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_ENCODING, form: FORM_DATA1}, Spec{at: AT_BYTE_SIZE, form: FORM_UDATA}};
+val BITS_SPECS:       [3]Spec = [3]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_ENCODING, form: FORM_DATA1}, Spec{at: AT_BIT_SIZE, form: FORM_UDATA}};
+val AGGREGATE_SPECS:  [2]Spec = [2]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_BYTE_SIZE, form: FORM_UDATA}};
+val MEMBER_SPECS:     [3]Spec = [3]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_TYPE, form: FORM_REF4}, Spec{at: AT_MEMBER_AT, form: FORM_UDATA}};
+val PART_SPECS:       [1]Spec = [1]Spec{Spec{at: AT_DISCR, form: FORM_REF4}};
+val VARIANT_SPECS:    [1]Spec = [1]Spec{Spec{at: AT_DISCR_VALUE, form: FORM_UDATA}};
+val ENUM_SPECS:       [3]Spec = [3]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_TYPE, form: FORM_REF4}, Spec{at: AT_BYTE_SIZE, form: FORM_UDATA}};
+val ENUMERATOR_SPECS: [2]Spec = [2]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_CONST_VALUE, form: FORM_UDATA}};
+val TYPED_SPECS:      [1]Spec = [1]Spec{Spec{at: AT_TYPE, form: FORM_REF4}};
+val COUNT_SPECS:      [1]Spec = [1]Spec{Spec{at: AT_COUNT, form: FORM_UDATA}};
+val POINTER_SPECS:    [2]Spec = [2]Spec{Spec{at: AT_TYPE, form: FORM_REF4}, Spec{at: AT_BYTE_SIZE, form: FORM_UDATA}};
+val SIZED_SPECS:      [1]Spec = [1]Spec{Spec{at: AT_BYTE_SIZE, form: FORM_UDATA}};
+val ROUTINE_SPECS:    [2]Spec = [2]Spec{Spec{at: AT_TYPE, form: FORM_REF4}, Spec{at: AT_PROTOTYPED, form: FORM_PRESENT}};
+val VOID_SPECS:       [1]Spec = [1]Spec{Spec{at: AT_PROTOTYPED, form: FORM_PRESENT}};
+val ABSTRACT_SPECS:   [2]Spec = [2]Spec{Spec{at: AT_NAME, form: FORM_STRX}, Spec{at: AT_INLINE, form: FORM_DATA1}};
+val INLINED_SPECS:    [2]Spec = [2]Spec{Spec{at: AT_ABSTRACT, form: FORM_REF4}, Spec{at: AT_RANGES, form: FORM_RNGLISTX}};
+val CALLED_SPECS:     [5]Spec = [5]Spec{
+    Spec{at: AT_ABSTRACT, form: FORM_REF4}, Spec{at: AT_RANGES, form: FORM_RNGLISTX}, Spec{at: AT_CALL_FILE, form: FORM_DATA4},
+    Spec{at: AT_CALL_LINE, form: FORM_UDATA}, Spec{at: AT_CALL_COLUMN, form: FORM_UDATA},
+};
+
+# the abbreviation codes, each its row's position in ABBREVS plus one
+val A_UNIT:       u32 = 1;
+val A_UNIT_LOC:   u32 = 2;
+val A_UNIT_LINE:  u32 = 3;
+val A_SUBPROGRAM: u32 = 4;
+# a variable, then a parameter, each named, located, declared, and both
+val A_VARIABLE:   u32 = 5;
+val A_PARAMETER:  u32 = 9;
+val A_BASE:       u32 = 13;
+val A_STRUCTURE:  u32 = 14;
+val A_UNION:      u32 = 15;
+val A_MEMBER:     u32 = 16;
+val A_PART:       u32 = 17;
+val A_VARIANT:    u32 = 18;
+val A_ENUM:       u32 = 19;
+val A_ENUMERATOR: u32 = 20;
+val A_ARRAY:      u32 = 21;
+val A_SUBRANGE:   u32 = 22;
+val A_POINTER:    u32 = 23;
+val A_OPAQUE:     u32 = 24;
+val A_ROUTINE:    u32 = 25;
+val A_VOID:       u32 = 26;
+val A_ARGUMENT:   u32 = 27;
+val A_ABSTRACT:   u32 = 28;
+val A_INLINED:    u32 = 29;
+val A_CALLED:     u32 = 30;
+# a base type of a width no whole number of bytes holds
+val A_BITS: u32 = 31;
+
+val ABBREVS: [31]Abbrev = [31]Abbrev{
+    Abbrev{tag: TAG_COMPILE_UNIT, children: true, specs: Slice[Spec]{data: ?UNIT_SPECS[0], size: 9}},
+    Abbrev{tag: TAG_COMPILE_UNIT, children: true, specs: Slice[Spec]{data: ?UNIT_LOC_SPECS[0], size: 10}},
+    Abbrev{tag: TAG_COMPILE_UNIT, children: true, specs: Slice[Spec]{data: ?UNIT_LINE_SPECS[0], size: 11}},
+    Abbrev{tag: TAG_SUBPROGRAM, children: true, specs: Slice[Spec]{data: ?SUBPROGRAM_SPECS[0], size: 4}},
+    Abbrev{tag: TAG_VARIABLE, children: false, specs: Slice[Spec]{data: ?NAMED_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_VARIABLE, children: false, specs: Slice[Spec]{data: ?LOCATED_SPECS[0], size: 3}},
+    Abbrev{tag: TAG_VARIABLE, children: false, specs: Slice[Spec]{data: ?DECLARED_SPECS[0], size: 4}},
+    Abbrev{tag: TAG_VARIABLE, children: false, specs: Slice[Spec]{data: ?PLACED_SPECS[0], size: 5}},
+    Abbrev{tag: TAG_PARAMETER, children: false, specs: Slice[Spec]{data: ?NAMED_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_PARAMETER, children: false, specs: Slice[Spec]{data: ?LOCATED_SPECS[0], size: 3}},
+    Abbrev{tag: TAG_PARAMETER, children: false, specs: Slice[Spec]{data: ?DECLARED_SPECS[0], size: 4}},
+    Abbrev{tag: TAG_PARAMETER, children: false, specs: Slice[Spec]{data: ?PLACED_SPECS[0], size: 5}},
+    Abbrev{tag: TAG_BASE, children: false, specs: Slice[Spec]{data: ?BASE_SPECS[0], size: 3}},
+    Abbrev{tag: TAG_STRUCTURE, children: true, specs: Slice[Spec]{data: ?AGGREGATE_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_UNION, children: true, specs: Slice[Spec]{data: ?AGGREGATE_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_MEMBER, children: false, specs: Slice[Spec]{data: ?MEMBER_SPECS[0], size: 3}},
+    Abbrev{tag: TAG_VARIANT_PART, children: true, specs: Slice[Spec]{data: ?PART_SPECS[0], size: 1}},
+    Abbrev{tag: TAG_VARIANT, children: true, specs: Slice[Spec]{data: ?VARIANT_SPECS[0], size: 1}},
+    Abbrev{tag: TAG_ENUMERATION, children: true, specs: Slice[Spec]{data: ?ENUM_SPECS[0], size: 3}},
+    Abbrev{tag: TAG_ENUMERATOR, children: false, specs: Slice[Spec]{data: ?ENUMERATOR_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_ARRAY, children: true, specs: Slice[Spec]{data: ?TYPED_SPECS[0], size: 1}},
+    Abbrev{tag: TAG_SUBRANGE, children: false, specs: Slice[Spec]{data: ?COUNT_SPECS[0], size: 1}},
+    Abbrev{tag: TAG_POINTER, children: false, specs: Slice[Spec]{data: ?POINTER_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_POINTER, children: false, specs: Slice[Spec]{data: ?SIZED_SPECS[0], size: 1}},
+    Abbrev{tag: TAG_SUBROUTINE, children: true, specs: Slice[Spec]{data: ?ROUTINE_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_SUBROUTINE, children: true, specs: Slice[Spec]{data: ?VOID_SPECS[0], size: 1}},
+    Abbrev{tag: TAG_PARAMETER, children: false, specs: Slice[Spec]{data: ?TYPED_SPECS[0], size: 1}},
+    Abbrev{tag: TAG_SUBPROGRAM, children: false, specs: Slice[Spec]{data: ?ABSTRACT_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_INLINED, children: true, specs: Slice[Spec]{data: ?INLINED_SPECS[0], size: 2}},
+    Abbrev{tag: TAG_INLINED, children: true, specs: Slice[Spec]{data: ?CALLED_SPECS[0], size: 5}},
+    Abbrev{tag: TAG_BASE, children: false, specs: Slice[Spec]{data: ?BITS_SPECS[0], size: 3}},
+};
+
+# what a fixed-width field of a section is, filled once the builder lays the object out
+# ---
+# datum:      a label's place plus an addend, relocated as masc's datum of the width
+# difference: the distance between two labels of one section
+tag Patch: u8 {
+    datum:      build.Reference;
+    difference: build.Difference;
+}
+
+# a field of a section's bytes the builder fills
+# ---
+# at:    its offset in the section
+# width: its bytes
+# patch: what fills it
+rec Fix {
+    at:    usize;
+    width: u8;
+    patch: Patch;
+}
+
+# one section as it is made: its bytes, zero where a fix goes, and its fixes in order
+# ---
+# bytes: the bytes
+# fixes: the fixes, ascending in offset
+# label: the label at its start, which every reference to it names
+rec Out {
+    bytes: vector.Vector[u8];
+    fixes: vector.Vector[Fix];
+    label: build.Label;
+}
+
+# a reference to a type's entry waiting for the entry's offset
+# ---
+# at:   where in the information entries the reference is
+# type: the type it names
+rec Wait {
+    at:   usize;
+    type: ir_debug.Type;
+}
+
+# an inlining site of a function and the runs of its code
+# ---
+# site:   the site
+# ranges: its range list's index
+rec Inlined {
+    site:   ir_debug.Site;
+    ranges: u32;
+}
+
+# what one writing shares
+# ---
+# r:        the request
+# info:     the information entries
+# abbrev:   the abbreviations
+# strings:  the strings
+# offsets:  the string offsets, one datum per string
+# addrs:    the address table, one datum per label
+# locs:     the location lists
+# rngs:     the range lists
+# interned: each string's index, by its bytes
+# texts:    each string in index order
+# indexes:  each label's index into the address table, by its id
+# labels:   each address in index order
+# loclists: each location list's offset from the first list, in index order
+# rnglists: each range list's offset from the first list, in index order
+# entries:  each type's entry offset, NONE until written
+# waits:    the references waiting for a type's offset
+# origins:  each callee's abstract entry offset, by its symbol name
+# lists:    the bytes of the lists being written, before they are placed
+# error:    what refused the last step that did not hold
+rec Writing {
+    r:        *Request;
+    info:     Out;
+    abbrev:   Out;
+    strings:  Out;
+    offsets:  Out;
+    addrs:    Out;
+    locs:     Out;
+    rngs:     Out;
+    interned: map.MapBy[View, u32];
+    texts:    vector.Vector[View];
+    indexes:  map.Map[u32, u32];
+    labels:   vector.Vector[build.Label];
+    loclists: vector.Vector[u32];
+    rnglists: vector.Vector[u32];
+    entries:  vector.Vector[u32];
+    waits:    vector.Vector[Wait];
+    origins:  map.MapBy[View, u32];
+    lists:    vector.Vector[u8];
+    error:    Error;
+}
+
+val NONE: u32 = 0xffffffff;
+
+# whether a step held, keeping its error on the writing when it did not
+fun on(w: *Writing, e: err[Error]) bool {
+    if (sel e.err) {
+        w.error = e.err;
+        ret false;
+    }
+    ret true;
+}
+
+# the error the last step that did not hold kept
+fun stop(w: *Writing) err[Error] {
+    ret err[Error].err{w.error};
+}
+
+fun hash_name(v: *View) u64 {
+    ret slice.hash_view(0xcbf29ce484222325, @v);
+}
+
+fun same_name(x: *View, y: *View) bool {
+    ret slice.same_view(@x, @y);
+}
+
+fun lost(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun refused(r: err[build.Refusal]) err[Error] {
+    if (sel r.err) { ret err[Error].err{Error.builder{r.err}}; }
+    ret err[Error].ok{};
+}
+
+fun held(r: res[usize, allocator.Error]) err[Error] {
+    if (sel r.err) { ret lost(r.err); }
+    ret err[Error].ok{};
+}
+
+fun out(a: *allocator.Allocator) Out {
+    ret Out{bytes: vector.init[u8](a), fixes: vector.init[Fix](a), label: build.Label{id: 0}};
+}
+
+fun release_out(o: *Out) {
+    vector.dnit[u8](?o.bytes);
+    vector.dnit[Fix](?o.fixes);
+}
+
+fun byte(v: *vector.Vector[u8], x: u8) err[Error] {
+    ret held(vector.push[u8](v, x));
+}
+
+# the low `width` bytes of `value` in the object's byte order
+fun fixed(w: *Writing, v: *vector.Vector[u8], value: u64, width: usize) err[Error] {
+    var bytes: [8]u8;
+    build.ordered(w.r.b, value, width, ?bytes[0]);
+    var i: usize = 0;
+    for (i < width) {
+        val put: err[Error] = byte(v, bytes[i]);
+        if (sel put.err) { ret put; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# `value` written over the `width` bytes at `at`, in the object's byte order
+fun patch(w: *Writing, v: *vector.Vector[u8], at: usize, value: u64, width: usize) {
+    var bytes: [8]u8;
+    build.ordered(w.r.b, value, width, ?bytes[0]);
+    var i: usize = 0;
+    for (i < width) {
+        v.data[at + i] = bytes[i];
+        i              = i + 1;
+    }
+}
+
+fun uleb(v: *vector.Vector[u8], value: u64) err[Error] {
+    var n: u64 = value;
+    for {
+        var b: u8 = (n & 0x7f)::u8;
+        n = n >> 7;
+        if (n != 0) { b = b | 0x80; }
+        val put: err[Error] = byte(v, b);
+        if (sel put.err) { ret put; }
+        if (n == 0)      { brk; }
+    }
+    ret err[Error].ok{};
+}
+
+fun sleb(v: *vector.Vector[u8], value: i64) err[Error] {
+    var n: i64 = value;
+    for {
+        val b: u8 = (n & 0x7f)::u8;
+        n = n >> 7;
+        val done: bool = (n == 0 && (b & 0x40) == 0) || (n == -1 && (b & 0x40) != 0);
+        var out_: u8   = b;
+        if (!done) { out_ = b | 0x80; }
+        val put: err[Error] = byte(v, out_);
+        if (sel put.err) { ret put; }
+        if (done)        { brk; }
+    }
+    ret err[Error].ok{};
+}
+
+fun bytes_of(v: *vector.Vector[u8], from: *vector.Vector[u8]) err[Error] {
+    var i: usize = 0;
+    for (i < from.len) {
+        val put: err[Error] = byte(v, from.data[i]);
+        if (sel put.err) { ret put; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# a fix of `width` bytes at the end of a section, its bytes zero until the builder fills it
+fun fix(o: *Out, width: u8, p: Patch) err[Error] {
+    val at:   usize      = o.bytes.len;
+    val room: err[Error] = held(vector.push[Fix](?o.fixes, Fix{at: at, width: width, patch: p}));
+    if (sel room.err) { ret room; }
+    var i: u8 = 0;
+    for (i < width) {
+        val put: err[Error] = byte(?o.bytes, 0);
+        if (sel put.err) { ret put; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# a 4-byte offset into another section, a datum on its start label
+fun offset_into(o: *Out, to: *Out, addend: i64) err[Error] {
+    ret fix(o, 4, Patch.datum{build.Reference{target: to.label, addend: addend, width: 4, basis: core_fixup.ABSOLUTE}});
+}
+
+# the index of a string in the string offsets, added the first time it is named
+fun string(w: *Writing, v: View) res[u32, Error] {
+    val known: opt[*u32] = map.get_by[View, u32](?w.interned, ?v);
+    if (sel known.some) { ret res[u32, Error].ok{@known.some}; }
+    val index: u32   = w.texts.len::u32;
+    val at:    usize = w.strings.bytes.len;
+    var i:     usize = 0;
+    for (i < v.len) {
+        val put: err[Error] = byte(?w.strings.bytes, v.data[i]);
+        if (sel put.err) { ret res[u32, Error].err{put.err}; }
+        i = i + 1;
+    }
+    val nul: err[Error] = byte(?w.strings.bytes, 0);
+    if (sel nul.err) { ret res[u32, Error].err{nul.err}; }
+    val offset: err[Error] = offset_into(?w.offsets, ?w.strings, at::i64);
+    if (sel offset.err) { ret res[u32, Error].err{offset.err}; }
+    val listed: err[Error] = held(vector.push[View](?w.texts, v));
+    if (sel listed.err) { ret res[u32, Error].err{listed.err}; }
+    val keyed: res[bool, allocator.Error] = map.insert_by[View, u32](?w.interned, v, index);
+    if (sel keyed.err) { ret res[u32, Error].err{Error.alloc{keyed.err}}; }
+    ret res[u32, Error].ok{index};
+}
+
+fun text_of(s: str) View {
+    var n: usize = 0;
+    for (s[n] != 0) { n = n + 1; }
+    ret View{data: s, len: n};
+}
+
+# a string attribute: its index
+fun put_string(w: *Writing, v: View) err[Error] {
+    val index: res[u32, Error] = string(w, v);
+    if (sel index.err) { ret err[Error].err{index.err}; }
+    ret uleb(?w.info.bytes, index.ok::u64);
+}
+
+# the index of a label in the address table, added the first time it is named
+fun address(w: *Writing, l: build.Label) res[u32, Error] {
+    val known: opt[*u32] = map.get[u32, u32](?w.indexes, ?l.id);
+    if (sel known.some) { ret res[u32, Error].ok{@known.some}; }
+    val index: u32        = w.labels.len::u32;
+    val put:   err[Error] = fix(?w.addrs, w.r.address, Patch.datum{build.Reference{target: l, addend: 0, width: w.r.address, basis: core_fixup.ABSOLUTE}});
+    if (sel put.err) { ret res[u32, Error].err{put.err}; }
+    val listed: err[Error] = held(vector.push[build.Label](?w.labels, l));
+    if (sel listed.err) { ret res[u32, Error].err{listed.err}; }
+    val keyed: res[bool, allocator.Error] = map.insert[u32, u32](?w.indexes, l.id, index);
+    if (sel keyed.err) { ret res[u32, Error].err{Error.alloc{keyed.err}}; }
+    ret res[u32, Error].ok{index};
+}
+
+# a reference to a type's entry, filled once every type's entry is written
+fun type_ref(w: *Writing, t: ir_debug.Type) err[Error] {
+    val waits: err[Error] = held(vector.push[Wait](?w.waits, Wait{at: w.info.bytes.len, type: t}));
+    if (sel waits.err) { ret waits; }
+    ret fixed(w, ?w.info.bytes, 0, 4);
+}
+
+fun code(w: *Writing, c: u32) err[Error] {
+    ret uleb(?w.info.bytes, c::u64);
+}
+
+fun end_children(w: *Writing) err[Error] {
+    ret byte(?w.info.bytes, 0);
+}
+
+fun dlayout(e: res[u64, record.Error]) res[u64, Error] {
+    if (sel e.err) { ret res[u64, Error].err{Error.layout{e.err}}; }
+    ret res[u64, Error].ok{e.ok};
+}
+
+fun table[T](r: res[T, ir_debug.Error]) res[T, Error] {
+    if (sel r.err) { ret res[T, Error].err{Error.table{r.err}}; }
+    ret res[T, Error].ok{r.ok};
+}
+
+# the entries of one member of an aggregate laid out as `owner`, at its field's offset plus `base`
+fun member(w: *Writing, owner: Type, m: ir_debug.Member, base: u64) err[Error] {
+    val at: res[u64, Error] = dlayout(layout.offset(w.r.l, owner, DEFAULT_SPACE, m.field));
+    if (sel at.err) { ret err[Error].err{at.err}; }
+    val c: err[Error] = code(w, A_MEMBER);
+    if (sel c.err) { ret c; }
+    val n: err[Error] = put_string(w, m.name);
+    if (sel n.err) { ret n; }
+    val t: err[Error] = type_ref(w, m.type);
+    if (sel t.err) { ret t; }
+    ret uleb(?w.info.bytes, base + at.ok);
+}
+
+fun encoding_of(e: ir_debug.Encoding) u8 {
+    if (sel e.signed)    { ret 0x05; }
+    if (sel e.unsigned)  { ret 0x07; }
+    if (sel e.float)     { ret 0x04; }
+    if (sel e.boolean)   { ret 0x02; }
+    if (sel e.character) { ret 0x10; }
+    ret 0x01;
+}
+
+# the size of an ir type the layout routine answers
+fun size_of(w: *Writing, ty: Type) res[u64, Error] {
+    ret dlayout(layout.size(w.r.l, ty, DEFAULT_SPACE));
+}
+
+# a tagged union: a structure of its discriminant and a variant part of its cases
+fun tagged(w: *Writing, owner: Type, t: ir_debug.Tagged) err[Error] {
+    val disc: usize      = w.info.bytes.len;
+    val head: err[Error] = member(w, owner, t.discriminant, 0);
+    if (sel head.err) { ret head; }
+    val c: err[Error] = code(w, A_PART);
+    if (sel c.err) { ret c; }
+    val d: err[Error] = fixed(w, ?w.info.bytes, disc::u64, 4);
+    if (sel d.err) { ret d; }
+    val payload: res[u64, Error] = dlayout(layout.offset(w.r.l, owner, DEFAULT_SPACE, t.payload));
+    if (sel payload.err) { ret err[Error].err{payload.err}; }
+    val fields: res[Slice[Type], types.Error] = types.members(?w.r.m.types, owner);
+    if (sel fields.err)                     { ret err[Error].err{Error.module{module.Error.types{fields.err}}}; }
+    if (t.payload::usize >= fields.ok.size) { ret err[Error].err{Error.table{ir_debug.Error.field{t.payload}}}; }
+    val union: Type  = fields.ok.data[t.payload];
+    var i:     usize = 0;
+    for (i < t.cases.size) {
+        val k:  ir_debug.Case = t.cases.data[i];
+        val vc: err[Error]    = code(w, A_VARIANT);
+        if (sel vc.err) { ret vc; }
+        val v: err[Error] = uleb(?w.info.bytes, k.value);
+        if (sel v.err) { ret v; }
+        val carried: opt[ir_debug.Member] = k.payload;
+        if (sel carried.some) {
+            val m: err[Error] = member(w, union, carried.some, payload.ok);
+            if (sel m.err) { ret m; }
+        }
+        val e: err[Error] = end_children(w);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    val part: err[Error] = end_children(w);
+    if (sel part.err) { ret part; }
+    ret end_children(w);
+}
+
+# the entry of one type of the debug table, and its children
+fun type_entry(w: *Writing, t: ir_debug.Type) err[Error] {
+    w.entries.data[t.index] = w.info.bytes.len::u32;
+    val dt:   *ir_debug.Table  = ?w.r.m.debug;
+    val name: res[View, Error] = table[View](ir_debug.name(dt, t));
+    if (sel name.err) { ret err[Error].err{name.err}; }
+    val shape: res[ir_debug.Shape, Error] = table[ir_debug.Shape](ir_debug.shape(dt, t));
+    if (sel shape.err) { ret err[Error].err{shape.err}; }
+    val s: ir_debug.Shape = shape.ok;
+    if (sel s.base) {
+        val whole: bool       = s.base.width % 8 == 0;
+        var c:     err[Error] = code(w, A_BITS);
+        if (whole)     { c = code(w, A_BASE); }
+        if (sel c.err) { ret c; }
+        val n: err[Error] = put_string(w, name.ok);
+        if (sel n.err) { ret n; }
+        val e: err[Error] = byte(?w.info.bytes, encoding_of(s.base.encoding));
+        if (sel e.err) { ret e; }
+        if (whole)     { ret uleb(?w.info.bytes, (s.base.width / 8)::u64); }
+        ret uleb(?w.info.bytes, s.base.width::u64);
+    }
+    if (sel s.structure || sel s.union || sel s.tagged) {
+        val laid: res[Type, Error] = table[Type](ir_debug.layout(dt, t));
+        if (sel laid.err) { ret err[Error].err{laid.err}; }
+        val size: res[u64, Error] = size_of(w, laid.ok);
+        if (sel size.err) { ret err[Error].err{size.err}; }
+        var c: err[Error];
+        if (sel s.union) { c = code(w, A_UNION); }
+        or               { c = code(w, A_STRUCTURE); }
+        if (sel c.err)   { ret c; }
+        val n: err[Error] = put_string(w, name.ok);
+        if (sel n.err) { ret n; }
+        val z: err[Error] = uleb(?w.info.bytes, size.ok);
+        if (sel z.err)    { ret z; }
+        if (sel s.tagged) { ret tagged(w, laid.ok, s.tagged); }
+        var members: Slice[ir_debug.Member] = Slice[ir_debug.Member]{data: nil, size: 0};
+        if (sel s.structure) { members = s.structure; }
+        if (sel s.union)     { members = s.union; }
+        var i: usize = 0;
+        for (i < members.size) {
+            val m: err[Error] = member(w, laid.ok, members.data[i], 0);
+            if (sel m.err) { ret m; }
+            i = i + 1;
+        }
+        ret end_children(w);
+    }
+    if (sel s.enumeration) {
+        val base: res[ir_debug.Shape, Error] = table[ir_debug.Shape](ir_debug.shape(dt, s.enumeration.base));
+        if (sel base.err) { ret err[Error].err{base.err}; }
+        var bytes: u64            = 0;
+        val b:     ir_debug.Shape = base.ok;
+        if (sel b.base) { bytes = ((b.base.width + 7) / 8)::u64; }
+        val c: err[Error] = code(w, A_ENUM);
+        if (sel c.err) { ret c; }
+        val n: err[Error] = put_string(w, name.ok);
+        if (sel n.err) { ret n; }
+        val bt: err[Error] = type_ref(w, s.enumeration.base);
+        if (sel bt.err) { ret bt; }
+        val z: err[Error] = uleb(?w.info.bytes, bytes);
+        if (sel z.err) { ret z; }
+        var i: usize = 0;
+        for (i < s.enumeration.enumerators.size) {
+            val e:  ir_debug.Enumerator = s.enumeration.enumerators.data[i];
+            val ec: err[Error]          = code(w, A_ENUMERATOR);
+            if (sel ec.err) { ret ec; }
+            val en: err[Error] = put_string(w, e.name);
+            if (sel en.err) { ret en; }
+            val ev: err[Error] = uleb(?w.info.bytes, e.value);
+            if (sel ev.err) { ret ev; }
+            i = i + 1;
+        }
+        ret end_children(w);
+    }
+    if (sel s.array) {
+        val c: err[Error] = code(w, A_ARRAY);
+        if (sel c.err) { ret c; }
+        val et: err[Error] = type_ref(w, s.array.element);
+        if (sel et.err) { ret et; }
+        val sc: err[Error] = code(w, A_SUBRANGE);
+        if (sel sc.err) { ret sc; }
+        val n: err[Error] = uleb(?w.info.bytes, s.array.count);
+        if (sel n.err) { ret n; }
+        ret end_children(w);
+    }
+    if (sel s.pointer) {
+        val target: opt[ir_debug.Type] = s.pointer.target;
+        if (sel target.some) {
+            val c: err[Error] = code(w, A_POINTER);
+            if (sel c.err) { ret c; }
+            val pt: err[Error] = type_ref(w, target.some);
+            if (sel pt.err) { ret pt; }
+        }
+        or {
+            val c: err[Error] = code(w, A_OPAQUE);
+            if (sel c.err) { ret c; }
+        }
+        ret uleb(?w.info.bytes, w.r.address::u64);
+    }
+    if (!(sel s.function)) { ret err[Error].ok{}; }
+    val f: ir_debug.Function = s.function;
+    if (f.results.size > 0) {
+        val c: err[Error] = code(w, A_ROUTINE);
+        if (sel c.err) { ret c; }
+        val rt: err[Error] = type_ref(w, f.results.data[0]);
+        if (sel rt.err) { ret rt; }
+    }
+    or {
+        val c: err[Error] = code(w, A_VOID);
+        if (sel c.err) { ret c; }
+    }
+    var i: usize = 0;
+    for (i < f.params.size) {
+        val pc: err[Error] = code(w, A_ARGUMENT);
+        if (sel pc.err) { ret pc; }
+        val pt: err[Error] = type_ref(w, f.params.data[i]);
+        if (sel pt.err) { ret pt; }
+        i = i + 1;
+    }
+    ret end_children(w);
+}
+
+# the dwarf number of a register under the object's context
+fun number_of(w: *Writing, reg: rf.Id) res[u32, Error] {
+    val n: opt[u32] = core_state.debug_number(w.r.context.view.file, reg, rf.DWARF, w.r.context);
+    if (sel n.none) { ret res[u32, Error].err{Error.number{reg}}; }
+    ret res[u32, Error].ok{n.some};
+}
+
+# the width in bits of an integer ir type, 64 for any other
+fun bits_of(w: *Writing, ty: Type) u32 {
+    val got: res[u32, types.Error] = types.width(?w.r.m.types, ty);
+    if (sel got.err) { ret 64; }
+    ret got.ok;
+}
+
+fun mask(v: *vector.Vector[u8], bits: u32) err[Error] {
+    if (bits >= 64) { ret err[Error].ok{}; }
+    val c: err[Error] = byte(v, OP_CONSTU);
+    if (sel c.err) { ret c; }
+    val m: err[Error] = uleb(v, ((1::u64) << bits::u64) - 1);
+    if (sel m.err) { ret m; }
+    ret byte(v, OP_AND);
+}
+
+# the value of an integer constant, none for one of more than one word or of another kind
+fun word_of(w: *Writing, c: id.Constant) opt[u64] {
+    val got: res[ConstantData, module.Error] = module.constant_data(w.r.m, c);
+    if (sel got.err) { ret opt[u64].none{}; }
+    val d: ConstantData = got.ok;
+    if (!(sel d.integer))          { ret opt[u64].none{}; }
+    if (d.integer.words.size != 1) { ret opt[u64].none{}; }
+    ret opt[u64].some{d.integer.words.data[0]};
+}
+
+# the salvage steps of an expression over the value on the stack, from a value of type `from`
+fun steps(w: *Writing, v: *vector.Vector[u8], e: Expression, from: Type) err[Error] {
+    val got: res[Slice[Step], module.Error] = module.steps(w.r.m, e);
+    if (sel got.err) { ret err[Error].err{Error.module{got.err}}; }
+    var width: u32   = bits_of(w, from);
+    var i:     usize = 0;
+    for (i < got.ok.size) {
+        val s:   Step           = got.ok.data[i];
+        val arg: point.Argument = s.argument;
+        if (s.kind.index == point.ADD.index || s.kind.index == point.SUB.index) {
+            if (!(sel arg.constant)) { ret err[Error].ok{}; }
+            val k: opt[u64] = word_of(w, arg.constant);
+            if (sel k.none) { ret err[Error].ok{}; }
+            val c: err[Error] = byte(v, OP_CONSTU);
+            if (sel c.err) { ret c; }
+            val n: err[Error] = uleb(v, k.some);
+            if (sel n.err) { ret n; }
+            var op: u8 = OP_PLUS;
+            if (s.kind.index == point.SUB.index) { op = OP_MINUS; }
+            val o: err[Error] = byte(v, op);
+            if (sel o.err) { ret o; }
+        }
+        or (sel arg.to) {
+            val to: u32 = bits_of(w, arg.to);
+            if (s.kind.index == point.EXT_S.index && width < 64) {
+                val shift: u64        = (64 - width)::u64;
+                val a:     err[Error] = byte(v, OP_CONSTU);
+                if (sel a.err) { ret a; }
+                val b: err[Error] = uleb(v, shift);
+                if (sel b.err) { ret b; }
+                val c: err[Error] = byte(v, OP_SHL);
+                if (sel c.err) { ret c; }
+                val d: err[Error] = byte(v, OP_CONSTU);
+                if (sel d.err) { ret d; }
+                val e2: err[Error] = uleb(v, shift);
+                if (sel e2.err) { ret e2; }
+                val f: err[Error] = byte(v, OP_SHRA);
+                if (sel f.err) { ret f; }
+                val g: err[Error] = mask(v, to);
+                if (sel g.err) { ret g; }
+            }
+            or (s.kind.index == point.EXT_U.index) {
+                val m: err[Error] = mask(v, width);
+                if (sel m.err) { ret m; }
+            }
+            or {
+                val m: err[Error] = mask(v, to);
+                if (sel m.err) { ret m; }
+            }
+            width = to;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether an expression has no steps
+fun plain(w: *Writing, e: Expression) bool {
+    val got: res[Slice[Step], module.Error] = module.steps(w.r.m, e);
+    ret sel got.ok && got.ok.size == 0;
+}
+
+# a location that is not pieces as a dwarf expression, the salvage steps over
+# its value, answering false for one dwarf cannot state here: a slot whose
+# offset scales or that steps read, or a constant wider than a word
+fun single(w: *Writing, v: *vector.Vector[u8], at: Where, e: Expression, from: Type) res[bool, Error] {
+    val bare: bool = plain(w, e);
+    if (sel at.register) {
+        val n: res[u32, Error] = number_of(w, at.register);
+        if (sel n.err) { ret res[bool, Error].err{n.err}; }
+        var put: bool = true;
+        if (bare) {
+            if (n.ok < 32) { put = on(w, byte(v, OP_REG0 + n.ok::u8)); }
+            or {
+                put = on(w, byte(v, OP_REGX));
+                put = put && on(w, uleb(v, n.ok::u64));
+            }
+            if (!put) { ret res[bool, Error].err{w.error}; }
+            ret res[bool, Error].ok{true};
+        }
+        if (n.ok < 32) { put = on(w, byte(v, OP_BREG0 + n.ok::u8)); }
+        or {
+            put = on(w, byte(v, OP_BREGX));
+            put = put && on(w, uleb(v, n.ok::u64));
+        }
+        if (!put) { ret res[bool, Error].err{w.error}; }
+        val zero: err[Error] = sleb(v, 0);
+        if (sel zero.err) { ret res[bool, Error].err{zero.err}; }
+        val st: err[Error] = steps(w, v, e, from);
+        if (sel st.err) { ret res[bool, Error].err{st.err}; }
+        val sv: err[Error] = byte(v, OP_STACK_VALUE);
+        if (sel sv.err) { ret res[bool, Error].err{sv.err}; }
+        ret res[bool, Error].ok{true};
+    }
+    if (sel at.slot) {
+        if (at.slot.per != 0 || !bare) { ret res[bool, Error].ok{false}; }
+        val op: err[Error] = byte(v, OP_FBREG);
+        if (sel op.err) { ret res[bool, Error].err{op.err}; }
+        val off: err[Error] = sleb(v, at.slot.fixed);
+        if (sel off.err) { ret res[bool, Error].err{off.err}; }
+        ret res[bool, Error].ok{true};
+    }
+    if (sel at.constant) {
+        val k: opt[u64] = word_of(w, at.constant);
+        if (sel k.none) { ret res[bool, Error].ok{false}; }
+        val c: err[Error] = byte(v, OP_CONSTU);
+        if (sel c.err) { ret res[bool, Error].err{c.err}; }
+        val n: err[Error] = uleb(v, k.some);
+        if (sel n.err) { ret res[bool, Error].err{n.err}; }
+        val st: err[Error] = steps(w, v, e, from);
+        if (sel st.err) { ret res[bool, Error].err{st.err}; }
+        val sv: err[Error] = byte(v, OP_STACK_VALUE);
+        if (sel sv.err) { ret res[bool, Error].err{sv.err}; }
+        ret res[bool, Error].ok{true};
+    }
+    ret res[bool, Error].ok{false};
+}
+
+# a location as a dwarf expression, answering false for one it cannot state
+fun expression(w: *Writing, v: *vector.Vector[u8], s: *Span) res[bool, Error] {
+    val admitted: err[producer.Refusal] = producer.admit(?rows.DWARF, s.where);
+    if (sel admitted.err) { ret res[bool, Error].err{Error.refused{admitted.err}}; }
+    val at: Where = s.where;
+    if (!(sel at.pieces)) { ret single(w, v, at, s.expression, s.type); }
+    var any: bool  = false;
+    var i:   usize = 0;
+    for (i < at.pieces.size) {
+        val p:     Piece = at.pieces.data[i];
+        val where: Where = p.location;
+        if (!(sel where.unavailable)) {
+            val stated: res[bool, Error] = single(w, v, where, p.expression, p.from);
+            if (sel stated.err) { ret stated; }
+            if (stated.ok)      { any = true; }
+        }
+        var put: bool = true;
+        if (p.bits % 8 == 0) {
+            put = on(w, byte(v, OP_PIECE));
+            put = put && on(w, uleb(v, p.bits / 8));
+        }
+        or {
+            put = on(w, byte(v, OP_BIT_PIECE));
+            put = put && on(w, uleb(v, p.bits));
+            put = put && on(w, uleb(v, 0));
+        }
+        if (!put) { ret res[bool, Error].err{w.error}; }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{any};
+}
+
+# a list of the lists of a section: its bytes from the scratch appended, its offset noted
+fun place_list(w: *Writing, to: *Out, offsets: *vector.Vector[u32], base: usize) res[u32, Error] {
+    val index: u32        = offsets.len::u32;
+    val noted: err[Error] = held(vector.push[u32](offsets, (to.bytes.len - base)::u32));
+    if (sel noted.err) { ret res[u32, Error].err{noted.err}; }
+    val copied: err[Error] = bytes_of(?to.bytes, ?w.lists);
+    if (sel copied.err) { ret res[u32, Error].err{copied.err}; }
+    ret res[u32, Error].ok{index};
+}
+
+# the location list of a variable's spans, none when no span is stated
+fun location_list(w: *Writing, spans: Slice[Span], b: ir_debug.Binding) res[opt[u32], Error] {
+    w.lists.len = 0;
+    var expr: vector.Vector[u8] = vector.init[u8](w.r.a);
+    fin { vector.dnit[u8](?expr); }
+    var count: u32   = 0;
+    var i:     usize = 0;
+    for (i < spans.size) {
+        val s: *Span = ?spans.data[i];
+        if (s.binding.index == b.index) {
+            expr.len = 0;
+            val stated: res[bool, Error] = expression(w, ?expr, s);
+            if (sel stated.err) { ret res[opt[u32], Error].err{stated.err}; }
+            if (stated.ok) {
+                val start: res[u32, Error] = address(w, s.start);
+                if (sel start.err) { ret res[opt[u32], Error].err{start.err}; }
+                val end: res[u32, Error] = address(w, s.end);
+                if (sel end.err) { ret res[opt[u32], Error].err{end.err}; }
+                var put: bool = on(w, byte(?w.lists, LLE_STARTX_ENDX));
+                put = put && on(w, uleb(?w.lists, start.ok::u64));
+                put = put && on(w, uleb(?w.lists, end.ok::u64));
+                put = put && on(w, uleb(?w.lists, expr.len::u64));
+                put = put && on(w, bytes_of(?w.lists, ?expr));
+                if (!put) { ret res[opt[u32], Error].err{w.error}; }
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (count == 0) { ret res[opt[u32], Error].ok{opt[u32].none{}}; }
+    val ended: err[Error] = byte(?w.lists, LLE_END);
+    if (sel ended.err) { ret res[opt[u32], Error].err{ended.err}; }
+    val placed: res[u32, Error] = place_list(w, ?w.locs, ?w.loclists, 0);
+    if (sel placed.err) { ret res[opt[u32], Error].err{placed.err}; }
+    ret res[opt[u32], Error].ok{opt[u32].some{placed.ok}};
+}
+
+# one range of a range list in the scratch
+fun range_entry(w: *Writing, start: build.Label, end: build.Label) err[Error] {
+    val s: res[u32, Error] = address(w, start);
+    if (sel s.err) { ret err[Error].err{s.err}; }
+    val e: res[u32, Error] = address(w, end);
+    if (sel e.err) { ret err[Error].err{e.err}; }
+    var put: bool = on(w, byte(?w.lists, RLE_STARTX_ENDX));
+    put = put && on(w, uleb(?w.lists, s.ok::u64));
+    put = put && on(w, uleb(?w.lists, e.ok::u64));
+    if (!put) { ret stop(w); }
+    ret err[Error].ok{};
+}
+
+fun range_list(w: *Writing) res[u32, Error] {
+    val ended: err[Error] = byte(?w.lists, RLE_END);
+    if (sel ended.err) { ret res[u32, Error].err{ended.err}; }
+    ret place_list(w, ?w.rngs, ?w.rnglists, 0);
+}
+
+# whether a site is `s` or one `s` was inlined through
+fun within(w: *Writing, inner: ir_debug.Site, s: ir_debug.Site) bool {
+    var here:  ir_debug.Site = inner;
+    var depth: usize         = 0;
+    for (depth <= w.r.m.debug.sites.len) {
+        if (here.index == s.index) { ret true; }
+        val got: res[ir_debug.Inlining, ir_debug.Error] = ir_debug.inlining(?w.r.m.debug, here);
+        if (sel got.err) { ret false; }
+        val up: opt[ir_debug.Site] = got.ok.parent;
+        if (sel up.none) { ret false; }
+        here  = up.some;
+        depth = depth + 1;
+    }
+    ret false;
+}
+
+# the abstract entry of a callee, its offset
+fun origin(w: *Writing, callee: View) res[u32, Error] {
+    val known: opt[*u32] = map.get_by[View, u32](?w.origins, ?callee);
+    if (sel known.some) { ret res[u32, Error].ok{@known.some}; }
+    ret res[u32, Error].ok{NONE};
+}
+
+# the inlined subroutine of a site and the sites inlined within it, nested
+fun inlined(w: *Writing, p: *Subprogram, s: ir_debug.Site) err[Error] {
+    val got: res[ir_debug.Inlining, Error] = table[ir_debug.Inlining](ir_debug.inlining(?w.r.m.debug, s));
+    if (sel got.err) { ret err[Error].err{got.err}; }
+    w.lists.len = 0;
+    var i: usize = 0;
+    for (i < p.runs.size) {
+        if (within(w, p.runs.data[i].site, s)) {
+            val e: err[Error] = range_entry(w, p.runs.data[i].start, p.runs.data[i].end);
+            if (sel e.err) { ret e; }
+        }
+        i = i + 1;
+    }
+    val list: res[u32, Error] = range_list(w);
+    if (sel list.err) { ret err[Error].err{list.err}; }
+    val from: res[u32, Error] = origin(w, got.ok.callee);
+    if (sel from.err)    { ret err[Error].err{from.err}; }
+    if (from.ok == NONE) { ret err[Error].ok{}; }
+    var c: err[Error];
+    if (w.r.lines) { c = code(w, A_CALLED); }
+    or             { c = code(w, A_INLINED); }
+    if (sel c.err) { ret c; }
+    val o: err[Error] = fixed(w, ?w.info.bytes, from.ok::u64, 4);
+    if (sel o.err) { ret o; }
+    val r: err[Error] = uleb(?w.info.bytes, list.ok::u64);
+    if (sel r.err) { ret r; }
+    if (w.r.lines) {
+        val at: res[ir_debug.Position, Error] = table[ir_debug.Position](ir_debug.position(?w.r.m.debug, got.ok.call));
+        if (sel at.err) { ret err[Error].err{at.err}; }
+        var put: bool = on(w, fixed(w, ?w.info.bytes, at.ok.file.index::u64, 4));
+        put = put && on(w, uleb(?w.info.bytes, at.ok.line::u64));
+        put = put && on(w, uleb(?w.info.bytes, at.ok.column::u64));
+        if (!put) { ret stop(w); }
+    }
+    # the sites inlined directly within this one
+    var seen: vector.Vector[u32] = vector.init[u32](w.r.a);
+    fin { vector.dnit[u32](?seen); }
+    i = 0;
+    for (i < p.runs.size) {
+        val child: opt[ir_debug.Site] = child_of(w, p.runs.data[i].site, opt[ir_debug.Site].some{s});
+        if (sel child.some) {
+            if (!listed(?seen, child.some.index)) {
+                val noted: err[Error] = held(vector.push[u32](?seen, child.some.index));
+                if (sel noted.err) { ret noted; }
+                val nested: err[Error] = inlined(w, p, child.some);
+                if (sel nested.err) { ret nested; }
+            }
+        }
+        i = i + 1;
+    }
+    ret end_children(w);
+}
+
+fun listed(v: *vector.Vector[u32], x: u32) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == x) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the site on the chain from `inner` out whose parent is `parent`, none for a
+# chain `parent` is not on; none for a parent of none is the outermost site
+fun child_of(w: *Writing, inner: ir_debug.Site, parent: opt[ir_debug.Site]) opt[ir_debug.Site] {
+    var at:    ir_debug.Site = inner;
+    var depth: usize         = 0;
+    for (depth <= w.r.m.debug.sites.len) {
+        val got: res[ir_debug.Inlining, ir_debug.Error] = ir_debug.inlining(?w.r.m.debug, at);
+        if (sel got.err) { ret opt[ir_debug.Site].none{}; }
+        val up: opt[ir_debug.Site] = got.ok.parent;
+        if (sel parent.none) {
+            if (sel up.none) { ret opt[ir_debug.Site].some{at}; }
+        }
+        or {
+            if (sel up.some) {
+                if (up.some.index == parent.some.index) { ret opt[ir_debug.Site].some{at}; }
+            }
+        }
+        if (sel up.none) { ret opt[ir_debug.Site].none{}; }
+        at    = up.some;
+        depth = depth + 1;
+    }
+    ret opt[ir_debug.Site].none{};
+}
+
+# the variables a function binds: those its records and its storage bindings name
+fun bound(w: *Writing, f: id.Function, out_: *vector.Vector[u32]) err[Error] {
+    val body: res[*Body, module.Error] = module.body(w.r.m, f);
+    if (sel body.err) { ret err[Error].err{Error.module{body.err}}; }
+    val b: *Body = body.ok;
+    var i: usize = 0;
+    for (i < b.points.len) {
+        val v: u32 = b.points.data[i].binding.index;
+        if (!listed(out_, v)) {
+            val p: err[Error] = held(vector.push[u32](out_, v));
+            if (sel p.err) { ret p; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < b.instructions.len) {
+        val list: res[Slice[ir_debug.Binding], module.Error] = module.bound(w.r.m, b.instructions.data[i].metadata.bindings);
+        if (sel list.ok) {
+            val held_: Slice[ir_debug.Binding] = list.ok;
+            var k:     usize                   = 0;
+            for (k < held_.size) {
+                if (!listed(out_, held_.data[k].index)) {
+                    val p: err[Error] = held(vector.push[u32](out_, held_.data[k].index));
+                    if (sel p.err) { ret p; }
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the entry of one variable of a function
+fun variable(w: *Writing, p: *Subprogram, b: ir_debug.Binding) err[Error] {
+    val got: res[ir_debug.Variable, Error] = table[ir_debug.Variable](ir_debug.variable(?w.r.m.debug, b));
+    if (sel got.err) { ret err[Error].err{got.err}; }
+    val v:    ir_debug.Variable    = got.ok;
+    val list: res[opt[u32], Error] = location_list(w, p.spans, b);
+    if (sel list.err) { ret err[Error].err{list.err}; }
+    var c: u32 = A_VARIABLE;
+    if (sel v.parameter.some) { c = A_PARAMETER; }
+    if (sel list.ok.some)     { c = c + 1; }
+    if (w.r.lines)            { c = c + 2; }
+    val cc: err[Error] = code(w, c);
+    if (sel cc.err) { ret cc; }
+    val n: err[Error] = put_string(w, v.name);
+    if (sel n.err) { ret n; }
+    val t: err[Error] = type_ref(w, v.type);
+    if (sel t.err) { ret t; }
+    if (w.r.lines) {
+        val at: res[ir_debug.Position, Error] = table[ir_debug.Position](ir_debug.position(?w.r.m.debug, v.declared));
+        if (sel at.err) { ret err[Error].err{at.err}; }
+        var put: bool = on(w, fixed(w, ?w.info.bytes, at.ok.file.index::u64, 4));
+        put = put && on(w, uleb(?w.info.bytes, at.ok.line::u64));
+        if (!put) { ret stop(w); }
+    }
+    val held_list: opt[u32] = list.ok;
+    if (sel held_list.some) { ret uleb(?w.info.bytes, held_list.some::u64); }
+    ret err[Error].ok{};
+}
+
+# the entry of one function, its variables and the code inlined in it
+fun subprogram(w: *Writing, p: *Subprogram) err[Error] {
+    val data: res[FunctionData, module.Error] = module.function_data(w.r.m, p.function);
+    if (sel data.err) { ret err[Error].err{Error.module{data.err}}; }
+    val c: err[Error] = code(w, A_SUBPROGRAM);
+    if (sel c.err) { ret c; }
+    val n: err[Error] = put_string(w, data.ok.name);
+    if (sel n.err) { ret n; }
+    val low: res[u32, Error] = address(w, p.start);
+    if (sel low.err) { ret err[Error].err{low.err}; }
+    val l: err[Error] = uleb(?w.info.bytes, low.ok::u64);
+    if (sel l.err) { ret l; }
+    val high: err[Error] = fix(?w.info, 4, Patch.difference{build.Difference{plus: p.end, minus: p.start, addend: 0}});
+    if (sel high.err) { ret high; }
+    var put: bool = on(w, uleb(?w.info.bytes, 1));
+    put = put && on(w, byte(?w.info.bytes, OP_CFA));
+    if (!put) { ret stop(w); }
+    var vars: vector.Vector[u32] = vector.init[u32](w.r.a);
+    fin { vector.dnit[u32](?vars); }
+    val named: err[Error] = bound(w, p.function, ?vars);
+    if (sel named.err) { ret named; }
+    var i: usize = 0;
+    for (i < vars.len) {
+        val one: err[Error] = variable(w, p, ir_debug.Binding{index: vars.data[i]});
+        if (sel one.err) { ret one; }
+        i = i + 1;
+    }
+    var seen: vector.Vector[u32] = vector.init[u32](w.r.a);
+    fin { vector.dnit[u32](?seen); }
+    i = 0;
+    for (i < p.runs.size) {
+        val root: opt[ir_debug.Site] = child_of(w, p.runs.data[i].site, opt[ir_debug.Site].none{});
+        if (sel root.some) {
+            if (!listed(?seen, root.some.index)) {
+                val noted: err[Error] = held(vector.push[u32](?seen, root.some.index));
+                if (sel noted.err) { ret noted; }
+                val nested: err[Error] = inlined(w, p, root.some);
+                if (sel nested.err) { ret nested; }
+            }
+        }
+        i = i + 1;
+    }
+    ret end_children(w);
+}
+
+# the abstract entry of every callee whose code a function holds inlined
+fun abstracts(w: *Writing) err[Error] {
+    var f: usize = 0;
+    for (f < w.r.functions.size) {
+        val p: *Subprogram = ?w.r.functions.data[f];
+        var i: usize       = 0;
+        for (i < p.runs.size) {
+            var at:    ir_debug.Site = p.runs.data[i].site;
+            var depth: usize         = 0;
+            for (depth <= w.r.m.debug.sites.len) {
+                val got: res[ir_debug.Inlining, Error] = table[ir_debug.Inlining](ir_debug.inlining(?w.r.m.debug, at));
+                if (sel got.err) { ret err[Error].err{got.err}; }
+                if (!map.contains_by[View, u32](?w.origins, ?got.ok.callee)) {
+                    val keyed: res[bool, allocator.Error] = map.insert_by[View, u32](?w.origins, got.ok.callee, w.info.bytes.len::u32);
+                    if (sel keyed.err) { ret lost(keyed.err); }
+                    var put: bool = on(w, code(w, A_ABSTRACT));
+                    put = put && on(w, put_string(w, got.ok.callee));
+                    put = put && on(w, byte(?w.info.bytes, INLINED));
+                    if (!put) { ret stop(w); }
+                }
+                val up: opt[ir_debug.Site] = got.ok.parent;
+                if (sel up.none) { brk; }
+                at    = up.some;
+                depth = depth + 1;
+            }
+            i = i + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the abbreviations, each row in order, and the table's end
+fun abbreviations(w: *Writing) err[Error] {
+    val v: *vector.Vector[u8] = ?w.abbrev.bytes;
+    var i: usize              = 0;
+    for (i < $length_of(ABBREVS)) {
+        val a:   *Abbrev = ?ABBREVS[i];
+        var put: bool    = on(w, uleb(v, (i + 1)::u64));
+        put = put && on(w, uleb(v, a.tag::u64));
+        if (put) {
+            if (a.children) { put = on(w, byte(v, 1)); }
+            or              { put = on(w, byte(v, 0)); }
+        }
+        var k: usize = 0;
+        for (put && k < a.specs.size) {
+            put = on(w, uleb(v, a.specs.data[k].at::u64));
+            put = put && on(w, uleb(v, a.specs.data[k].form::u64));
+            k   = k + 1;
+        }
+        put = put && on(w, byte(v, 0));
+        put = put && on(w, byte(v, 0));
+        if (!put) { ret stop(w); }
+        i = i + 1;
+    }
+    ret byte(v, 0);
+}
+
+# a list section's header and its offsets table, before its lists, which
+# `base` names the start of
+fun list_header(w: *Writing, o: *Out, offsets: *vector.Vector[u32], lists: *vector.Vector[u8]) err[Error] {
+    val head: usize = 12 + 4 * offsets.len;
+    var put:  bool  = on(w, fixed(w, ?o.bytes, (head - 4 + lists.len)::u64, 4));
+    put = put && on(w, fixed(w, ?o.bytes, VERSION::u64, 2));
+    put = put && on(w, byte(?o.bytes, w.r.address));
+    put = put && on(w, byte(?o.bytes, 0));
+    put = put && on(w, fixed(w, ?o.bytes, offsets.len::u64, 4));
+    var i: usize = 0;
+    for (put && i < offsets.len) {
+        put = on(w, fixed(w, ?o.bytes, (4 * offsets.len + offsets.data[i]::usize)::u64, 4));
+        i   = i + 1;
+    }
+    put = put && on(w, bytes_of(?o.bytes, lists));
+    if (!put) { ret stop(w); }
+    ret err[Error].ok{};
+}
+
+# the information entries of the unit
+fun entries(w: *Writing) err[Error] {
+    val v:   *vector.Vector[u8] = ?w.info.bytes;
+    var put: bool               = on(w, fixed(w, v, 0, 4));
+    put = put && on(w, fixed(w, v, VERSION::u64, 2));
+    put = put && on(w, byte(v, UT_COMPILE));
+    put = put && on(w, byte(v, w.r.address));
+    put = put && on(w, offset_into(?w.info, ?w.abbrev, 0));
+    if (!put) { ret stop(w); }
+    var unit: u32 = A_UNIT_LOC;
+    if (w.r.lines) { unit = A_UNIT_LINE; }
+    put = on(w, code(w, unit));
+    put = put && on(w, put_string(w, text_of(PRODUCER)));
+    put = put && on(w, fixed(w, v, LANGUAGE::u64, 2));
+    if (!put) { ret stop(w); }
+    val first: res[View, Error] = table[View](ir_debug.path(?w.r.m.debug, ir_debug.File{index: 0}));
+    if (sel first.err) { ret err[Error].err{first.err}; }
+    put = on(w, put_string(w, first.ok));
+    put = put && on(w, put_string(w, View{data: ".", len: 1}));
+    put = put && on(w, fixed(w, v, 0, w.r.address::usize));
+    if (!put) { ret stop(w); }
+    # the unit's ranges: every function's code
+    w.lists.len = 0;
+    var i: usize = 0;
+    for (i < w.r.functions.size) {
+        val e: err[Error] = range_entry(w, w.r.functions.data[i].start, w.r.functions.data[i].end);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    val ranges: res[u32, Error] = range_list(w);
+    if (sel ranges.err) { ret err[Error].err{ranges.err}; }
+    put = on(w, uleb(v, ranges.ok::u64));
+    put = put && on(w, offset_into(?w.info, ?w.offsets, 8));
+    put = put && on(w, offset_into(?w.info, ?w.addrs, 8));
+    put = put && on(w, offset_into(?w.info, ?w.rngs, 12));
+    put = put && on(w, offset_into(?w.info, ?w.locs, 12));
+    if (put && w.r.lines) { put = on(w, fixed(w, v, 0, 4)); }
+    if (!put)             { ret stop(w); }
+    # every type, then the callees inlined, then the functions
+    i = 0;
+    for (i < w.r.m.debug.nodes.len) {
+        val t: err[Error] = type_entry(w, ir_debug.Type{index: i::u32});
+        if (sel t.err) { ret t; }
+        i = i + 1;
+    }
+    val origins: err[Error] = abstracts(w);
+    if (sel origins.err) { ret origins; }
+    i = 0;
+    for (i < w.r.functions.size) {
+        val s: err[Error] = subprogram(w, ?w.r.functions.data[i]);
+        if (sel s.err) { ret s; }
+        i = i + 1;
+    }
+    put = on(w, end_children(w));
+    if (!put) { ret stop(w); }
+    i = 0;
+    for (i < w.waits.len) {
+        val wait: Wait = w.waits.data[i];
+        val at:   u32  = w.entries.data[wait.type.index];
+        patch(w, v, wait.at, at::u64, 4);
+        i = i + 1;
+    }
+    patch(w, v, 0, (v.len - 4)::u64, 4);
+    ret err[Error].ok{};
+}
+
+# one section opened, its start label placed and its bytes and fixes written
+fun emit_out(w: *Writing, name: str, o: *Out) err[Error] {
+    val opened: res[build.Section, build.Refusal] = build.open(w.r.b, build.Spec{name: opt[str].some{name}, kind: ?section.DEBUG_INFO, flags: section.DEBUG_INFO.flags, disposition: ?section.WHOLE, entsize: 0, apart: false});
+    if (sel opened.err) { ret err[Error].err{Error.builder{opened.err}}; }
+    val switched: err[Error] = refused(build.switch(w.r.b, opened.ok));
+    if (sel switched.err) { ret switched; }
+    val placed: err[Error] = refused(build.define(w.r.b, o.label));
+    if (sel placed.err) { ret placed; }
+    var at: usize = 0;
+    var i:  usize = 0;
+    for (i < o.fixes.len) {
+        val f: Fix = o.fixes.data[i];
+        if (f.at > at) {
+            val run: err[Error] = refused(build.data(w.r.b, ?o.bytes.data[at], f.at - at));
+            if (sel run.err) { ret run; }
+        }
+        val p:    Patch = f.patch;
+        var made: err[build.Refusal];
+        if (sel p.datum) { made = build.datum(w.r.b, p.datum); }
+        or               { made = build.difference(w.r.b, p.difference, f.width); }
+        val done: err[Error] = refused(made);
+        if (sel done.err) { ret done; }
+        at = f.at + f.width::usize;
+        i  = i + 1;
+    }
+    if (o.bytes.len > at) { ret refused(build.data(w.r.b, ?o.bytes.data[at], o.bytes.len - at)); }
+    ret err[Error].ok{};
+}
+
+fun labelled(w: *Writing, o: *Out) err[Error] {
+    val l: res[build.Label, build.Refusal] = build.anonymous(w.r.b);
+    if (sel l.err) { ret err[Error].err{Error.builder{l.err}}; }
+    o.label = l.ok;
+    ret err[Error].ok{};
+}
+
+fun write_all(w: *Writing) err[Error] {
+    var put: bool = on(w, labelled(w, ?w.info));
+    put = put && on(w, labelled(w, ?w.abbrev));
+    put = put && on(w, labelled(w, ?w.strings));
+    put = put && on(w, labelled(w, ?w.offsets));
+    put = put && on(w, labelled(w, ?w.addrs));
+    put = put && on(w, labelled(w, ?w.locs));
+    put = put && on(w, labelled(w, ?w.rngs));
+    if (!put) { ret stop(w); }
+    val types: err[allocator.Error] = slice.fill[u32](?w.entries, w.r.m.debug.nodes.len, 0);
+    if (sel types.err) { ret lost(types.err); }
+    # the string offsets and address tables' headers come before their entries, which the entries append
+    put = on(w, fixed(w, ?w.offsets.bytes, 0, 4));
+    put = put && on(w, fixed(w, ?w.offsets.bytes, VERSION::u64, 2));
+    put = put && on(w, fixed(w, ?w.offsets.bytes, 0, 2));
+    put = put && on(w, fixed(w, ?w.addrs.bytes, 0, 4));
+    put = put && on(w, fixed(w, ?w.addrs.bytes, VERSION::u64, 2));
+    put = put && on(w, byte(?w.addrs.bytes, w.r.address));
+    put = put && on(w, byte(?w.addrs.bytes, 0));
+    put = put && on(w, entries(w));
+    put = put && on(w, abbreviations(w));
+    if (!put) { ret stop(w); }
+    patch(w, ?w.offsets.bytes, 0, (w.offsets.bytes.len - 4)::u64, 4);
+    patch(w, ?w.addrs.bytes, 0, (w.addrs.bytes.len - 4)::u64, 4);
+    # the list sections, each its header and offsets before the lists the entries placed
+    var locs: vector.Vector[u8] = w.locs.bytes;
+    var rngs: vector.Vector[u8] = w.rngs.bytes;
+    w.locs.bytes = vector.init[u8](w.r.a);
+    w.rngs.bytes = vector.init[u8](w.r.a);
+    fin {
+        vector.dnit[u8](?locs);
+        vector.dnit[u8](?rngs);
+    }
+    put = on(w, list_header(w, ?w.locs, ?w.loclists, ?locs));
+    put = put && on(w, list_header(w, ?w.rngs, ?w.rnglists, ?rngs));
+    if (!put) { ret stop(w); }
+    val names: *Names = w.r.names;
+    put = on(w, emit_out(w, names.abbrev, ?w.abbrev));
+    put = put && on(w, emit_out(w, names.info, ?w.info));
+    put = put && on(w, emit_out(w, names.strings, ?w.strings));
+    put = put && on(w, emit_out(w, names.offsets, ?w.offsets));
+    put = put && on(w, emit_out(w, names.addresses, ?w.addrs));
+    put = put && on(w, emit_out(w, names.locations, ?w.locs));
+    put = put && on(w, emit_out(w, names.ranges, ?w.rngs));
+    if (!put) { ret stop(w); }
+    ret err[Error].ok{};
+}
+
+# write a module's debug sections into the builder
+# ---
+# r:   the request, whose module states at least one source file
+# ret: ok, or why the sections were not written, the builder holding what was written so far
+pub fun write(r: *Request) err[Error] {
+    val a: *allocator.Allocator = r.a;
+    var w: Writing              = Writing{
+        r:        r,
+        info:     out(a),
+        abbrev:   out(a),
+        strings:  out(a),
+        offsets:  out(a),
+        addrs:    out(a),
+        locs:     out(a),
+        rngs:     out(a),
+        interned: map.init_by[View, u32](a, hash_name, same_name),
+        texts:    vector.init[View](a),
+        indexes:  map.init[u32, u32](a),
+        labels:   vector.init[build.Label](a),
+        loclists: vector.init[u32](a),
+        rnglists: vector.init[u32](a),
+        entries:  vector.init[u32](a),
+        waits:    vector.init[Wait](a),
+        origins:  map.init_by[View, u32](a, hash_name, same_name),
+        lists:    vector.init[u8](a),
+        error:    Error.alloc{allocator.Error.exhausted{}},
+    };
+    fin {
+        release_out(?w.info);
+        release_out(?w.abbrev);
+        release_out(?w.strings);
+        release_out(?w.offsets);
+        release_out(?w.addrs);
+        release_out(?w.locs);
+        release_out(?w.rngs);
+        map.dnit_by[View, u32](?w.interned);
+        vector.dnit[View](?w.texts);
+        map.dnit[u32, u32](?w.indexes);
+        vector.dnit[build.Label](?w.labels);
+        vector.dnit[u32](?w.loclists);
+        vector.dnit[u32](?w.rnglists);
+        vector.dnit[u32](?w.entries);
+        vector.dnit[Wait](?w.waits);
+        map.dnit_by[View, u32](?w.origins);
+        vector.dnit[u8](?w.lists);
+    }
+    ret write_all(?w);
+}

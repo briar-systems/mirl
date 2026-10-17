@@ -67,6 +67,18 @@ When what a record reads goes, through an erased instruction, a removed paramete
 
 Records are made through the builder, by `mirl.build.bind_at`, at the builder's cursor and with no sticky attribute. `copy_binding` copies one through a map.
 
+### Composite bindings
+
+A record can give part of a variable, a piece of bits at an offset from its lowest bit (`mirl.ir.point.Bits`), the whole variable when it states none. Consecutive records at one point that bind one variable compose: each gives its piece and the variable is all of them. The verifier refuses a piece past the width of a variable's base type and two overlapping pieces of one binding at one point. A pass that splits a value, as the legalization of wide integers splits an `i128` into words on RV64, splits each record that reads it into one record per part with `mirl.ir.body.split`, so splitting never makes a variable unavailable. A part the split cannot describe is `unavailable` in its own piece only.
+
+### Below the IR
+
+Selection gives each record a machine record (`mirl.machine.point.Point`) before the first instruction made for the instruction it stood before, reading the virtual register of its value or the constant. Allocation turns the register into its location, and a storage binding becomes a record of the slot at the function's entry. Every stage that writes the function anew carries the records to the instruction its own now begins at. `mirl.machine.range.ranges` then runs over the framed function, block by block: a variable is where its last record put it until a later record, a write to its register or a call that clobbers it ends that, and at a block's entry it is where every predecessor agrees. Each range is a location of `Where` from one instruction to another or to the block's end, its pieces composed. A value with no location over a stretch has no range there, which a producer writes as optimised out.
+
+### DWARF
+
+`mirl.debug.dwarf.write` writes one DWARF 5 compile unit for the module through masc's builder. Strings, addresses, location lists and range lists are indexed forms with their bases in the unit. Each type of the debug table is an entry whose byte size and member offsets the layout routine gives, a tagged union is a structure of its discriminant and a `DW_TAG_variant_part` of its cases, and a function is a subprogram whose frame base is the canonical frame address. A variable's location list has an entry per range, of `DW_OP_reg`/`DW_OP_breg`, `DW_OP_fbreg`, or a constant with `DW_OP_stack_value`, the salvage steps over it, and `DW_OP_piece` or `DW_OP_bit_piece` per piece. Code inlined at a site is a `DW_TAG_inlined_subroutine` of the callee's abstract entry, at the call's file and line.
+
 ### Salvage expressions
 
 A salvage expression is a list of steps applied in order to the operand, made by `mirl.ir.module.expression` and shared by id like a binding list. The empty expression is the operand as it is. Each kind of step is a row of the step table in `mirl.ir.point`, which states its name, what argument it takes and how its result type follows from what it reads.
@@ -83,7 +95,7 @@ Every step is one a DWARF location expression can state, so a producer encodes e
 
 ## Location kinds
 
-Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
+Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Where`, named apart from the IR's source location `mirl.ir.debug.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
 
 | kind | where the value is |
 |---|---|

@@ -57,6 +57,13 @@ emit(a, ?module, ?build, ?target, units)           # res[object.Object, emit.Err
 - The traits of the object that the convention owns come from the convention row (`Convention.traits`). Each RISC-V row states the float ABI, `riscv-float-abi` as `soft`, `single` or `double`. The builder passes them to the object unchanged, and masc refuses a set whose required axis is not stated.
 - `instruction.fixed` is masc's `emit.fixed`: it states the same fact, a row's fixed register for an operand, so mirl keeps no reading of the effect.
 
+## Frame, line and debug facts
+
+- A function whose architecture masc states a starting frame for is a frame of the builder: `cfi_start` at its label and `cfi_end` after its last instruction. Each call frame fact of `Framed.facts` is handed to masc through `cfi` in order at its instruction, before it or after it as the fact states. A fact at an instruction layout left in no block is refused (`Reason.fact`). mink lowers the frame records to the format's call frame information.
+- A module whose debug table states a source file hands masc its files in table order, so a file's index is its id's, and states each change of source location along the laid out code through masc's `line.location`, before the instruction it begins at. An instruction with no location is line 0 with no statement flag, never a neighbour's line. mink lowers the line records to `.debug_line`.
+- Before the builder finishes, the dwarf producer (`mirl.debug.dwarf`) writes `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_str_offsets`, `.debug_addr`, `.debug_loclists` and `.debug_rnglists`, named as the object format names them. Every address is a datum masc relocates.
+- Where each variable is comes from `mirl.machine.range`, computed over the framed function from its value binding records (doc/ir/debug.md). A range begins and ends at labels placed before the instructions it begins and ends at, or at its block's end when it runs to it. The runs of code inlined at each site are delimited by labels where the site of the instructions changes.
+
 ## Refusals
 
 An instruction is refused, naming the function, the instruction and the operand, when it is a pseudo no stage expanded, still names a virtual register or a frame slot, names a location of a memory-backed class, sits at an `id` operand position, which a family that keeps no SSA ids does not give, names a relocation kind the set binds no fixup kind to, or has a label problem or a span the block cannot hold.
@@ -67,8 +74,12 @@ The object is refused as `Error.unmapped` when masc finishes it with a relocatio
 
 ## Limits
 
-- Call frame facts stay mirl records (`Framed.facts`) and are not handed over: masc has no call frame calls yet (#197, masc#41).
-- Debug line and location facts are not carried until masc states its location API (#200, masc#42).
+- mink's writers refuse an object with frame records (mink#201), so at the pinned mink no object with a framed function is written. PE and Mach-O images are gated by mink#70 and mink#73.
+- `DW_AT_stmt_list` is offset 0 with no relocation, which holds for one unit per object.
+- The unit states `DW_LANG_C11`, since the IR names no source language.
+- A slot whose offset scales, salvage steps over a slot, and a slot of a realigned frame or the outgoing area are not stated, so the variable is optimised out there.
+- The variables of an inlined body are scoped at the subprogram, not the inlined subroutine.
+- A record standing at an instruction a stage dropped moves to the instruction that follows.
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
 - The listing is refused, as `Error.listing`, for an object masc cannot state as source: one with line facts, a first section that is not `.text`, or a format with no assembly dialect (COFF, Mach-O). The round trip therefore covers the ELF targets only.
 - The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, which the example lane links from its `test/example/exit` stub, assembled by masc.
