@@ -1,0 +1,237 @@
+# webassembly's basic c abi, at either address width
+#
+# a call's values travel as the operands of wasm's own call, one value type
+# each, so every piece is an operand of the call form, numbered in the order
+# the call takes them. a scalar of at most 64 bits is one piece, an integer
+# narrower than 32 bits extended to an i32 by its signedness, and a 128-bit
+# integer argument two i64 pieces, low first. a structure whose one member,
+# however nested, fills it travels as that member. any other aggregate, a
+# vector and a wider integer are passed by reference to a copy the caller
+# makes, an empty aggregate is no piece, and a result that is not one piece
+# is returned by reference through an address passed as the first operand,
+# which the callee does not hand back. the stack lives in linear memory, its
+# pointer homed in the global `__stack_pointer` and aligned to 16 bytes at a
+# call. unnamed arguments and tail calls are not carried yet.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use std.collections.slice.Slice;
+
+use rf: masc.core.register;
+
+use mirl.ir.place.Fill;
+use mirl.ir.place.Place;
+use mirl.ir.place.Scale;
+use mirl.target.abi.convention.Abi;
+use mirl.target.abi.convention.Call;
+use mirl.target.abi.convention.Carrier;
+use mirl.target.abi.convention.Classifiers;
+use mirl.target.abi.convention.Convention;
+use mirl.target.abi.convention.Count;
+use mirl.target.abi.convention.Floats;
+use mirl.target.abi.convention.Frame;
+use mirl.target.abi.convention.Half;
+use mirl.target.abi.convention.Home;
+use mirl.target.abi.convention.Indirect;
+use mirl.target.abi.convention.Kept;
+use mirl.target.abi.convention.Link;
+use mirl.target.abi.convention.List;
+use mirl.target.abi.convention.Packing;
+use mirl.target.abi.convention.Pairs;
+use mirl.target.abi.convention.Pointer;
+use mirl.target.abi.convention.Probe;
+use mirl.target.abi.convention.Prologue;
+use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.convention.Returned;
+use mirl.target.abi.convention.Stack;
+use mirl.target.abi.convention.Unnamed;
+use mirl.target.abi.convention.Unwind;
+use mirl.target.abi.convention.Value;
+use mirl.target.abi.convention.Variadic;
+use mirl.target.abi.piece;
+use mirl.target.abi.piece.Assignment;
+use mirl.target.abi.piece.Copy;
+use mirl.target.abi.piece.Passing;
+use mirl.target.abi.piece.Piece;
+use mirl.target.abi.piece.Refusal;
+use mirl.target.abi.view;
+use mirl.target.abi.view.Node;
+use mirl.target.abi.view.View;
+use mirl.target.capability.Bits;
+
+# the bits of the integer value type a narrow integer is extended to
+val WORD: u32 = 32;
+
+# the operands of the call taken so far
+rec State {
+    operand: u32;
+}
+
+fun laid(n: *Node) u64 {
+    if (sel n.room.laid) { ret n.room.laid.size; }
+    ret 0;
+}
+
+fun alignment(n: *Node) u64 {
+    if (sel n.room.laid) { ret n.room.laid.align; }
+    ret 1;
+}
+
+fun next(s: *State, offset: u64, size: u64, fill: Fill) Piece {
+    s.operand = s.operand + 1;
+    ret Piece{place: Place.operand{s.operand - 1}, offset: offset, size: size, scale: Scale.fixed{}, fill: fill};
+}
+
+# whether a node is a scalar of at most 64 bits a value type holds
+fun scalar(n: *Node) bool {
+    if (sel n.shape.integer) { ret n.shape.integer <= 64; }
+    if (sel n.shape.pointer) { ret true; }
+    if (sel n.shape.float)   { ret n.shape.float.width == 32 || n.shape.float.width == 64; }
+    ret false;
+}
+
+# the fill of a scalar's value type
+fun fill_of(n: *Node) Fill {
+    if (sel n.shape.integer) {
+        val w: u32 = n.shape.integer;
+        if (w == 1)   { ret Fill.zero{1}; }
+        if (w < WORD) { ret Fill.declared{w}; }
+    }
+    ret Fill.exact{};
+}
+
+# the one scalar member a structure or array of one element comes to, at its
+# offset in the value, none when it has another shape or does not fill it
+fun single(v: *View, at_node: u32, base: u64, offset: *u64) opt[u32] {
+    val n: *Node = view.node(v, at_node);
+    if (scalar(n)) {
+        @offset = base;
+        ret opt[u32].some{at_node};
+    }
+    var inner: opt[u32] = opt[u32].none{};
+    if (sel n.shape.structure) {
+        var k: u32 = 0;
+        for (k < n.count) {
+            val c: u32 = view.child(v, at_node, k);
+            if (laid(view.node(v, c)) != 0) {
+                val taken: bool = sel inner.some;
+                if (taken) { ret opt[u32].none{}; }
+                val found: opt[u32] = single(v, c, base + view.node(v, c).offset, offset);
+                if (sel found.none) { ret found; }
+                inner = found;
+            }
+            k = k + 1;
+        }
+    }
+    or (sel n.shape.array) {
+        if (n.shape.array.count != 1) { ret opt[u32].none{}; }
+        inner = single(v, view.child(v, at_node, 0), base, offset);
+    }
+    if (sel inner.some && laid(view.node(v, inner.some)) == laid(n)) { ret inner; }
+    ret opt[u32].none{};
+}
+
+fun copied(s: *State, asg: *Assignment, n: *Node, passing: *Passing, address: bool) err[Refusal] {
+    @passing = Passing.reference{Copy{size: laid(n), align: alignment(n)}};
+    if (!address) { ret err[Refusal].ok{}; }
+    ret piece.add(asg, next(s, 0, 0, Fill.exact{}));
+}
+
+# place one value and say how it travels. a result by reference takes no
+# piece, its address travelling as the call's first operand
+fun place(s: *State, asg: *Assignment, v: *View, value: Value, passing: *Passing, result: bool) err[Refusal] {
+    val n: *Node = view.node(v, value.node);
+    if (sel n.room.unsized) { ret err[Refusal].err{Refusal.unsized{value.node}}; }
+    val size: u64 = laid(n);
+    @passing = Passing.value{};
+    if (sel value.by.reference) { ret copied(s, asg, n, passing, !result); }
+    if (size == 0)              { ret err[Refusal].ok{}; }
+    if (scalar(n))              { ret piece.add(asg, next(s, 0, size, fill_of(n))); }
+    if (sel n.shape.integer && n.shape.integer == 128 && !result) {
+        val low: err[Refusal] = piece.add(asg, next(s, 0, 8, Fill.exact{}));
+        if (sel low.err) { ret low; }
+        ret piece.add(asg, next(s, 8, 8, Fill.exact{}));
+    }
+    if (sel n.shape.structure || sel n.shape.array) {
+        var offset: u64      = 0;
+        val one:    opt[u32] = single(v, value.node, 0, ?offset);
+        if (sel one.some) {
+            val m: *Node = view.node(v, one.some);
+            ret piece.add(asg, next(s, offset, laid(m), Fill.exact{}));
+        }
+    }
+    ret copied(s, asg, n, passing, !result);
+}
+
+fun results(r: *Resolved, call: *Call, asg: *Assignment) err[Refusal] {
+    if (call.results.size > 1) { ret err[Refusal].err{Refusal.results{call.results.size::u32}}; }
+    var s: State = State{operand: 0};
+    var i: usize = 0;
+    for (i < call.results.size) {
+        val first:   u32          = piece.open(asg);
+        var passing: Passing;
+        val placed:  err[Refusal] = place(?s, asg, call.view, call.results.data[i], ?passing, true);
+        if (sel placed.err) { ret placed; }
+        val closed: err[Refusal] = piece.close(asg, true, passing, first);
+        if (sel closed.err) { ret closed; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+fun arguments(r: *Resolved, call: *Call, asg: *Assignment) err[Refusal] {
+    var s: State = State{operand: 0};
+    var i: usize = 0;
+    for (i < asg.results.len) {
+        if (sel asg.results.data[i].passing.reference) { asg.address = opt[Piece].some{next(?s, 0, 0, Fill.exact{})}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < call.arguments.size) {
+        val first:   u32          = piece.open(asg);
+        var passing: Passing;
+        val placed:  err[Refusal] = place(?s, asg, call.view, call.arguments.data[i], ?passing, false);
+        if (sel placed.err) { ret placed; }
+        val closed: err[Refusal] = piece.close(asg, false, passing, first);
+        if (sel closed.err) { ret closed; }
+        i = i + 1;
+    }
+    asg.stack = 0;
+    ret err[Refusal].ok{};
+}
+
+# no call is made as a tail call until the tail call extension is carried
+fun tail(r: *Resolved, asg: *Assignment) bool {
+    ret false;
+}
+
+val CLASSIFIERS: Classifiers = Classifiers{results: results, arguments: arguments};
+
+val FRAME: Stack = Stack.memory{Frame{align: 16, red: 0, shadow: 0, link: Link.none{}, pointer: Pointer.none{}, pointer_home: Home.global{"__stack_pointer"}, prologue: Prologue{probe: Probe.none{}, pair_saves: false, unwind: Unwind.none{}}}};
+
+# the basic c abi, the one convention of wasm32 and of wasm64, which differ in
+# their pointers alone
+pub val BASIC: Convention = Convention{
+    name:        "basic",
+    abi:         Abi.none{},
+    file:        opt[*rf.File].none{},
+    classifiers: CLASSIFIERS,
+    word:        Bits.bits{WORD},
+    floats:      Floats.none{},
+    passing:     Slice[rf.Id]{data: nil, size: 0},
+    returning:   Slice[rf.Id]{data: nil, size: 0},
+    preserved:   Slice[Kept]{data: nil, size: 0},
+    reserved:    Slice[rf.Id]{data: nil, size: 0},
+    stack:       FRAME,
+    indirect:    Indirect{carrier: Carrier.first{}, returned: Returned.none{}},
+    variadic:    Variadic{unnamed: Unnamed.none{}, count: Count.none{}, list: List.none{}},
+    half:        Half.float{},
+    pairs:       Pairs.any{},
+    packing:     Packing.natural{},
+    tail:        tail,
+};
