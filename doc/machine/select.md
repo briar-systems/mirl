@@ -29,6 +29,8 @@ An emitted instruction is a row, a pseudo or a target's loop (see [loops](loop.m
 
 A guard's hook reads the matched instructions through `mirl.machine.select.match`, the one reader the engine also uses, so a hook never repeats how the engine finds an operand or a constant.
 
+`address` builds a memory operand from the pattern, as x86's `[b + i*s + d]`: a base and an index, each the register of a value the pattern reads or a fixed register of masc's file for the base, as the string moves' `rdi`, a scale that is a literal or derived from a constant, as the shift or the power of two of a multiplier the pattern covers, a displacement that is a constant's bits or a symbol's address, a segment register, and whether it is formed from the instruction's own address, as x86-64's rip-relative reach of a symbol. The engine admits it where the row's memory position takes that address (`mirl.machine.instruction.fits_address`), so the scales, the displacement's reach and the forms a row takes are masc's.
+
 Three sources name what only the engine knows. `slot` is the frame slot an `alloca` root asks for, of its type's size at its alignment. `partner` is the address of an earlier instruction of the same expansion under a relocation kind, which labels that instruction, as a pc-relative low part names its high part. `lookup` is the runtime function the target's general dynamic thread-local access calls, which the module declares. An emitted instruction may also state the registers it reads and writes beyond its operands and row, as the call to the lookup reads and writes its argument register.
 
 ## Shared nodes
