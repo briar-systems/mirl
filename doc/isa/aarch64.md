@@ -7,7 +7,7 @@
 - The register is 64 bits. A rule's type tests state the width against it, `register` for a doubleword and `part{2}` for a word, so a word takes the w form of a row and a doubleword the x form.
 - The extensions come from the target's selection. A rule emits rows and the engine drops a rule whose row masc does not admit, so LSE's atomics, CSSC's `ctz`, `cnt` and the SVE whole register rows are each a row's requirement and never a branch in the table. FP and SIMD are the baseline both rows require.
 - The object format comes from the target's record. A symbol is reached through ELF's relocation kinds or Mach-O's, each address rule's hook reading the format, so no rule names a system.
-- Every register and class is a handle of the register module (`gen.X_CLASS`, `gen.XZR`), so no file here holds a position in masc's register file but that module, which stands in for masc's generated handles until the take that publishes them.
+- Every register and class is a handle masc generates (`gen_register.X_CLASS`, `gen_register.XZR`), so no file here holds a position in masc's register file.
 
 ## Values
 
