@@ -1,0 +1,515 @@
+# a scheduled module as one wasm module in mink's container
+#
+# mirl writes the final module, every index and address its own: the
+# functions another module defines are imported first, from the module the
+# environment names for its imports, then every function the module
+# defines, each of the type its placement gives. a function whose address is
+# taken has a slot in the one table, from 1 so no slot is the null address,
+# filled by an active element segment. the module's globals are laid out in
+# linear memory from the host's image base, one active data segment their
+# initial values, and the stack grows down from that base, its pointer the
+# first global, as wasm-ld lays memory out stack first. the memory is
+# exported as `memory`, and so is every function the module defines that
+# other images see, by its name. masc's stream holds the types, the index
+# spaces and the labels, and its container states the sections.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.vector;
+use std.encoding.binary;
+
+use masc.core.state;
+use masc.core.stream.Hooks;
+use wasm_container: masc.isa.wasm.container;
+use masc.isa.wasm.gen_row_index;
+use wasm_kind:   masc.isa.wasm.kind;
+use wasm_stream: masc.isa.wasm.stream;
+
+use mink.base.fail.Fail;
+use mink.base.store.Held;
+use mink.base.table;
+use catalog_kind: mink.catalog.kind;
+use systems:      mink.catalog.os;
+use mink_model:   mink.format.wasm.model;
+use mink_neutral: mink.format.wasm.neutral;
+use mink_tables:  mink.format.wasm.tables;
+use mink.model.object;
+use mink.model.symbol;
+
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.function.Node;
+use mirl.ir.global.GlobalData;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Global;
+use mirl.ir.id.Symbol;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use types: mirl.ir.type;
+use mirl.machine.emit.data;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.cache.Cache;
+use mirl.target.address.Access;
+use mirl.target.address.Addresses;
+use mirl.target.basis;
+use mirl.target.build.Build;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record;
+use mirl.target.record.Target;
+use mirl.target.wasm.code;
+use mirl.target.wasm.error.Encoding;
+use mirl.target.wasm.error.Error;
+use mirl.target.wasm.signature;
+use mirl.target.wasm.signature.Signature;
+use mirl.target.wasm.unit;
+use mirl.target.wasm.unit.Unit;
+use mirl.target.wasm.value;
+use mirl.target.wasm.writer;
+use mirl.target.wasm.writer.Writer;
+
+use io: std.io.writer;
+
+# the bytes of a page of linear memory, the stack a module with no host takes below its data
+pub val PAGE: u64 = 0x1_0000;
+
+# the module imports come from where the environment names none
+pub val IMPORTS: str = "env";
+
+val NO_NAME: View = View{data: nil, len: 0};
+
+fun lost(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun kept[T](got: res[table.Id[T], Fail]) err[Error] {
+    if (sel got.err) { ret err[Error].err{Error.container{got.err}}; }
+    ret err[Error].ok{};
+}
+
+fun defined(p: ptr, at: u16, code: u32) res[u32, Error] {
+    val got: res[u32, str] = wasm_stream.define(p, at, code, NO_NAME);
+    if (sel got.err) { ret res[u32, Error].err{Error.encoding{Encoding{function: Function{index: 0xFFFF_FFFF}, message: got.err}}}; }
+    ret res[u32, Error].ok{got.ok};
+}
+
+fun declared(m: *Module, f: usize) bool {
+    ret m.functions.data[f].body.blocks.len == 0;
+}
+
+# where the module's data starts: the image base of the host that runs it,
+# else a page above the stack
+fun image_base(t: *Target) u64 {
+    var i: usize = 0;
+    for (i < t.system.host_count) {
+        val h:      *systems.Host     = ?t.system.hosts[i];
+        val env:    opt[*systems.Env] = h.env;
+        val wanted: opt[*systems.Env] = t.env;
+        var same:   bool              = false;
+        if (sel wanted.none) { same = sel env.none; }
+        or (sel wanted.some) {
+            if (sel env.some) { same = env.some == wanted.some; }
+        }
+        if (h.arch == t.arch && same) { ret h.image_base; }
+        i = i + 1;
+    }
+    ret PAGE;
+}
+
+# the module the environment names for the imports of the functions another module defines
+fun import_module(t: *Target) str {
+    if (sel t.env.none) { ret IMPORTS; }
+    val e: *systems.Env = t.env.some;
+    var i: usize        = 0;
+    for (i < e.fact_count) {
+        if (e.facts[i].role == ?systems.IMPORT_MODULE) { ret e.facts[i].name; }
+        i = i + 1;
+    }
+    ret IMPORTS;
+}
+
+# whether one thread runs, by the target's statement of how a thread-local
+# variable is reached: one is an ordinary variable exactly where one thread
+# runs. a target that states no model states no threads, and reaches no
+# atomic as an ordinary access
+fun threadless(b: *Build, t: *Target) res[bool, Error] {
+    val a: Addresses = t.addresses;
+    if (!(sel a.model)) { ret res[bool, Error].ok{false}; }
+    val access: Access = a.model.threads.local_exec;
+    if (!(sel access.single)) { ret res[bool, Error].ok{false}; }
+    val met: res[bool, basis.Error] = basis.meets(opt[*basis.Basis].some{?b.basis}, access.single);
+    if (sel met.err) { ret res[bool, Error].ok{false}; }
+    ret res[bool, Error].ok{!met.ok};
+}
+
+# a name owned by the container
+fun name(mm: *mink_model.Module, data: *u8, len: usize) res[mink_model.Name, Error] {
+    val got: res[mink_model.Name, Fail] = wasm_container.name(mm, data, len);
+    if (sel got.err) { ret res[mink_model.Name, Error].err{Error.container{got.err}}; }
+    ret res[mink_model.Name, Error].ok{got.ok};
+}
+
+# a constant expression of one constant of the address type `code`
+fun expression(u: *Unit, mm: *mink_model.Module, code: u32, n: u64) res[mink_model.Expr, Error] {
+    var w: Writer = writer.make(u.a, u.codec, u.ctx);
+    fin { writer.release(?w); }
+    w.observe = false;
+    if (code == value.I64) { writer.i64(?w, n:~i64); }
+    or                     { writer.i32(?w, n:~i64); }
+    writer.plain(?w, gen_row_index.END);
+    if (sel w.refused.some) { ret res[mink_model.Expr, Error].err{Error.encoding{Encoding{function: Function{index: 0xFFFF_FFFF}, message: w.refused.some}}}; }
+    val held: res[Held, Fail] = wasm_container.held(mm, ?w.out);
+    if (sel held.err) { ret res[mink_model.Expr, Error].err{Error.container{held.err}}; }
+    ret res[mink_model.Expr, Error].ok{mink_model.Expr{bytes: held.ok}};
+}
+
+# the type index of a signature, the stream's first of it or a new one
+fun type_index(p: ptr, s: *Signature) res[u32, Error] {
+    val found: opt[u32] = wasm_stream.find_type(p, s.params.data, s.params.len::u32, s.results.data, s.results.len::u32);
+    if (sel found.some) { ret res[u32, Error].ok{found.some}; }
+    val made: res[u32, str] = wasm_stream.add_type(p, s.params.data, s.params.len::u32, s.results.data, s.results.len::u32, NO_NAME);
+    if (sel made.err) { ret res[u32, Error].err{Error.encoding{Encoding{function: Function{index: 0xFFFF_FFFF}, message: made.err}}}; }
+    ret res[u32, Error].ok{made.ok};
+}
+
+# every function's type, index and import
+fun functions(u: *Unit, mm: *mink_model.Module) err[Error] {
+    val m: *Module = u.m;
+    val n: usize   = m.functions.len;
+    var i: usize   = 0;
+    for (i < n) {
+        var s:      Signature                   = signature.make(u.a);
+        val got:    err[Error]                  = signature.of(u.a, u.b, u.l, m.functions.data[i].data.signature, u.pointer, ?s);
+        val pushed: res[usize, allocator.Error] = vector.push[Signature](?u.signatures, s);
+        if (sel pushed.err) {
+            signature.release(?s);
+            ret lost(pushed.err);
+        }
+        if (sel got.err) { ret got; }
+        val t: res[u32, Error] = type_index(u.ctx.stream, ?u.signatures.data[i]);
+        if (sel t.err) { ret err[Error].err{t.err}; }
+        val typed: res[usize, allocator.Error] = vector.push[u32](?u.types, t.ok);
+        if (sel typed.err) { ret lost(typed.err); }
+        val indexed: res[usize, allocator.Error] = vector.push[u32](?u.index, 0);
+        if (sel indexed.err) { ret lost(indexed.err); }
+        i = i + 1;
+    }
+    val from: str = import_module(u.t);
+    i = 0;
+    for (i < n) {
+        if (declared(m, i)) {
+            val at: res[u32, Error] = defined(u.ctx.stream, wasm_kind.FUNCS, u.types.data[i]);
+            if (sel at.err) { ret err[Error].err{at.err}; }
+            u.index.data[i] = at.ok;
+            val origin: res[mink_model.Name, Error] = name(mm, from, str_len(from));
+            if (sel origin.err) { ret err[Error].err{origin.err}; }
+            val field: res[mink_model.Name, Error] = name(mm, m.functions.data[i].data.name.data, m.functions.data[i].data.name.len);
+            if (sel field.err) { ret err[Error].err{field.err}; }
+            val imp: mink_model.Import = mink_model.Import{module: origin.ok, field: field.ok, kind: mink_tables.WASM_EXTERNAL_FUNCTION.value::u8, desc: mink_model.Desc.function{wasm_container.leb(u.types.data[i]::u64)}};
+            val put: err[Error]        = kept[mink_model.Import](table.push[mink_model.Import](?mm.imports, imp));
+            if (sel put.err) { ret put; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        if (!declared(m, i)) {
+            val at: res[u32, Error] = defined(u.ctx.stream, wasm_kind.FUNCS, u.types.data[i]);
+            if (sel at.err) { ret err[Error].err{at.err}; }
+            u.index.data[i] = at.ok;
+            val put: err[Error] = kept[mink_model.Leb](table.push[mink_model.Leb](?mm.functions, wasm_container.leb(u.types.data[i]::u64)));
+            if (sel put.err) { ret put; }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun take_slot(u: *Unit, f: Function) {
+    if (f.index::usize < u.slots.len) { u.slots.data[f.index] = 1; }
+}
+
+# a slot for every function whose address the module takes, by a constant
+# or a `func.addr`, in function order from 1, and the table and element
+# segment that hold them
+fun slots(u: *Unit, mm: *mink_model.Module) err[Error] {
+    val m: *Module = u.m;
+    var i: usize   = 0;
+    for (i < m.functions.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?u.slots, unit.NO_SLOT);
+        if (sel pushed.err) { ret lost(pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.constants.len) {
+        val c: ConstantData = m.constants.data[i];
+        if (sel c.address) {
+            val named: Symbol = c.address.symbol;
+            if (sel named.function) { take_slot(u, named.function); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.functions.len) {
+        val b: *Body = ?m.functions.data[i].body;
+        var k: usize = 0;
+        for (k < b.instructions.len) {
+            val d: *InstructionData = ?b.instructions.data[k];
+            if (d.opcode.index == opcode.FUNC_ADDR.index && d.immediates.len > 0) {
+                val imm: Immediate = d.immediates.data[0];
+                if (sel imm.function) { take_slot(u, imm.function); }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var next:  u32   = 1;
+    val first: usize = table.count[mink_model.Leb](?mm.indices);
+    i = 0;
+    for (i < u.slots.len) {
+        if (u.slots.data[i] != unit.NO_SLOT) {
+            u.slots.data[i] = next;
+            next            = next + 1;
+            val put: err[Error] = kept[mink_model.Leb](table.push[mink_model.Leb](?mm.indices, wasm_container.leb(u.index.data[i]::u64)));
+            if (sel put.err) { ret put; }
+        }
+        i = i + 1;
+    }
+    if (next == 1) { ret err[Error].ok{}; }
+    val at: res[u32, Error] = defined(u.ctx.stream, wasm_kind.TABLES, wasm_stream.I32);
+    if (sel at.err) { ret err[Error].err{at.err}; }
+    val funcref: mink_model.RefType = wasm_container.ref_type(wasm_container.FUNCREF::i64);
+    val limits:  mink_model.Limits  = mink_model.Limits{flags: mink_tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8, min: wasm_container.leb(next::u64), max: wasm_container.leb(next::u64), page: wasm_container.leb(0)};
+    val tabled:  err[Error]         = kept[mink_model.TableDef](table.push[mink_model.TableDef](?mm.tables, mink_model.TableDef{type: mink_model.TableType{elem: funcref, limits: limits}, init: opt[mink_model.Expr].none{}}));
+    if (sel tabled.err) { ret tabled; }
+    val offset: res[mink_model.Expr, Error] = expression(u, mm, value.I32, 1);
+    if (sel offset.err) { ret err[Error].err{offset.err}; }
+    val flags: u64                = wasm_container.element_flags(wasm_container.ACTIVE, 0, true, wasm_container.FUNCREF);
+    val e:     mink_model.Element = mink_model.Element{flags: wasm_container.leb(flags), table: wasm_container.leb(0), offset: offset.ok, kind: 0, type: funcref, items: mink_model.Items.indices{wasm_container.run(first, (next - 1)::usize)}};
+    ret kept[mink_model.Element](table.push[mink_model.Element](?mm.elements, e));
+}
+
+# lay the module's globals out in linear memory from the image base, their
+# initial values one data segment, and give the memory and the stack pointer
+fun memory(u: *Unit, mm: *mink_model.Module) err[Error] {
+    val m:    *Module = u.m;
+    val base: u64     = image_base(u.t);
+    var at:   u64     = base;
+    var i:    usize   = 0;
+    for (i < m.globals.len) {
+        val g: GlobalData = m.globals.data[i].data;
+        if (sel g.initial.none) { ret err[Error].err{Error.undefined{Global{index: i::u32}}}; }
+        var align: u64 = 0;
+        if (sel g.alignment.some) { align = g.alignment.some; }
+        or {
+            val own: res[u64, record.Error] = layout.align(u.l, g.type, types.DEFAULT_SPACE);
+            if (sel own.err) { ret err[Error].err{Error.layout{own.err}}; }
+            align = own.ok;
+        }
+        if (align == 0) { align = 1; }
+        at = (at + align - 1) / align * align;
+        val pushed: res[usize, allocator.Error] = vector.push[u64](?u.addresses, at);
+        if (sel pushed.err) { ret lost(pushed.err); }
+        val size: res[u64, record.Error] = layout.size(u.l, g.type, types.DEFAULT_SPACE);
+        if (sel size.err) { ret err[Error].err{Error.layout{size.err}}; }
+        at = at + size.ok;
+        i  = i + 1;
+    }
+    var bytes: vector.Vector[u8] = vector.init[u8](u.a);
+    fin { vector.dnit[u8](?bytes); }
+    var n: u64 = base;
+    for (n < at) {
+        val pushed: res[usize, allocator.Error] = vector.push[u8](?bytes, 0);
+        if (sel pushed.err) { ret lost(pushed.err); }
+        n = n + 1;
+    }
+    i = 0;
+    for (i < m.globals.len) {
+        val g:       GlobalData    = m.globals.data[i].data;
+        val initial: opt[Constant] = g.initial;
+        if (sel initial.none) { ret err[Error].err{Error.undefined{Global{index: i::u32}}}; }
+        val size: res[u64, record.Error] = layout.size(u.l, g.type, types.DEFAULT_SPACE);
+        if (sel size.err) { ret err[Error].err{Error.layout{size.err}}; }
+        val made: res[data.Image, data.Error] = data.image(u.a, m, u.l, types.DEFAULT_SPACE, binary.LITTLE, initial.some, size.ok);
+        if (sel made.err) { ret err[Error].err{Error.image{made.err}}; }
+        var image: data.Image = made.ok;
+        fin { data.release(?image); }
+        val start: usize = (u.addresses.data[i] - base)::usize;
+        var k:     usize = 0;
+        for (k < image.bytes.len) {
+            bytes.data[start + k] = image.bytes.data[k];
+            k                     = k + 1;
+        }
+        k = 0;
+        for (k < image.datums.len) {
+            val d: data.Datum = image.datums.data[k];
+            var v: u64        = 0;
+            if (sel d.symbol.function) {
+                if (d.addend != 0) { ret err[Error].err{Error.offset{d.symbol.function}}; }
+                v = u.slots.data[d.symbol.function.index]::u64;
+            }
+            or { v = u.addresses.data[d.symbol.global.index] + d.addend:~u64; }
+            binary.put_uint(?bytes.data[start + d.offset::usize], v, d.width::usize, binary.LITTLE);
+            k = k + 1;
+        }
+    }
+
+    val mem: res[u32, Error] = defined(u.ctx.stream, wasm_kind.MEMORIES, u.pointer);
+    if (sel mem.err) { ret err[Error].err{mem.err}; }
+    var pages: u64 = (at + PAGE - 1) / PAGE;
+    if (pages == 0) { pages = 1; }
+    var flags: u8 = 0;
+    if (u.pointer == value.I64) { flags = mink_tables.WASM_LIMITS_FLAG_IS_64.value::u8; }
+    val limits: err[Error] = kept[mink_model.Limits](table.push[mink_model.Limits](?mm.memories, mink_model.Limits{flags: flags, min: wasm_container.leb(pages), max: wasm_container.leb(0), page: wasm_container.leb(0)}));
+    if (sel limits.err) { ret limits; }
+
+    val sp: res[u32, Error] = defined(u.ctx.stream, wasm_kind.GLOBALS, u.pointer);
+    if (sel sp.err) { ret err[Error].err{sp.err}; }
+    u.stack = sp.ok;
+    val init: res[mink_model.Expr, Error] = expression(u, mm, u.pointer, base);
+    if (sel init.err) { ret err[Error].err{init.err}; }
+    val gt:     mink_model.GlobalType = mink_model.GlobalType{valtype: wasm_container.valtype(u.pointer::i64), mutable: 1};
+    val global: err[Error]            = kept[mink_model.Global](table.push[mink_model.Global](?mm.globals, mink_model.Global{type: gt, init: init.ok}));
+    if (sel global.err) { ret global; }
+
+    if (bytes.len == 0) { ret err[Error].ok{}; }
+    val offset: res[mink_model.Expr, Error] = expression(u, mm, u.pointer, base);
+    if (sel offset.err) { ret err[Error].err{offset.err}; }
+    val held: res[Held, Fail] = wasm_container.held(mm, ?bytes);
+    if (sel held.err) { ret err[Error].err{Error.container{held.err}}; }
+    val s: mink_model.Segment = mink_model.Segment{flags: wasm_container.leb(wasm_container.data_flags(wasm_container.ACTIVE, 0)), memory: wasm_container.leb(0), offset: offset.ok, width: mink_model.SHORTEST, data: held.ok};
+    ret kept[mink_model.Segment](table.push[mink_model.Segment](?mm.data, s));
+}
+
+fun export(mm: *mink_model.Module, data: *u8, len: usize, kind: u8, index: u32) err[Error] {
+    val n: res[mink_model.Name, Error] = name(mm, data, len);
+    if (sel n.err) { ret err[Error].err{n.err}; }
+    ret kept[mink_model.Export](table.push[mink_model.Export](?mm.exports, mink_model.Export{name: n.ok, kind: kind, index: wasm_container.leb(index::u64)}));
+}
+
+# the memory, and every function the module defines that other images see
+fun exports(u: *Unit, mm: *mink_model.Module) err[Error] {
+    val memory_name: str        = "memory";
+    val e:           err[Error] = export(mm, memory_name, str_len(memory_name), mink_tables.WASM_EXTERNAL_MEMORY.value::u8, 0);
+    if (sel e.err) { ret e; }
+    val m: *Module = u.m;
+    var i: usize   = 0;
+    for (i < m.functions.len) {
+        val f: *Node = ?m.functions.data[i];
+        if (!declared(m, i) && symbol.binds(f.data.linkage.binding, symbol.EXTERNAL) && (f.data.linkage.visibility.caps & symbol.EXPORTED) != 0) {
+            val put: err[Error] = export(mm, f.data.name.data, f.data.name.len, mink_tables.WASM_EXTERNAL_FUNCTION.value::u8, u.index.data[i]);
+            if (sel put.err) { ret put; }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# every defined function's body
+fun bodies(u: *Unit, mm: *mink_model.Module) err[Error] {
+    val m: *Module = u.m;
+    var i: usize   = 0;
+    for (i < m.functions.len) {
+        if (!declared(m, i)) {
+            var out: vector.Vector[u8] = vector.init[u8](u.a);
+            fin { vector.dnit[u8](?out); }
+            val got: err[Error] = code.function(u, Function{index: i::u32}, ?out);
+            if (sel got.err) { ret got; }
+            val held: res[Held, Fail] = wasm_container.held(mm, ?out);
+            if (sel held.err) { ret err[Error].err{Error.container{held.err}}; }
+            val put: err[Error] = kept[mink_model.Function](table.push[mink_model.Function](?mm.code, mink_model.Function{width: mink_model.SHORTEST, body: held.ok}));
+            if (sel put.err) { ret put; }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun release_unit(u: *Unit) {
+    var i: usize = 0;
+    for (i < u.signatures.len) {
+        signature.release(?u.signatures.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[Signature](?u.signatures);
+    vector.dnit[u32](?u.index);
+    vector.dnit[u32](?u.types);
+    vector.dnit[u32](?u.slots);
+    vector.dnit[u64](?u.addresses);
+}
+
+fun build(u: *Unit, mm: *mink_model.Module) err[Error] {
+    val listed: err[Error] = functions(u, mm);
+    if (sel listed.err) { ret listed; }
+    val slotted: err[Error] = slots(u, mm);
+    if (sel slotted.err) { ret slotted; }
+    val laid: err[Error] = memory(u, mm);
+    if (sel laid.err) { ret laid; }
+    val exported: err[Error] = exports(u, mm);
+    if (sel exported.err) { ret exported; }
+    val written: err[Error] = bodies(u, mm);
+    if (sel written.err) { ret written; }
+    val shut: err[Fail] = wasm_container.close(mm, u.ctx.stream, opt[u32].none{}, false);
+    if (sel shut.err) { ret err[Error].err{Error.container{shut.err}}; }
+    ret err[Error].ok{};
+}
+
+# compile a scheduled module into mink's object of one wasm module
+# ---
+# a:        the allocator every stage and the object take
+# m:        the module, scheduled
+# b:        the build the family opened
+# t:        the target
+# warnings: where a warning is written, none for nowhere
+# ret:      the object, or why it was not made
+pub fun compile(a: *allocator.Allocator, m: *Module, b: *Build, t: *Target, warnings: opt[*io.Writer]) res[object.Object, Error] {
+    var l:       Layout                       = layout.of(t, ?m.types, basis.context_of(opt[*basis.Basis].some{?b.basis}));
+    val address: res[types.Type, types.Error] = types.intern(?m.types, types.Shape.pointer{types.Pointer{space: types.DEFAULT_SPACE}});
+    if (sel address.err) { ret res[object.Object, Error].err{Error.ir{module.Error.types{address.err}}}; }
+    val bytes: res[u64, record.Error] = layout.size(?l, address.ok, types.DEFAULT_SPACE);
+    if (sel bytes.err) { ret res[object.Object, Error].err{Error.layout{bytes.err}}; }
+    val alone: res[bool, Error] = threadless(b, t);
+    if (sel alone.err) { ret res[object.Object, Error].err{alone.err}; }
+
+    val hooks: *Hooks                    = b.basis.set.codec.stream;
+    val made:  res[ptr, allocator.Error] = hooks.make(a);
+    if (sel made.err) { ret res[object.Object, Error].err{Error.alloc{made.err}}; }
+    fin { hooks.release(a, made.ok); }
+    hooks.begin(made.ok);
+    var ctx: state.Context = b.basis.context;
+    ctx.stream = made.ok;
+
+    var c: Cache = cache.init(m, t, opt[*basis.Basis].some{?b.basis}, analysis.rows());
+    fin { val dropped: err[allocator.Error] = cache.dnit(?c); }
+
+    var u: Unit = Unit{a: a, m: m, b: b, t: t, l: ?l, cache: ?c, pointer: value.pointer(bytes.ok), bytes: bytes.ok, codec: b.basis.set.codec, ctx: ?ctx, index: vector.init[u32](a), types: vector.init[u32](a), signatures: vector.init[Signature](a), slots: vector.init[u32](a), addresses: vector.init[u64](a), stack: 0, threadless: alone.ok, warnings: warnings};
+    fin { release_unit(?u); }
+
+    var mm: mink_model.Module = mink_model.make(a);
+    fin { val freed: err[Fail] = mink_model.release(?mm); }
+    val built: err[Error] = build(?u, ?mm);
+    if (sel built.err) { ret res[object.Object, Error].err{built.err}; }
+
+    var o:    object.Object = object.make(a, t.arch, ?catalog_kind.MODULE);
+    val conv: err[Fail]     = mink_neutral.to((?mm)::ptr, ?b.formats.relocs, ?o);
+    if (sel conv.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[object.Object, Error].err{Error.container{conv.err}};
+    }
+    ret res[object.Object, Error].ok{o};
+}

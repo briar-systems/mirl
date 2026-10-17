@@ -1,0 +1,1403 @@
+# the code of one function: its structured control from the region tree, and
+# the selection of each instruction
+#
+# the regions are laid out in their tree's order. a block's instructions run
+# in their own order, each that is no operand on the stack pushing its
+# operands and leaving its results in their locals. a selection is an `if`
+# for a two-way branch, and for a switch a block per target nested about a
+# `br_table` or a chain of tests, its merge the result of the construct, so a
+# block parameter of a merge is a block result: every edge into the merge
+# pushes its arguments and branches out, and the merge takes them off the
+# stack into its parameters' locals. a loop is a `loop` whose label is its
+# header, inside a block whose result is its merge, about a block whose
+# result is its latch when the latch is not the header. an edge to the next
+# block in a sequence or into an arm writes the target's parameters' locals
+# as a parallel copy, every argument pushed before any is written, and so
+# does an edge back to a loop's header before its branch. no code falls off
+# the end of a construct: every arm ends in a branch, so after a construct
+# no edge leaves, the code is unreachable and says so.
+#
+# a frame of linear memory is taken from the stack pointer's global at entry
+# when the function has stack slots and given back before every return, its
+# base in a local. an atomic access is an ordinary one where one thread runs,
+# and refused where threads run, which reach no atomic yet.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use io: std.io.writer;
+
+use masc_ct: masc.core.ct;
+use masc.isa.wasm.gen_row_index;
+use wasm_kind:   masc.isa.wasm.kind;
+use wasm_stream: masc.isa.wasm.stream;
+use masc.walk.walk;
+
+use mirl.ct;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use Spot: mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Def;
+use mirl.pass.analysis;
+use mirl.pass.analysis.live.Liveness;
+use mirl.pass.failure.Why;
+use mirl.structure.region;
+use mirl.structure.region.Region;
+use mirl.structure.region.Structure;
+use mirl.target.layout;
+use mirl.target.record;
+use mirl.target.wasm.error.At;
+use mirl.target.wasm.error.Encoding;
+use mirl.target.wasm.error.Error;
+use mirl.target.wasm.local;
+use mirl.target.wasm.local.Locals;
+use mirl.target.wasm.operand;
+use mirl.target.wasm.select;
+use mirl.target.wasm.signature.Signature;
+use mirl.target.wasm.unit.Unit;
+use mirl.target.wasm.value;
+use mirl.target.wasm.writer;
+use mirl.target.wasm.writer.Writer;
+
+# the empty name, as nothing the code defines is named
+val NO_NAME: View = View{data: nil, len: 0};
+
+# one open block, loop or if of the code
+# ---
+# block:    the ir block a branch to it reaches, NONE for one none reaches by
+#           its label alone
+# carries:  a branch to it carries its block's parameters, as a merge's
+# branched: some branch reaches it
+pub rec Frame {
+    block:    u32;
+    carries:  bool;
+    branched: bool;
+}
+
+# what the code of one function is emitted with
+pub rec Emitter {
+    u:      *Unit;
+    f:      Function;
+    b:      *Body;
+    s:      *Structure;
+    l:      *Locals;
+    w:      *Writer;
+    frames: vector.Vector[Frame];
+    slots:  vector.Vector[u64];
+    frame:  u64;
+    base:   u32;
+    failed: opt[Error];
+}
+
+fun fail(e: *Emitter, why: Error) {
+    val first: bool = sel e.failed.none;
+    if (first) { e.failed = opt[Error].some{why}; }
+}
+
+fun lost(e: *Emitter, why: allocator.Error) {
+    fail(e, Error.alloc{why});
+}
+
+fun unselected(e: *Emitter, i: Instruction) {
+    fail(e, Error.unselected{At{function: e.f, instruction: i}});
+}
+
+fun unstructured(e: *Emitter) {
+    fail(e, Error.unstructured{e.f});
+}
+
+fun ok(e: *Emitter) bool {
+    ret sel e.failed.none;
+}
+
+# the value type of a value
+fun code_of(e: *Emitter, v: Value) u32 {
+    val got: opt[u32] = value.of(?e.u.m.types, e.b.values.data[v.index].type, e.u.pointer);
+    if (sel got.none) {
+        fail(e, Error.unvalued{e.b.values.data[v.index].type});
+        ret value.I32;
+    }
+    ret got.some;
+}
+
+fun class_of(e: *Emitter, v: Value) u32 {
+    ret value.class(code_of(e, v));
+}
+
+fun width_of(e: *Emitter, v: Value) u32 {
+    ret value.width(?e.u.m.types, e.b.values.data[v.index].type);
+}
+
+fun wide(e: *Emitter) bool {
+    ret e.u.pointer == value.I64;
+}
+
+# a constant of the address type
+fun address(e: *Emitter, n: u64) {
+    if (wide(e)) { writer.i64(e.w, n:~i64); }
+    or           { writer.i32(e.w, n:~i64); }
+}
+
+fun pointer_op(e: *Emitter, narrow: u32, broad: u32) {
+    if (wide(e)) { writer.plain(e.w, broad); }
+    or           { writer.plain(e.w, narrow); }
+}
+
+# clear the bits of an i32 above a width below 32, which a narrow value holds zero
+fun mask(e: *Emitter, width: u32) {
+    if (width == 0 || width >= 32) { ret; }
+    writer.i32(e.w, ((1::u64 << width::u64) - 1)::i64);
+    writer.plain(e.w, gen_row_index.I32AND);
+}
+
+# sign extend an i32 holding a narrow value of a width below 32 to all 32 bits
+fun sign(e: *Emitter, width: u32) {
+    if (width == 0 || width >= 32) { ret; }
+    val shift: i64 = (32 - width)::i64;
+    writer.i32(e.w, shift);
+    writer.plain(e.w, gen_row_index.I32SHL);
+    writer.i32(e.w, shift);
+    writer.plain(e.w, gen_row_index.I32SHRS);
+}
+
+# push a constant
+fun constant(e: *Emitter, v: Value, c: Constant) {
+    val got: res[ConstantData, module.Error] = module.constant_data(e.u.m, c);
+    if (sel got.err) {
+        fail(e, Error.ir{got.err});
+        ret;
+    }
+    val data: ConstantData = got.ok;
+    val code: u32          = code_of(e, v);
+    if (sel data.integer || sel data.float) {
+        var bits: u64 = 0;
+        if (sel data.integer) {
+            if (data.integer.words.size > 0) { bits = data.integer.words.data[0]; }
+        }
+        if (sel data.float) {
+            if (data.float.words.size > 0) { bits = data.float.words.data[0]; }
+        }
+        if (code == value.I32) { writer.i32(e.w, bits:~i64); }
+        or (code == value.I64) { writer.i64(e.w, bits:~i64); }
+        or (code == value.F32) { writer.immediate(e.w, gen_row_index.F32CONST, (bits & 0xFFFF_FFFF):~i64); }
+        or                     { writer.immediate(e.w, gen_row_index.F64CONST, bits:~i64); }
+        ret;
+    }
+    if (sel data.zero) {
+        if (code == value.I32) { writer.i32(e.w, 0); }
+        or (code == value.I64) { writer.i64(e.w, 0); }
+        or (code == value.F32) { writer.immediate(e.w, gen_row_index.F32CONST, 0); }
+        or                     { writer.immediate(e.w, gen_row_index.F64CONST, 0); }
+        ret;
+    }
+    if (sel data.address) {
+        val s: Symbol = data.address.symbol;
+        if (sel s.function) {
+            if (data.address.offset != 0) {
+                fail(e, Error.offset{s.function});
+                ret;
+            }
+            address(e, e.u.slots.data[s.function.index]::u64);
+            ret;
+        }
+        address(e, e.u.addresses.data[s.global.index] + data.address.offset:~u64);
+        ret;
+    }
+    fail(e, Error.unvalued{e.b.values.data[v.index].type});
+}
+
+# push a value: its tree when it stays on the stack, else its constant or its local
+fun push(e: *Emitter, v: Value) {
+    if (!ok(e)) { ret; }
+    if (e.l.stacked.data[v.index]) {
+        val d: Def = e.b.values.data[v.index].def;
+        if (sel d.result) { tree(e, d.result.instruction); }
+        ret;
+    }
+    val d: Def = e.b.values.data[v.index].def;
+    if (sel d.constant) {
+        constant(e, v, d.constant);
+        ret;
+    }
+    val home: u32 = e.l.home.data[v.index];
+    if (home == local.NONE) {
+        fail(e, Error.encoding{Encoding{function: e.f, message: "a value is read that no local holds"}});
+        ret;
+    }
+    writer.index(e.w, gen_row_index.LOCALGET, home);
+}
+
+# an instruction and the operands it pushes before it
+fun tree(e: *Emitter, i: Instruction) {
+    val d:     *InstructionData = ?e.b.instructions.data[i.index];
+    var first: u32              = 0;
+    if (d.operands.len > 0) { first = width_of(e, d.operands.data[0]); }
+    if (!operand.rereads(e.u.m, d, first)) {
+        var pushes: vector.Vector[usize] = vector.init[usize](e.u.a);
+        fin { vector.dnit[usize](?pushes); }
+        val ordered: res[bool, allocator.Error] = operand.order(e.u.m, e.b, d, ?pushes);
+        if (sel ordered.err) {
+            lost(e, ordered.err);
+            ret;
+        }
+        if (!ordered.ok) {
+            unselected(e, i);
+            ret;
+        }
+        var k: usize = 0;
+        for (k < pushes.len) {
+            push(e, d.operands.data[pushes.data[k]]);
+            k = k + 1;
+        }
+    }
+    if (ok(e)) { instruction(e, i, d); }
+}
+
+# an instruction that stays on no stack: its tree, then its results into their locals
+fun root(e: *Emitter, i: Instruction) {
+    tree(e, i);
+    if (!ok(e)) { ret; }
+    val d: *InstructionData = ?e.b.instructions.data[i.index];
+    if (d.results.len == 0) { ret; }
+    var order: vector.Vector[usize] = vector.init[usize](e.u.a);
+    fin { vector.dnit[usize](?order); }
+    val got: res[bool, allocator.Error] = operand.result_order(d, ?order);
+    if (sel got.err) {
+        lost(e, got.err);
+        ret;
+    }
+    var k: usize = order.len;
+    for (k > 0) {
+        k = k - 1;
+        val r:    Value = d.results.data[order.data[k]];
+        val home: u32   = e.l.home.data[r.index];
+        if (home != local.NONE) { writer.index(e.w, gen_row_index.LOCALSET, home); }
+        or                      { writer.plain(e.w, gen_row_index.DROP); }
+    }
+}
+
+# the instructions of a block before its terminator
+fun body(e: *Emitter, k: u32) {
+    val list: *vector.Vector[Instruction] = ?e.b.blocks.data[k].instructions;
+    if (list.len == 0) {
+        unstructured(e);
+        ret;
+    }
+    var j: usize = 0;
+    for (j + 1 < list.len && ok(e)) {
+        val i:     Instruction      = list.data[j];
+        val r:     *InstructionData = ?e.b.instructions.data[i.index];
+        var stays: bool             = false;
+        if (r.results.len == 1) { stays = e.l.stacked.data[r.results.data[0].index]; }
+        if (!stays)             { root(e, i); }
+        j = j + 1;
+    }
+}
+
+fun terminator(e: *Emitter, k: u32) *InstructionData {
+    val list: *vector.Vector[Instruction] = ?e.b.blocks.data[k].instructions;
+    ret ?e.b.instructions.data[list.data[list.len - 1].index];
+}
+
+fun terminator_id(e: *Emitter, k: u32) Instruction {
+    val list: *vector.Vector[Instruction] = ?e.b.blocks.data[k].instructions;
+    ret list.data[list.len - 1];
+}
+
+# the value types of a block's parameters
+fun parameter_codes(e: *Emitter, k: u32, out: *vector.Vector[u32]) {
+    out.len = 0;
+    val params: *vector.Vector[Value] = ?e.b.blocks.data[k].parameters;
+    var j:      usize                 = 0;
+    for (j < params.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](out, code_of(e, params.data[j]));
+        if (sel pushed.err) {
+            lost(e, pushed.err);
+            ret;
+        }
+        j = j + 1;
+    }
+}
+
+# the index of a function type, the stream's first of it or a new one
+fun typed(e: *Emitter, params: *u32, np: u32, results: *u32, nr: u32) u32 {
+    val found: opt[u32] = wasm_stream.find_type(e.u.ctx.stream, params, np, results, nr);
+    if (sel found.some) { ret found.some; }
+    val made: res[u32, str] = wasm_stream.add_type(e.u.ctx.stream, params, np, results, nr, NO_NAME);
+    if (sel made.err) {
+        fail(e, Error.encoding{Encoding{function: e.f, message: made.err}});
+        ret 0;
+    }
+    ret made.ok;
+}
+
+# open a block, loop or if whose result is a block's parameters, none for NONE
+fun open(e: *Emitter, row: u32, results: u32, frame: Frame) {
+    if (results == NONE || e.b.blocks.data[results].parameters.len == 0) {
+        writer.open(e.w, row);
+    }
+    or {
+        var codes: vector.Vector[u32] = vector.init[u32](e.u.a);
+        fin { vector.dnit[u32](?codes); }
+        parameter_codes(e, results, ?codes);
+        if (codes.len == 1) { writer.open_valued(e.w, row, codes.data[0]); }
+        or {
+            writer.open_typed(e.w, row, typed(e, nil, 0, codes.data, codes.len::u32));
+        }
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Frame](?e.frames, frame);
+    if (sel pushed.err) { lost(e, pushed.err); }
+}
+
+# close the innermost frame, its block's parameters taken off the stack when it carries them
+fun close(e: *Emitter) {
+    if (e.frames.len == 0) {
+        unstructured(e);
+        ret;
+    }
+    val f: Frame = e.frames.data[e.frames.len - 1];
+    e.frames.len = e.frames.len - 1;
+    writer.plain(e.w, gen_row_index.END);
+    if (!f.branched) {
+        writer.plain(e.w, gen_row_index.UNREACHABLE);
+        ret;
+    }
+    if (f.carries && f.block != NONE) { take(e, f.block); }
+}
+
+# a merge's parameters off the stack, the last first
+fun take(e: *Emitter, k: u32) {
+    val params: *vector.Vector[Value] = ?e.b.blocks.data[k].parameters;
+    var j:      usize                 = params.len;
+    for (j > 0) {
+        j = j - 1;
+        val home: u32 = e.l.home.data[params.data[j].index];
+        if (home != local.NONE) { writer.index(e.w, gen_row_index.LOCALSET, home); }
+        or                      { writer.plain(e.w, gen_row_index.DROP); }
+    }
+}
+
+# an edge's arguments into its target's parameters' locals, as one parallel copy
+fun deliver(e: *Emitter, edge: *Edge) {
+    val params: *vector.Vector[Value] = ?e.b.blocks.data[edge.block.index].parameters;
+    if (params.len != edge.arguments.len) {
+        unstructured(e);
+        ret;
+    }
+    var j: usize = 0;
+    for (j < params.len) {
+        if (copied(e, params.data[j], edge.arguments.data[j])) { push(e, edge.arguments.data[j]); }
+        j = j + 1;
+    }
+    j = params.len;
+    for (j > 0) {
+        j = j - 1;
+        if (copied(e, params.data[j], edge.arguments.data[j])) { writer.index(e.w, gen_row_index.LOCALSET, e.l.home.data[params.data[j].index]); }
+    }
+}
+
+fun copied(e: *Emitter, param: Value, arg: Value) bool {
+    ret e.l.home.data[param.index] != local.NONE && param.index != arg.index;
+}
+
+# the depth of the innermost frame a branch to a block reaches, NONE for none
+fun depth(e: *Emitter, k: u32) u32 {
+    var i: usize = e.frames.len;
+    for (i > 0) {
+        i = i - 1;
+        if (e.frames.data[i].block == k) { ret (e.frames.len - 1 - i)::u32; }
+    }
+    ret NONE;
+}
+
+# an edge out through a frame: a merge's carries its arguments, a header's
+# takes them in its locals first
+fun branch(e: *Emitter, edge: *Edge) {
+    val d: u32 = depth(e, edge.block.index);
+    if (d == NONE) {
+        unstructured(e);
+        ret;
+    }
+    val at: usize = e.frames.len - 1 - d::usize;
+    if (e.frames.data[at].carries) {
+        var j: usize = 0;
+        for (j < edge.arguments.len) {
+            push(e, edge.arguments.data[j]);
+            j = j + 1;
+        }
+    }
+    or { deliver(e, edge); }
+    e.frames.data[at].branched = true;
+    writer.index(e.w, gen_row_index.BR, d);
+}
+
+# the first block a region's code runs
+fun first(e: *Emitter, r: u32) u32 {
+    if (r == NONE) { ret NONE; }
+    val g: Region      = region.region(e.s, r);
+    val k: region.Kind = g.kind;
+    if (sel k.sequence) { ret first(e, g.child); }
+    ret g.block;
+}
+
+# a sequence's regions in order
+fun sequence(e: *Emitter, r: u32) {
+    var c: u32 = region.region(e.s, r).child;
+    for (c != NONE && ok(e)) {
+        val next: u32 = region.region(e.s, c).next;
+        emit(e, c, next);
+        c = next;
+    }
+}
+
+# one region, the region after it among its parent's children `next`
+fun emit(e: *Emitter, r: u32, next: u32) {
+    val g: Region      = region.region(e.s, r);
+    val k: region.Kind = g.kind;
+    if (sel k.sequence)  { sequence(e, r); }
+    or (sel k.selection) { selection(e, r); }
+    or (sel k.loop)      { looped(e, r); }
+    or {
+        body(e, g.block);
+        if (ok(e)) { ending(e, g.block, next); }
+    }
+}
+
+# a block's terminator, its successor the next region's first block or one a frame reaches
+fun ending(e: *Emitter, k: u32, next: u32) {
+    val i:    Instruction      = terminator_id(e, k);
+    val d:    *InstructionData = terminator(e, k);
+    val code: u32              = d.opcode.index;
+    if (code == opcode.BR.index) {
+        val edge: *Edge = ?d.edges.data[0];
+        if (next != NONE && first(e, next) == edge.block.index) { deliver(e, edge); }
+        or                                                      { branch(e, edge); }
+        ret;
+    }
+    if (code == opcode.RET_PLACED.index || code == opcode.UNREACHABLE.index) {
+        tree(e, i);
+        ret;
+    }
+    unstructured(e);
+}
+
+# an arm of a selection: the edge into it, and its sequence when it has one
+fun arm(e: *Emitter, r: u32, edge: *Edge) {
+    if (r == NONE || region.region(e.s, r).child == NONE) {
+        branch(e, edge);
+        ret;
+    }
+    if (first(e, r) != edge.block.index) {
+        unstructured(e);
+        ret;
+    }
+    deliver(e, edge);
+    sequence(e, r);
+}
+
+fun merge_frame(merge: u32) Frame {
+    ret Frame{block: merge, carries: true, branched: false};
+}
+
+fun plain_frame() Frame {
+    ret Frame{block: NONE, carries: false, branched: false};
+}
+
+# a selection: its header, then its arms by its terminator's targets
+fun selection(e: *Emitter, r: u32) {
+    val g: Region = region.region(e.s, r);
+    body(e, g.block);
+    if (!ok(e)) { ret; }
+    val d:    *InstructionData   = terminator(e, g.block);
+    val code: u32                = d.opcode.index;
+    var arms: vector.Vector[u32] = vector.init[u32](e.u.a);
+    fin { vector.dnit[u32](?arms); }
+    var c: u32 = g.child;
+    for (c != NONE) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?arms, c);
+        if (sel pushed.err) {
+            lost(e, pushed.err);
+            ret;
+        }
+        c = region.region(e.s, c).next;
+    }
+    if (arms.len != d.edges.len) {
+        unstructured(e);
+        ret;
+    }
+    if (code == opcode.CBR.index) {
+        push(e, d.operands.data[0]);
+        open(e, gen_row_index.IF, g.merge, merge_frame(g.merge));
+        arm(e, arms.data[0], ?d.edges.data[0]);
+        writer.plain(e.w, gen_row_index.ELSE);
+        arm(e, arms.data[1], ?d.edges.data[1]);
+        close(e);
+        ret;
+    }
+    if (code == opcode.BR.index) {
+        open(e, gen_row_index.BLOCK, g.merge, merge_frame(g.merge));
+        arm(e, arms.data[0], ?d.edges.data[0]);
+        close(e);
+        ret;
+    }
+    if (code == opcode.SWITCH.index) {
+        switched(e, terminator_id(e, g.block), d, g.merge, ?arms);
+        ret;
+    }
+    unstructured(e);
+}
+
+# a switch: one block per target about its dispatch, each closed before its arm
+fun switched(e: *Emitter, i: Instruction, d: *InstructionData, merge: u32, arms: *vector.Vector[u32]) {
+    val n: usize = d.edges.len;
+    if (merge != NONE) { open(e, gen_row_index.BLOCK, merge, merge_frame(merge)); }
+    var k: usize = 0;
+    for (k < n) {
+        open(e, gen_row_index.BLOCK, NONE, plain_frame());
+        k = k + 1;
+    }
+    if (!ok(e)) { ret; }
+    val base: usize     = e.frames.len - n;
+    val imm:  Immediate = d.immediates.data[0];
+    if (!(sel imm.cases)) {
+        unselected(e, i);
+        ret;
+    }
+    val cases: Slice[u64] = imm.cases;
+    if (cases.size + 1 != n) {
+        unselected(e, i);
+        ret;
+    }
+    val selector: Value = d.operands.data[0];
+    val width:    u32   = width_of(e, selector);
+    val wide64:   bool  = class_of(e, selector) == select.I64;
+    # arm t's block is t from the innermost, where the dispatch stands
+    k = 0;
+    for (k < n) {
+        e.frames.data[base + n - 1 - k].branched = true;
+        k                                        = k + 1;
+    }
+    if (operand.dense(e.u.m, d, width) && !wide64) {
+        val low:  u64 = cases.data[0];
+        val high: u64 = cases.data[cases.size - 1];
+        push(e, selector);
+        if (low != 0) {
+            writer.i32(e.w, low:~i64);
+            writer.plain(e.w, gen_row_index.I32SUB);
+        }
+        var depths: vector.Vector[u32] = vector.init[u32](e.u.a);
+        fin { vector.dnit[u32](?depths); }
+        var x: u64   = low;
+        var c: usize = 0;
+        for (x <= high) {
+            var t: u32 = 0;
+            if (c < cases.size && cases.data[c] == x) {
+                t = (c + 1)::u32;
+                c = c + 1;
+            }
+            val pushed: res[usize, allocator.Error] = vector.push[u32](?depths, t);
+            if (sel pushed.err) {
+                lost(e, pushed.err);
+                ret;
+            }
+            x = x + 1;
+        }
+        val fallback: res[usize, allocator.Error] = vector.push[u32](?depths, 0);
+        if (sel fallback.err) {
+            lost(e, fallback.err);
+            ret;
+        }
+        writer.table(e.w, e.u.a, ?depths);
+    }
+    or {
+        var c: usize = 0;
+        for (c < cases.size) {
+            push(e, selector);
+            if (wide64) {
+                writer.i64(e.w, cases.data[c]:~i64);
+                writer.plain(e.w, gen_row_index.I64EQ);
+            }
+            or {
+                writer.i32(e.w, cases.data[c]:~i64);
+                writer.plain(e.w, gen_row_index.I32EQ);
+            }
+            writer.index(e.w, gen_row_index.BRIF, (c + 1)::u32);
+            c = c + 1;
+        }
+        writer.index(e.w, gen_row_index.BR, 0);
+    }
+    k = 0;
+    for (k < n && ok(e)) {
+        close(e);
+        arm(e, arms.data[k], ?d.edges.data[k]);
+        k = k + 1;
+    }
+    if (merge != NONE) { close(e); }
+}
+
+# a loop: its merge's block about its header's loop, about its latch's block
+fun looped(e: *Emitter, r: u32) {
+    val g:    Region = region.region(e.s, r);
+    val body: u32    = g.child;
+    if (body == NONE) {
+        unstructured(e);
+        ret;
+    }
+    val rest: u32 = region.region(e.s, body).next;
+    if (g.merge != NONE) { open(e, gen_row_index.BLOCK, g.merge, merge_frame(g.merge)); }
+    open(e, gen_row_index.LOOP, NONE, Frame{block: g.block, carries: false, branched: false});
+    val latched: bool = g.latch != NONE && g.latch != g.block && rest != NONE;
+    if (latched) { open(e, gen_row_index.BLOCK, g.latch, merge_frame(g.latch)); }
+    sequence(e, body);
+    if (latched && ok(e)) {
+        close(e);
+        sequence(e, rest);
+    }
+    if (!ok(e)) { ret; }
+    # a branch to a loop's label runs it again, so its end is never reached
+    e.frames.data[e.frames.len - 1].branched = false;
+    close(e);
+    if (g.merge != NONE) { close(e); }
+}
+
+# the address of a stack slot
+fun slot(e: *Emitter, i: Instruction) {
+    writer.index(e.w, gen_row_index.LOCALGET, e.base);
+    val at: u64 = e.slots.data[i.index];
+    if (at != 0) {
+        address(e, at);
+        pointer_op(e, gen_row_index.I32ADD, gen_row_index.I64ADD);
+    }
+}
+
+# the stack pointer given back before a return
+fun unwind(e: *Emitter) {
+    if (e.base == local.NONE) { ret; }
+    writer.index(e.w, gen_row_index.LOCALGET, e.base);
+    address(e, e.frame);
+    pointer_op(e, gen_row_index.I32ADD, gen_row_index.I64ADD);
+    writer.index(e.w, gen_row_index.GLOBALSET, e.u.stack);
+}
+
+# the load of a value type of a width from memory
+fun load_row(code: u32, width: u32) u32 {
+    if (code == value.F32)         { ret gen_row_index.F32LOAD; }
+    if (code == value.F64)         { ret gen_row_index.F64LOAD; }
+    if (code == value.I64)         { ret gen_row_index.I64LOAD; }
+    if (width != 0 && width <= 8)  { ret gen_row_index.I32LOAD8U; }
+    if (width != 0 && width <= 16) { ret gen_row_index.I32LOAD16U; }
+    ret gen_row_index.I32LOAD;
+}
+
+fun store_row(code: u32, width: u32) u32 {
+    if (code == value.F32)         { ret gen_row_index.F32STORE; }
+    if (code == value.F64)         { ret gen_row_index.F64STORE; }
+    if (code == value.I64)         { ret gen_row_index.I64STORE; }
+    if (width != 0 && width <= 8)  { ret gen_row_index.I32STORE8; }
+    if (width != 0 && width <= 16) { ret gen_row_index.I32STORE16; }
+    ret gen_row_index.I32STORE;
+}
+
+# the bytes an access of a value type of a width moves
+fun natural(code: u32, width: u32) u64 {
+    if (code == value.F32)                      { ret 4; }
+    if (code == value.F64 || code == value.I64) { ret 8; }
+    if (width != 0 && width <= 8)               { ret 1; }
+    if (width != 0 && width <= 16)              { ret 2; }
+    ret 4;
+}
+
+fun aligned(stated: u64, most: u64) u64 {
+    if (stated == 0 || stated > most) { ret most; }
+    ret stated;
+}
+
+fun alignment_of(d: *InstructionData, slot: usize) u64 {
+    if (slot >= d.immediates.len) { ret 0; }
+    val imm: Immediate = d.immediates.data[slot];
+    if (sel imm.alignment) { ret imm.alignment; }
+    ret 0;
+}
+
+fun type_of(d: *InstructionData, slot: usize) opt[Type] {
+    if (slot >= d.immediates.len) { ret opt[Type].none{}; }
+    val imm: Immediate = d.immediates.data[slot];
+    if (sel imm.ty) { ret opt[Type].some{imm.ty}; }
+    ret opt[Type].none{};
+}
+
+# a value of the class of an integer `from` converted to the address type
+fun to_pointer(e: *Emitter, from: u32) {
+    if (wide(e) && from == select.I32)  { writer.plain(e.w, gen_row_index.I64EXTENDI32S); }
+    or (!wide(e) && from == select.I64) { writer.plain(e.w, gen_row_index.I32WRAPI64); }
+}
+
+# a local of a value type that holds a step of an instruction's code
+fun scratch(e: *Emitter, code: u32) u32 {
+    val made: res[u32, allocator.Error] = local.add(e.l, code);
+    if (sel made.err) {
+        lost(e, made.err);
+        ret 0;
+    }
+    val defined: res[u32, str] = wasm_stream.define(e.u.ctx.stream, wasm_kind.LOCALS, code, NO_NAME);
+    if (sel defined.err) { fail(e, Error.encoding{Encoding{function: e.f, message: defined.err}}); }
+    ret made.ok;
+}
+
+# an operation of one instruction at a class, refused where it has none
+fun simple(e: *Emitter, i: Instruction, op: Opcode, class: u32) {
+    val got: opt[u32] = select.simple(op, class);
+    if (sel got.none) {
+        unselected(e, i);
+        ret;
+    }
+    writer.plain(e.w, got.some);
+}
+
+# an atomic read, modify and write where one thread runs: the value held
+# before, read once into a local, and the update stored over it
+fun update(e: *Emitter, i: Instruction, d: *InstructionData) {
+    if (!e.u.threadless) {
+        fail(e, Error.threads{At{function: e.f, instruction: i}});
+        ret;
+    }
+    val at:   Value = d.operands.data[0];
+    val held: Value = d.results.data[0];
+    val code: u32   = code_of(e, held);
+    val w:    u32   = width_of(e, held);
+    val n:    u64   = natural(code, w);
+    val old:  u32   = scratch(e, code);
+    push(e, at);
+    writer.memory(e.w, load_row(code, w), 0, n);
+    writer.index(e.w, gen_row_index.LOCALSET, old);
+    push(e, at);
+    val op:    u32 = d.opcode.index;
+    val class: u32 = value.class(code);
+    if (op == opcode.ATOMIC_CMPXCHG.index) {
+        val expected: Value = d.operands.data[1];
+        push(e, d.operands.data[2]);
+        writer.index(e.w, gen_row_index.LOCALGET, old);
+        writer.index(e.w, gen_row_index.LOCALGET, old);
+        push(e, expected);
+        simple(e, i, opcode.EQ, class);
+        writer.plain(e.w, gen_row_index.SELECT);
+        writer.memory(e.w, store_row(code, w), 0, n);
+        writer.index(e.w, gen_row_index.LOCALGET, old);
+        writer.index(e.w, gen_row_index.LOCALGET, old);
+        push(e, expected);
+        simple(e, i, opcode.EQ, class);
+        ret;
+    }
+    val v: Value = d.operands.data[1];
+    if (op == opcode.ATOMIC_XCHG.index) {
+        push(e, v);
+    }
+    or (op == opcode.ATOMIC_SMAX.index || op == opcode.ATOMIC_SMIN.index || op == opcode.ATOMIC_UMAX.index || op == opcode.ATOMIC_UMIN.index) {
+        if (w < 32 && (op == opcode.ATOMIC_SMAX.index || op == opcode.ATOMIC_SMIN.index)) {
+            unselected(e, i);
+            ret;
+        }
+        writer.index(e.w, gen_row_index.LOCALGET, old);
+        push(e, v);
+        writer.index(e.w, gen_row_index.LOCALGET, old);
+        push(e, v);
+        var cmp: Opcode = opcode.GT_S;
+        if (op == opcode.ATOMIC_SMIN.index) { cmp = opcode.LT_S; }
+        or (op == opcode.ATOMIC_UMAX.index) { cmp = opcode.GT_U; }
+        or (op == opcode.ATOMIC_UMIN.index) { cmp = opcode.LT_U; }
+        simple(e, i, cmp, class);
+        writer.plain(e.w, gen_row_index.SELECT);
+    }
+    or {
+        writer.index(e.w, gen_row_index.LOCALGET, old);
+        push(e, v);
+        var with: Opcode = opcode.ADD;
+        if (op == opcode.ATOMIC_SUB.index)                                   { with = opcode.SUB; }
+        or (op == opcode.ATOMIC_AND.index || op == opcode.ATOMIC_NAND.index) { with = opcode.AND; }
+        or (op == opcode.ATOMIC_OR.index)                                    { with = opcode.OR; }
+        or (op == opcode.ATOMIC_XOR.index)                                   { with = opcode.XOR; }
+        simple(e, i, with, class);
+        if (op == opcode.ATOMIC_NAND.index) {
+            if (class == select.I64) { writer.i64(e.w, -1); }
+            or                       { writer.i32(e.w, -1); }
+            simple(e, i, opcode.XOR, class);
+        }
+        if (class == select.I32) { mask(e, w); }
+    }
+    writer.memory(e.w, store_row(code, w), 0, n);
+    writer.index(e.w, gen_row_index.LOCALGET, old);
+}
+
+# a float compare wasm has no one instruction of, each operand read twice
+fun unordered(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val x:     Value = d.operands.data[0];
+    val y:     Value = d.operands.data[1];
+    val class: u32   = class_of(e, x);
+    val op:    u32   = d.opcode.index;
+    if (op == opcode.FNE_O.index || op == opcode.FEQ_U.index) {
+        push(e, x);
+        push(e, y);
+        simple(e, i, opcode.FLT_O, class);
+        push(e, x);
+        push(e, y);
+        simple(e, i, opcode.FGT_O, class);
+        writer.plain(e.w, gen_row_index.I32OR);
+        if (op == opcode.FEQ_U.index) { writer.plain(e.w, gen_row_index.I32EQZ); }
+        ret;
+    }
+    var test: Opcode = opcode.FEQ_O;
+    var join: u32    = gen_row_index.I32AND;
+    if (op == opcode.FUNO.index) {
+        test = opcode.FNE_U;
+        join = gen_row_index.I32OR;
+    }
+    push(e, x);
+    push(e, x);
+    simple(e, i, test, class);
+    push(e, y);
+    push(e, y);
+    simple(e, i, test, class);
+    writer.plain(e.w, join);
+}
+
+# the float compares that are the negation of one wasm states
+fun negated(op: Opcode) opt[Opcode] {
+    val i: u32 = op.index;
+    if (i == opcode.FLT_U.index) { ret opt[Opcode].some{opcode.FGE_O}; }
+    if (i == opcode.FLE_U.index) { ret opt[Opcode].some{opcode.FGT_O}; }
+    if (i == opcode.FGT_U.index) { ret opt[Opcode].some{opcode.FLE_O}; }
+    if (i == opcode.FGE_U.index) { ret opt[Opcode].some{opcode.FLT_O}; }
+    ret opt[Opcode].none{};
+}
+
+# a conversion between integers, a narrow one held zero extended in an i32
+fun integer(e: *Emitter, i: Instruction, op: u32, from: Value, to: Value) {
+    val fw: u32 = width_of(e, from);
+    val tw: u32 = width_of(e, to);
+    val fc: u32 = class_of(e, from);
+    val tc: u32 = class_of(e, to);
+    if (op == opcode.TRUNC.index) {
+        if (fc == select.I64 && tc == select.I32) { writer.plain(e.w, gen_row_index.I32WRAPI64); }
+        if (tc == select.I32)                     { mask(e, tw); }
+        ret;
+    }
+    if (op == opcode.EXT_U.index) {
+        if (fc == select.I32 && tc == select.I64) { writer.plain(e.w, gen_row_index.I64EXTENDI32U); }
+        ret;
+    }
+    if (fw == 1) {
+        writer.i32(e.w, -1);
+        writer.plain(e.w, gen_row_index.I32MUL);
+    }
+    or                                        { sign(e, fw); }
+    if (tc == select.I64 && fc == select.I32) { writer.plain(e.w, gen_row_index.I64EXTENDI32S); }
+    or (tc == select.I32)                     { mask(e, tw); }
+}
+
+# a conversion between an integer and a float, or between two floats
+fun numeric(e: *Emitter, i: Instruction, op: u32, from: Value, to: Value) {
+    val fc: u32 = class_of(e, from);
+    val tc: u32 = class_of(e, to);
+    if (op == opcode.FPROMOTE.index) {
+        writer.plain(e.w, gen_row_index.F64PROMOTEF32);
+        ret;
+    }
+    if (op == opcode.FDEMOTE.index) {
+        writer.plain(e.w, gen_row_index.F32DEMOTEF64);
+        ret;
+    }
+    val signed: bool = op == opcode.ITOF_S.index || op == opcode.FTOI_S.index;
+    if (op == opcode.ITOF_S.index || op == opcode.ITOF_U.index) {
+        if (signed && fc == select.I32) { sign(e, width_of(e, from)); }
+        var r: u32 = 0;
+        if (tc == select.F32) {
+            if (fc == select.I32) { r = if_signed(signed, gen_row_index.F32CONVERTI32S, gen_row_index.F32CONVERTI32U); }
+            or                    { r = if_signed(signed, gen_row_index.F32CONVERTI64S, gen_row_index.F32CONVERTI64U); }
+        }
+        or {
+            if (fc == select.I32) { r = if_signed(signed, gen_row_index.F64CONVERTI32S, gen_row_index.F64CONVERTI32U); }
+            or                    { r = if_signed(signed, gen_row_index.F64CONVERTI64S, gen_row_index.F64CONVERTI64U); }
+        }
+        writer.plain(e.w, r);
+        ret;
+    }
+    # a float to an integer saturates at the width of the result, which wasm's saturating truncation
+    # gives at 32 and 64 bits
+    val tw: u32 = width_of(e, to);
+    if (tw != 32 && tw != 64) {
+        unselected(e, i);
+        ret;
+    }
+    var r: u32 = 0;
+    if (tc == select.I32) {
+        if (fc == select.F32) { r = if_signed(signed, gen_row_index.I32TRUNCSATF32S, gen_row_index.I32TRUNCSATF32U); }
+        or                    { r = if_signed(signed, gen_row_index.I32TRUNCSATF64S, gen_row_index.I32TRUNCSATF64U); }
+    }
+    or {
+        if (fc == select.F32) { r = if_signed(signed, gen_row_index.I64TRUNCSATF32S, gen_row_index.I64TRUNCSATF32U); }
+        or                    { r = if_signed(signed, gen_row_index.I64TRUNCSATF64S, gen_row_index.I64TRUNCSATF64U); }
+    }
+    writer.plain(e.w, r);
+}
+
+fun if_signed(signed: bool, yes: u32, no: u32) u32 {
+    if (signed) { ret yes; }
+    ret no;
+}
+
+# the code of one instruction, its operands pushed as it pushes them
+fun instruction(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val op: u32 = d.opcode.index;
+    if (op == opcode.RET_PLACED.index) {
+        unwind(e);
+        writer.plain(e.w, gen_row_index.RETURN);
+        ret;
+    }
+    if (op == opcode.UNREACHABLE.index) {
+        writer.plain(e.w, gen_row_index.UNREACHABLE);
+        ret;
+    }
+    if (op == opcode.CALL_PLACED.index) {
+        call(e, i, d);
+        ret;
+    }
+    if (op == opcode.DECLASSIFY.index) { ret; }
+    if (op == opcode.FENCE.index) {
+        if (!e.u.threadless) { fail(e, Error.threads{At{function: e.f, instruction: i}}); }
+        ret;
+    }
+    if (operand.updates(d.opcode)) {
+        update(e, i, d);
+        ret;
+    }
+    if (op == opcode.FNE_O.index || op == opcode.FEQ_U.index || op == opcode.FORD.index || op == opcode.FUNO.index) {
+        unordered(e, i, d);
+        ret;
+    }
+    if (op == opcode.LOAD.index || op == opcode.ATOMIC_LOAD.index) {
+        if (op == opcode.ATOMIC_LOAD.index && !e.u.threadless) {
+            fail(e, Error.threads{At{function: e.f, instruction: i}});
+            ret;
+        }
+        val r:     Value = d.results.data[0];
+        val code:  u32   = code_of(e, r);
+        val w:     u32   = width_of(e, r);
+        var align: u64   = 0;
+        if (op == opcode.LOAD.index) { align = alignment_of(d, 1); }
+        writer.memory(e.w, load_row(code, w), 0, aligned(align, natural(code, w)));
+        ret;
+    }
+    if (op == opcode.STORE.index || op == opcode.ATOMIC_STORE.index) {
+        if (op == opcode.ATOMIC_STORE.index && !e.u.threadless) {
+            fail(e, Error.threads{At{function: e.f, instruction: i}});
+            ret;
+        }
+        val v:     Value = d.operands.data[1];
+        val code:  u32   = code_of(e, v);
+        val w:     u32   = width_of(e, v);
+        var align: u64   = 0;
+        if (op == opcode.STORE.index) { align = alignment_of(d, 0); }
+        writer.memory(e.w, store_row(code, w), 0, aligned(align, natural(code, w)));
+        ret;
+    }
+    if (op == opcode.ALLOCA.index) {
+        slot(e, i);
+        ret;
+    }
+    if (op == opcode.FUNC_ADDR.index) {
+        val imm: Immediate = d.immediates.data[0];
+        if (!(sel imm.function)) {
+            unselected(e, i);
+            ret;
+        }
+        address(e, e.u.slots.data[imm.function.index]::u64);
+        ret;
+    }
+    if (op == opcode.PTR_ADD.index) {
+        to_pointer(e, class_of(e, d.operands.data[1]));
+        pointer_op(e, gen_row_index.I32ADD, gen_row_index.I64ADD);
+        ret;
+    }
+    if (op == opcode.PTR_MEMBER.index) {
+        val ty:     opt[Type] = type_of(d, 0);
+        val member: Immediate = d.immediates.data[1];
+        if (sel ty.none) {
+            unselected(e, i);
+            ret;
+        }
+        if (!(sel member.member)) {
+            unselected(e, i);
+            ret;
+        }
+        val at: res[u64, record.Error] = layout.offset(e.u.l, ty.some, types.DEFAULT_SPACE, member.member);
+        if (sel at.err) {
+            fail(e, Error.layout{at.err});
+            ret;
+        }
+        if (at.ok != 0) {
+            address(e, at.ok);
+            pointer_op(e, gen_row_index.I32ADD, gen_row_index.I64ADD);
+        }
+        ret;
+    }
+    if (op == opcode.PTR_INDEX.index) {
+        val ty: opt[Type] = type_of(d, 0);
+        if (sel ty.none) {
+            unselected(e, i);
+            ret;
+        }
+        val step: res[u64, record.Error] = layout.stride(e.u.l, ty.some, types.DEFAULT_SPACE);
+        if (sel step.err) {
+            fail(e, Error.layout{step.err});
+            ret;
+        }
+        val index: Value = d.operands.data[1];
+        if (class_of(e, index) == select.I32) { sign(e, width_of(e, index)); }
+        to_pointer(e, class_of(e, index));
+        address(e, step.ok);
+        pointer_op(e, gen_row_index.I32MUL, gen_row_index.I64MUL);
+        pointer_op(e, gen_row_index.I32ADD, gen_row_index.I64ADD);
+        ret;
+    }
+    if (op == opcode.SELECT.index) {
+        writer.plain(e.w, gen_row_index.SELECT);
+        ret;
+    }
+    if (op == opcode.EXT_U.index || op == opcode.EXT_S.index || op == opcode.TRUNC.index) {
+        integer(e, i, op, d.operands.data[0], d.results.data[0]);
+        ret;
+    }
+    if (op == opcode.ITOF_S.index || op == opcode.ITOF_U.index || op == opcode.FTOI_S.index || op == opcode.FTOI_U.index || op == opcode.FPROMOTE.index || op == opcode.FDEMOTE.index) {
+        numeric(e, i, op, d.operands.data[0], d.results.data[0]);
+        ret;
+    }
+    if (op == opcode.BITCAST.index || op == opcode.PTRTOINT.index || op == opcode.INTTOPTR.index) {
+        cast(e, i, op, d.operands.data[0], d.results.data[0]);
+        ret;
+    }
+    if (d.operands.len == 0 || d.results.len != 1) {
+        unselected(e, i);
+        ret;
+    }
+    val x:     Value = d.operands.data[0];
+    val class: u32   = class_of(e, x);
+    val w:     u32   = width_of(e, x);
+    if (op == opcode.NEG.index) {
+        if (class == select.I64) { writer.i64(e.w, -1); }
+        or                       { writer.i32(e.w, -1); }
+        simple(e, i, opcode.MUL, class);
+        if (class == select.I32) { mask(e, w); }
+        ret;
+    }
+    if (op == opcode.NOT.index) {
+        if (class == select.I64) { writer.i64(e.w, -1); }
+        or                       { if_narrow_not(e, w); }
+        simple(e, i, opcode.XOR, class);
+        ret;
+    }
+    val flipped: opt[Opcode] = negated(d.opcode);
+    if (sel flipped.some) {
+        simple(e, i, flipped.some, class);
+        writer.plain(e.w, gen_row_index.I32EQZ);
+        ret;
+    }
+    if (class == select.I32 && w != 0 && w < 32) {
+        if (select.signed(d.opcode)) {
+            unselected(e, i);
+            ret;
+        }
+        if (op == opcode.CTZ.index) {
+            writer.i32(e.w, (1::u64 << w::u64)::i64);
+            writer.plain(e.w, gen_row_index.I32OR);
+        }
+    }
+    simple(e, i, d.opcode, class);
+    if (class == select.I32 && w != 0 && w < 32) {
+        if (op == opcode.CLZ.index) {
+            writer.i32(e.w, (32 - w)::i64);
+            writer.plain(e.w, gen_row_index.I32SUB);
+        }
+        or (!select.exact(d.opcode) && !select.compare(d.opcode) && op != opcode.CTZ.index) { mask(e, w); }
+    }
+}
+
+# the all-ones mask of an i32 at a width, as a narrow not flips it
+fun if_narrow_not(e: *Emitter, w: u32) {
+    if (w != 0 && w < 32) { writer.i32(e.w, ((1::u64 << w::u64) - 1)::i64); }
+    or                    { writer.i32(e.w, -1); }
+}
+
+# the same bits as another type, or an address as an integer and back
+fun cast(e: *Emitter, i: Instruction, op: u32, from: Value, to: Value) {
+    val fc: u32 = class_of(e, from);
+    val tc: u32 = class_of(e, to);
+    if (fc == tc) {
+        if (op == opcode.PTRTOINT.index) { mask(e, width_of(e, to)); }
+        ret;
+    }
+    if (fc == select.I32 && tc == select.F32) { writer.plain(e.w, gen_row_index.F32REINTERPRETI32); }
+    or (fc == select.I64 && tc == select.F64) { writer.plain(e.w, gen_row_index.F64REINTERPRETI64); }
+    or (fc == select.F32 && tc == select.I32) { writer.plain(e.w, gen_row_index.I32REINTERPRETF32); }
+    or (fc == select.F64 && tc == select.I64) { writer.plain(e.w, gen_row_index.I64REINTERPRETF64); }
+    or (fc == select.I64 && tc == select.I32) {
+        writer.plain(e.w, gen_row_index.I32WRAPI64);
+        mask(e, width_of(e, to));
+    }
+    or (fc == select.I32 && tc == select.I64) { writer.plain(e.w, gen_row_index.I64EXTENDI32U); }
+    or                                        { unselected(e, i); }
+}
+
+# a placed call: a function by its index, or an address through the table
+# by the type its operands and results are
+fun call(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val callee: opt[Function] = operand.direct(e.u.m, e.b, d.operands.data[0]);
+    if (sel callee.some) {
+        writer.index(e.w, gen_row_index.CALL, e.u.index.data[callee.some.index]);
+        ret;
+    }
+    if (wide(e)) { writer.plain(e.w, gen_row_index.I32WRAPI64); }
+    var params:  vector.Vector[u32] = vector.init[u32](e.u.a);
+    var results: vector.Vector[u32] = vector.init[u32](e.u.a);
+    fin {
+        vector.dnit[u32](?params);
+        vector.dnit[u32](?results);
+    }
+    var order: vector.Vector[usize] = vector.init[usize](e.u.a);
+    fin { vector.dnit[usize](?order); }
+    val got: res[bool, allocator.Error] = operand.order(e.u.m, e.b, d, ?order);
+    if (sel got.err) {
+        lost(e, got.err);
+        ret;
+    }
+    var k: usize = 0;
+    for (k + 1 < order.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?params, code_of(e, d.operands.data[order.data[k]]));
+        if (sel pushed.err) {
+            lost(e, pushed.err);
+            ret;
+        }
+        k = k + 1;
+    }
+    val listed: res[bool, allocator.Error] = operand.result_order(d, ?order);
+    if (sel listed.err) {
+        lost(e, listed.err);
+        ret;
+    }
+    k = 0;
+    for (k < order.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?results, code_of(e, d.results.data[order.data[k]]));
+        if (sel pushed.err) {
+            lost(e, pushed.err);
+            ret;
+        }
+        k = k + 1;
+    }
+    writer.indirect(e.w, typed(e, params.data, params.len::u32, results.data, results.len::u32));
+}
+
+# lay out the function's stack slots in its frame, each at its alignment
+fun frame(e: *Emitter) {
+    var at:  u64   = 0;
+    var any: bool  = false;
+    var k:   usize = 0;
+    for (k < e.b.instructions.len) {
+        val d:      *InstructionData = ?e.b.instructions.data[k];
+        val placed: Spot             = d.place;
+        if (d.opcode.index == opcode.ALLOCA.index && sel placed.placed) {
+            val ty: opt[Type] = type_of(d, 0);
+            if (sel ty.none) {
+                unselected(e, Instruction{index: k::u32});
+                ret;
+            }
+            val size: res[u64, record.Error] = layout.size(e.u.l, ty.some, types.DEFAULT_SPACE);
+            if (sel size.err) {
+                fail(e, Error.layout{size.err});
+                ret;
+            }
+            var align: u64 = alignment_of(d, 2);
+            if (align == 0) {
+                val own: res[u64, record.Error] = layout.align(e.u.l, ty.some, types.DEFAULT_SPACE);
+                if (sel own.err) {
+                    fail(e, Error.layout{own.err});
+                    ret;
+                }
+                align = own.ok;
+            }
+            if (align == 0) { align = 1; }
+            at              = (at + align - 1) / align * align;
+            e.slots.data[k] = at;
+            at              = at + size.ok;
+            any             = true;
+        }
+        k = k + 1;
+    }
+    if (!any) { ret; }
+    e.frame = (at + 15) / 16 * 16;
+    e.base  = scratch(e, e.u.pointer);
+    writer.index(e.w, gen_row_index.GLOBALGET, e.u.stack);
+    address(e, e.frame);
+    pointer_op(e, gen_row_index.I32SUB, gen_row_index.I64SUB);
+    writer.index(e.w, gen_row_index.LOCALTEE, e.base);
+    writer.index(e.w, gen_row_index.GLOBALSET, e.u.stack);
+}
+
+# the blocks of a region in the order their code is laid out
+fun lay(s: *Structure, r: u32, out: *vector.Vector[u32]) err[allocator.Error] {
+    if (r == NONE) { ret err[allocator.Error].ok{}; }
+    val g: Region      = region.region(s, r);
+    val k: region.Kind = g.kind;
+    if (sel k.block || sel k.selection) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](out, g.block);
+        if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+    }
+    if (sel k.block) { ret err[allocator.Error].ok{}; }
+    var c: u32 = g.child;
+    for (c != NONE) {
+        val got: err[allocator.Error] = lay(s, c, out);
+        if (sel got.err) { ret got; }
+        c = region.region(s, c).next;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+fun analysed[T](got: res[*T, Why]) res[*T, Error] {
+    if (sel got.err) { ret res[*T, Error].err{Error.analysis{got.err}}; }
+    ret res[*T, Error].ok{got.ok};
+}
+
+# the body of one defined function: its locals vector, then its code
+# ---
+# u:   the module laid out
+# f:   the function
+# out: where the body is written
+pub fun function(u: *Unit, f: Function, out: *vector.Vector[u8]) err[Error] {
+    val b: *Body                  = ?u.m.functions.data[f.index].body;
+    val s: res[*Structure, Error] = analysed[Structure](analysis.structure_of(u.cache, f));
+    if (sel s.err) { ret err[Error].err{s.err}; }
+    val live: res[*Liveness, Error] = analysed[Liveness](analysis.liveness_of(u.cache, f));
+    if (sel live.err) { ret err[Error].err{live.err}; }
+    var order: vector.Vector[u32] = vector.init[u32](u.a);
+    fin { vector.dnit[u32](?order); }
+    val laid: err[allocator.Error] = lay(s.ok, region.root(s.ok), ?order);
+    if (sel laid.err) { ret err[Error].err{Error.alloc{laid.err}}; }
+    val sig:      *Signature         = ?u.signatures.data[f.index];
+    val assigned: res[Locals, Error] = local.assign(u.a, u.m, b, ?order, live.ok, ?sig.params, u.pointer);
+    if (sel assigned.err) { ret err[Error].err{assigned.err}; }
+    var l: Locals = assigned.ok;
+    fin { local.release(?l); }
+
+    val entered: err[str] = wasm_stream.enter(u.ctx.stream, u.types.data[f.index]);
+    if (sel entered.err) { ret err[Error].err{Error.encoding{Encoding{function: f, message: entered.err}}}; }
+    var n: usize = 0;
+    for (n < l.types.len) {
+        val defined: res[u32, str] = wasm_stream.define(u.ctx.stream, wasm_kind.LOCALS, l.types.data[n], NO_NAME);
+        if (sel defined.err) { ret err[Error].err{Error.encoding{Encoding{function: f, message: defined.err}}}; }
+        n = n + 1;
+    }
+    var w: Writer = writer.make(u.a, u.codec, u.ctx);
+    fin { writer.release(?w); }
+    var e: Emitter = Emitter{u: u, f: f, b: b, s: s.ok, l: ?l, w: ?w, frames: vector.init[Frame](u.a), slots: vector.init[u64](u.a), frame: 0, base: local.NONE, failed: opt[Error].none{}};
+    fin {
+        vector.dnit[Frame](?e.frames);
+        vector.dnit[u64](?e.slots);
+    }
+    n = 0;
+    for (n < b.instructions.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u64](?e.slots, 0);
+        if (sel pushed.err) { ret err[Error].err{Error.alloc{pushed.err}}; }
+        n = n + 1;
+    }
+    frame(?e);
+    if (ok(?e)) { sequence(?e, region.root(s.ok)); }
+    writer.plain(?w, gen_row_index.END);
+    if (sel e.failed.some)  { ret err[Error].err{e.failed.some}; }
+    if (sel w.refused.some) { ret err[Error].err{Error.encoding{Encoding{function: f, message: w.refused.some}}}; }
+
+    writer.locals(out, ?l.types);
+    n = 0;
+    for (n < w.out.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u8](out, w.out.data[n]);
+        if (sel pushed.err) { ret err[Error].err{Error.alloc{pushed.err}}; }
+        n = n + 1;
+    }
+    if (u.m.functions.data[f.index].data.constant_time) { ret timed(u, f, b, ?l, ?w.out); }
+    ret err[Error].ok{};
+}
+
+# a constant-time function's code walked from its secret params: refused
+# where the walk finds a secret where none may be, and warned of where wasm
+# cannot guarantee its timing
+fun timed(u: *Unit, f: Function, b: *Body, l: *Locals, code: *vector.Vector[u8]) err[Error] {
+    val entered: err[str] = wasm_stream.enter(u.ctx.stream, u.types.data[f.index]);
+    if (sel entered.err) { ret err[Error].err{Error.encoding{Encoding{function: f, message: entered.err}}}; }
+    var n: usize = 0;
+    for (n < l.types.len) {
+        val defined: res[u32, str] = wasm_stream.define(u.ctx.stream, wasm_kind.LOCALS, l.types.data[n], NO_NAME);
+        if (sel defined.err) { ret err[Error].err{Error.encoding{Encoding{function: f, message: defined.err}}}; }
+        n = n + 1;
+    }
+    var seeds: vector.Vector[walk.Seed] = vector.init[walk.Seed](u.a);
+    fin { vector.dnit[walk.Seed](?seeds); }
+    if (b.blocks.len > 0) {
+        val entry: *vector.Vector[Value] = ?b.blocks.data[0].parameters;
+        var j:     usize                 = 0;
+        for (j < entry.len) {
+            val v: Value = entry.data[j];
+            if (b.values.data[v.index].secret) {
+                val pushed: res[usize, allocator.Error] = vector.push[walk.Seed](?seeds, walk.Seed.entry{walk.Entry{space: wasm_kind.LOCALS, index: l.home.data[v.index]}});
+                if (sel pushed.err) { ret err[Error].err{Error.alloc{pushed.err}}; }
+            }
+            j = j + 1;
+        }
+    }
+    var walked:  walk.Code                       = walk.Code{set: u.b.basis.set, data: code.data, len: code.len};
+    var secrets: walk.Secrets                    = walk.Secrets{at: seeds.data, len: seeds.len::u32};
+    val answer:  res[ct.Answer, allocator.Error] = ct.check(u.a, ?walked, u.ctx, ?secrets);
+    if (sel answer.err) { ret err[Error].err{Error.alloc{answer.err}}; }
+    val got: ct.Answer = answer.ok;
+    if (sel got.refused || sel got.unread) { ret err[Error].err{Error.timing{f}}; }
+    if (sel got.warned)                    { warn(u, f); }
+    ret err[Error].ok{};
+}
+
+fun write(w: *io.Writer, data: *u8, len: usize) {
+    val wrote: err[io.WriteError] = io.write_all(w, data, len);
+}
+
+# the warning that wasm cannot hold a function to constant time
+fun warn(u: *Unit, f: Function) {
+    if (sel u.warnings.none) { ret; }
+    val w:    *io.Writer   = u.warnings.some;
+    val name: FunctionData = u.m.functions.data[f.index].data;
+    write(w, "warning: ", 9);
+    write(w, name.name.data, name.name.len);
+    write(w, ": ", 2);
+    write(w, masc_ct.UNGUARANTEED, str_len(masc_ct.UNGUARANTEED));
+    write(w, "\n", 1);
+}

@@ -1,0 +1,365 @@
+# where each value of a function is held: on the operand stack, or in a local
+#
+# a value stays on the stack when the instruction after its definition reads
+# it, as its one use and an operand the instruction pushes, so the code is
+# the ir's own order and nothing moves: walking an instruction's operands
+# back from the last it pushes, each one the instruction just before defines
+# is taken into it, and that instruction's operands after it. every other
+# value with a use is held in a local of its value type. a local is assigned
+# by live range: the function's blocks are numbered in the order their code
+# is laid out, a value's range spans every point it is defined, read or live
+# at, by the ir's liveness, and values of one type whose ranges do not meet
+# share a local. a block parameter is written by the edges into it, so its
+# range spans those edges too. a function's params are its first locals, by
+# the operand each entry piece is placed at.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.ir.block.BlockData;
+use mirl.ir.function.Body;
+use mirl.ir.function.Entry;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module.Module;
+use mirl.ir.value.Def;
+use mirl.pass.analysis.live.Liveness;
+use mirl.target.wasm.error.Error;
+use mirl.target.wasm.operand;
+use mirl.target.wasm.value;
+
+# no local
+pub val NONE: u32 = 0xFFFF_FFFF;
+
+# where a function's values are held
+# ---
+# home:    per value, its local, NONE for a value on the stack, a constant
+#          or one nothing reads
+# stacked: per value, whether it stays on the stack
+# params:  how many params the function has, its first locals
+# types:   the value type of each local after the params, in index order
+pub rec Locals {
+    home:    vector.Vector[u32];
+    stacked: vector.Vector[bool];
+    params:  u32;
+    types:   vector.Vector[u32];
+}
+
+# give back what a function's locals hold
+pub fun release(l: *Locals) {
+    vector.dnit[u32](?l.home);
+    vector.dnit[bool](?l.stacked);
+    vector.dnit[u32](?l.types);
+}
+
+# a new local of a value type, after every other
+pub fun add(l: *Locals, code: u32) res[u32, allocator.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[u32](?l.types, code);
+    if (sel pushed.err) { ret res[u32, allocator.Error].err{pushed.err}; }
+    ret res[u32, allocator.Error].ok{l.params + (l.types.len - 1)::u32};
+}
+
+# one value's live range over the laid out positions
+rec Range {
+    value: u32;
+    code:  u32;
+    low:   u32;
+    high:  u32;
+}
+
+fun by_low(a: *Range, b: *Range) i64 {
+    if (a.low < b.low)     { ret -1; }
+    if (a.low > b.low)     { ret 1; }
+    if (a.value < b.value) { ret -1; }
+    if (a.value > b.value) { ret 1; }
+    ret 0;
+}
+
+# what assigning reads and keeps
+rec Work {
+    a:        *allocator.Allocator;
+    m:        *Module;
+    b:        *Body;
+    pointer:  u32;
+    order:    vector.Vector[usize];
+    position: vector.Vector[u32];
+    start:    vector.Vector[u32];
+    end:      vector.Vector[u32];
+    low:      vector.Vector[u32];
+    high:     vector.Vector[u32];
+}
+
+fun lost(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun filled[T](v: *vector.Vector[T], n: usize, x: T) err[Error] {
+    var i: usize = 0;
+    for (i < n) {
+        val pushed: res[usize, allocator.Error] = vector.push[T](v, x);
+        if (sel pushed.err) { ret lost(pushed.err); }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the width of an integer value, 0 for any other
+fun width_of(w: *Work, v: Value) u32 {
+    ret value.width(?w.m.types, w.b.values.data[v.index].type);
+}
+
+# take into `j` the operands the instructions just before it define, from
+# the last it pushes, moving the cursor back past each one taken
+fun take(w: *Work, l: *Locals, list: *vector.Vector[Instruction], j: Instruction, cursor: *i64) err[Error] {
+    val d: *InstructionData = ?w.b.instructions.data[j.index];
+    if (d.operands.len == 0) { ret err[Error].ok{}; }
+    var first: u32 = 0;
+    if (d.operands.len > 0)             { first = width_of(w, d.operands.data[0]); }
+    if (operand.rereads(w.m, d, first)) { ret err[Error].ok{}; }
+    var pushes: vector.Vector[usize] = vector.init[usize](w.a);
+    fin { vector.dnit[usize](?pushes); }
+    val ordered: res[bool, allocator.Error] = operand.order(w.m, w.b, d, ?pushes);
+    if (sel ordered.err) { ret lost(ordered.err); }
+    if (!ordered.ok)     { ret err[Error].ok{}; }
+    var k: usize = pushes.len;
+    for (k > 0 && @cursor >= 0) {
+        k = k - 1;
+        val v:   Value = d.operands.data[pushes.data[k]];
+        val def: Def   = w.b.values.data[v.index].def;
+        if (sel def.result) {
+            val i: Instruction = list.data[(@cursor)::usize];
+            if (def.result.instruction.index == i.index && def.result.index == 0 && w.b.instructions.data[i.index].results.len == 1 && w.b.values.data[v.index].uses.len == 1) {
+                l.stacked.data[v.index] = true;
+                @cursor                 = @cursor - 1;
+                val inner: err[Error] = take(w, l, list, i, cursor);
+                if (sel inner.err) { ret inner; }
+            }
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# the values of a block the stack holds
+fun stack_block(w: *Work, l: *Locals, k: usize) err[Error] {
+    val list: *vector.Vector[Instruction] = ?w.b.blocks.data[k].instructions;
+    var p:    i64                         = list.len::i64 - 1;
+    for (p >= 0) {
+        var cursor: i64        = p - 1;
+        val got:    err[Error] = take(w, l, list, list.data[p::usize], ?cursor);
+        if (sel got.err) { ret got; }
+        p = cursor;
+    }
+    ret err[Error].ok{};
+}
+
+fun widen(w: *Work, v: u32, at: u32) {
+    if (at < w.low.data[v])  { w.low.data[v] = at; }
+    if (at > w.high.data[v]) { w.high.data[v] = at; }
+}
+
+fun position_of(w: *Work, i: Instruction) u32 {
+    ret w.position.data[i.index];
+}
+
+# widen every value of a set, live in or out of block `k`, to the point `at`
+fun live_at(w: *Work, set: *vector.Vector[u64], words: u32, k: usize, at: u32) {
+    var word: u32 = 0;
+    for (word < words) {
+        var bits: u64 = set.data[k * words::usize + word::usize];
+        var bit:  u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                val v: u32 = word * 64 + bit;
+                if (v::usize < w.low.len) { widen(w, v, at); }
+            }
+            bits = bits >> 1;
+            bit  = bit + 1;
+        }
+        word = word + 1;
+    }
+}
+
+# where a function's values are held
+# ---
+# a:       the allocator the locals take
+# m:       the module
+# b:       the function's body
+# order:   its blocks in the order their code is laid out
+# live:    its liveness
+# params:  the value type of each of the function's params
+# pointer: the value type of an address
+# ret:     the locals, given back with `release`, or why there are none
+pub fun assign(a: *allocator.Allocator, m: *Module, b: *Body, order: *vector.Vector[u32], live: *Liveness, params: *vector.Vector[u32], pointer: u32) res[Locals, Error] {
+    var l:   Locals     = Locals{home: vector.init[u32](a), stacked: vector.init[bool](a), params: params.len::u32, types: vector.init[u32](a)};
+    val got: err[Error] = fill(a, m, b, order, live, pointer, ?l);
+    if (sel got.err) {
+        release(?l);
+        ret res[Locals, Error].err{got.err};
+    }
+    ret res[Locals, Error].ok{l};
+}
+
+fun fill(a: *allocator.Allocator, m: *Module, b: *Body, order: *vector.Vector[u32], live: *Liveness, pointer: u32, l: *Locals) err[Error] {
+    var w: Work = Work{a: a, m: m, b: b, pointer: pointer, order: vector.init[usize](a), position: vector.init[u32](a), start: vector.init[u32](a), end: vector.init[u32](a), low: vector.init[u32](a), high: vector.init[u32](a)};
+    fin {
+        vector.dnit[usize](?w.order);
+        vector.dnit[u32](?w.position);
+        vector.dnit[u32](?w.start);
+        vector.dnit[u32](?w.end);
+        vector.dnit[u32](?w.low);
+        vector.dnit[u32](?w.high);
+    }
+    val nv: usize      = b.values.len;
+    val e0: err[Error] = filled[u32](?l.home, nv, NONE);
+    if (sel e0.err) { ret e0; }
+    val e1: err[Error] = filled[bool](?l.stacked, nv, false);
+    if (sel e1.err) { ret e1; }
+    val e2: err[Error] = filled[u32](?w.position, b.instructions.len, 0);
+    if (sel e2.err) { ret e2; }
+    val e3: err[Error] = filled[u32](?w.start, b.blocks.len, 0);
+    if (sel e3.err) { ret e3; }
+    val e4: err[Error] = filled[u32](?w.end, b.blocks.len, 0);
+    if (sel e4.err) { ret e4; }
+    val e5: err[Error] = filled[u32](?w.low, nv, 0xFFFF_FFFF);
+    if (sel e5.err) { ret e5; }
+    val e6: err[Error] = filled[u32](?w.high, nv, 0);
+    if (sel e6.err) { ret e6; }
+
+    var pos: u32   = 0;
+    var i:   usize = 0;
+    for (i < order.len) {
+        val k: usize      = order.data[i]::usize;
+        val s: err[Error] = stack_block(?w, l, k);
+        if (sel s.err) { ret s; }
+        w.start.data[k] = pos;
+        pos             = pos + 1;
+        val list: *vector.Vector[Instruction] = ?b.blocks.data[k].instructions;
+        var j:    usize                       = 0;
+        for (j < list.len) {
+            w.position.data[list.data[j].index] = pos;
+            pos                                 = pos + 1;
+            j                                   = j + 1;
+        }
+        w.end.data[k] = pos - 1;
+        i             = i + 1;
+    }
+
+    # the entry's parameters are the function's params, by the operand each is placed at
+    if (b.blocks.len > 0) {
+        val entry:  *vector.Vector[Value] = ?b.blocks.data[0].parameters;
+        val placed: Entry                 = b.entry;
+        var j:      usize                 = 0;
+        for (j < entry.len) {
+            var k: u32 = j::u32;
+            if (sel placed.placed) {
+                if (j < placed.placed.len) { k = operand.at(placed.placed.data[j]); }
+            }
+            l.home.data[entry.data[j].index] = k;
+            j                                = j + 1;
+        }
+    }
+
+    # every value's range, from its definition, its uses and the blocks it is live through
+    i = 0;
+    for (i < order.len) {
+        val k:  usize      = order.data[i]::usize;
+        val bd: *BlockData = ?b.blocks.data[k];
+        var j:  usize      = 0;
+        for (j < bd.parameters.len) {
+            val v: u32 = bd.parameters.data[j].index;
+            widen(?w, v, w.start.data[k]);
+            var p: usize = 0;
+            for (p < bd.predecessors.len) {
+                widen(?w, v, position_of(?w, bd.predecessors.data[p]));
+                p = p + 1;
+            }
+            j = j + 1;
+        }
+        j = 0;
+        for (j < bd.instructions.len) {
+            val d:  *InstructionData = ?b.instructions.data[bd.instructions.data[j].index];
+            val at: u32              = position_of(?w, bd.instructions.data[j]);
+            var r:  usize            = 0;
+            for (r < d.results.len) {
+                widen(?w, d.results.data[r].index, at);
+                r = r + 1;
+            }
+            r = 0;
+            for (r < d.operands.len) {
+                widen(?w, d.operands.data[r].index, at);
+                r = r + 1;
+            }
+            r = 0;
+            for (r < d.edges.len) {
+                var x: usize = 0;
+                for (x < d.edges.data[r].arguments.len) {
+                    widen(?w, d.edges.data[r].arguments.data[x].index, at);
+                    x = x + 1;
+                }
+                r = r + 1;
+            }
+            j = j + 1;
+        }
+        live_at(?w, ?live.live_in, live.words, k, w.start.data[k]);
+        live_at(?w, ?live.live_out, live.words, k, w.end.data[k]);
+        i = i + 1;
+    }
+
+    var ranges: vector.Vector[Range] = vector.init[Range](a);
+    fin { vector.dnit[Range](?ranges); }
+    var v: usize = 0;
+    for (v < nv) {
+        if (wanted(b, l, v)) {
+            val code: opt[u32] = value.of(?m.types, b.values.data[v].type, pointer);
+            if (sel code.none) { ret err[Error].err{Error.unvalued{b.values.data[v].type}}; }
+            val pushed: res[usize, allocator.Error] = vector.push[Range](?ranges, Range{value: v::u32, code: code.some, low: w.low.data[v], high: w.high.data[v]});
+            if (sel pushed.err) { ret lost(pushed.err); }
+        }
+        v = v + 1;
+    }
+    sort.sort_by[Range](ranges.data, ranges.len, by_low);
+
+    # each range takes the first local of its type free before it starts
+    var free: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?free); }
+    var r: usize = 0;
+    for (r < ranges.len) {
+        val x:     *Range = ?ranges.data[r];
+        var taken: u32    = NONE;
+        var n:     usize  = 0;
+        for (n < l.types.len && taken == NONE) {
+            if (l.types.data[n] == x.code && free.data[n] < x.low) { taken = n::u32; }
+            n = n + 1;
+        }
+        if (taken == NONE) {
+            val made: res[u32, allocator.Error] = add(l, x.code);
+            if (sel made.err) { ret lost(made.err); }
+            val room: res[usize, allocator.Error] = vector.push[u32](?free, 0);
+            if (sel room.err) { ret lost(room.err); }
+            taken = (made.ok - l.params);
+        }
+        free.data[taken::usize]     = x.high;
+        l.home.data[x.value::usize] = l.params + taken;
+        r                           = r + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether a value needs a local of its own: it is read, is no constant, does
+# not stay on the stack and is no param of the function
+fun wanted(b: *Body, l: *Locals, v: usize) bool {
+    if (l.stacked.data[v] || l.home.data[v] != NONE) { ret false; }
+    if (b.values.data[v].uses.len == 0)              { ret false; }
+    val d: Def = b.values.data[v].def;
+    ret sel d.parameter || sel d.result;
+}
