@@ -42,6 +42,7 @@ use mirl.fold.algebra;
 use mirl.base.slice;
 use mirl.ir.constant.Address;
 use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.Binding;
 use mirl.ir.debug.Location;
 use mirl.ir.debug.Site;
 use mirl.ir.function.Body;
@@ -59,8 +60,13 @@ use ir: mirl.ir.opcode;
 use mirl.ir.opcode.row.Immediate;
 use ir_place: mirl.ir.place;
 use mirl.ir.place.Placed;
+use mirl.ir.point;
+use mirl.ir.point.Expression;
+use IrPoint: mirl.ir.point.Point;
+use mirl.ir.point.Reads;
 use types: mirl.ir.type;
 use mirl.ir.type.Type;
+use mirl.ir.value.Def;
 use mirl.ir.value.ValueData;
 use mirl.machine.alloc.live.Clobber;
 use mirl.machine.alloc.location;
@@ -86,6 +92,8 @@ use FrameSlot: mirl.machine.operand.Slot;
 use mirl.machine.operand.Symbol;
 use mirl.machine.operand.Tied;
 use mirl.machine.operand.Virtual;
+use mirl.machine.point.Point;
+use mirl.machine.point.Reading;
 use mirl.machine.pseudo;
 use mirl.machine.select.match;
 use mirl.machine.select.reach;
@@ -792,6 +800,9 @@ rec Move {
 # labels:    how many labels partner operands name so far
 # layout:    the target's data layout, which sizes slots
 # implied:   the implicit locations of the instruction being made
+# firsts:    per ir instruction, the first machine instruction made with it as
+#            the root of a rule, NONE for one made with none
+# stored:    the variables bound to the storage of a slot selection made
 rec State {
     s:         *Selector;
     m:         *Module;
@@ -818,9 +829,13 @@ rec State {
     pred:      vector.Vector[u32];
     ready:     vector.Vector[u32];
     todo:      vector.Vector[u32];
+    firsts:    vector.Vector[u32];
+    stored:    vector.Vector[Stored];
 }
 
 fun drop_state(st: *State) {
+    vector.dnit[u32](?st.firsts);
+    vector.dnit[Stored](?st.stored);
     vector.dnit[u32](?st.registers);
     vector.dnit[bool](?st.secret);
     vector.dnit[u32](?st.held);
@@ -1738,7 +1753,24 @@ fun slot_for(st: *State, root: id.Instruction) res[u32, Error] {
     if (sel size.err) { ret res[u32, Error].err{Error.layout{ty}}; }
     val got: res[FrameSlot, mf.Error] = mf.slot(st.out, mf.fixed_slot(size.ok, align));
     if (sel got.err) { ret res[u32, Error].err{Error.machine{got.err}}; }
+    val bound: res[Slice[Binding], module.Error] = module.bound(st.m, d.metadata.bindings);
+    if (sel bound.err) { ret res[u32, Error].err{Error.module{bound.err}}; }
+    var b: usize = 0;
+    for (b < bound.ok.size) {
+        val kept: res[usize, allocator.Error] = vector.push[Stored](?st.stored, Stored{binding: bound.ok.data[b], slot: got.ok});
+        if (sel kept.err) { ret res[u32, Error].err{Error.alloc{kept.err}}; }
+        b = b + 1;
+    }
     ret res[u32, Error].ok{got.ok.index};
+}
+
+# a variable bound to the storage a slot holds
+# ---
+# binding: the variable
+# slot:    the slot its storage is
+rec Stored {
+    binding: Binding;
+    slot:    FrameSlot;
 }
 
 # the module's function the target's general dynamic thread-local access calls
@@ -2233,6 +2265,8 @@ fun emit_block(st: *State, k: id.Block) err[Error] {
         var md: Metadata = d.metadata;
         md.flags.bounded = false;
         md.flags.checked = false;
+        val before: u32        = st.out.instructions.len::u32;
+        val root:   u32        = c.found.nodes[0].index;
         val routed: err[Error] = edges(st, b, c, md);
         if (sel routed.err) { ret routed; }
         val pieces: opt[Slice[Placed]] = places_of(d);
@@ -2244,6 +2278,74 @@ fun emit_block(st: *State, k: id.Block) err[Error] {
             val done: err[Error] = expand(st, b, r, ?c.found, NONE, md, decl);
             if (sel done.err) { ret done; }
         }
+        if (st.out.instructions.len::u32 > before && st.firsts.data[root] == NONE) { st.firsts.data[root] = before; }
+    }
+    ret err[Error].ok{};
+}
+
+# what a machine record reads for what an ir record reads: a constant itself,
+# the virtual register of any other value, or nothing for a value selection
+# gave no register, as one a rule folded into its user
+fun reading_of(st: *State, r: Reads) Reading {
+    if (!(sel r.operand)) { ret Reading.unavailable{}; }
+    val v: id.Value = r.operand.value;
+    val d: Def      = value(st, v).def;
+    if (sel d.constant)                                                           { ret Reading.constant{d.constant}; }
+    if (v.index::usize >= st.registers.len || st.registers.data[v.index] == NONE) { ret Reading.unavailable{}; }
+    ret Reading.register{Register.virtual{Virtual{index: st.registers.data[v.index]}}};
+}
+
+# each ir record a machine record before the first machine instruction made
+# for the ir instruction it stood before, or for the next one of its block
+# that made any, and none for the records no instruction after them made
+# anything for
+fun place_points(st: *State) err[Error] {
+    # a variable bound to its storage is in its slot at every point, from the first instruction of the entry on
+    if (st.blocks.len > 0 && st.blocks.data[0] != NONE) {
+        val entry: Slice[Instruction] = mf.instructions(st.out, Block{index: st.blocks.data[0]});
+        var s:     usize              = 0;
+        for (entry.size > 0 && s < st.stored.len) {
+            val held:   Stored                      = st.stored.data[s];
+            val made:   Point                       = Point{at: entry.data[0], binding: held.binding, piece: point.WHOLE, reads: Reading.slot{held.slot}, expression: point.PLAIN, from: Type{index: 0}};
+            val pushed: res[usize, allocator.Error] = vector.push[Point](?st.out.points, made);
+            if (sel pushed.err) { ret alloc_err(pushed.err); }
+            s = s + 1;
+        }
+    }
+    var k: usize = 0;
+    for (k < st.body.blocks.len) {
+        if (!st.body.blocks.data[k].erased) {
+            val list:    *vector.Vector[id.Instruction] = ?st.body.blocks.data[k].instructions;
+            var pending: usize                          = 0;
+            var p:       usize                          = 0;
+            for (p < list.len) {
+                val at: u32 = list.data[p].index;
+                if (st.firsts.data[at] != NONE) {
+                    var q: usize = pending;
+                    for (q <= p) {
+                        var r: u32 = st.body.instructions.data[list.data[q].index].points.first;
+                        for (r != 0) {
+                            val pt:   IrPoint    = st.body.points.data[r - 1];
+                            val read: Reads      = pt.reads;
+                            var e:    Expression = point.PLAIN;
+                            var from: Type       = Type{index: 0};
+                            if (sel read.operand) {
+                                e    = read.operand.expression;
+                                from = value(st, read.operand.value).type;
+                            }
+                            val made:   Point                       = Point{at: Instruction{index: st.firsts.data[at]}, binding: pt.binding, piece: pt.piece, reads: reading_of(st, read), expression: e, from: from};
+                            val pushed: res[usize, allocator.Error] = vector.push[Point](?st.out.points, made);
+                            if (sel pushed.err) { ret alloc_err(pushed.err); }
+                            r = pt.next;
+                        }
+                        q = q + 1;
+                    }
+                    pending = p + 1;
+                }
+                p = p + 1;
+            }
+        }
+        k = k + 1;
     }
     ret err[Error].ok{};
 }
@@ -2257,6 +2359,8 @@ fun run(st: *State) err[Error] {
     if (sel eaten.err) { ret eaten; }
     val read: err[Error] = grow(?st.shared, st.body.instructions.len, 0);
     if (sel read.err) { ret read; }
+    val first: err[Error] = grow(?st.firsts, st.body.instructions.len, NONE);
+    if (sel first.err) { ret first; }
     var k: usize = 0;
     for (k < st.body.blocks.len) {
         if (st.body.blocks.data[k].erased) {
@@ -2281,7 +2385,7 @@ fun run(st: *State) err[Error] {
         }
         k = k + 1;
     }
-    ret err[Error].ok{};
+    ret place_points(st);
 }
 
 # select an ir function into a new machine function
@@ -2323,6 +2427,8 @@ pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls) res[Sele
         pred:      vector.init[u32](s.a),
         ready:     vector.init[u32](s.a),
         todo:      vector.init[u32](s.a),
+        firsts:    vector.init[u32](s.a),
+        stored:    vector.init[Stored](s.a),
     };
     val ran: err[Error] = run(?st);
     drop_state(?st);
