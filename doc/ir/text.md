@@ -203,7 +203,7 @@ functions
   block       = label [ "(" param { "," param } ")" ] ":" newline { line } ;
   param       = local ":" [ "secret" ] type ;
   line        = newline | binding newline | instruction newline ;
-  binding     = "bind" dref ( "=" operand { "," step } | "unavailable" ) ;
+  binding     = "bind" dref [ "piece" number number ] ( "=" operand { "," step } | "unavailable" ) ;
   step        = word ( constant | type ) ;
   instruction = [ local { "," local } "=" ] ( operation | assembly ) ;
   operation   = word [ entry { "," entry } ] [ "loc" dref ] [ "site" dref ]
@@ -260,7 +260,9 @@ functions
   variable is the operand, read through each step in order. a step is a
   salvage step row's name, then a constant of the type it reads when the
   row takes one, or the type it gives otherwise: `add` and `sub` a
-  constant, `ext.u`, `ext.s` and `trunc` a type. `unavailable` gives the
+  constant, `ext.u`, `ext.s` and `trunc` a type. `piece` names the bits
+  the record gives, their offset from the variable's lowest bit and their
+  size, the whole variable when it is left out. `unavailable` gives the
   variable no value from the point on. a record stands just before the
   instruction line after it, or at its block's end when none follows, so
   the records after a block's label stand at its entry, and records print
