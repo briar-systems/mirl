@@ -83,7 +83,7 @@ Every step is one a DWARF location expression can state, so a producer encodes e
 
 ## Location kinds
 
-Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
+Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Where`, named apart from the IR's source location `mirl.ir.debug.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
 
 | kind | where the value is |
 |---|---|
