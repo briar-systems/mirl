@@ -46,6 +46,14 @@ The pass schedule is split by what it reads. A neutral row (`mirl.pass.Row`) run
 
 `mirl.target.declared(t)` says whether a target is complete. Every declaration has an unstated zero case, so a row left zeroed reads as incomplete and never as an answer. A list that may rightly be empty sits under a case of its own, so an empty list is a stated answer.
 
+## Sharing a target
+
+An assembled target is read-only from `mirl.target.assemble` until `mirl.target.release`, and compiling reads it alone. Nothing on the compile path writes through a `*Target`, which holds pointers into mink's static architecture and system catalogs, the declarations, data facts, convention rows, baseline and addresses that `assemble` fixes, and the storage `assemble` took. Every per-compile state lives in the `Build` that `compile_in` opens on its own stack for each call and closes on exit: the basis and masc's context, the resolved convention rows, mink's format registry and the family's own state. Beside it `compile_in` also builds the families' owners index per call and releases it on exit. So one target can be shared by concurrent compiles, each with its own module and allocator, and mirl holds no module-level `var` outside `#[testing]`.
+
+- a caller supplies per compile the module and an allocator that is the compile's own or safe to share,
+- `release` of a target happens only after every compile over it has returned,
+- a lazy cache, interned table or scratch buffer a later change needs goes in the `Build` or the family's `state`, never on `Target` and never in a module-level `var`.
+
 ## Capabilities
 
 The capability declarations are
