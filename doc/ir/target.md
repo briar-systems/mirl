@@ -62,6 +62,7 @@ The capability declarations are
 |---|---|
 | `registers` | values live in registers the pipeline allocates, in locals it assigns by live range, or nowhere it assigns |
 | `control` | control flow is free, or must be structured |
+| `tables` | a multi-way branch free control lowers is always a compare chain (`none`), or branches through a table where it is `dense`: at least `least` cases that fill at least `fill` percent of the values from the least to the greatest |
 | `addressing` | memory is addressed physically, or only by access chains (logical) |
 | `functions` | a function's address, the value `func.addr` gives, is a location as a data address is (`addresses`), or a slot of an indirect call table (`slots`), or code has none (`none`), as SPIR-V's logical addressing has no function pointers, so no `func.addr` stands and a call names its callee directly |
 | `values` | values are untyped, or carry their type into the output |
@@ -88,7 +89,9 @@ A vector splits to the widest unit the build meets that packs its lane type (`mi
 
 ### Multi-way branches
 
-The `compare chain` legalisation (`mirl.legal.CHAIN`) applies where `control` is `free` and lowers a `switch` to a test of each case in its order, an `eq` of the selector and the case and a `cbr` to the case's target or on to the next test, a block of its own, with the last test going on to the first target. A `switch` with no case is a `br`. A structured target keeps the branch whole for its own multi-way form, SPIR-V's `OpSwitch` and WebAssembly's `br_table`. The chain branches only on the selector the branch already branched on, so it keeps constant time. A jump table for a dense case list is not built yet.
+The `compare chain` legalisation (`mirl.legal.CHAIN`) applies where `control` is `free` and lowers a `switch` to a test of each case in its order, an `eq` of the selector and the case and a `cbr` to the case's target or on to the next test, a block of its own, with the last test going on to the first target. A `switch` with no case is a `br`. A structured target keeps the branch whole for its own multi-way form, SPIR-V's `OpSwitch` and WebAssembly's `br_table`. The chain branches only on the selector the branch already branched on, so it keeps constant time.
+
+Where the target's `tables` are `dense` and admit the case list, the switch stays a `switch`, indexed: its selector is the distance from its least case (a `sub`, left out when that case is 0), read unsigned at the register's width (an `ext.u` of a narrower one), and its cases are every value from 0 to its span, each to the target of the case it stands for or to the first target where none does. A selector wider than the register is tested against the span at its own width first, and one outside it becomes the span, which is no case, through a `select` of the `trunc`. A span that does not fit the register's width less one is a chain. An indexed switch is left as it is, so the pass changes nothing the second time. The density is the target's data and the pass reads nothing else of it: RISC-V states four cases filling two fifths of their span, and x86-64 and AArch64 state `none`, since their tables select no `switch` yet. The selection branches through a table of the indexed switch's targets after its first (see [selection](../machine/select.md)).
 
 ### Float operations a format lacks
 
