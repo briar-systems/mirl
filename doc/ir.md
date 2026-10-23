@@ -299,6 +299,8 @@ The check asks masc through `mirl.ct`. The machine form's question of an instruc
 - A set whose timing is not guaranteed, as wasm, compiles the code with masc's one warning (`masc.core.ct.UNGUARANTEED`), which states no guarantee. Its walk still refuses a secret that decides a branch or forms an address. The walk reads wasm code under a context whose stream is entered into the function the code is the body of, and code it cannot follow compiles with the warning as not verified, its discipline kept by mirl's own passes.
 - A set that classifies no timing, as SPIR-V, refuses the requirement with masc's one refusal record and wording.
 
+Both of masc's questions are asked under the build's context with the timing modes the guarantee assumes set, in one place, `mirl.ct.assumed` (mach#3872, "The guarantee"): `dit=on` on AArch64, where std sets PSTATE.DIT wherever the CPU has it, and `doitm=on` on x86-64, the data operand independent timing mode. On x86-64 only the operating system sets DOITM, and an AArch64 CPU without FEAT_DIT has no DIT, so on a system that does not set the mode the code still runs, without the guarantee the mode gives.
+
 Every function that requires constant time is checked at four sites, and every site reports the one record `mirl.ct.Refused`: masc's refusal (`masc.core.ct.Refusal`, worded once by masc), the function, and where in its code it stands.
 
 - A pass that cannot keep the requirement refuses with `Why.timing`, which carries masc's record, as the helpers legalisation refuses a copy or fill whose length is secret.
