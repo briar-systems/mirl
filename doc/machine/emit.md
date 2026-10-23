@@ -81,6 +81,7 @@ The object is refused as `Error.unmapped` when masc finishes it with a relocatio
 - The variables of an inlined body are scoped at the subprogram, not the inlined subroutine.
 - A record standing at an instruction a stage dropped moves to the instruction that follows.
 - Default section names mirror a mink fact, deleted by #222 (blocked by mink#214).
-- The listing is refused, as `Error.listing`, for an object masc cannot state as source: one with line facts, a first section that is not `.text`, or a format with no assembly dialect (COFF, Mach-O). The round trip therefore covers the ELF targets only.
+- The listing is refused, as `Error.listing`, for an object masc cannot state as source. A COFF object's frames have no call frame directive the listing writes, and a Mach-O object holds labels as no symbol, whose names the assembler would make symbols. The round trip therefore covers the ELF targets only.
+- x86_64 listings refuse a rel32 branch to a block label and a rip-relative symbol with its pc32 kind, neither of which masc reads back, until a masc fix.
 - The start stubs cannot make the exit syscall, since the IR has no inline assembly (#44). They call `__mirl_exit`, which the example lane links from `test/example/exit.s`, or `exit-<arch>.s` for an architecture that has one, assembled by masc.
 - `mirl emit` writes to standard output only, the object's bytes included.
