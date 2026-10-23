@@ -1,0 +1,279 @@
+# inline assembly blocks in the machine form
+#
+# selection hands masc the text and operands of an ir block under the context
+# the build encodes under, and keeps what masc parsed as one `Inline`, which
+# the machine instruction standing for the block names as its opcode, as an
+# instruction names its row. the instruction has one operand per operand of
+# the block, in order: a virtual register of the constraint's class for a
+# register the block reads or writes, tied for one it reads and writes, an
+# address whose base holds the bound address for memory, and an immediate for
+# a constant. what the block itself reads and writes of the register file,
+# each name's operand left out, is masc's footprint of it, answered once here,
+# which selection states as the instruction's implicit locations, so liveness
+# keeps no value in a register the block writes across it and the frame saves
+# a preserved register it writes. a footprint masc leaves undecided, as a data
+# directive that declares nothing it writes, is taken as writing every register
+# the build's view admits but the stack pointer and a zero register. after
+# allocation, the handover hands masc the block with each operand's location,
+# and masc encodes it at the builder's cursor.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use ia: mirl.ir.assembly;
+
+use masc.core.diagnostic;
+use masc.core.effect;
+use masc.core.footprint;
+use rf:   masc.core.register;
+use mset: masc.core.set;
+use masc.core.state;
+use masc.inline.inline;
+
+# one block masc parsed
+# ---
+# block:    masc's reading of it, which `encode` writes after allocation
+# operands: its operands as masc was given them, one per operand of the
+#           instruction, their names left out
+# reads:    the registers the block itself reads
+# writes:   the registers the block itself writes or leaves unspecified
+# stack:    what the block does to the stack pointer
+# transfer: how the block transfers control, none or a call
+pub rec Inline {
+    block:    inline.Block;
+    operands: Slice[inline.Operand];
+    reads:    Slice[rf.Id];
+    writes:   Slice[rf.Id];
+    stack:    effect.Stack;
+    transfer: effect.Transfer;
+}
+
+# the blocks one selector parsed, each held until the selector is given back,
+# since every form of a function after selection names them
+# ---
+# a:    the allocator each is taken from
+# held: each block, at an address of its own
+pub rec Inlines {
+    a:    *allocator.Allocator;
+    held: vector.Vector[*Inline];
+}
+
+# why a block was refused
+# ---
+# alloc:    the allocator refused storage
+# parsed:   masc refused the text, with its first diagnostic's wording
+# leaves:   the block transfers control out of itself other than by a call
+# operands: the block binds more operands than one block may
+# class:    the operand at this position binds a value the selection holds in
+#           another class than its constraint's
+# symbolic: the immediate at this position binds an address, which the machine
+#           form carries no relocation kind for yet
+pub tag Refusal: u8 {
+    alloc:  allocator.Error;
+    parsed: str;
+    leaves;
+    operands;
+    class:    u32;
+    symbolic: u32;
+}
+
+pub fun init(a: *allocator.Allocator) Inlines {
+    ret Inlines{a: a, held: vector.init[*Inline](a)};
+}
+
+fun release_one(a: *allocator.Allocator, x: *Inline) {
+    inline.release(?x.block);
+    if (x.operands.size > 0) { allocator.deallocate[inline.Operand](a, x.operands.data, x.operands.size); }
+    if (x.reads.size > 0)    { allocator.deallocate[rf.Id](a, x.reads.data, x.reads.size); }
+    if (x.writes.size > 0)   { allocator.deallocate[rf.Id](a, x.writes.data, x.writes.size); }
+    allocator.deallocate[Inline](a, x, 1);
+}
+
+# give back every block held
+pub fun release(x: *Inlines) {
+    var i: usize = 0;
+    for (i < x.held.len) {
+        release_one(x.a, x.held.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[*Inline](?x.held);
+}
+
+# the rows of `set` of the file `fp` is over, as register identities
+fun listed(a: *allocator.Allocator, file: *rf.File, words: *u64, n: usize) res[Slice[rf.Id], allocator.Error] {
+    var count: usize = 0;
+    var r:     u32   = 0;
+    for (r < file.register_count) {
+        if (r::usize / 64 < n && ((words[r / 64] >> (r % 64)::u64) & 1) != 0) { count = count + 1; }
+        r = r + 1;
+    }
+    if (count == 0) { ret res[Slice[rf.Id], allocator.Error].ok{Slice[rf.Id]{data: nil, size: 0}}; }
+    val got: res[*rf.Id, allocator.Error] = allocator.allocate[rf.Id](a, count);
+    if (sel got.err) { ret res[Slice[rf.Id], allocator.Error].err{got.err}; }
+    var at: usize = 0;
+    r = 0;
+    for (r < file.register_count) {
+        if (r::usize / 64 < n && ((words[r / 64] >> (r % 64)::u64) & 1) != 0) {
+            got.ok[at] = rf.id_of(?file.registers[r]);
+            at         = at + 1;
+        }
+        r = r + 1;
+    }
+    ret res[Slice[rf.Id], allocator.Error].ok{Slice[rf.Id]{data: got.ok, size: count}};
+}
+
+# every register the view admits but the stack pointer and a zero register,
+# which a block whose footprint masc leaves undecided is taken to write
+fun everything(a: *allocator.Allocator, ctx: *state.Context, file: *rf.File) res[Slice[rf.Id], allocator.Error] {
+    var count: usize = 0;
+    var r:     u32   = 0;
+    for (r < file.register_count) {
+        if (clobbered(ctx, ?file.registers[r])) { count = count + 1; }
+        r = r + 1;
+    }
+    if (count == 0) { ret res[Slice[rf.Id], allocator.Error].ok{Slice[rf.Id]{data: nil, size: 0}}; }
+    val got: res[*rf.Id, allocator.Error] = allocator.allocate[rf.Id](a, count);
+    if (sel got.err) { ret res[Slice[rf.Id], allocator.Error].err{got.err}; }
+    var at: usize = 0;
+    r = 0;
+    for (r < file.register_count) {
+        if (clobbered(ctx, ?file.registers[r])) {
+            got.ok[at] = rf.id_of(?file.registers[r]);
+            at         = at + 1;
+        }
+        r = r + 1;
+    }
+    ret res[Slice[rf.Id], allocator.Error].ok{Slice[rf.Id]{data: got.ok, size: count}};
+}
+
+fun clobbered(ctx: *state.Context, reg: *rf.Register) bool {
+    if ((reg.flags & (rf.STACK | rf.ZERO)) != 0) { ret false; }
+    val held: err[rf.Absent] = rf.admitted(ctx.view, rf.id_of(reg));
+    ret sel held.ok;
+}
+
+# the operands masc reads a block with, each name copied with a nul after it
+# into `names`, which the caller gives back once masc has copied them
+fun operands_of(a: *allocator.Allocator, given: Slice[ia.Operand], names: *Slice[u8]) res[Slice[inline.Operand], allocator.Error] {
+    var total: usize = 0;
+    var k:     usize = 0;
+    for (k < given.size) {
+        total = total + given.data[k].name.len + 1;
+        k     = k + 1;
+    }
+    @names = Slice[u8]{data: nil, size: 0};
+    if (given.size == 0) { ret res[Slice[inline.Operand], allocator.Error].ok{Slice[inline.Operand]{data: nil, size: 0}}; }
+    val bytes: res[*u8, allocator.Error] = allocator.allocate[u8](a, total);
+    if (sel bytes.err) { ret res[Slice[inline.Operand], allocator.Error].err{bytes.err}; }
+    val rows: res[*inline.Operand, allocator.Error] = allocator.allocate[inline.Operand](a, given.size);
+    if (sel rows.err) {
+        allocator.deallocate[u8](a, bytes.ok, total);
+        ret res[Slice[inline.Operand], allocator.Error].err{rows.err};
+    }
+    var at: usize = 0;
+    k = 0;
+    for (k < given.size) {
+        val name: View  = given.data[k].name;
+        var i:    usize = 0;
+        for (i < name.len) {
+            bytes.ok[at + i] = name.data[i];
+            i                = i + 1;
+        }
+        bytes.ok[at + name.len] = 0;
+        rows.ok[k]              = inline.Operand{name: ?bytes.ok[at], constraint: given.data[k].constraint, role: given.data[k].role};
+        at                      = at + name.len + 1;
+        k                       = k + 1;
+    }
+    @names = Slice[u8]{data: bytes.ok, size: total};
+    ret res[Slice[inline.Operand], allocator.Error].ok{Slice[inline.Operand]{data: rows.ok, size: given.size}};
+}
+
+# what masc answers of a parsed block's footprint, written into `x`
+fun footprinted(a: *allocator.Allocator, ctx: *state.Context, file: *rf.File, x: *Inline) err[Refusal] {
+    val made: res[footprint.Footprint, allocator.Error] = footprint.make(a, file);
+    if (sel made.err) { ret err[Refusal].err{Refusal.alloc{made.err}}; }
+    var fp: footprint.Footprint = made.ok;
+    fin { footprint.release(?fp); }
+    val got: res[effect.Answer[*footprint.Footprint], allocator.Error] = inline.effects(?x.block, ?fp);
+    if (sel got.err) { ret err[Refusal].err{Refusal.alloc{got.err}}; }
+    val answer: effect.Answer[*footprint.Footprint] = got.ok;
+    if (sel answer.undecided) {
+        val all: res[Slice[rf.Id], allocator.Error] = everything(a, ctx, file);
+        if (sel all.err) { ret err[Refusal].err{Refusal.alloc{all.err}}; }
+        x.writes = all.ok;
+        ret err[Refusal].ok{};
+    }
+    val found: *footprint.Footprint = answer.decided;
+    val c:     effect.Control       = found.control;
+    if (c.transfer != effect.NONE && c.transfer != effect.MERGE && c.transfer != effect.CALL) { ret err[Refusal].err{Refusal.leaves{}}; }
+    x.transfer = c.transfer;
+    x.stack    = found.stack;
+    var w: usize = 0;
+    for (w < found.written.len) {
+        found.written.data[w] = found.written.data[w] | found.clobbers.data[w];
+        w                     = w + 1;
+    }
+    val reads: res[Slice[rf.Id], allocator.Error] = listed(a, file, found.reads.data, found.reads.len);
+    if (sel reads.err) { ret err[Refusal].err{Refusal.alloc{reads.err}}; }
+    x.reads = reads.ok;
+    val writes: res[Slice[rf.Id], allocator.Error] = listed(a, file, found.written.data, found.written.len);
+    if (sel writes.err) { ret err[Refusal].err{Refusal.alloc{writes.err}}; }
+    x.writes = writes.ok;
+    ret err[Refusal].ok{};
+}
+
+# a block masc reads in `s` under `ctx`, held by `x`
+# ---
+# x:   where the block is held
+# b:   the ir block, its text and operands
+# s:   the target's instruction set
+# ctx: the context the build encodes under
+# ret: the block with what its footprint answers, or why masc refused it
+pub fun parse(x: *Inlines, b: *ia.Assembly, s: *mset.Set, ctx: *state.Context) res[*Inline, Refusal] {
+    if (s.codec == nil || s.codec.registers == nil) { ret res[*Inline, Refusal].err{Refusal.parsed{inline.UNAVAILABLE}}; }
+    if (b.operands.size > ia.MOST_OPERANDS::usize)  { ret res[*Inline, Refusal].err{Refusal.operands{}}; }
+    val a:     *allocator.Allocator                        = x.a;
+    var names: Slice[u8]                                   = Slice[u8]{data: nil, size: 0};
+    val ops:   res[Slice[inline.Operand], allocator.Error] = operands_of(a, b.operands, ?names);
+    if (sel ops.err) { ret res[*Inline, Refusal].err{Refusal.alloc{ops.err}}; }
+    val read: res[inline.Block, inline.Diagnostics] = inline.parse(a, b.text, diagnostic.START, s, ctx, inline.Operands{at: ops.ok.data, len: ops.ok.size::u32});
+    var k:    usize                                 = 0;
+    for (k < ops.ok.size) {
+        ops.ok.data[k].name = nil;
+        k                   = k + 1;
+    }
+    if (names.size > 0) { allocator.deallocate[u8](a, names.data, names.size); }
+    if (sel read.err) {
+        var why: str = inline.UNAVAILABLE;
+        if (read.err.len > 0) { why = read.err.at[0].message; }
+        inline.release_diagnostics(a, read.err);
+        if (ops.ok.size > 0) { allocator.deallocate[inline.Operand](a, ops.ok.data, ops.ok.size); }
+        ret res[*Inline, Refusal].err{Refusal.parsed{why}};
+    }
+    val held: res[*Inline, allocator.Error] = allocator.allocate[Inline](a, 1);
+    if (sel held.err) {
+        var blk: inline.Block = read.ok;
+        inline.release(?blk);
+        if (ops.ok.size > 0) { allocator.deallocate[inline.Operand](a, ops.ok.data, ops.ok.size); }
+        ret res[*Inline, Refusal].err{Refusal.alloc{held.err}};
+    }
+    val one: *Inline = held.ok;
+    @one = Inline{block: read.ok, operands: ops.ok, reads: Slice[rf.Id]{data: nil, size: 0}, writes: Slice[rf.Id]{data: nil, size: 0}, stack: effect.Stack.none{}, transfer: effect.NONE};
+    val kept: res[usize, allocator.Error] = vector.push[*Inline](?x.held, one);
+    if (sel kept.err) {
+        release_one(a, one);
+        ret res[*Inline, Refusal].err{Refusal.alloc{kept.err}};
+    }
+    val answered: err[Refusal] = footprinted(a, ctx, s.codec.registers, one);
+    if (sel answered.err) { ret res[*Inline, Refusal].err{answered.err}; }
+    ret res[*Inline, Refusal].ok{one};
+}

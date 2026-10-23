@@ -40,6 +40,7 @@ use mirl.base.fail.keep;
 use mirl.fold.algebra;
 
 use mirl.base.slice;
+use ia: mirl.ir.assembly;
 use mirl.ir.constant.Address;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.debug.Binding;
@@ -78,7 +79,8 @@ use mf: mirl.machine.function;
 use mirl.machine.function.Area;
 use mirl.machine.function.Argued;
 use mirl.machine.function.SlotData;
-use mi: mirl.machine.instruction;
+use minline: mirl.machine.inline;
+use mi:      mirl.machine.instruction;
 use mirl.machine.instruction.Implicit;
 use mirl.machine.isa.Isa;
 use lrow:  mirl.machine.loop.row;
@@ -125,6 +127,7 @@ use rf:         masc.core.register;
 use rows:       masc.core.row;
 use mset:       masc.core.set;
 use core_state: masc.core.state;
+use masc.inline.inline;
 
 val NONE: u32 = 0xffffffff;
 
@@ -235,6 +238,8 @@ pub rec Unmatched {
 # unchecked: a division without the checked mark on a target whose division
 #            gives a result for a trap its opcode row states, so no test
 #            stands before it
+# assembly:  an inline assembly item whose block masc refused, or whose
+#            operands the machine form does not bind
 pub tag Error: u8 {
     alloc:     allocator.Error;
     module:    module.Error;
@@ -256,6 +261,16 @@ pub tag Error: u8 {
     unplaced:  id.Function;
     undecided: mi.Undecided;
     unchecked: id.Instruction;
+    assembly:  Assembled;
+}
+
+# an inline assembly item selection refused
+# ---
+# instruction: the ir instruction
+# refusal:     why its block was refused
+pub rec Assembled {
+    instruction: id.Instruction;
+    refusal:     minline.Refusal;
 }
 
 # what call lowering states to the register allocator
@@ -307,6 +322,9 @@ pub fun release(x: *Selected) err[allocator.Error] {
 # order:      the rules' indices grouped by opcode, each group by cost, the
 #             least first, and rules of one cost in table order
 # constants:  the constant rules' indices in the same order
+# inlines:    the inline assembly blocks every selection parsed, which every
+#             form of a function after selection names, held until the
+#             selector is given back
 pub rec Selector {
     a:          *allocator.Allocator;
     isa:        *Isa;
@@ -316,6 +334,7 @@ pub rec Selector {
     first:      Slice[u32];
     order:      Slice[u32];
     constants:  Slice[u32];
+    inlines:    minline.Inlines;
 }
 
 # sort rule indices by their rules' cost, keeping indices of one cost in the
@@ -742,6 +761,7 @@ pub fun init(a: *allocator.Allocator, isa: *Isa, target: *Target, context: *core
         first:      Slice[u32]{data: first, size: count::usize + 1},
         order:      Slice[u32]{data: order, size: size},
         constants:  Slice[u32]{data: constants, size: many},
+        inlines:    minline.init(a),
     }};
 }
 
@@ -751,6 +771,7 @@ pub fun dnit(s: *Selector) err[allocator.Error] {
     keep(?failed, slice.release[u32](s.a, s.first));
     keep(?failed, slice.release[u32](s.a, s.order));
     keep(?failed, slice.release[u32](s.a, s.constants));
+    minline.release(?s.inlines);
     ret failed;
 }
 
@@ -2228,7 +2249,14 @@ fun choose_block(st: *State, k: id.Block) err[Error] {
         i = i - 1;
         val at: id.Instruction = list.data[i];
         if (st.shared.data[at.index] != 0 && read_by_matches(st, at)) { st.consumed.data[at.index] = true; }
-        if (!st.consumed.data[at.index]) {
+        if (instruction(st, at).opcode.index == ir.ASM.index) {
+            var held: Choice = Choice{rule: NONE, found: unmatched_match(st), consumes: 0};
+            held.found.nodes[0] = at;
+            held.found.count    = 1;
+            val p: res[usize, allocator.Error] = vector.push[Choice](?st.choices, held);
+            if (sel p.err) { ret alloc_err(p.err); }
+        }
+        or (!st.consumed.data[at.index]) {
             val got: res[Choice, Error] = choose(st, at);
             if (sel got.err) { ret err[Error].err{got.err}; }
             var c:     Choice     = got.ok;
@@ -2247,6 +2275,141 @@ fun choose_block(st: *State, k: id.Block) err[Error] {
     ret err[Error].ok{};
 }
 
+# a match of no rule over the function, which an inline assembly item's choice holds
+fun unmatched_match(st: *State) Match {
+    var mt: Match;
+    mt.module   = st.m;
+    mt.body     = st.body;
+    mt.function = st.f;
+    mt.target   = st.s.target;
+    mt.count    = 0;
+    mt.swapped  = 0;
+    ret mt;
+}
+
+fun assembled(at: id.Instruction, why: minline.Refusal) err[Error] {
+    ret err[Error].err{Error.assembly{Assembled{instruction: at, refusal: why}}};
+}
+
+# the virtual register value `v` is read in at instruction `user`, a constant
+# materialised into one of its own first
+fun value_register(st: *State, b: u32, v: id.Value, user: id.Instruction, md: Metadata) res[u32, Error] {
+    val d: *ValueData = value(st, v);
+    if (!(sel d.def.constant)) { ret register(st, v); }
+    val t: res[u32, Error] = virtual(st, d.type, false);
+    if (sel t.err) { ret t; }
+    val built: err[Error] = materialise(st, b, v, t.ok, user, md);
+    if (sel built.err) { ret res[u32, Error].err{built.err}; }
+    ret t;
+}
+
+# whether virtual register `r` is of class `class` of the set's register file
+fun of_class(st: *State, r: u32, class: u16) bool {
+    val k: Class = mf.class_of(st.out, Virtual{index: r});
+    if (!(sel k.hardware)) { ret false; }
+    ret k.hardware.file == mf.file(st.out) && k.hardware.index == class;
+}
+
+# the immediate constant `v` binds under constraint `c`, its bits extended
+# as the constraint reads them
+fun bound_immediate(st: *State, v: id.Value, c: inline.Immediate) res[opt[i64], Error] {
+    var mt:  Match                        = unmatched_match(st);
+    val got: res[opt[i64], match.Refusal] = match.bits(?mt, v);
+    if (sel got.err)     { ret res[opt[i64], Error].err{refused(got.err)}; }
+    if (sel got.ok.none) { ret res[opt[i64], Error].ok{got.ok}; }
+    var x: i64 = got.ok.some;
+    if (!c.signed && x < 0) {
+        val s: res[types.Shape, types.Error] = types.shape(?st.m.types, value(st, v).type);
+        if (sel s.err) { ret res[opt[i64], Error].err{Error.types{s.err}}; }
+        if (sel s.ok.integer) {
+            val w: u32 = s.ok.integer.width;
+            if (w < 64) { x = (x:~u64 & ((1::u64 << w::u64) - 1)):~i64; }
+        }
+    }
+    ret res[opt[i64], Error].ok{opt[i64].some{x}};
+}
+
+# an inline assembly item emitted into block `b` as one instruction of the
+# block masc parsed: each operand of the block at a virtual register of its
+# class, tied where it reads and writes one, an address based in the
+# register its pointer is in, or the constant it binds, and what the block
+# itself reads and writes as the instruction's implicit locations. a block
+# that calls leaves undefined what the default convention row's callee does
+fun assemble(st: *State, b: u32, at: id.Instruction, md: Metadata) err[Error] {
+    val d: *InstructionData = instruction(st, at);
+    if (d.immediates.len == 0) { ret err[Error].err{defect(NONE, false, UNKNOWN_NODE)}; }
+    val imm: Immediate = d.immediates.data[0];
+    if (!(sel imm.assembly)) { ret err[Error].err{defect(NONE, false, UNKNOWN_NODE)}; }
+    val blk: *ia.Assembly = imm.assembly;
+    if (st.s.context == nil) { ret assembled(at, minline.Refusal.parsed{inline.UNAVAILABLE}); }
+    val parsed: res[*minline.Inline, minline.Refusal] = minline.parse(?st.s.inlines, blk, st.s.isa.set, st.s.context);
+    if (sel parsed.err) { ret assembled(at, parsed.err); }
+    val x:   *minline.Inline = parsed.ok;
+    val n:   usize           = blk.operands.size;
+    var ops: [ia.MOST_OPERANDS]Operand;
+    var arg: usize           = 0;
+    var out: usize           = 0;
+    var k:   usize           = 0;
+    for (k < n) {
+        val o: *ia.Operand       = ?blk.operands.data[k];
+        val c: inline.Constraint = o.constraint;
+        if (sel c.class) {
+            var source: u32 = NONE;
+            var dest:   u32 = NONE;
+            if ((o.role & mo.READ) != 0) {
+                val r: res[u32, Error] = value_register(st, b, d.operands.data[arg], at, md);
+                if (sel r.err) { ret err[Error].err{r.err}; }
+                source = r.ok;
+                arg    = arg + 1;
+                if (!of_class(st, source, c.class)) { ret assembled(at, minline.Refusal.class{k::u32}); }
+            }
+            if ((o.role & mo.WRITE) != 0) {
+                val r: res[u32, Error] = register(st, d.results.data[out]);
+                if (sel r.err) { ret err[Error].err{r.err}; }
+                dest = r.ok;
+                out  = out + 1;
+                if (!of_class(st, dest, c.class)) { ret assembled(at, minline.Refusal.class{k::u32}); }
+            }
+            if (source != NONE && dest != NONE) { ops[k] = Operand.tied{Tied{dest: Register.virtual{Virtual{index: dest}}, source: Register.virtual{Virtual{index: source}}}}; }
+            or (source != NONE)                 { ops[k] = Operand.virtual{Virtual{index: source}}; }
+            or                                  { ops[k] = Operand.virtual{Virtual{index: dest}}; }
+        }
+        or (sel c.memory) {
+            val r: res[u32, Error] = value_register(st, b, d.operands.data[arg], at, md);
+            if (sel r.err) { ret err[Error].err{r.err}; }
+            arg    = arg + 1;
+            ops[k] = Operand.address{Built{base: opt[Register].some{Register.virtual{Virtual{index: r.ok}}}, index: opt[Register].none{}, segment: opt[Register].none{}, scale: 0, disp: 0, symbol: opt[Symbol].none{}, mode: mo.OFFSET, extend: 0, broadcast: 0}};
+        }
+        or {
+            val got: res[opt[i64], Error] = bound_immediate(st, d.operands.data[arg], c.immediate);
+            if (sel got.err)     { ret err[Error].err{got.err}; }
+            if (sel got.ok.none) { ret assembled(at, minline.Refusal.symbolic{k::u32}); }
+            arg    = arg + 1;
+            ops[k] = Operand.immediate{got.ok.some};
+        }
+        k = k + 1;
+    }
+    vector.clear[Implicit](?st.implied);
+    var j: usize = 0;
+    for (j < x.reads.size) {
+        val noted: err[Error] = note(st, Physical.register{x.reads.data[j]}, false);
+        if (sel noted.err) { ret noted; }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < x.writes.size) {
+        val noted: err[Error] = note(st, Physical.register{x.writes.data[j]}, true);
+        if (sel noted.err) { ret noted; }
+        j = j + 1;
+    }
+    var clobbered: Slice[rf.Id] = Slice[rf.Id]{data: nil, size: 0};
+    if (x.transfer == effect.CALL && st.calls.rows.size != 0 && st.s.convention != nil) { clobbered = st.s.convention.clobbered; }
+    val made_at: res[Instruction, Error] = made(st, b, mi.Opcode.inline{x}, ?ops[0], n::u32, md, false, vstate.NONE, clobbered);
+    if (sel made_at.err)     { ret err[Error].err{made_at.err}; }
+    if (st.implied.len == 0) { ret err[Error].ok{}; }
+    ret imply(st, made_at.ok);
+}
+
 # emit the chosen expansions of an ir block in order
 fun emit_block(st: *State, k: id.Block) err[Error] {
     val b: u32 = st.blocks.data[k.index];
@@ -2259,14 +2422,20 @@ fun emit_block(st: *State, k: id.Block) err[Error] {
         i = i - 1;
         val c:    *Choice          = ?st.choices.data[i];
         val d:    *InstructionData = instruction(st, c.found.nodes[0]);
-        val r:    *Rule            = ?st.s.isa.table.rules.at[c.rule];
         val decl: bool             = declassifies(d.opcode);
         # the count-bounded and checked marks are read by the guards and are not carried to the machine form
         var md: Metadata = d.metadata;
         md.flags.bounded = false;
         md.flags.checked = false;
-        val before: u32        = st.out.instructions.len::u32;
-        val root:   u32        = c.found.nodes[0].index;
+        val before: u32 = st.out.instructions.len::u32;
+        val root:   u32 = c.found.nodes[0].index;
+        if (c.rule == NONE) {
+            val done: err[Error] = assemble(st, b, c.found.nodes[0], md);
+            if (sel done.err)                                                          { ret done; }
+            if (st.out.instructions.len::u32 > before && st.firsts.data[root] == NONE) { st.firsts.data[root] = before; }
+            cnt;
+        }
+        val r:      *Rule      = ?st.s.isa.table.rules.at[c.rule];
         val routed: err[Error] = edges(st, b, c, md);
         if (sel routed.err) { ret routed; }
         val pieces: opt[Slice[Placed]] = places_of(d);
