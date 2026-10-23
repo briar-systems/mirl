@@ -24,6 +24,13 @@
 # the set's spans state. alignment and fill come from the target's code
 # declaration.
 #
+# a jump table is laid out after its function, in the read-only section of
+# the kind a constant holding addresses is placed in under the target's
+# relocation model, at its entries' alignment: its label, which the jump's
+# address names as a partner, then one absolute datum of the pointer's width
+# per block it names, the block's label. the table emits nothing in the code,
+# whose last instruction is the jump through it.
+#
 # an inline assembly block is handed to masc whole, each of its operands at
 # the location allocation gave it, and masc encodes it at the builder's
 # cursor as the assembler encodes the same text.
@@ -121,6 +128,7 @@ use mirl.machine.operand.Block;
 use mirl.machine.operand.Instruction;
 use mirl.machine.operand.Operand;
 use mirl.machine.operand.Register;
+use mirl.machine.pseudo;
 use mirl.machine.range.Range;
 use mirl.machine.range.Ranges;
 use mirl.target.abi.call;
@@ -169,6 +177,8 @@ pub rec Unit {
 # label:     a label two instructions hold, or inside a sequence, or a partner naming a label no instruction holds
 # span:      a relocation covering more instructions than the block has after it
 # fact:      a call frame fact at an instruction layout left in no block
+# table:     a jump table on a target that states no address model or no
+#            pointer, so neither its section nor its entries' width is stated
 pub tag Reason: u8 {
     pseudo;
     unplaced;
@@ -179,6 +189,7 @@ pub tag Reason: u8 {
     label;
     span;
     fact;
+    table;
 }
 
 # where and why an instruction was refused
@@ -375,6 +386,7 @@ rec Mark {
 # run:    the label the current run of inlined code began at
 # at:     the source location last stated, none for none
 # spoke:  whether a location was stated for the unit yet
+# tables: the jump tables of the unit, laid out after its code
 rec Body {
     e:      *Emitter;
     u:      Unit;
@@ -389,6 +401,7 @@ rec Body {
     run:    build.Label;
     at:     opt[ir_debug.Location];
     spoke:  bool;
+    tables: vector.Vector[Instruction];
 }
 
 val NONE: u32 = 0xffffffff;
@@ -979,6 +992,66 @@ fun end_block(b: *Body, at: Block) err[Error] {
     ret err[Error].ok{};
 }
 
+# whether an instruction is a jump table
+fun tabled(code: *Function, at: Instruction) bool {
+    val op: Opcode = function.data(code, at).opcode;
+    ret sel op.pseudo && op.pseudo == pseudo.TABLE;
+}
+
+# a jump table met in the code, which emits nothing there: what a range or a
+# call frame fact states at it is stated where it stands, after the jump
+fun keep_table(b: *Body, at: Instruction) err[Error] {
+    val marked: err[Error] = mark_range(b, at);
+    if (sel marked.err) { ret marked; }
+    val before: err[Error] = hand_facts(b, at, false);
+    if (sel before.err) { ret before; }
+    val after: err[Error] = hand_facts(b, at, true);
+    if (sel after.err) { ret after; }
+    ret alloc(vector.push[Instruction](?b.tables, at));
+}
+
+# the jump tables of a unit laid out, each at its label in the section of a
+# constant holding addresses, then the text section current again
+fun lay_tables(b: *Body) err[Error] {
+    if (b.tables.len == 0) { ret err[Error].ok{}; }
+    val e:       *Emitter            = b.e;
+    val first:   Instruction         = b.tables.data[0];
+    val model:   Addresses           = e.t.addresses;
+    val pointer: opt[arches.Pointer] = e.t.arch.pointer;
+    if (!(sel model.model)) { ret err[Error].err{refused(b, first, NO_OPERAND, Reason.table{})}; }
+    if (sel pointer.none)   { ret err[Error].err{refused(b, first, NO_OPERAND, Reason.table{})}; }
+    val width:  u64                       = pointer.some.bytes::u64;
+    val held:   Contents                  = Contents.addresses{};
+    val kind:   *section.Kind             = address.placement(true, false, held, address.loaded(model.model.relocation, held));
+    val placed: res[build.Section, Error] = kind_section(e, kind);
+    if (sel placed.err) { ret err[Error].err{placed.err}; }
+    val switched: err[Error] = builder(build.switch(e.b, placed.ok));
+    if (sel switched.err) { ret switched; }
+    var i: usize = 0;
+    for (i < b.tables.len) {
+        val at:   Instruction       = b.tables.data[i];
+        val d:    *InstructionData  = function.data(b.u.code, at);
+        val mark: opt[*build.Label] = map.get[u32, build.Label](?b.marks, ?d.label);
+        if (sel mark.none) { ret err[Error].err{refused(b, at, NO_OPERAND, Reason.label{})}; }
+        val aligned: err[Error] = builder(build.align(e.b, build.Align{boundary: width, fill: opt[u8].none{}, max: opt[u64].none{}}));
+        if (sel aligned.err) { ret aligned; }
+        val defined: err[Error] = builder(build.define(e.b, @mark.some));
+        if (sel defined.err) { ret defined; }
+        var k: usize = 0;
+        for (k < d.operands.size) {
+            val o: Operand = d.operands.data[k];
+            if (!(sel o.block)) { ret err[Error].err{refused(b, at, k::u32, Reason.shape{})}; }
+            val put: err[Error] = builder(build.datum(e.b, build.Reference{target: b.blocks.data[o.block.index], addend: 0, width: width::u8, basis: core_fixup.ABSOLUTE}));
+            if (sel put.err) { ret put; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    val text: res[build.Section, Error] = kind_section(e, ?section.TEXT);
+    if (sel text.err) { ret err[Error].err{text.err}; }
+    ret builder(build.switch(e.b, text.ok));
+}
+
 fun emit_body(b: *Body) err[Error] {
     val code: *Function = b.u.code;
     var i:    usize     = 0;
@@ -989,6 +1062,12 @@ fun emit_body(b: *Body) err[Error] {
         if (sel placed.err) { ret placed; }
         var k: usize = 0;
         for (k < list.size) {
+            if (tabled(code, list.data[k])) {
+                val kept: err[Error] = keep_table(b, list.data[k]);
+                if (sel kept.err) { ret kept; }
+                k = k + 1;
+                cnt;
+            }
             val n: u32 = function.data(code, list.data[k]).label;
             if (n != instruction.NO_LABEL) {
                 val mark: opt[*build.Label] = map.get[u32, build.Label](?b.marks, ?n);
@@ -1162,6 +1241,7 @@ fun emit_unit(e: *Emitter, u: Unit, end: build.Label) err[Error] {
         run:    l.ok,
         at:     opt[ir_debug.Location].none{},
         spoke:  false,
+        tables: vector.init[Instruction](e.a),
     };
     fin {
         vector.dnit[build.Label](?body.blocks);
@@ -1171,6 +1251,7 @@ fun emit_unit(e: *Emitter, u: Unit, end: build.Label) err[Error] {
         vector.dnit[bool](?body.given);
         map.dnit[u32, Mark](?body.ranged);
         vector.dnit[opt[build.Label]](?body.ends);
+        vector.dnit[Instruction](?body.tables);
     }
     val labelled: err[Error] = label_body(?body);
     if (sel labelled.err) { ret labelled; }
@@ -1205,7 +1286,9 @@ fun emit_unit(e: *Emitter, u: Unit, end: build.Label) err[Error] {
         val ended: err[Error] = builder(build.ct_end(e.b));
         if (sel ended.err) { ret ended; }
     }
-    ret builder(build.define(e.b, end));
+    val closed_at: err[Error] = builder(build.define(e.b, end));
+    if (sel closed_at.err) { ret closed_at; }
+    ret lay_tables(?body);
 }
 
 fun hash_name(v: *View) u64 {
@@ -1567,7 +1650,7 @@ pub fun emit(a: *allocator.Allocator, m: *Module, opened: *Build, t: *Target, un
             object.release(?o);
             ret res[object.Object, Error].err{Error.dialect{format.ok}};
         }
-        val listed: err[masc_listing.Refusal] = masc_listing.write(?b, masc_listing.Options{syntax: masc_listing.DEFAULT, dialect: dialect.some, lines: nil}, listing.some);
+        val listed: err[masc_listing.Refusal] = masc_listing.write(?b, masc_listing.Options{syntax: masc_listing.DEFAULT, dialect: dialect.some}, listing.some);
         if (sel listed.err) {
             object.release(?o);
             ret res[object.Object, Error].err{Error.listing{listed.err}};
