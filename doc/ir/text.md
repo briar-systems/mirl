@@ -54,7 +54,7 @@ function @f.main_1: fun(i32) -> (i32) linkage global visibility default {
 
 ## The grammar
 
-The grammar below is the single statement of the text form. `mirl.ir.text.parse` reads every construct of it but the inline assembly item, which it refuses as not supported yet, and `mirl.ir.text.print` writes nothing outside it.
+The grammar below is the single statement of the text form. `mirl.ir.text.parse` reads every construct of it, and `mirl.ir.text.print` writes nothing outside it.
 
 ```text
 grammar
@@ -205,13 +205,13 @@ functions
   line        = newline | binding newline | instruction newline ;
   binding     = "bind" dref [ "piece" number number ] ( "=" operand { "," step } | "unavailable" ) ;
   step        = word ( constant | type ) ;
-  instruction = [ local { "," local } "=" ] ( operation | assembly ) ;
+  instruction = [ local { "," local } "=" ] operation ;
   operation   = word [ entry { "," entry } ] [ "loc" dref ] [ "site" dref ]
                 [ "volatile" ] [ "kept" ] [ "bounded" ] [ "checked" ] [ "secret" ] [ "bind" "[" [ dref { "," dref } ] "]" ] ;
   entry       = operand | immediate | target ;
   operand     = local | constant ;
   immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]"
-                     | "all" | places | symbol ) ;
+                     | "all" | places | symbol | block ) ;
   places      = "[" [ place { "," place } ] "]" ;
   place       = ( "register" uint uint | "stack" uint | "operand" uint )
                 ( "fixed" | "scaled" uint ) fill ;
@@ -219,7 +219,10 @@ functions
               | ( "sign" | "zero" | "declared" ) uint ;
   ordering    = "relaxed" | "acquire" | "release" | "acq_rel" | "seq_cst" ;
   target      = label [ "(" [ operand { "," operand } ] ")" ] ;
-  assembly    = "asm" ... ;
+  block       = string "[" [ bound { "," bound } ] "]" [ "reads" ] [ "writes" ] ;
+  bound       = name ":" ( "read" | "write" | "read_write" ) constraint type ;
+  constraint  = "class" uint | "memory"
+              | "immediate" uint ( "signed" | "unsigned" ) [ "symbolic" ] ;
 
   `kept` marks a store or a fill whose write no pass may take away (see
   the specification's memory section). `bounded` marks a shift whose count is
@@ -269,8 +272,14 @@ functions
   in the order they stand. no opcode is named `bind`, so the first word
   tells a record from an instruction.
 
-  `asm` is reserved for inline assembly items, whose block is spelled
-  through masc's text form.
+  an inline assembly item is the `asm` operation, whose `block` immediate
+  is the block's text in the set's source dialect, its operands in order,
+  each its name, role, constraint and the type of the value it binds, and
+  `reads` and `writes` where it declares it touches memory beyond its memory
+  operands. a class is masc's handle of a class of the set's register file.
+  the item's operands are the values the block binds, before the block:
+  `%d = asm %x, i64 7, block "addi {d}, {a}, {k}" [d: write class 0 i64,
+  a: read class 0 i64, k: read immediate 12 signed i64]`.
 
 debug table
 
