@@ -17,8 +17,12 @@
 # address. a result returned by reference lands in a slot whose address the
 # caller passes, and the callee rebuilds an incoming aggregate in a slot of
 # its own. the copies move whole words up to the target's bound and are one
-# native copy past it, and a piece whose size no integer has is read and
-# written in the widest words that fit it.
+# bulk copy past it, and a piece whose size no integer has is read and
+# written in the widest words that fit it. a bulk copy the target has no
+# instruction for calls the copy helper, which the pass delivers itself,
+# since the helpers legalisation has run before it: once a function is
+# lowered, each such copy becomes a call of the helper, lowered at once, and
+# the helper's own entry is lowered with every function after it.
 #
 # a result returned by reference is built in place where nothing can tell. in
 # the callee, a stack slot every return hands back whole, read just before it,
@@ -63,6 +67,7 @@ use std.types.string.str_len;
 use std.types.view.View;
 
 use std.allocator;
+use std.allocator.arena;
 use std.collections.slice.Slice;
 use std.collections.vector;
 use std.collections.vector.Vector;
@@ -76,6 +81,7 @@ use mirl.build.Failure;
 use mirl.fold.word;
 use mirl.ir.body;
 use mirl.ir.body.Records;
+use mirl.ir.constant.Address;
 use mirl.ir.constant.Bits;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.debug.Binding;
@@ -108,6 +114,9 @@ use types: mirl.ir.type;
 use mirl.ir.type.Type;
 use mirl.ir.value.Declaration;
 use mirl.ir.value.Def;
+use mirl.legal.helper.deliver;
+use mirl.legal.helper.deliver.Want;
+use mirl.legal.helper.table.Operation;
 use mirl.legal.moves;
 use mirl.pass.analysis;
 use mirl.pass.failure;
@@ -140,11 +149,11 @@ use mirl.target.basis;
 use mirl.target.basis.Basis;
 use build_record: mirl.target.build;
 use mirl.target.build.Build;
-use mirl.target.capability.Capabilities;
 use mirl.target.capability.Held;
 use mirl.target.layout;
 use mirl.target.layout.Layout;
 use target_record: mirl.target.record;
+use mirl.target.record.Target;
 
 # the pass: it adds and removes instructions and entry parameters and never
 # touches the graph. it classifies through the build's convention, so it is
@@ -159,7 +168,7 @@ fun convened(g: *Ground) bool {
 # one function's lowering
 # ---
 # m:          the module
-# caps:       the target's capabilities, which bound the words a copy moves
+# t:          the target, whose capabilities bound the words a copy moves
 # basis:      the build's selection, which says which float formats it holds
 # build:      the build, whose resolved rows classify
 # convention: the row the entry, return or call being lowered is under, the
@@ -175,9 +184,11 @@ fun convened(g: *Ground) bool {
 #             result travels by reference
 # storage:    the instruction that addresses the result's memory through the
 #             carrier, made once a variable is bound to that memory
+# bulk:       the copies past the bound the target has no instruction for,
+#             which call the copy helper once the function is lowered
 rec Work {
     m:          *Module;
-    caps:       *Capabilities;
+    t:          *Target;
     basis:      opt[*Basis];
     build:      *Build;
     convention: *Resolved;
@@ -190,6 +201,7 @@ rec Work {
     unused:     Vector[Instruction];
     carrier:    opt[Value];
     storage:    opt[Instruction];
+    bulk:       Vector[Instruction];
 }
 
 fun body_of(w: *Work) *Body {
@@ -527,16 +539,23 @@ fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u
 # copy bytes from one storage to another, nothing when they are one storage,
 # as a result built in place is. the copy is the widest words both
 # alignments allow up to the target's bound of moves, and one `mem.copy`
-# past it where the target's copy is native: the helpers legalisation has run,
-# so no helper would be called for one that is not
+# past it. one the target has no instruction for is noted, and calls the copy
+# helper once the function is lowered. the helper is called only where the
+# target addresses memory physically, so elsewhere a copy past the bound is
+# native or in words
 fun copy(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64) err[Why] {
     if (from.index == to.index) { ret err[Why].ok{}; }
-    if (!moves.in_words(w.caps, size, align, WORD, false, false)) {
+    val helped: bool = sel w.t.caps.addressing.physical;
+    if (!moves.in_words(?w.t.caps, size, align, WORD, false, helped)) {
         val length: res[Value, Why] = integer(w, w.offset, size);
         if (sel length.err) { ret err[Why].err{length.err}; }
-        var ops: [3]Value     = [3]Value{to, from, length.ok};
-        var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
-        build.emit(bld, Request{opcode: opcode.MEM_COPY, operands: Slice[Value]{data: ?ops[0], size: 3}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+        var ops:  [3]Value     = [3]Value{to, from, length.ok};
+        var imm:  [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+        val made: Instruction  = build.emit(bld, Request{opcode: opcode.MEM_COPY, operands: Slice[Value]{data: ?ops[0], size: 3}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+        if (!build.failed(bld) && !(sel w.t.caps.bulk.copy.native)) {
+            val noted: res[usize, allocator.Error] = vector.push[Instruction](?w.bulk, made);
+            if (sel noted.err) { ret failure.lost(noted.err); }
+        }
         ret err[Why].ok{};
     }
     var done: u64 = 0;
@@ -1776,7 +1795,53 @@ fun lower(w: *Work) err[Why] {
         if (sel ok.err) { ret ok; }
         i = i + 1;
     }
+    val copied: err[Why] = call_copies(w);
+    if (sel copied.err) { ret copied; }
     ret through_unheld(w);
+}
+
+# the copies the lowering noted, each a call of the copy helper in its place,
+# lowered as any call. the helper is delivered only now, since a delivery may
+# move the module's functions and the lowering holds their bodies
+fun call_copies(w: *Work) err[Why] {
+    if (w.bulk.len == 0) { ret err[Why].ok{}; }
+    val bits: res[types.Shape, Why] = shape_of(w, w.offset);
+    if (sel bits.err)           { ret err[Why].err{bits.err}; }
+    if (!(sel bits.ok.integer)) { ret err[Why].err{Why.reason{"an address offset that is not an integer"}}; }
+    val want: Want           = Want{operation: Operation.copy{}, bits: bits.ok.integer.width, format: opt[types.Format].none{}, space: 0, source: opt[types.Format].none{}};
+    val sig:  res[Type, Why] = deliver.signature(w.m, want);
+    if (sel sig.err) { ret err[Why].err{sig.err}; }
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, w.m.a, 0);
+    if (sel made.err) { ret failure.lost(made.err); }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+    val helper: res[Function, Why] = deliver.deliver(w.m, w.t, ?scratch, want);
+    if (sel helper.err) { ret err[Why].err{helper.err}; }
+    val ptr: res[Type, Why] = intern(w, types.Shape.pointer{types.Pointer{space: 0}});
+    if (sel ptr.err) { ret err[Why].err{ptr.err}; }
+    var i: usize = 0;
+    for (i < w.bulk.len) {
+        val at:  Instruction = w.bulk.data[i];
+        var bld: Builder     = build.init(w.m);
+        build.enter(?bld, w.f);
+        build.derive(?bld, at);
+        build.secret(?bld, false);
+        val c:      Constant         = build.constant(?bld, ConstantData.address{Address{type: ptr.ok, symbol: Symbol.function{helper.ok}, offset: 0}});
+        val callee: Value            = build.use_constant(?bld, c);
+        val d:      *InstructionData = ?body_of(w).instructions.data[at.index];
+        var ops:    [4]Value         = [4]Value{callee, d.operands.data[0], d.operands.data[1], d.operands.data[2]};
+        build.replacing(?bld, at);
+        var imm:  [2]Immediate = [2]Immediate{Immediate.ty{sig.ok}, Immediate.named{Named.all{}}};
+        val call: Instruction  = build.emit(?bld, Request{opcode: opcode.CALL, operands: Slice[Value]{data: ?ops[0], size: 4}, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: no_targets()});
+        val ok:   err[Why]     = built(?bld);
+        if (sel ok.err) { ret ok; }
+        val lowered: err[Why] = lower_call(w, call);
+        if (sel lowered.err) { ret lowered; }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
 }
 
 # whether a type is a float of a format the build holds no unit for
@@ -1784,7 +1849,7 @@ fun unheld(w: *Work, ty: Type) bool {
     val s: res[types.Shape, types.Error] = types.shape(?w.m.types, ty);
     if (sel s.err)         { ret false; }
     if (!(sel s.ok.float)) { ret false; }
-    val h: res[opt[*Held], basis.Error] = basis.held(w.basis, w.caps, s.ok.float.format);
+    val h: res[opt[*Held], basis.Error] = basis.held(w.basis, ?w.t.caps, s.ok.float.format);
     if (sel h.err) { ret false; }
     ret sel h.ok.none;
 }
@@ -1911,9 +1976,10 @@ fun run(c: *Context, b: *Build) res[bool, Why] {
     for (i < c.m.functions.len) {
         val f: Function = Function{index: i::u32};
         if (record.touches(c, f)) {
-            var w:  Work     = Work{m: c.m, caps: ?c.t.caps, basis: c.basis, build: b, convention: build_record.default_row(b), l: ?l, f: f, entry: Block{index: 0}, slots: 0, ptr: ptr.ok, offset: word.ok, unused: vector.init[Instruction](c.m.a), carrier: opt[Value].none{}, storage: opt[Instruction].none{}};
+            var w:  Work     = Work{m: c.m, t: c.t, basis: c.basis, build: b, convention: build_record.default_row(b), l: ?l, f: f, entry: Block{index: 0}, slots: 0, ptr: ptr.ok, offset: word.ok, unused: vector.init[Instruction](c.m.a), carrier: opt[Value].none{}, storage: opt[Instruction].none{}, bulk: vector.init[Instruction](c.m.a)};
             val ok: err[Why] = lower(?w);
             vector.dnit[Instruction](?w.unused);
+            vector.dnit[Instruction](?w.bulk);
             if (sel ok.err) { ret res[bool, Why].err{ok.err}; }
             changed = true;
         }
