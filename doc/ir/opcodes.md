@@ -147,6 +147,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `extract` | `aggregate` | `member` a member index | none | propagates |
 | `insert` | `aggregate`, `value` | `member` a member index | none | propagates |
 | `func.addr` | none | `function` a function of the module, `pointer` a type | none | propagates |
+| `asm` | any number of value operands | `block` an inline assembly block | none | propagates |
 
 ### `add`
 
@@ -2183,4 +2184,17 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - secrecy: propagates
 - vector: none
 - address: of the function `function` names, the only way code names a function's address
+
+### `asm`
+
+- operands: any number of value operands
+- immediates: `block` an inline assembly block
+- targets: 0
+- typing:
+  - `block` is a well formed block, and the tail operands are the values it binds, each operand it reads and each memory and immediate operand in order, of the types they state
+- results:
+  - one result per register `block` writes, of the type its operand states, in order
+- effects: reads memory, writes memory
+- secrecy: propagates
+- vector: none
 
