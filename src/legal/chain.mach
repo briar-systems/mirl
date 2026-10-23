@@ -1,5 +1,6 @@
-# multi-way branches as compare chains: a branch on a selector's cases
-# becomes a test of each case in turn
+# multi-way branches as compare chains or indexed tables: a branch on a
+# selector's cases becomes a test of each case in turn, or a branch on the
+# selector's distance from its least case where the target's tables admit it
 #
 # a row whose rules state a case list over a selector branches to the target
 # after the first whose case the selector's value is, or to the first when
@@ -9,6 +10,17 @@
 # no case is a `br` to the first target. every target keeps the arguments
 # its edge passed, which the block the branch ended dominates, so every new
 # block reads them as they stand.
+#
+# a branch the target's density admits stays a multi-way branch, indexed: its
+# selector is the distance from the least case, read unsigned at the width of
+# the target's register, and its cases are every value from 0 to its span,
+# each to the target of the case it stands for or to the first target where
+# no case does. a selector wider than the register is tested against the
+# span at its own width first, and one outside it is the span, which is no
+# case, so the indexed branch never reads a selector it truncated wrong. a
+# branch already indexed is left as it is. the selection branches through a
+# table of the indexed branch's targets after its first, testing the
+# selector against their count.
 #
 # the pass applies where the target's control is free: a structured target
 # keeps the branch whole for its structured multi-way form, as SPIR-V's
@@ -45,6 +57,7 @@ use mirl.ir.opcode.Immediate;
 use mirl.ir.opcode.Row;
 use mirl.ir.opcode.Rule;
 use mirl.ir.opcode.Rules;
+use types: mirl.ir.type;
 use mirl.ir.type.Type;
 use mirl.ir.value.Declaration;
 use mirl.legal.emit;
@@ -58,6 +71,10 @@ use mirl.pass.record.Pass;
 use mirl.pass.record.Scope;
 use mirl.pass.record.Time;
 use mirl.pass.record.Unit;
+use mirl.target.capability.Bits;
+use mirl.target.capability.Density;
+use mirl.target.capability.Tables;
+use mirl.target.record.Target;
 
 # the pass: it adds blocks and edges, so it keeps no analysis
 pub val CHAIN: Pass = Pass{name: "compare chain", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: cache.NONE, time: Time.keeps{}, applies: free};
@@ -110,9 +127,121 @@ fun test_case(s: *Site, selector: Value, value: Value, taken: Branch, next: Bran
     build.emit(?s.bld, Request{opcode: opcode.CBR, operands: Slice[Value]{data: ?cond[0], size: 1}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?sides[0], size: 2}});
 }
 
-# lower the instruction at an index of a block to a compare chain if its row
-# states a case list, answering whether it did
-fun lower(s: *Site, k: Block, n: u32, i: Instruction) res[bool, Why] {
+# the width of the target's register, 0 where it states none
+fun register_width(t: *Target) u32 {
+    val b: Bits = t.caps.widths.register;
+    if (sel b.bits) { ret b.bits; }
+    ret 0;
+}
+
+# whether the target's tables admit a branch on `cases`, a list in increasing
+# order, whose entries from the least case to the greatest fit the register
+fun admitted(t: *Target, cases: Slice[u64]) bool {
+    val tables: Tables = t.caps.tables;
+    if (!(sel tables.dense)) { ret false; }
+    val d:     Density = tables.dense;
+    val count: u64     = cases.size::u64;
+    if (count == 0 || count < d.least::u64) { ret false; }
+    val span: u64 = cases.data[cases.size - 1] - cases.data[0];
+    # the entries, span + 1, are at most 100 / fill per case
+    if (span >= count * 100 / d.fill::u64) { ret false; }
+    val reg: u32 = register_width(t);
+    if (reg == 0)                                     { ret false; }
+    if (reg < 64 && span >= (1::u64 << reg::u64) - 1) { ret false; }
+    ret true;
+}
+
+# whether a branch on `cases` over a selector of `width` bits is indexed: its
+# cases are 0 to its count less one, over a selector as wide as the register
+fun indexed(t: *Target, width: u32, cases: Slice[u64]) bool {
+    if (width != register_width(t)) { ret false; }
+    var j: usize = 0;
+    for (j < cases.size) {
+        if (cases.data[j] != j::u64) { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# the integer type of a width
+fun integer(s: *Site, width: u32) res[Type, Why] {
+    val made: res[Type, types.Error] = types.intern(?s.m.types, types.Shape.integer{types.Integer{width: width}});
+    if (sel made.err) { ret res[Type, Why].err{Why.ir{module.Error.types{made.err}}}; }
+    ret res[Type, Why].ok{made.ok};
+}
+
+# the bits of an integer type, 0 for any other
+fun width_of(s: *Site, ty: Type) res[u32, Why] {
+    val shape: res[types.Shape, types.Error] = types.shape(?s.m.types, ty);
+    if (sel shape.err)           { ret res[u32, Why].err{Why.ir{module.Error.types{shape.err}}}; }
+    if (!(sel shape.ok.integer)) { ret res[u32, Why].ok{0}; }
+    ret res[u32, Why].ok{shape.ok.integer.width};
+}
+
+# rewrite a branch the tables admit as the indexed branch on the selector's
+# distance from its least case, given its edges copied out, first the one
+# taken where no case is
+fun index(s: *Site, t: *Target, k: Block, n: u32, i: Instruction, selector: Value, ty: Type, width: u32, cases: Slice[u64], edges: *Branch) res[bool, Why] {
+    val reg:  u32            = register_width(t);
+    val wide: res[Type, Why] = integer(s, reg);
+    if (sel wide.err) { ret res[bool, Why].err{wide.err}; }
+    val least:   u64                        = cases.data[0];
+    val entries: u64                        = cases.data[cases.size - 1] - least + 1;
+    val values:  res[*u64, allocator.Error] = allocator.zallocate[u64](s.scratch, entries::usize);
+    if (sel values.err) { ret res[bool, Why].err{Why.alloc{values.err}}; }
+    val targets: res[*Branch, allocator.Error] = allocator.zallocate[Branch](s.scratch, entries::usize + 1);
+    if (sel targets.err) { ret res[bool, Why].err{Why.alloc{targets.err}}; }
+    targets.ok[0] = edges[0];
+    var v: u64   = 0;
+    var c: usize = 0;
+    for (v < entries) {
+        values.ok[v::usize] = v;
+        var to: Branch = edges[0];
+        if (c < cases.size && cases.data[c] - least == v) {
+            to = edges[c + 1];
+            c  = c + 1;
+        }
+        targets.ok[v::usize + 1] = to;
+        v                        = v + 1;
+    }
+    var low: Value = selector;
+    if (least != 0) {
+        val made: res[Value, Why] = emit.constant(s, ty, word.small(least));
+        if (sel made.err) { ret res[bool, Why].err{made.err}; }
+        low = made.ok;
+    }
+    var bound: Value = selector;
+    var span:  Value = selector;
+    if (width > reg) {
+        val top: res[Value, Why] = emit.constant(s, ty, word.small(entries));
+        if (sel top.err) { ret res[bool, Why].err{top.err}; }
+        bound = top.ok;
+        val out: res[Value, Why] = emit.constant(s, wide.ok, word.small(entries));
+        if (sel out.err) { ret res[bool, Why].err{out.err}; }
+        span = out.ok;
+    }
+    emit.open(s, i, k, n);
+    var at: Value = selector;
+    if (least != 0)  { at = emit.binary(s, opcode.SUB, selector, low); }
+    if (width < reg) { at = emit.convert(s, opcode.EXT_U, at, wide.ok); }
+    or (width > reg) {
+        val within: Value = emit.binary(s, opcode.LT_U, at, bound);
+        val cut:    Value = emit.convert(s, opcode.TRUNC, at, wide.ok);
+        at = emit.ternary(s, opcode.SELECT, within, cut, span);
+    }
+    emit.close(s, i);
+    var ops:  [1]Value     = [1]Value{at};
+    var list: [1]Immediate = [1]Immediate{Immediate.cases{Slice[u64]{data: values.ok, size: entries::usize}}};
+    build.emit(?s.bld, Request{opcode: opcode.SWITCH, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: ?list[0], size: 1}, targets: Slice[Branch]{data: targets.ok, size: entries::usize + 1}});
+    val built: err[Why] = emit.done(s);
+    if (sel built.err) { ret res[bool, Why].err{built.err}; }
+    ret res[bool, Why].ok{true};
+}
+
+# lower the instruction at an index of a block if its row states a case list,
+# to the indexed branch where the target's tables admit it and to a compare
+# chain otherwise, answering whether it changed it
+fun lower(s: *Site, t: *Target, k: Block, n: u32, i: Instruction) res[bool, Why] {
     val d:   *InstructionData = ?s.b.instructions.data[i.index];
     val row: opt[Row]         = opcode.row(d.opcode);
     if (sel row.none) { ret res[bool, Why].ok{false}; }
@@ -142,6 +271,12 @@ fun lower(s: *Site, k: Block, n: u32, i: Instruction) res[bool, Why] {
         if (sel got.err) { ret res[bool, Why].err{got.err}; }
         edges.ok[e] = got.ok;
         e           = e + 1;
+    }
+    if (admitted(t, list.cases)) {
+        val width: res[u32, Why] = width_of(s, ty);
+        if (sel width.err)                    { ret res[bool, Why].err{width.err}; }
+        if (indexed(t, width.ok, list.cases)) { ret res[bool, Why].ok{false}; }
+        ret index(s, t, k, n, i, selector, ty, width.ok, list.cases, edges.ok);
     }
     e = 0;
     for (e < count) {
@@ -207,7 +342,7 @@ fun visit(u: *Unit) res[bool, Why] {
             arena.reset(?ar);
             val last: usize          = got.ok.blocks.data[k].instructions.len - 1;
             val i:    Instruction    = got.ok.blocks.data[k].instructions.data[last];
-            val done: res[bool, Why] = lower(?s, Block{index: k::u32}, last::u32, i);
+            val done: res[bool, Why] = lower(?s, c.t, Block{index: k::u32}, last::u32, i);
             if (sel done.err) { ret res[bool, Why].err{done.err}; }
             if (done.ok)      { changed = true; }
         }
