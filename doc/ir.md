@@ -311,7 +311,7 @@ Every function that requires constant time is checked at four sites, and every s
 
 ## 8. The verifier
 
-The verifier checks a module against the target it names. `mirl.verify.check(m)` assembles the target from the module's tuple, refused by the rule of assembly it breaks, and checks the module as it stands before legalisation, and `mirl.verify.against(m, t, stage)` checks against a given target at a given stage. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
+The verifier checks a module against the target it names. `mirl.verify.check(m)` assembles the target from the module's tuple, refused by the rule of assembly it breaks, and checks the module as it stands before legalisation, and `mirl.verify.against(m, t, ctx, stage)` checks against a given target at a given stage, laying types out under the context the build's selection opened, or `mirl.target.NO_BUILD` where no family opened one, so a stated offset is held to the alignment its member has under the vector registers the build meets. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
 
 The stage says how far the module has come through its schedule. `open` is any module before legalisation, so no rule that holds only of legal code applies to it. `legal` is a module past every legalisation, and carries a lookup of the region tree each function's structure analysis holds. The pass driver verifies a run as `open` until it reaches the last legalisation of its plan, and as `legal` from that pass's own verification on.
 
