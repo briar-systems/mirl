@@ -1,0 +1,165 @@
+# what a relocatable object names by symbol, and the relocations of it
+#
+# a final module is written with every index and address its own. an object
+# names each function, global and the stack pointer by its entry of the
+# symbol table instead: every function the module holds in its order, then
+# every global, then the stack pointer, so a symbol's index is known before
+# any body is written. masc writes a symbolic operand as its site's padded
+# zero and records a fixup of it, its handle one past the symbol's index, as
+# masc reserves 0 for no symbol. a type index masc cannot place, so a
+# TYPE_INDEX_LEB fixup's handle is one past the type entry it names, and its
+# relocation names that entry. each site then holds its provisional value, as
+# clang writes it, so the object reads as a module before a link: a
+# function's index, a global's address in the object's own layout and the
+# stack pointer's index, and a table index 0, as the object has no table
+# slots. mink's relocation rows write it, as a link would.
+
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.collections.vector;
+
+use masc.core.field;
+use core_fixup: masc.core.fixup;
+use masc.core.operand;
+use wasm_fixup: masc.isa.wasm.fixup;
+
+use mink.base.fail.Fail;
+use mink.bytes.reader;
+use mink_model: mink.format.wasm.model;
+use mink.reloc.engine;
+
+use mirl.ir.id.Function;
+use mirl.ir.id.Global;
+use mirl.ir.id.Symbol;
+use mirl.machine.emit.data;
+use mirl.target.wasm.error.Encoding;
+use mirl.target.wasm.error.Error;
+use mirl.target.wasm.unit.Unit;
+
+# the symbol table index of a function
+pub fun function_symbol(u: *Unit, f: Function) u32 {
+    ret f.index;
+}
+
+# the symbol table index of a global
+pub fun global_symbol(u: *Unit, g: Global) u32 {
+    ret u.m.functions.len::u32 + g.index;
+}
+
+# the symbol table index of the stack pointer
+pub fun stack_symbol(u: *Unit) u32 {
+    ret u.m.functions.len::u32 + u.m.globals.len::u32;
+}
+
+# a symbolic operand of the symbol at `index`, at `addend`, of fixup `kind`,
+# operand.NO_FIXUP for the operand's default
+pub fun symbolic(index: u32, addend: i64, kind: operand.FixupKind) operand.Value {
+    ret operand.Value.symbol{operand.Symbol{id: index + 1, addend: addend, fixup: kind}};
+}
+
+# a function's operand of a call: its index, or in an object its symbol
+pub fun function(u: *Unit, f: Function) operand.Value {
+    if (u.relocatable) { ret symbolic(function_symbol(u, f), 0, operand.NO_FIXUP); }
+    ret operand.Value.id{u.index.data[f.index]};
+}
+
+# the stack pointer's operand of a global.get or global.set
+pub fun stack(u: *Unit) operand.Value {
+    if (u.relocatable) { ret symbolic(stack_symbol(u), 0, operand.NO_FIXUP); }
+    ret operand.Value.id{u.stack};
+}
+
+# a type's operand: its index, or in an object a fixup of its entry
+pub fun type(u: *Unit, index: u32) operand.Value {
+    if (u.relocatable) { ret symbolic(index, 0, wasm_fixup.TYPE_INDEX_LEB); }
+    ret operand.Value.id{index};
+}
+
+# the symbol a handle names, none for a type's handle
+fun symbol_of(u: *Unit, handle: u32) opt[Symbol] {
+    val index: u32 = handle - 1;
+    val nf:    u32 = u.m.functions.len::u32;
+    if (index < nf)                        { ret opt[Symbol].some{Symbol.function{Function{index: index}}}; }
+    if (index - nf < u.m.globals.len::u32) { ret opt[Symbol].some{Symbol.global{Global{index: index - nf}}}; }
+    ret opt[Symbol].none{};
+}
+
+# the value a fixup's site holds before a link
+fun provisional(u: *Unit, f: *field.Fixup) i128 {
+    if (f.kind == wasm_fixup.TYPE_INDEX_LEB) { ret (f.symbol - 1)::i128; }
+    val s: opt[Symbol] = symbol_of(u, f.symbol);
+    if (sel s.none) { ret u.stack::i128; }
+    val named: Symbol = s.some;
+    if (sel named.function) {
+        if (f.kind == wasm_fixup.FUNCTION_INDEX_LEB) { ret u.index.data[named.function.index]::i128; }
+        ret 0;
+    }
+    ret u.addresses.data[named.global.index]::i128 + f.addend::i128;
+}
+
+# the mink row of a fixup kind's relocation
+fun row_of(kind: operand.FixupKind) res[*wasm_fixup.Site, Error] {
+    val s: opt[*wasm_fixup.Site] = wasm_fixup.site_of(kind);
+    if (sel s.none) { ret res[*wasm_fixup.Site, Error].err{Error.encoding{Encoding{function: Function{index: 0xFFFF_FFFF}, message: "a fixup of no wasm relocation kind"}}}; }
+    ret res[*wasm_fixup.Site, Error].ok{s.some};
+}
+
+# the value `v` written into the site of fixup `kind` at `at` of `out`
+fun put(out: *vector.Vector[u8], kind: operand.FixupKind, at: u64, v: i128) err[Error] {
+    val s: res[*wasm_fixup.Site, Error] = row_of(kind);
+    if (sel s.err) { ret err[Error].err{s.err}; }
+    var site:  engine.Site = engine.Site{file: "", section: "", data: out.data, size: out.len::u64, base: 0, offset: at, order: reader.LITTLE};
+    val wrote: err[Fail]   = engine.insert(s.ok.row, ?site, v);
+    if (sel wrote.err) { ret err[Error].err{Error.container{wrote.err}}; }
+    ret err[Error].ok{};
+}
+
+# every fixup's site in `out` given its provisional value
+pub fun settle(u: *Unit, out: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) err[Error] {
+    var i: usize = 0;
+    for (i < fixups.len) {
+        val f:   *field.Fixup = ?fixups.data[i];
+        val got: err[Error]   = put(out, f.kind, f.offset::u64, provisional(u, f));
+        if (sel got.err) { ret got; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun leb(v: u64) mink_model.Leb {
+    ret mink_model.Leb{value: v, width: mink_model.SHORTEST};
+}
+
+# the relocation of a fixup whose site lies at `at` of its section's payload
+pub fun record(u: *Unit, f: *field.Fixup, at: u64) mink_model.Reloc {
+    ret mink_model.Reloc{type: (f.kind - 1)::u8, offset: leb(at), index: leb((f.symbol - 1)::u64), addend: mink_model.Sleb{value: f.addend, width: mink_model.SHORTEST}};
+}
+
+# the fixup kind of an address in an initial value: a function's table index
+# or a global's memory address, of the address's width, none for a width no
+# relocation writes
+pub fun datum_kind(d: data.Datum) opt[operand.FixupKind] {
+    if (sel d.symbol.function) {
+        if (d.width == 4) { ret opt[operand.FixupKind].some{wasm_fixup.TABLE_INDEX_I32}; }
+        if (d.width == 8) { ret opt[operand.FixupKind].some{wasm_fixup.TABLE_INDEX_I64}; }
+        ret opt[operand.FixupKind].none{};
+    }
+    var i: u32 = 0;
+    for (i < wasm_fixup.DATA_COUNT) {
+        val row: *core_fixup.Datum = ?wasm_fixup.DATA[i];
+        if (row.basis == core_fixup.ABSOLUTE && row.width::u64 == d.width) { ret opt[operand.FixupKind].some{row.fixup}; }
+        i = i + 1;
+    }
+    ret opt[operand.FixupKind].none{};
+}
+
+# the fixup of an address in an initial value whose kind is `kind`, at `offset` of its section's payload
+pub fun datum_fixup(u: *Unit, d: data.Datum, kind: operand.FixupKind, offset: u64) field.Fixup {
+    var index: u32 = 0;
+    if (sel d.symbol.function) { index = function_symbol(u, d.symbol.function); }
+    or                         { index = global_symbol(u, d.symbol.global); }
+    ret field.Fixup{kind: kind, operand: 0, field: 0, offset: offset::usize, symbol: index + 1, addend: d.addend};
+}
