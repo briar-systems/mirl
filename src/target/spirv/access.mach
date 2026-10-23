@@ -1,0 +1,511 @@
+# memory through logical pointers
+#
+# a pointer is a variable or an access chain into one, and what it points to
+# is the type its variable holds or the member a chain reaches. an access at
+# the type a pointer points to reads or writes it whole. one at a type the
+# pointer's pointee starts with descends to it through the pointee's first
+# members, a union being its largest member, and one at a scalar of the
+# width of the scalar the pointee starts with reads or writes that scalar
+# and casts its bits, so a union's member of another type is reached with no
+# reinterpretation of memory. any other access reinterprets memory, which
+# logical addressing cannot, and is refused. a value moved between a layout
+# its storage class fixes and the plain one is rebuilt member by member.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use masc.isa.spirv.gen_row_index;
+
+use mirl.ir.constant.ConstantData;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.rule.Ordering;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.value.Def;
+use mirl.target.spirv.buffer.Slot;
+use mirl.target.spirv.emitter;
+use mirl.target.spirv.emitter.Emitter;
+use mirl.target.spirv.emitter.Pointer;
+use mirl.target.spirv.error.Error;
+use mirl.target.spirv.schema;
+use spirv_types: mirl.target.spirv.types;
+use mirl.target.spirv.unit;
+use mirl.target.spirv.unit.NONE;
+
+# the memory access operand of a volatile access
+pub val VOLATILE: u32 = 1;
+
+# the scope of every atomic, the device
+val DEVICE: u64 = 1;
+
+# the memory semantics of an ordering and of the storage class it orders
+val ACQUIRE:          u32 = 0x2;
+val RELEASE:          u32 = 0x4;
+val ACQUIRE_RELEASE:  u32 = 0x8;
+val SEQUENTIAL:       u32 = 0x10;
+val UNIFORM_MEMORY:   u32 = 0x40;
+val WORKGROUP_MEMORY: u32 = 0x100;
+val IMAGE_MEMORY:     u32 = 0x800;
+
+fun same(x: Type, y: Type) bool {
+    ret x.index == y.index;
+}
+
+fun reinterpreted(e: *Emitter, i: Instruction) {
+    emitter.fail(e, Error.reinterpreted{emitter.at(e, i)});
+}
+
+# the pointer a value is, refused where it is chosen at run time
+pub fun pointer_of(e: *Emitter, v: Value, i: Instruction) opt[Pointer] {
+    val d: Def = e.b.values.data[v.index].def;
+    if (sel d.constant) {
+        val got: res[ConstantData, module.Error] = module.constant_data(e.u.m, d.constant);
+        if (sel got.err) {
+            emitter.fail(e, Error.ir{got.err});
+            ret opt[Pointer].none{};
+        }
+        val c: ConstantData = got.ok;
+        if (sel c.address) {
+            val s: Symbol = c.address.symbol;
+            if (sel s.global) {
+                val g:     u32                           = s.global.index;
+                val shape: res[types.Shape, types.Error] = types.shape(?e.u.m.types, c.address.type);
+                if (sel shape.ok) {
+                    val k: types.Shape = shape.ok;
+                    if (sel k.pointer && k.pointer.space != e.u.classes.data[g]) {
+                        emitter.fail(e, Error.storage{s.global});
+                        ret opt[Pointer].none{};
+                    }
+                }
+                if (c.address.offset == 0) { ret opt[Pointer].some{Pointer{id: e.u.globals.data[g], pointee: e.u.m.globals.data[g].data.type, key: e.u.keys.data[g], class: e.u.classes.data[g], known: true}}; }
+            }
+        }
+        emitter.unselected(e, i);
+        ret opt[Pointer].none{};
+    }
+    val p: Pointer = e.pointers.data[v.index];
+    if (!p.known) {
+        emitter.fail(e, Error.variable{emitter.at(e, i)});
+        ret opt[Pointer].none{};
+    }
+    ret opt[Pointer].some{p};
+}
+
+# a pointer's type
+pub fun pointer_type(e: *Emitter, p: Pointer) u32 {
+    val pointee: u32 = spirv_types.type_of(e.u, p.pointee, p.key);
+    if (pointee == NONE) { ret NONE; }
+    ret spirv_types.pointer_type(e.u, p.class, pointee);
+}
+
+# a pointer to a member of what a pointer points to, through an access chain
+# of constant indices
+fun chained(e: *Emitter, p: Pointer, member: Type, index: u32) Pointer {
+    val q:     Pointer = Pointer{id: emitter.fresh(e), pointee: member, key: spirv_types.member_key(p.key), class: p.class, known: true};
+    val t:     u32     = pointer_type(e, q);
+    var at:    [1]u32  = [1]u32{spirv_types.uint(e.u, 32, index::u64)};
+    var slots: [4]Slot = [4]Slot{Slot.id{t}, Slot.id{q.id}, Slot.id{p.id}, Slot.list{unit.list(e.u, ?at[0], 1)}};
+    emitter.put(e, gen_row_index.OPACCESSCHAIN, ?slots[0], 4);
+    ret q;
+}
+
+# a pointer's pointee taken through a union to the member it is held as
+fun held(e: *Emitter, p: Pointer) Pointer {
+    var q: Pointer = p;
+    var n: u32     = 0;
+    for (n < 16) {
+        val m: opt[Type] = spirv_types.union_member(e.u, q.pointee, q.key);
+        if (sel m.none) { ret q; }
+        q.pointee = m.some;
+        n         = n + 1;
+    }
+    ret q;
+}
+
+# the first member of an aggregate a pointer points to, none for any other
+fun first(e: *Emitter, p: Pointer) opt[Pointer] {
+    val s: res[types.Shape, types.Error] = types.shape(?e.u.m.types, p.pointee);
+    if (sel s.err) { ret opt[Pointer].none{}; }
+    val k: types.Shape = s.ok;
+    if (sel k.structure) {
+        val st: types.Structure = k.structure;
+        if (st.members.size == 0) { ret opt[Pointer].none{}; }
+        if (sel st.offsets.some) {
+            val at: Slice[u64] = st.offsets.some;
+            if (at.size > 0 && at.data[0] != 0) { ret opt[Pointer].none{}; }
+        }
+        ret opt[Pointer].some{chained(e, p, st.members.data[0], 0)};
+    }
+    if (sel k.array) { ret opt[Pointer].some{chained(e, p, k.array.element, 0)}; }
+    ret opt[Pointer].none{};
+}
+
+# a pointer to a type at the start of what a pointer points to, none where
+# none starts there
+pub fun reach(e: *Emitter, p: Pointer, want: Type) opt[Pointer] {
+    var q: Pointer = held(e, p);
+    var n: u32     = 0;
+    for (n < 16) {
+        if (same(q.pointee, want))         { ret opt[Pointer].some{q}; }
+        if (!descends(e, q.pointee, want)) { ret opt[Pointer].none{}; }
+        val down: opt[Pointer] = first(e, q);
+        if (sel down.none) { ret opt[Pointer].none{}; }
+        q = held(e, down.some);
+        n = n + 1;
+    }
+    ret opt[Pointer].none{};
+}
+
+# whether a type starts, through first members and unions, with another
+fun descends(e: *Emitter, from: Type, want: Type) bool {
+    var t: Type = from;
+    var n: u32  = 0;
+    for (n < 16) {
+        if (same(t, want)) { ret true; }
+        val m: opt[Type] = spirv_types.union_member(e.u, t, spirv_types.PLAIN);
+        if (sel m.some) { t = m.some; }
+        or {
+            val k: opt[Type] = spirv_types.member_of(e.u, t, 0);
+            if (sel k.none)                                            { ret false; }
+            if (spirv_types.count_of(e.u, t) == 0 && !aggregate(e, t)) { ret false; }
+            t = k.some;
+        }
+        n = n + 1;
+    }
+    ret false;
+}
+
+fun aggregate(e: *Emitter, t: Type) bool {
+    val s: res[types.Shape, types.Error] = types.shape(?e.u.m.types, t);
+    if (sel s.err) { ret false; }
+    val k: types.Shape = s.ok;
+    ret sel k.structure || sel k.array;
+}
+
+# the scalar or vector a pointer's pointee starts with
+fun leading(e: *Emitter, p: Pointer) opt[Pointer] {
+    var q: Pointer = held(e, p);
+    var n: u32     = 0;
+    for (n < 16) {
+        if (spirv_types.scalar_or_vector(e.u, q.pointee)) { ret opt[Pointer].some{q}; }
+        val down: opt[Pointer] = first(e, q);
+        if (sel down.none) { ret opt[Pointer].none{}; }
+        q = held(e, down.some);
+        n = n + 1;
+    }
+    ret opt[Pointer].none{};
+}
+
+fun bits(e: *Emitter, t: Type) u32 {
+    ret spirv_types.bits_of(e.u, t) * spirv_types.lanes_of(e.u, t);
+}
+
+# a value of a type held in one layout as the same value in another,
+# rebuilt member by member where the layouts differ, into an id or a fresh one
+pub fun coerce(e: *Emitter, id: u32, ty: Type, from: u32, to: u32, into: u32) u32 {
+    val f: u32 = spirv_types.norm(e.u, ty, from);
+    val t: u32 = spirv_types.norm(e.u, ty, to);
+    if (f == t) {
+        if (into == NONE) { ret id; }
+        emitter.copy(e, spirv_types.type_of(e.u, ty, to), into, id);
+        ret into;
+    }
+    var dest: u32 = into;
+    if (dest == NONE) { dest = emitter.fresh(e); }
+    val held_as: opt[Type] = spirv_types.union_member(e.u, ty, from);
+    if (sel held_as.some) { ret coerce(e, id, held_as.some, from, to, into); }
+    val n: u64 = spirv_types.count_of(e.u, ty);
+    if (n == 0 || n > 0xFFFF) {
+        emitter.fail(e, Error.untyped{ty});
+        ret NONE;
+    }
+    var members: vector.Vector[u32] = vector.init[u32](e.u.a);
+    fin { vector.dnit[u32](?members); }
+    var k: u64 = 0;
+    for (k < n && emitter.ok(e)) {
+        val m: opt[Type] = spirv_types.member_of(e.u, ty, k::u32);
+        if (sel m.none) {
+            emitter.fail(e, Error.untyped{ty});
+            ret NONE;
+        }
+        val part: u32 = emitter.fresh(e);
+        emitter.extract(e, spirv_types.type_of(e.u, m.some, spirv_types.member_key(from)), part, id, k::u32);
+        val moved:  u32                         = coerce(e, part, m.some, spirv_types.member_key(from), spirv_types.member_key(to), NONE);
+        val pushed: res[usize, allocator.Error] = vector.push[u32](?members, moved);
+        if (sel pushed.err) {
+            emitter.lost(e, pushed.err);
+            ret NONE;
+        }
+        k = k + 1;
+    }
+    emitter.construct(e, spirv_types.type_of(e.u, ty, to), dest, members.data, members.len);
+    ret dest;
+}
+
+fun access(d: *InstructionData) Slot {
+    if (d.metadata.flags.volatile) { ret unit.enumerant(VOLATILE); }
+    ret Slot.none{};
+}
+
+fun type_slot(d: *InstructionData, slot: usize) opt[Type] {
+    if (slot >= d.immediates.len) { ret opt[Type].none{}; }
+    val imm: Immediate = d.immediates.data[slot];
+    if (sel imm.ty) { ret opt[Type].some{imm.ty}; }
+    ret opt[Type].none{};
+}
+
+fun member_slot(d: *InstructionData, slot: usize) opt[u32] {
+    if (slot >= d.immediates.len) { ret opt[u32].none{}; }
+    val imm: Immediate = d.immediates.data[slot];
+    if (sel imm.member) { ret opt[u32].some{imm.member}; }
+    ret opt[u32].none{};
+}
+
+# a load: the value whole where the pointer points to its type, else the
+# scalar of its width the pointee starts with, its bits cast
+pub fun load(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val p: opt[Pointer] = pointer_of(e, d.operands.data[0], i);
+    if (sel p.none) { ret; }
+    val r:    Value        = d.results.data[0];
+    val want: Type         = emitter.value_type(e, r);
+    val q:    opt[Pointer] = reach(e, p.some, want);
+    if (sel q.some) {
+        val t:     u32  = spirv_types.type_of(e.u, want, q.some.key);
+        var got:   u32  = e.ids.data[r.index];
+        val moved: bool = spirv_types.norm(e.u, want, q.some.key) != spirv_types.PLAIN;
+        if (moved) { got = emitter.fresh(e); }
+        var slots: [4]Slot = [4]Slot{Slot.id{t}, Slot.id{got}, Slot.id{q.some.id}, access(d)};
+        emitter.put(e, gen_row_index.OPLOAD, ?slots[0], 4);
+        if (moved) { coerce(e, got, want, q.some.key, spirv_types.PLAIN, e.ids.data[r.index]); }
+        ret;
+    }
+    val s: opt[Pointer] = scalar(e, p.some, want, i);
+    if (sel s.none) { ret; }
+    val raw:   u32     = emitter.fresh(e);
+    var slots: [4]Slot = [4]Slot{Slot.id{spirv_types.type_of(e.u, s.some.pointee, s.some.key)}, Slot.id{raw}, Slot.id{s.some.id}, access(d)};
+    emitter.put(e, gen_row_index.OPLOAD, ?slots[0], 4);
+    emitter.one(e, gen_row_index.OPBITCAST, emitter.type_id(e, r), e.ids.data[r.index], raw);
+}
+
+# the scalar of a value's width a pointer's pointee starts with, refused as
+# a reinterpretation where there is none
+fun scalar(e: *Emitter, p: Pointer, want: Type, i: Instruction) opt[Pointer] {
+    if (spirv_types.scalar_or_vector(e.u, want) && !spirv_types.boolean(e.u, want)) {
+        val s: opt[Pointer] = leading(e, p);
+        if (sel s.some) {
+            val lead: Pointer = s.some;
+            if (!spirv_types.boolean(e.u, lead.pointee) && bits(e, lead.pointee) == bits(e, want)) { ret s; }
+        }
+    }
+    reinterpreted(e, i);
+    ret opt[Pointer].none{};
+}
+
+# a store, as a load reaches what it writes
+pub fun store(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val p: opt[Pointer] = pointer_of(e, d.operands.data[0], i);
+    if (sel p.none) { ret; }
+    val v:    Value = d.operands.data[1];
+    val want: Type  = emitter.value_type(e, v);
+    if (spirv_types.pointer(e.u, want)) {
+        emitter.fail(e, Error.untyped{want});
+        ret;
+    }
+    val q: opt[Pointer] = reach(e, p.some, want);
+    if (sel q.some) {
+        val moved: u32     = coerce(e, emitter.id_of(e, v), want, spirv_types.PLAIN, q.some.key, NONE);
+        var slots: [3]Slot = [3]Slot{Slot.id{q.some.id}, Slot.id{moved}, access(d)};
+        emitter.put(e, gen_row_index.OPSTORE, ?slots[0], 3);
+        ret;
+    }
+    val s: opt[Pointer] = scalar(e, p.some, want, i);
+    if (sel s.none) { ret; }
+    val cast: u32 = emitter.fresh(e);
+    emitter.one(e, gen_row_index.OPBITCAST, spirv_types.type_of(e.u, s.some.pointee, s.some.key), cast, emitter.id_of(e, v));
+    var slots: [3]Slot = [3]Slot{Slot.id{s.some.id}, Slot.id{cast}, access(d)};
+    emitter.put(e, gen_row_index.OPSTORE, ?slots[0], 3);
+}
+
+# a pointer to a member of a structure or an element of an array, by an
+# access chain from a pointer to the aggregate
+pub fun member(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val ty:    opt[Type] = type_slot(d, 0);
+    val index: opt[u32]  = member_slot(d, 1);
+    if (sel ty.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    if (sel index.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val k: opt[Type] = spirv_types.member_of(e.u, ty.some, index.some);
+    if (sel k.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val chain: u32 = spirv_types.uint(e.u, 32, index.some::u64);
+    chain_to(e, i, d, ty.some, k.some, chain);
+}
+
+# a pointer to an element of an array by a run-time index
+pub fun index(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val ty: opt[Type] = type_slot(d, 0);
+    if (sel ty.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val k: opt[Type] = spirv_types.member_of(e.u, ty.some, 0);
+    if (sel k.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    chain_to(e, i, d, ty.some, k.some, emitter.id_of(e, d.operands.data[1]));
+}
+
+fun chain_to(e: *Emitter, i: Instruction, d: *InstructionData, aggregate: Type, member: Type, chain: u32) {
+    val p: opt[Pointer] = pointer_of(e, d.operands.data[0], i);
+    if (sel p.none) { ret; }
+    val q: opt[Pointer] = reach(e, p.some, aggregate);
+    if (sel q.none) {
+        reinterpreted(e, i);
+        ret;
+    }
+    val r:     Value   = d.results.data[0];
+    val made:  Pointer = Pointer{id: e.ids.data[r.index], pointee: member, key: spirv_types.member_key(q.some.key), class: q.some.class, known: true};
+    var at:    [1]u32  = [1]u32{chain};
+    var slots: [4]Slot = [4]Slot{Slot.id{pointer_type(e, made)}, Slot.id{made.id}, Slot.id{q.some.id}, Slot.list{unit.list(e.u, ?at[0], 1)}};
+    emitter.put(e, gen_row_index.OPACCESSCHAIN, ?slots[0], 4);
+    e.pointers.data[r.index] = made;
+}
+
+fun ordering_bits(o: Ordering) u32 {
+    if (sel o.acquire) { ret ACQUIRE; }
+    if (sel o.release) { ret RELEASE; }
+    if (sel o.acq_rel) { ret ACQUIRE_RELEASE; }
+    if (sel o.seq_cst) { ret SEQUENTIAL; }
+    ret 0;
+}
+
+fun class_bits(class: u32) u32 {
+    val c: u64 = class::u64;
+    if (c == schema.UNIFORM || c == schema.STORAGE_BUFFER || c == 5349) { ret UNIFORM_MEMORY; }
+    if (c == schema.WORKGROUP)                                          { ret WORKGROUP_MEMORY; }
+    if (c == schema.IMAGE)                                              { ret IMAGE_MEMORY; }
+    ret 0;
+}
+
+fun ordering_at(d: *InstructionData, slot: usize) Ordering {
+    if (slot < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[slot];
+        if (sel imm.ordering) { ret imm.ordering; }
+    }
+    ret Ordering.seq_cst{};
+}
+
+# the memory semantics of an ordering of an access to a storage class
+fun semantics(e: *Emitter, o: Ordering, class: u32) u32 {
+    val order: u32 = ordering_bits(o);
+    var bits:  u32 = order;
+    if (order != 0) { bits = bits | class_bits(class); }
+    ret spirv_types.uint(e.u, 32, bits::u64);
+}
+
+fun scope(e: *Emitter) u32 {
+    ret spirv_types.uint(e.u, 32, DEVICE);
+}
+
+# the atomic row of a read, modify and write, NO_ROW where spir-v has none
+fun update_row(code: u32) u32 {
+    if (code == opcode.ATOMIC_ADD.index)  { ret gen_row_index.OPATOMICIADD; }
+    if (code == opcode.ATOMIC_SUB.index)  { ret gen_row_index.OPATOMICISUB; }
+    if (code == opcode.ATOMIC_AND.index)  { ret gen_row_index.OPATOMICAND; }
+    if (code == opcode.ATOMIC_OR.index)   { ret gen_row_index.OPATOMICOR; }
+    if (code == opcode.ATOMIC_XOR.index)  { ret gen_row_index.OPATOMICXOR; }
+    if (code == opcode.ATOMIC_XCHG.index) { ret gen_row_index.OPATOMICEXCHANGE; }
+    if (code == opcode.ATOMIC_SMAX.index) { ret gen_row_index.OPATOMICSMAX; }
+    if (code == opcode.ATOMIC_SMIN.index) { ret gen_row_index.OPATOMICSMIN; }
+    if (code == opcode.ATOMIC_UMAX.index) { ret gen_row_index.OPATOMICUMAX; }
+    if (code == opcode.ATOMIC_UMIN.index) { ret gen_row_index.OPATOMICUMIN; }
+    ret emitter.NO_ROW;
+}
+
+# whether an opcode is an atomic access
+pub fun atomic(code: u32) bool {
+    ret code == opcode.ATOMIC_LOAD.index || code == opcode.ATOMIC_STORE.index || code == opcode.ATOMIC_CMPXCHG.index || code == opcode.ATOMIC_NAND.index || update_row(code) != emitter.NO_ROW;
+}
+
+# an atomic access at the device scope, of the integer a pointer points to
+pub fun atomically(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val code: u32 = d.opcode.index;
+    if (code == opcode.ATOMIC_NAND.index) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val p: opt[Pointer] = pointer_of(e, d.operands.data[0], i);
+    if (sel p.none) { ret; }
+    var want: Type = Type{index: 0};
+    if (code == opcode.ATOMIC_LOAD.index) { want = emitter.value_type(e, d.results.data[0]); }
+    or                                    { want = emitter.value_type(e, d.operands.data[1]); }
+    val q: opt[Pointer] = reach(e, p.some, want);
+    if (sel q.none) {
+        reinterpreted(e, i);
+        ret;
+    }
+    val at: u32 = q.some.id;
+    if (code == opcode.ATOMIC_LOAD.index) {
+        val r:     Value   = d.results.data[0];
+        var slots: [5]Slot = [5]Slot{Slot.id{emitter.type_id(e, r)}, Slot.id{e.ids.data[r.index]}, Slot.id{at}, Slot.id{scope(e)}, Slot.id{semantics(e, ordering_at(d, 1), q.some.class)}};
+        emitter.put(e, gen_row_index.OPATOMICLOAD, ?slots[0], 5);
+        ret;
+    }
+    if (code == opcode.ATOMIC_STORE.index) {
+        var slots: [4]Slot = [4]Slot{Slot.id{at}, Slot.id{scope(e)}, Slot.id{semantics(e, ordering_at(d, 0), q.some.class)}, Slot.id{emitter.id_of(e, d.operands.data[1])}};
+        emitter.put(e, gen_row_index.OPATOMICSTORE, ?slots[0], 4);
+        ret;
+    }
+    if (code == opcode.ATOMIC_CMPXCHG.index) {
+        val old:      Value   = d.results.data[0];
+        val expected: u32     = emitter.id_of(e, d.operands.data[1]);
+        var slots:    [8]Slot = [8]Slot{
+            Slot.id{emitter.type_id(e, old)},
+            Slot.id{e.ids.data[old.index]},
+            Slot.id{at},
+            Slot.id{scope(e)},
+            Slot.id{semantics(e, ordering_at(d, 0), q.some.class)},
+            Slot.id{semantics(e, ordering_at(d, 1), q.some.class)},
+            Slot.id{emitter.id_of(e, d.operands.data[2])},
+            Slot.id{expected},
+        };
+        emitter.put(e, gen_row_index.OPATOMICCOMPAREEXCHANGE, ?slots[0], 8);
+        if (d.results.len > 1) {
+            val ok: Value = d.results.data[1];
+            emitter.two(e, gen_row_index.OPIEQUAL, emitter.type_id(e, ok), e.ids.data[ok.index], e.ids.data[old.index], expected);
+        }
+        ret;
+    }
+    val r:     Value   = d.results.data[0];
+    var slots: [6]Slot = [6]Slot{Slot.id{emitter.type_id(e, r)}, Slot.id{e.ids.data[r.index]}, Slot.id{at}, Slot.id{scope(e)}, Slot.id{semantics(e, ordering_at(d, 0), q.some.class)}, Slot.id{emitter.id_of(e, d.operands.data[1])}};
+    emitter.put(e, update_row(code), ?slots[0], 6);
+}
+
+# a fence, a barrier of the device's memory
+pub fun fence(e: *Emitter, d: *InstructionData) {
+    val order: u32     = ordering_bits(ordering_at(d, 0)) | UNIFORM_MEMORY | WORKGROUP_MEMORY;
+    var slots: [2]Slot = [2]Slot{Slot.id{scope(e)}, Slot.id{spirv_types.uint(e.u, 32, order::u64)}};
+    emitter.put(e, gen_row_index.OPMEMORYBARRIER, ?slots[0], 2);
+}

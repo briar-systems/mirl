@@ -1,0 +1,1447 @@
+# the code of one function: its structured control from the region tree,
+# and the selection of each instruction
+#
+# the regions are laid out in their tree's order, which is an order of
+# dominance, every block after the blocks that dominate it and every merge
+# after its construct. a block parameter is an OpPhi with one entry per
+# predecessor the tree reaches, from the label its edge leaves. a selection
+# declares its merge, or a block of its own that is never reached where
+# control never meets again, unless every edge out of its header breaks out
+# of the innermost loop or continues it. a loop header's phis and its loop
+# merge stand in a block of their own that branches to the header's code, so
+# a header that also selects declares its selection's merge in the block
+# after, and a header that is its own latch continues at a block of its own
+# that branches back. a branch with one target that the tree makes a
+# selection is a switch on a constant with its one target the default, so a
+# break out of it is a branch to its merge.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use masc.isa.spirv.gen_row_index;
+
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use FunctionNode: mirl.ir.function.Node;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use Spot: mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.type.format;
+use mirl.ir.value.Def;
+use mirl.pass.analysis;
+use mirl.pass.failure.Why;
+use mirl.structure.region;
+use mirl.structure.region.Region;
+use mirl.structure.region.Structure;
+use mirl.target.spirv.access;
+use mirl.target.spirv.buffer;
+use mirl.target.spirv.buffer.Slot;
+use mirl.target.spirv.debug;
+use mirl.target.spirv.emitter;
+use mirl.target.spirv.emitter.Emitter;
+use mirl.target.spirv.emitter.Frame;
+use mirl.target.spirv.emitter.Pointer;
+use mirl.target.spirv.error.Error;
+use mirl.target.spirv.schema;
+use spirv_types: mirl.target.spirv.types;
+use mirl.target.spirv.unit;
+use mirl.target.spirv.unit.Signature;
+use mirl.target.spirv.unit.Unit;
+
+# no id, as unit.NONE
+val NO_ID: u32 = 0;
+
+# the function control of every function, none
+val NO_CONTROL: u32 = 0;
+
+fun ok(e: *Emitter) bool {
+    ret emitter.ok(e);
+}
+
+fun push_u32(e: *Emitter, v: *vector.Vector[u32], x: u32) {
+    val pushed: res[usize, allocator.Error] = vector.push[u32](v, x);
+    if (sel pushed.err) { emitter.lost(e, pushed.err); }
+}
+
+fun terminator_id(e: *Emitter, k: u32) Instruction {
+    val list: *vector.Vector[Instruction] = ?e.b.blocks.data[k].instructions;
+    ret list.data[list.len - 1];
+}
+
+fun terminator(e: *Emitter, k: u32) *InstructionData {
+    ret ?e.b.instructions.data[terminator_id(e, k).index];
+}
+
+fun block_of(d: *InstructionData) u32 {
+    val p: Spot = d.place;
+    if (sel p.placed) { ret p.placed.index; }
+    ret NONE;
+}
+
+# the label an edge out of a block branches to: its target's, but the
+# continue target of a header that is its own latch for its back edge
+fun target(e: *Emitter, from: u32, edge: *Edge) u32 {
+    val k: u32 = edge.block.index;
+    if (k == from && e.cts.data[k] != NO_ID) { ret e.cts.data[k]; }
+    ret e.labels.data[k];
+}
+
+# the label an edge out of a block leaves from, as a phi names it
+fun parent(e: *Emitter, from: u32, to: u32) u32 {
+    if (from == to && e.cts.data[to] != NO_ID) { ret e.cts.data[to]; }
+    ret e.bodies.data[from];
+}
+
+# a label
+fun label(e: *Emitter, id: u32) {
+    var s: [1]Slot = [1]Slot{Slot.id{id}};
+    emitter.put(e, gen_row_index.OPLABEL, ?s[0], 1);
+    e.line = 0xFFFF_FFFF;
+}
+
+fun branch_to(e: *Emitter, id: u32) {
+    var s: [1]Slot = [1]Slot{Slot.id{id}};
+    emitter.put(e, gen_row_index.OPBRANCH, ?s[0], 1);
+}
+
+# a block never reached, the merge of a construct control never leaves
+fun unreached(e: *Emitter, id: u32) {
+    label(e, id);
+    var s: [1]Slot = [1]Slot{Slot.none{}};
+    emitter.put(e, gen_row_index.OPUNREACHABLE, ?s[0], 0);
+}
+
+# the phis of a block's parameters, one entry per edge into it from a block
+# the tree reaches
+fun phis(e: *Emitter, k: u32) {
+    val params: *vector.Vector[Value] = ?e.b.blocks.data[k].parameters;
+    if (params.len == 0) { ret; }
+    var seen: vector.Vector[u32] = vector.init[u32](e.u.a);
+    fin { vector.dnit[u32](?seen); }
+    var j: usize = 0;
+    for (j < params.len && ok(e)) {
+        val p: Value = params.data[j];
+        if (spirv_types.pointer(e.u, emitter.value_type(e, p))) {
+            emitter.fail(e, Error.variable{emitter.at(e, emitter.NOWHERE)});
+            ret;
+        }
+        var pairs: vector.Vector[Slot] = vector.init[Slot](e.u.a);
+        fin { vector.dnit[Slot](?pairs); }
+        seen.len = 0;
+        val preds: *vector.Vector[Instruction] = ?e.b.blocks.data[k].predecessors;
+        var n:     usize                       = 0;
+        for (n < preds.len && ok(e)) {
+            val pi:         Instruction      = preds.data[n];
+            val d:          *InstructionData = ?e.b.instructions.data[pi.index];
+            val from:       u32              = block_of(d);
+            var fresh_pred: bool             = from != NONE && e.reached.data[from];
+            var s:          usize            = 0;
+            for (s < seen.len) {
+                if (seen.data[s] == pi.index) { fresh_pred = false; }
+                s = s + 1;
+            }
+            if (fresh_pred) {
+                push_u32(e, ?seen, pi.index);
+                var edges: u32   = 0;
+                var x:     usize = 0;
+                for (x < d.edges.len) {
+                    val edge: *Edge = ?d.edges.data[x];
+                    if (edge.block.index == k) {
+                        edges = edges + 1;
+                        var pair:   [2]Slot                     = [2]Slot{Slot.id{emitter.id_of(e, edge.arguments.data[j])}, Slot.id{parent(e, from, k)}};
+                        val group:  Slot                        = Slot.group{unit.slots(e.u, ?pair[0], 2)};
+                        val pushed: res[usize, allocator.Error] = vector.push[Slot](?pairs, group);
+                        if (sel pushed.err) {
+                            emitter.lost(e, pushed.err);
+                            ret;
+                        }
+                    }
+                    x = x + 1;
+                }
+                if (edges > 1) {
+                    emitter.unstructured(e);
+                    ret;
+                }
+            }
+            n = n + 1;
+        }
+        var slots: [3]Slot = [3]Slot{Slot.id{emitter.type_id(e, p)}, Slot.id{e.ids.data[p.index]}, Slot.list{unit.slots(e.u, pairs.data, pairs.len)}};
+        emitter.put(e, gen_row_index.OPPHI, ?slots[0], 3);
+        j = j + 1;
+    }
+}
+
+# the start of a block's code: its label and phis, or a loop header's own
+# label where its phis already stand, then the stack slots of the entry
+fun start(e: *Emitter, k: u32) {
+    if (e.bodies.data[k] != e.labels.data[k]) {
+        label(e, e.bodies.data[k]);
+    }
+    or {
+        label(e, e.labels.data[k]);
+        if (k != 0) { phis(e, k); }
+    }
+    if (k == 0) { slots(e); }
+    debug.scope(e);
+}
+
+# a variable of the Function class for every stack slot, which spir-v wants
+# first in the entry block
+fun slots(e: *Emitter) {
+    var k: usize = 0;
+    for (k < e.b.instructions.len && ok(e)) {
+        val d:      *InstructionData = ?e.b.instructions.data[k];
+        val placed: Spot             = d.place;
+        if (d.opcode.index == opcode.ALLOCA.index && sel placed.placed) {
+            val i:       Instruction = Instruction{index: k::u32};
+            var ty:      opt[Type]   = opt[Type].none{};
+            var pointer: opt[Type]   = opt[Type].none{};
+            if (d.immediates.len > 1) {
+                val a: Immediate = d.immediates.data[0];
+                val b: Immediate = d.immediates.data[1];
+                if (sel a.ty) { ty = opt[Type].some{a.ty}; }
+                if (sel b.ty) { pointer = opt[Type].some{b.ty}; }
+            }
+            if (sel ty.none) {
+                emitter.unselected(e, i);
+                ret;
+            }
+            if (sel pointer.none) {
+                emitter.unselected(e, i);
+                ret;
+            }
+            val shape: res[types.Shape, types.Error] = types.shape(?e.u.m.types, pointer.some);
+            var space: u32                           = 0xFFFF_FFFF;
+            if (sel shape.ok) {
+                val s: types.Shape = shape.ok;
+                if (sel s.pointer) { space = s.pointer.space; }
+            }
+            if (space::u64 != schema.FUNCTION) {
+                emitter.fail(e, Error.slot{emitter.at(e, i)});
+                ret;
+            }
+            val r: Value   = d.results.data[0];
+            val p: Pointer = Pointer{id: e.ids.data[r.index], pointee: ty.some, key: spirv_types.PLAIN, class: space, known: true};
+            e.pointers.data[r.index] = p;
+            var s: [4]Slot = [4]Slot{Slot.id{access.pointer_type(e, p)}, Slot.id{p.id}, unit.enumerant(space), Slot.none{}};
+            emitter.put(e, gen_row_index.OPVARIABLE, ?s[0], 4);
+        }
+        k = k + 1;
+    }
+}
+
+# the instructions of a block before its terminator
+fun body(e: *Emitter, k: u32) {
+    val list: *vector.Vector[Instruction] = ?e.b.blocks.data[k].instructions;
+    if (list.len == 0) {
+        emitter.unstructured(e);
+        ret;
+    }
+    var j: usize = 0;
+    for (j + 1 < list.len && ok(e)) {
+        val i: Instruction = list.data[j];
+        debug.line(e, ?e.b.instructions.data[i.index]);
+        instruction(e, i, ?e.b.instructions.data[i.index]);
+        j = j + 1;
+    }
+    if (ok(e)) { debug.line(e, terminator(e, k)); }
+}
+
+# the first block a region's code runs
+fun first(e: *Emitter, r: u32) u32 {
+    if (r == NONE) { ret NONE; }
+    val g: Region      = region.region(e.s, r);
+    val k: region.Kind = g.kind;
+    if (sel k.sequence) { ret first(e, g.child); }
+    ret g.block;
+}
+
+fun sequence(e: *Emitter, r: u32) {
+    var c: u32 = region.region(e.s, r).child;
+    for (c != NONE && ok(e)) {
+        emit(e, c);
+        c = region.region(e.s, c).next;
+    }
+}
+
+fun emit(e: *Emitter, r: u32) {
+    val g: Region      = region.region(e.s, r);
+    val k: region.Kind = g.kind;
+    if (sel k.sequence)  { sequence(e, r); }
+    or (sel k.selection) { selection(e, r); }
+    or (sel k.loop)      { looped(e, r); }
+    or {
+        start(e, g.block);
+        body(e, g.block);
+        if (ok(e)) { ending(e, g.block); }
+    }
+}
+
+# a block's terminator that selects nothing: a branch, a return or a trap
+fun ending(e: *Emitter, k: u32) {
+    val i: Instruction      = terminator_id(e, k);
+    val d: *InstructionData = terminator(e, k);
+    val c: u32              = d.opcode.index;
+    if (c == opcode.BR.index) {
+        branch_to(e, target(e, k, ?d.edges.data[0]));
+        ret;
+    }
+    if (c == opcode.RET.index || c == opcode.RET_PLACED.index) {
+        returned(e, d);
+        ret;
+    }
+    if (c == opcode.UNREACHABLE.index) {
+        var s: [1]Slot = [1]Slot{Slot.none{}};
+        emitter.put(e, gen_row_index.OPUNREACHABLE, ?s[0], 0);
+        ret;
+    }
+    emitter.unstructured(e);
+}
+
+fun returned(e: *Emitter, d: *InstructionData) {
+    val sig: *Signature = unit.signature(e.u, e.f);
+    if (d.operands.len == 0) {
+        var s: [1]Slot = [1]Slot{Slot.none{}};
+        emitter.put(e, gen_row_index.OPRETURN, ?s[0], 0);
+        ret;
+    }
+    var value: u32 = NO_ID;
+    if (d.operands.len == 1) { value = emitter.id_of(e, d.operands.data[0]); }
+    or {
+        var members: vector.Vector[u32] = vector.init[u32](e.u.a);
+        fin { vector.dnit[u32](?members); }
+        var j: usize = 0;
+        for (j < d.operands.len) {
+            push_u32(e, ?members, emitter.id_of(e, d.operands.data[j]));
+            j = j + 1;
+        }
+        value = emitter.fresh(e);
+        emitter.construct(e, sig.result, value, members.data, members.len);
+    }
+    var s: [1]Slot = [1]Slot{Slot.id{value}};
+    emitter.put(e, gen_row_index.OPRETURNVALUE, ?s[0], 1);
+}
+
+# whether an edge breaks out of the innermost loop or continues it
+fun exits(e: *Emitter, edge: *Edge) bool {
+    if (e.loops.len == 0) { ret false; }
+    val f: Frame = e.loops.data[e.loops.len - 1];
+    val k: u32   = edge.block.index;
+    ret k == f.header || (f.merge != NONE && k == f.merge) || (f.latch != NONE && k == f.latch);
+}
+
+# the arm of a selection, its code when the tree gives it any
+fun arm(e: *Emitter, r: u32, edge: *Edge) {
+    if (r == NONE || region.region(e.s, r).child == NONE) { ret; }
+    if (first(e, r) != edge.block.index) {
+        emitter.unstructured(e);
+        ret;
+    }
+    sequence(e, r);
+}
+
+# the label a construct merges at: its merge block's, or a fresh one for a
+# construct control never leaves, given back for the block the caller
+# supplies after it
+fun merge_label(e: *Emitter, merge: u32, supplied: *u32) u32 {
+    if (merge != NONE) { ret e.labels.data[merge]; }
+    @supplied = emitter.fresh(e);
+    ret @supplied;
+}
+
+fun selection_merge(e: *Emitter, merge: u32) {
+    var s: [2]Slot = [2]Slot{Slot.id{merge}, unit.enumerant(0)};
+    emitter.put(e, gen_row_index.OPSELECTIONMERGE, ?s[0], 2);
+}
+
+fun selection(e: *Emitter, r: u32) {
+    val g: Region = region.region(e.s, r);
+    start(e, g.block);
+    body(e, g.block);
+    if (!ok(e)) { ret; }
+    val d:    *InstructionData   = terminator(e, g.block);
+    val c:    u32                = d.opcode.index;
+    var arms: vector.Vector[u32] = vector.init[u32](e.u.a);
+    fin { vector.dnit[u32](?arms); }
+    var child: u32 = g.child;
+    for (child != NONE) {
+        push_u32(e, ?arms, child);
+        child = region.region(e.s, child).next;
+    }
+    if (arms.len != d.edges.len) {
+        emitter.unstructured(e);
+        ret;
+    }
+    var supplied: u32 = NO_ID;
+    if (c == opcode.CBR.index) {
+        val a: *Edge = ?d.edges.data[0];
+        val b: *Edge = ?d.edges.data[1];
+        if (!(exits(e, a) && exits(e, b))) { selection_merge(e, merge_label(e, g.merge, ?supplied)); }
+        var s: [4]Slot = [4]Slot{Slot.id{emitter.id_of(e, d.operands.data[0])}, Slot.id{target(e, g.block, a)}, Slot.id{target(e, g.block, b)}, Slot.list{buffer.EMPTY}};
+        emitter.put(e, gen_row_index.OPBRANCHCONDITIONAL, ?s[0], 4);
+    }
+    or (c == opcode.BR.index) {
+        selection_merge(e, merge_label(e, g.merge, ?supplied));
+        var s: [3]Slot = [3]Slot{Slot.id{spirv_types.uint(e.u, 32, 0)}, Slot.id{target(e, g.block, ?d.edges.data[0])}, Slot.list{buffer.EMPTY}};
+        emitter.put(e, gen_row_index.OPSWITCH, ?s[0], 3);
+    }
+    or (c == opcode.SWITCH.index) {
+        switched(e, g, d, ?supplied);
+    }
+    or {
+        emitter.unstructured(e);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < arms.len && ok(e)) {
+        arm(e, arms.data[k], ?d.edges.data[k]);
+        k = k + 1;
+    }
+    if (supplied != NO_ID && ok(e)) { unreached(e, supplied); }
+}
+
+# a switch: its default the first edge, then one literal of the selector's
+# width per case
+fun switched(e: *Emitter, g: Region, d: *InstructionData, supplied: *u32) {
+    val i: Instruction = terminator_id(e, g.block);
+    if (d.immediates.len == 0) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val imm: Immediate = d.immediates.data[0];
+    if (!(sel imm.cases)) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val cases: Slice[u64] = imm.cases;
+    if (cases.size + 1 != d.edges.len) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val selector: Value = d.operands.data[0];
+    val width:    u32   = spirv_types.bits_of(e.u, emitter.value_type(e, selector));
+    if (width == 1 || width > 64) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    selection_merge(e, merge_label(e, g.merge, supplied));
+    var groups: vector.Vector[Slot] = vector.init[Slot](e.u.a);
+    fin { vector.dnit[Slot](?groups); }
+    var k: usize = 0;
+    for (k < cases.size) {
+        var pair:   [2]Slot                     = [2]Slot{Slot.literal{unit.words(e.u, cases.data[k], (width + 31) / 32)}, Slot.id{target(e, g.block, ?d.edges.data[k + 1])}};
+        val pushed: res[usize, allocator.Error] = vector.push[Slot](?groups, Slot.group{unit.slots(e.u, ?pair[0], 2)});
+        if (sel pushed.err) {
+            emitter.lost(e, pushed.err);
+            ret;
+        }
+        k = k + 1;
+    }
+    var s: [3]Slot = [3]Slot{Slot.id{emitter.id_of(e, selector)}, Slot.id{target(e, g.block, ?d.edges.data[0])}, Slot.list{unit.slots(e.u, groups.data, groups.len)}};
+    emitter.put(e, gen_row_index.OPSWITCH, ?s[0], 3);
+}
+
+# a loop: its header's phis and loop merge in a block of their own, its
+# body from the header's code, its continue sequence, and the continue
+# target of a header that is its own latch
+fun looped(e: *Emitter, r: u32) {
+    val g:     Region = region.region(e.s, r);
+    val inner: u32    = g.child;
+    if (inner == NONE) {
+        emitter.unstructured(e);
+        ret;
+    }
+    val rest: u32 = region.region(e.s, inner).next;
+    val h:    u32 = g.block;
+    label(e, e.labels.data[h]);
+    phis(e, h);
+    var supplied: u32 = NO_ID;
+    val merge:    u32 = merge_label(e, g.merge, ?supplied);
+    var latch:    u32 = NONE;
+    var cont:     u32 = e.cts.data[h];
+    if (cont == NO_ID) {
+        latch = g.latch;
+        cont  = e.labels.data[latch];
+    }
+    var s: [3]Slot = [3]Slot{Slot.id{merge}, Slot.id{cont}, unit.enumerant(0)};
+    emitter.put(e, gen_row_index.OPLOOPMERGE, ?s[0], 3);
+    branch_to(e, e.bodies.data[h]);
+    val pushed: res[usize, allocator.Error] = vector.push[Frame](?e.loops, Frame{header: h, merge: g.merge, latch: latch});
+    if (sel pushed.err) {
+        emitter.lost(e, pushed.err);
+        ret;
+    }
+    sequence(e, inner);
+    if (rest != NONE && ok(e)) { sequence(e, rest); }
+    if (e.cts.data[h] != NO_ID && ok(e)) {
+        label(e, e.cts.data[h]);
+        branch_to(e, e.labels.data[h]);
+    }
+    e.loops.len = e.loops.len - 1;
+    if (supplied != NO_ID && ok(e)) { unreached(e, supplied); }
+}
+
+# the rows of the instructions of two operands of one type
+fun integer_row(code: u32) u32 {
+    if (code == opcode.ADD.index)   { ret gen_row_index.OPIADD; }
+    if (code == opcode.SUB.index)   { ret gen_row_index.OPISUB; }
+    if (code == opcode.MUL.index)   { ret gen_row_index.OPIMUL; }
+    if (code == opcode.DIV_S.index) { ret gen_row_index.OPSDIV; }
+    if (code == opcode.DIV_U.index) { ret gen_row_index.OPUDIV; }
+    if (code == opcode.REM_S.index) { ret gen_row_index.OPSREM; }
+    if (code == opcode.REM_U.index) { ret gen_row_index.OPUMOD; }
+    if (code == opcode.AND.index)   { ret gen_row_index.OPBITWISEAND; }
+    if (code == opcode.OR.index)    { ret gen_row_index.OPBITWISEOR; }
+    if (code == opcode.XOR.index)   { ret gen_row_index.OPBITWISEXOR; }
+    if (code == opcode.SHL.index)   { ret gen_row_index.OPSHIFTLEFTLOGICAL; }
+    if (code == opcode.SHR_U.index) { ret gen_row_index.OPSHIFTRIGHTLOGICAL; }
+    if (code == opcode.SHR_S.index) { ret gen_row_index.OPSHIFTRIGHTARITHMETIC; }
+    if (code == opcode.EQ.index)    { ret gen_row_index.OPIEQUAL; }
+    if (code == opcode.NE.index)    { ret gen_row_index.OPINOTEQUAL; }
+    if (code == opcode.LT_S.index)  { ret gen_row_index.OPSLESSTHAN; }
+    if (code == opcode.LE_S.index)  { ret gen_row_index.OPSLESSTHANEQUAL; }
+    if (code == opcode.GT_S.index)  { ret gen_row_index.OPSGREATERTHAN; }
+    if (code == opcode.GE_S.index)  { ret gen_row_index.OPSGREATERTHANEQUAL; }
+    if (code == opcode.LT_U.index)  { ret gen_row_index.OPULESSTHAN; }
+    if (code == opcode.LE_U.index)  { ret gen_row_index.OPULESSTHANEQUAL; }
+    if (code == opcode.GT_U.index)  { ret gen_row_index.OPUGREATERTHAN; }
+    if (code == opcode.GE_U.index)  { ret gen_row_index.OPUGREATERTHANEQUAL; }
+    ret emitter.NO_ROW;
+}
+
+# the rows of the same operations on bools
+fun bool_row(code: u32) u32 {
+    if (code == opcode.ADD.index || code == opcode.SUB.index || code == opcode.XOR.index || code == opcode.NE.index) { ret gen_row_index.OPLOGICALNOTEQUAL; }
+    if (code == opcode.AND.index || code == opcode.MUL.index)                                                        { ret gen_row_index.OPLOGICALAND; }
+    if (code == opcode.OR.index)                                                                                     { ret gen_row_index.OPLOGICALOR; }
+    if (code == opcode.EQ.index)                                                                                     { ret gen_row_index.OPLOGICALEQUAL; }
+    ret emitter.NO_ROW;
+}
+
+fun float_row(code: u32) u32 {
+    if (code == opcode.FADD.index)  { ret gen_row_index.OPFADD; }
+    if (code == opcode.FSUB.index)  { ret gen_row_index.OPFSUB; }
+    if (code == opcode.FMUL.index)  { ret gen_row_index.OPFMUL; }
+    if (code == opcode.FDIV.index)  { ret gen_row_index.OPFDIV; }
+    if (code == opcode.FREM.index)  { ret gen_row_index.OPFREM; }
+    if (code == opcode.FEQ_O.index) { ret gen_row_index.OPFORDEQUAL; }
+    if (code == opcode.FNE_O.index) { ret gen_row_index.OPFORDNOTEQUAL; }
+    if (code == opcode.FLT_O.index) { ret gen_row_index.OPFORDLESSTHAN; }
+    if (code == opcode.FLE_O.index) { ret gen_row_index.OPFORDLESSTHANEQUAL; }
+    if (code == opcode.FGT_O.index) { ret gen_row_index.OPFORDGREATERTHAN; }
+    if (code == opcode.FGE_O.index) { ret gen_row_index.OPFORDGREATERTHANEQUAL; }
+    if (code == opcode.FEQ_U.index) { ret gen_row_index.OPFUNORDEQUAL; }
+    if (code == opcode.FNE_U.index) { ret gen_row_index.OPFUNORDNOTEQUAL; }
+    if (code == opcode.FLT_U.index) { ret gen_row_index.OPFUNORDLESSTHAN; }
+    if (code == opcode.FLE_U.index) { ret gen_row_index.OPFUNORDLESSTHANEQUAL; }
+    if (code == opcode.FGT_U.index) { ret gen_row_index.OPFUNORDGREATERTHAN; }
+    if (code == opcode.FGE_U.index) { ret gen_row_index.OPFUNORDGREATERTHANEQUAL; }
+    ret emitter.NO_ROW;
+}
+
+# the GLSL.std.450 rows of one float operand
+fun glsl_unary(code: u32) u32 {
+    if (code == opcode.FABS.index)     { ret gen_row_index.OPEXTINST_GLSL_STD_450_FABS; }
+    if (code == opcode.FSQRT.index)    { ret gen_row_index.OPEXTINST_GLSL_STD_450_SQRT; }
+    if (code == opcode.FFLOOR.index)   { ret gen_row_index.OPEXTINST_GLSL_STD_450_FLOOR; }
+    if (code == opcode.FCEIL.index)    { ret gen_row_index.OPEXTINST_GLSL_STD_450_CEIL; }
+    if (code == opcode.FINT.index)     { ret gen_row_index.OPEXTINST_GLSL_STD_450_TRUNC; }
+    if (code == opcode.FNEAREST.index) { ret gen_row_index.OPEXTINST_GLSL_STD_450_ROUNDEVEN; }
+    ret emitter.NO_ROW;
+}
+
+# how the lanes of a reduction combine
+# ---
+# row:  the row of two operands
+# glsl: the row is of the GLSL.std.450 set
+rec Combine {
+    row:  u32;
+    glsl: bool;
+}
+
+fun combine(code: u32, boolean: bool) Combine {
+    var c: Combine = Combine{row: emitter.NO_ROW, glsl: false};
+    if (code == opcode.REDUCE_ADD.index) {
+        if (boolean) { c.row = gen_row_index.OPLOGICALNOTEQUAL; }
+        or           { c.row = gen_row_index.OPIADD; }
+    }
+    or (code == opcode.REDUCE_MUL.index) {
+        if (boolean) { c.row = gen_row_index.OPLOGICALAND; }
+        or           { c.row = gen_row_index.OPIMUL; }
+    }
+    or (code == opcode.REDUCE_AND.index) {
+        if (boolean) { c.row = gen_row_index.OPLOGICALAND; }
+        or           { c.row = gen_row_index.OPBITWISEAND; }
+    }
+    or (code == opcode.REDUCE_OR.index) {
+        if (boolean) { c.row = gen_row_index.OPLOGICALOR; }
+        or           { c.row = gen_row_index.OPBITWISEOR; }
+    }
+    or (code == opcode.REDUCE_XOR.index) {
+        if (boolean) { c.row = gen_row_index.OPLOGICALNOTEQUAL; }
+        or           { c.row = gen_row_index.OPBITWISEXOR; }
+    }
+    or (boolean)                                                                      { ret c; }
+    or (code == opcode.REDUCE_SMIN.index)                                             { c = Combine{row: gen_row_index.OPEXTINST_GLSL_STD_450_SMIN, glsl: true}; }
+    or (code == opcode.REDUCE_SMAX.index)                                             { c = Combine{row: gen_row_index.OPEXTINST_GLSL_STD_450_SMAX, glsl: true}; }
+    or (code == opcode.REDUCE_UMIN.index)                                             { c = Combine{row: gen_row_index.OPEXTINST_GLSL_STD_450_UMIN, glsl: true}; }
+    or (code == opcode.REDUCE_UMAX.index)                                             { c = Combine{row: gen_row_index.OPEXTINST_GLSL_STD_450_UMAX, glsl: true}; }
+    or (code == opcode.REDUCE_FADD_SEQ.index || code == opcode.REDUCE_FADD_ANY.index) { c.row = gen_row_index.OPFADD; }
+    or (code == opcode.REDUCE_FMUL_SEQ.index || code == opcode.REDUCE_FMUL_ANY.index) { c.row = gen_row_index.OPFMUL; }
+    or (code == opcode.REDUCE_FMINNUM.index)                                          { c = Combine{row: gen_row_index.OPEXTINST_GLSL_STD_450_NMIN, glsl: true}; }
+    or (code == opcode.REDUCE_FMAXNUM.index)                                          { c = Combine{row: gen_row_index.OPEXTINST_GLSL_STD_450_NMAX, glsl: true}; }
+    ret c;
+}
+
+fun reduction(code: u32) bool {
+    ret code == opcode.REDUCE_ADD.index || code == opcode.REDUCE_MUL.index || code == opcode.REDUCE_AND.index || code == opcode.REDUCE_OR.index || code == opcode.REDUCE_XOR.index || code == opcode.REDUCE_SMIN.index || code == opcode.REDUCE_SMAX.index || code == opcode.REDUCE_UMIN.index || code == opcode.REDUCE_UMAX.index || code == opcode.REDUCE_FADD_SEQ.index || code == opcode.REDUCE_FADD_ANY.index || code == opcode.REDUCE_FMUL_SEQ.index || code == opcode.REDUCE_FMUL_ANY.index || code == opcode.REDUCE_FMIN.index || code == opcode.REDUCE_FMAX.index || code == opcode.REDUCE_FMINNUM.index || code == opcode.REDUCE_FMAXNUM.index;
+}
+
+# the lanes of a vector combined in order
+fun reduce(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val x: Value   = d.operands.data[0];
+    val r: Value   = d.results.data[0];
+    val c: Combine = combine(d.opcode.index, spirv_types.boolean(e.u, emitter.value_type(e, x)));
+    if (c.row == emitter.NO_ROW) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val t:     u32 = emitter.type_id(e, r);
+    val v:     u32 = emitter.id_of(e, x);
+    val lanes: u32 = spirv_types.lanes_of(e.u, emitter.value_type(e, x));
+    if (lanes <= 1) {
+        emitter.copy(e, t, e.ids.data[r.index], v);
+        ret;
+    }
+    var acc: u32 = emitter.fresh(e);
+    emitter.extract(e, t, acc, v, 0);
+    var k: u32 = 1;
+    for (k < lanes) {
+        val lane: u32 = emitter.fresh(e);
+        emitter.extract(e, t, lane, v, k);
+        var into: u32 = emitter.fresh(e);
+        if (k + 1 == lanes) { into = e.ids.data[r.index]; }
+        if (c.glsl)         { emitter.glsl_two(e, c.row, t, into, acc, lane); }
+        or                  { emitter.two(e, c.row, t, into, acc, lane); }
+        acc = into;
+        k   = k + 1;
+    }
+}
+
+# a constant of a type whose every lane is one value
+fun splat(e: *Emitter, ty: Type, value: u64) u32 {
+    ret spirv_types.splat(e.u, ty, value);
+}
+
+fun all_ones(width: u32) u64 {
+    if (width >= 64) { ret 0xFFFF_FFFF_FFFF_FFFF; }
+    ret (1::u64 << width::u64) - 1;
+}
+
+# a bool or a vector of them as integers of a width, one or minus one for true
+fun widened(e: *Emitter, x: u32, ty: Type, signed: bool) u32 {
+    val wide: Type = emitter.integer(e, 32, spirv_types.lanes_of(e.u, ty));
+    var yes:  u64  = 1;
+    if (signed) { yes = 0xFFFF_FFFF; }
+    val r: u32 = emitter.fresh(e);
+    emitter.three(e, gen_row_index.OPSELECT, spirv_types.type_of(e.u, wide, spirv_types.PLAIN), r, x, splat(e, wide, yes), splat(e, wide, 0));
+    ret r;
+}
+
+# a conversion between integers of different widths, or of bools
+fun converted(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val code: u32   = d.opcode.index;
+    val x:    Value = d.operands.data[0];
+    val r:    Value = d.results.data[0];
+    val from: Type  = emitter.value_type(e, x);
+    val to:   Type  = emitter.value_type(e, r);
+    val t:    u32   = emitter.type_id(e, r);
+    val into: u32   = e.ids.data[r.index];
+    val v:    u32   = emitter.id_of(e, x);
+    if (spirv_types.boolean(e.u, to)) {
+        if (code != opcode.TRUNC.index) {
+            emitter.unselected(e, i);
+            ret;
+        }
+        val low: u32 = emitter.fresh(e);
+        emitter.two(e, gen_row_index.OPBITWISEAND, emitter.type_id(e, x), low, v, splat(e, from, 1));
+        emitter.two(e, gen_row_index.OPINOTEQUAL, t, into, low, splat(e, from, 0));
+        ret;
+    }
+    if (spirv_types.boolean(e.u, from)) {
+        var yes: u64 = 1;
+        if (code == opcode.EXT_S.index) { yes = all_ones(spirv_types.bits_of(e.u, to)); }
+        emitter.three(e, gen_row_index.OPSELECT, t, into, v, splat(e, to, yes), splat(e, to, 0));
+        ret;
+    }
+    if (code == opcode.EXT_S.index) { emitter.one(e, gen_row_index.OPSCONVERT, t, into, v); }
+    or                              { emitter.one(e, gen_row_index.OPUCONVERT, t, into, v); }
+}
+
+# the bits of the float of a width nearest a whole number toward zero, the
+# largest finite one for a number past every finite one
+pub fun float_bits(width: u32, negative: bool, magnitude: u64) u64 {
+    var p:    u32 = 24;
+    var bias: u32 = 127;
+    if (width == 16) {
+        p    = 11;
+        bias = 15;
+    }
+    or (width == 64) {
+        p    = 53;
+        bias = 1023;
+    }
+    var sign: u64 = 0;
+    if (negative)       { sign = 1::u64 << (width - 1)::u64; }
+    if (magnitude == 0) { ret sign; }
+    var n: u32 = 0;
+    var v: u64 = magnitude;
+    for (v != 0) {
+        n = n + 1;
+        v = v >> 1;
+    }
+    val exp:  u32 = n - 1;
+    val mask: u64 = (1::u64 << (p - 1)::u64) - 1;
+    if (exp > bias) { ret sign | ((2 * bias)::u64 << (p - 1)::u64) | mask; }
+    var m: u64 = 0;
+    if (exp >= p - 1) { m = magnitude >> (exp - (p - 1))::u64; }
+    or                { m = magnitude << ((p - 1) - exp)::u64; }
+    ret sign | ((exp + bias)::u64 << (p - 1)::u64) | (m & mask);
+}
+
+# a float to an integer, toward zero, saturating at the integer's bounds
+# and zero for a nan, as spir-v's conversion leaves a value past the bounds
+# undefined
+fun saturated(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val x:      Value = d.operands.data[0];
+    val r:      Value = d.results.data[0];
+    val from:   Type  = emitter.value_type(e, x);
+    val to:     Type  = emitter.value_type(e, r);
+    val fw:     u32   = spirv_types.bits_of(e.u, from);
+    val tw:     u32   = spirv_types.bits_of(e.u, to);
+    val signed: bool  = d.opcode.index == opcode.FTOI_S.index;
+    if (tw <= 1 || tw > 64 || spirv_types.boolean(e.u, to)) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    var low:  u64 = 0;
+    var high: u64 = all_ones(tw);
+    if (signed) {
+        low  = float_bits(fw, true, 1::u64 << (tw - 1)::u64);
+        high = all_ones(tw - 1);
+    }
+    val ft:  u32 = emitter.type_id(e, x);
+    val t:   u32 = emitter.type_id(e, r);
+    val v:   u32 = emitter.id_of(e, x);
+    val nan: u32 = emitter.fresh(e);
+    emitter.one(e, gen_row_index.OPISNAN, emitter.bool_of(e, from), nan, v);
+    val above: u32 = emitter.fresh(e);
+    emitter.glsl_two(e, gen_row_index.OPEXTINST_GLSL_STD_450_NMAX, ft, above, v, splat(e, from, low));
+    val held: u32 = emitter.fresh(e);
+    emitter.glsl_two(e, gen_row_index.OPEXTINST_GLSL_STD_450_NMIN, ft, held, above, splat(e, from, float_bits(fw, false, high)));
+    val whole: u32 = emitter.fresh(e);
+    if (signed) { emitter.one(e, gen_row_index.OPCONVERTFTOS, t, whole, held); }
+    or          { emitter.one(e, gen_row_index.OPCONVERTFTOU, t, whole, held); }
+    emitter.three(e, gen_row_index.OPSELECT, t, e.ids.data[r.index], nan, splat(e, to, 0), whole);
+}
+
+# an integer to a float, a bool read as one or minus one
+fun floated(e: *Emitter, d: *InstructionData) {
+    val x:      Value = d.operands.data[0];
+    val r:      Value = d.results.data[0];
+    val from:   Type  = emitter.value_type(e, x);
+    val signed: bool  = d.opcode.index == opcode.ITOF_S.index;
+    var v:      u32   = emitter.id_of(e, x);
+    if (spirv_types.boolean(e.u, from)) { v = widened(e, v, from, signed); }
+    if (signed)                         { emitter.one(e, gen_row_index.OPCONVERTSTOF, emitter.type_id(e, r), e.ids.data[r.index], v); }
+    or                                  { emitter.one(e, gen_row_index.OPCONVERTUTOF, emitter.type_id(e, r), e.ids.data[r.index], v); }
+}
+
+# the same bits as another type
+fun cast(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val x:    Value = d.operands.data[0];
+    val r:    Value = d.results.data[0];
+    val from: Type  = emitter.value_type(e, x);
+    val to:   Type  = emitter.value_type(e, r);
+    if (spirv_types.pointer(e.u, from) || spirv_types.pointer(e.u, to)) {
+        emitter.fail(e, Error.reinterpreted{emitter.at(e, i)});
+        ret;
+    }
+    if (spirv_types.boolean(e.u, from) || spirv_types.boolean(e.u, to)) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val t: u32 = emitter.type_id(e, r);
+    if (t == emitter.type_id(e, x)) {
+        emitter.copy(e, t, e.ids.data[r.index], emitter.id_of(e, x));
+        ret;
+    }
+    emitter.one(e, gen_row_index.OPBITCAST, t, e.ids.data[r.index], emitter.id_of(e, x));
+}
+
+# a float with the sign of another, by their bits
+fun copysign(e: *Emitter, d: *InstructionData) {
+    val x:      Value = d.operands.data[0];
+    val y:      Value = d.operands.data[1];
+    val r:      Value = d.results.data[0];
+    val ty:     Type  = emitter.value_type(e, x);
+    val w:      u32   = spirv_types.bits_of(e.u, ty);
+    val bits:   Type  = emitter.integer(e, w, spirv_types.lanes_of(e.u, ty));
+    val it:     u32   = spirv_types.type_of(e.u, bits, spirv_types.PLAIN);
+    val sign:   u64   = 1::u64 << (w - 1)::u64;
+    val xi:     u32   = emitter.fresh(e);
+    val yi:     u32   = emitter.fresh(e);
+    val xm:     u32   = emitter.fresh(e);
+    val ym:     u32   = emitter.fresh(e);
+    val joined: u32   = emitter.fresh(e);
+    emitter.one(e, gen_row_index.OPBITCAST, it, xi, emitter.id_of(e, x));
+    emitter.one(e, gen_row_index.OPBITCAST, it, yi, emitter.id_of(e, y));
+    emitter.two(e, gen_row_index.OPBITWISEAND, it, xm, xi, splat(e, bits, all_ones(w) ^ sign));
+    emitter.two(e, gen_row_index.OPBITWISEAND, it, ym, yi, splat(e, bits, sign));
+    emitter.two(e, gen_row_index.OPBITWISEOR, it, joined, xm, ym);
+    emitter.one(e, gen_row_index.OPBITCAST, emitter.type_id(e, r), e.ids.data[r.index], joined);
+}
+
+# the bytes of an integer in the other order, by shifts and masks
+fun swapped(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val x:  Value = d.operands.data[0];
+    val r:  Value = d.results.data[0];
+    val ty: Type  = emitter.value_type(e, x);
+    val w:  u32   = spirv_types.bits_of(e.u, ty);
+    if (w < 16 || w % 8 != 0) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val t:   u32 = emitter.type_id(e, x);
+    val v:   u32 = emitter.id_of(e, x);
+    val n:   u32 = w / 8;
+    var acc: u32 = NO_ID;
+    var k:   u32 = 0;
+    for (k < n) {
+        val down: u32 = emitter.fresh(e);
+        emitter.two(e, gen_row_index.OPSHIFTRIGHTLOGICAL, t, down, v, splat(e, ty, (8 * k)::u64));
+        val byte: u32 = emitter.fresh(e);
+        emitter.two(e, gen_row_index.OPBITWISEAND, t, byte, down, splat(e, ty, 0xFF));
+        val up: u32 = emitter.fresh(e);
+        emitter.two(e, gen_row_index.OPSHIFTLEFTLOGICAL, t, up, byte, splat(e, ty, (8 * (n - 1 - k))::u64));
+        if (acc == NO_ID) { acc = up; }
+        or {
+            var into: u32 = emitter.fresh(e);
+            if (k + 1 == n) { into = e.ids.data[r.index]; }
+            emitter.two(e, gen_row_index.OPBITWISEOR, t, into, acc, up);
+            acc = into;
+        }
+        k = k + 1;
+    }
+}
+
+# leading or trailing zeros, through GLSL.std.450's bit scans of 32 bits
+fun zeros(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val x:  Value = d.operands.data[0];
+    val r:  Value = d.results.data[0];
+    val ty: Type  = emitter.value_type(e, x);
+    val w:  u32   = spirv_types.bits_of(e.u, ty);
+    if (w <= 1 || w > 32) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val word: Type = emitter.integer(e, 32, spirv_types.lanes_of(e.u, ty));
+    val wt:   u32  = spirv_types.type_of(e.u, word, spirv_types.PLAIN);
+    var v:    u32  = emitter.id_of(e, x);
+    if (w < 32) {
+        val up: u32 = emitter.fresh(e);
+        emitter.one(e, gen_row_index.OPUCONVERT, wt, up, v);
+        v = up;
+    }
+    var counted: u32 = emitter.fresh(e);
+    if (w == 32) { counted = e.ids.data[r.index]; }
+    if (d.opcode.index == opcode.CLZ.index) {
+        val msb: u32 = emitter.fresh(e);
+        emitter.glsl_one(e, gen_row_index.OPEXTINST_GLSL_STD_450_FINDUMSB, wt, msb, v);
+        emitter.two(e, gen_row_index.OPISUB, wt, counted, splat(e, word, (w - 1)::u64), msb);
+        if (w < 32) { emitter.one(e, gen_row_index.OPUCONVERT, emitter.type_id(e, r), e.ids.data[r.index], counted); }
+        ret;
+    }
+    val lsb: u32 = emitter.fresh(e);
+    emitter.glsl_one(e, gen_row_index.OPEXTINST_GLSL_STD_450_FINDILSB, wt, lsb, v);
+    val zero: u32 = emitter.fresh(e);
+    emitter.two(e, gen_row_index.OPIEQUAL, emitter.bool_of(e, ty), zero, v, splat(e, word, 0));
+    emitter.three(e, gen_row_index.OPSELECT, wt, counted, zero, splat(e, word, w::u64), lsb);
+    if (w < 32) { emitter.one(e, gen_row_index.OPUCONVERT, emitter.type_id(e, r), e.ids.data[r.index], counted); }
+}
+
+# the high half of a product, through the extended multiplies
+fun high(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val x:   Value = d.operands.data[0];
+    val r:   Value = d.results.data[0];
+    var row: u32   = gen_row_index.OPUMULEXTENDED;
+    if (d.opcode.index == opcode.MUL_HIGH_S.index) { row = gen_row_index.OPSMULEXTENDED; }
+    or (d.opcode.index != opcode.MUL_HIGH_U.index) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val t:    u32 = emitter.type_id(e, x);
+    val pair: u32 = emitter.fresh(e);
+    emitter.two(e, row, spirv_types.pair_of(e.u, t), pair, emitter.id_of(e, x), emitter.id_of(e, d.operands.data[1]));
+    emitter.extract(e, t, e.ids.data[r.index], pair, 1);
+}
+
+# an operation and whether it overflowed
+fun overflowed(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val code: u32   = d.opcode.index;
+    val x:    Value = d.operands.data[0];
+    val y:    Value = d.operands.data[1];
+    val r:    Value = d.results.data[0];
+    val o:    Value = d.results.data[1];
+    val ty:   Type  = emitter.value_type(e, x);
+    val t:    u32   = emitter.type_id(e, x);
+    val bt:   u32   = emitter.type_id(e, o);
+    val xv:   u32   = emitter.id_of(e, x);
+    val yv:   u32   = emitter.id_of(e, y);
+    val w:    u32   = spirv_types.bits_of(e.u, ty);
+    if (spirv_types.boolean(e.u, ty)) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val into: u32 = e.ids.data[r.index];
+    val flag: u32 = e.ids.data[o.index];
+    if (code == opcode.ADD_OV_U.index || code == opcode.SUB_OV_U.index || code == opcode.MUL_OV_U.index || code == opcode.MUL_OV_S.index) {
+        var row: u32 = gen_row_index.OPIADDCARRY;
+        if (code == opcode.SUB_OV_U.index) { row = gen_row_index.OPISUBBORROW; }
+        or (code == opcode.MUL_OV_U.index) { row = gen_row_index.OPUMULEXTENDED; }
+        or (code == opcode.MUL_OV_S.index) { row = gen_row_index.OPSMULEXTENDED; }
+        val pair: u32 = emitter.fresh(e);
+        emitter.two(e, row, spirv_types.pair_of(e.u, t), pair, xv, yv);
+        emitter.extract(e, t, into, pair, 0);
+        val top: u32 = emitter.fresh(e);
+        emitter.extract(e, t, top, pair, 1);
+        if (code == opcode.MUL_OV_S.index) {
+            val sign: u32 = emitter.fresh(e);
+            emitter.two(e, gen_row_index.OPSHIFTRIGHTARITHMETIC, t, sign, into, splat(e, ty, (w - 1)::u64));
+            emitter.two(e, gen_row_index.OPINOTEQUAL, bt, flag, top, sign);
+            ret;
+        }
+        emitter.two(e, gen_row_index.OPINOTEQUAL, bt, flag, top, splat(e, ty, 0));
+        ret;
+    }
+    var row: u32 = gen_row_index.OPIADD;
+    if (code == opcode.SUB_OV_S.index) { row = gen_row_index.OPISUB; }
+    or (code != opcode.ADD_OV_S.index) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    emitter.two(e, row, t, into, xv, yv);
+    val a: u32 = emitter.fresh(e);
+    val b: u32 = emitter.fresh(e);
+    val m: u32 = emitter.fresh(e);
+    if (code == opcode.ADD_OV_S.index) {
+        emitter.two(e, gen_row_index.OPBITWISEXOR, t, a, xv, into);
+        emitter.two(e, gen_row_index.OPBITWISEXOR, t, b, yv, into);
+    }
+    or {
+        emitter.two(e, gen_row_index.OPBITWISEXOR, t, a, xv, yv);
+        emitter.two(e, gen_row_index.OPBITWISEXOR, t, b, xv, into);
+    }
+    emitter.two(e, gen_row_index.OPBITWISEAND, t, m, a, b);
+    emitter.two(e, gen_row_index.OPSLESSTHAN, bt, flag, m, splat(e, ty, 0));
+}
+
+# the function a callee names, none for one chosen at run time
+fun callee(e: *Emitter, v: Value) opt[Function] {
+    val d: Def = e.b.values.data[v.index].def;
+    if (sel d.constant) {
+        val c: res[ConstantData, module.Error] = module.constant_data(e.u.m, d.constant);
+        if (sel c.err) { ret opt[Function].none{}; }
+        val data: ConstantData = c.ok;
+        if (!(sel data.address))      { ret opt[Function].none{}; }
+        if (data.address.offset != 0) { ret opt[Function].none{}; }
+        val s: Symbol = data.address.symbol;
+        if (sel s.function) { ret opt[Function].some{s.function}; }
+        ret opt[Function].none{};
+    }
+    if (sel d.result) {
+        val made: *InstructionData = ?e.b.instructions.data[d.result.instruction.index];
+        if (made.opcode.index == opcode.FUNC_ADDR.index && made.immediates.len > 0) {
+            val imm: Immediate = made.immediates.data[0];
+            if (sel imm.function) { ret opt[Function].some{imm.function}; }
+        }
+    }
+    ret opt[Function].none{};
+}
+
+# a call of a function of the module, its several results a structure
+fun call(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val f: opt[Function] = callee(e, d.operands.data[0]);
+    if (sel f.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val sig:  *Signature         = unit.signature(e.u, f.some);
+    var args: vector.Vector[u32] = vector.init[u32](e.u.a);
+    fin { vector.dnit[u32](?args); }
+    var j: usize = 1;
+    for (j < d.operands.len && ok(e)) {
+        val a: Value = d.operands.data[j];
+        if (spirv_types.pointer(e.u, emitter.value_type(e, a))) {
+            val p: opt[Pointer] = access.pointer_of(e, a, i);
+            if (sel p.none) { ret; }
+            val k: u32 = (j - 1)::u32;
+            if (k >= sig.params.len || access.pointer_type(e, p.some) != e.u.lists.data[sig.params.at + k]) {
+                emitter.fail(e, Error.reinterpreted{emitter.at(e, i)});
+                ret;
+            }
+            push_u32(e, ?args, p.some.id);
+        }
+        or { push_u32(e, ?args, emitter.id_of(e, a)); }
+        j = j + 1;
+    }
+    var r: u32 = emitter.fresh(e);
+    if (d.results.len == 1) { r = e.ids.data[d.results.data[0].index]; }
+    var s: [4]Slot = [4]Slot{Slot.id{sig.result}, Slot.id{r}, Slot.id{e.u.functions.data[f.some.index]}, Slot.list{unit.list(e.u, args.data, args.len)}};
+    emitter.put(e, gen_row_index.OPFUNCTIONCALL, ?s[0], 4);
+    if (d.results.len > 1) {
+        var k: usize = 0;
+        for (k < d.results.len) {
+            val v: Value = d.results.data[k];
+            emitter.extract(e, emitter.type_id(e, v), e.ids.data[v.index], r, k::u32);
+            k = k + 1;
+        }
+    }
+}
+
+fun lane_list(e: *Emitter, d: *InstructionData, slot: usize) opt[Slice[u32]] {
+    if (slot >= d.immediates.len) { ret opt[Slice[u32]].none{}; }
+    val imm: Immediate = d.immediates.data[slot];
+    if (sel imm.lanes) { ret opt[Slice[u32]].some{imm.lanes}; }
+    ret opt[Slice[u32]].none{};
+}
+
+fun index_at(d: *InstructionData, slot: usize) opt[u32] {
+    if (slot >= d.immediates.len) { ret opt[u32].none{}; }
+    val imm: Immediate = d.immediates.data[slot];
+    if (sel imm.lane)   { ret opt[u32].some{imm.lane}; }
+    if (sel imm.member) { ret opt[u32].some{imm.member}; }
+    ret opt[u32].none{};
+}
+
+# a vector or aggregate made, taken apart or changed
+fun composite(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val code: u32   = d.opcode.index;
+    val r:    Value = d.results.data[0];
+    val t:    u32   = emitter.type_id(e, r);
+    val into: u32   = e.ids.data[r.index];
+    if (code == opcode.VSPLAT.index || code == opcode.VBUILD.index) {
+        var members: vector.Vector[u32] = vector.init[u32](e.u.a);
+        fin { vector.dnit[u32](?members); }
+        if (code == opcode.VSPLAT.index) {
+            val lanes: u32 = spirv_types.lanes_of(e.u, emitter.value_type(e, r));
+            val x:     u32 = emitter.id_of(e, d.operands.data[0]);
+            var k:     u32 = 0;
+            for (k < lanes) {
+                push_u32(e, ?members, x);
+                k = k + 1;
+            }
+        }
+        or {
+            var k: usize = 0;
+            for (k < d.operands.len) {
+                push_u32(e, ?members, emitter.id_of(e, d.operands.data[k]));
+                k = k + 1;
+            }
+        }
+        emitter.construct(e, t, into, members.data, members.len);
+        ret;
+    }
+    if (code == opcode.VSHUFFLE.index) {
+        val lanes: opt[Slice[u32]] = lane_list(e, d, 1);
+        if (sel lanes.none) {
+            emitter.unselected(e, i);
+            ret;
+        }
+        var s: [5]Slot = [5]Slot{Slot.id{t}, Slot.id{into}, Slot.id{emitter.id_of(e, d.operands.data[0])}, Slot.id{emitter.id_of(e, d.operands.data[1])}, Slot.list{unit.numbers(e.u, lanes.some.data, lanes.some.size)}};
+        emitter.put(e, gen_row_index.OPVECTORSHUFFLE, ?s[0], 5);
+        ret;
+    }
+    val at: opt[u32] = index_at(d, 0);
+    if (sel at.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    if (code == opcode.VEXTRACT.index || code == opcode.EXTRACT.index) {
+        emitter.extract(e, t, into, emitter.id_of(e, d.operands.data[0]), at.some);
+        ret;
+    }
+    var index: [1]u32  = [1]u32{at.some};
+    var s:     [5]Slot = [5]Slot{Slot.id{t}, Slot.id{into}, Slot.id{emitter.id_of(e, d.operands.data[1])}, Slot.id{emitter.id_of(e, d.operands.data[0])}, Slot.list{unit.numbers(e.u, ?index[0], 1)}};
+    emitter.put(e, gen_row_index.OPCOMPOSITEINSERT, ?s[0], 5);
+}
+
+fun composite_op(code: u32) bool {
+    ret code == opcode.VSPLAT.index || code == opcode.VBUILD.index || code == opcode.VSHUFFLE.index || code == opcode.VEXTRACT.index || code == opcode.VINSERT.index || code == opcode.EXTRACT.index || code == opcode.INSERT.index;
+}
+
+# the code of one instruction, its results in the ids they were given
+fun instruction(e: *Emitter, i: Instruction, d: *InstructionData) {
+    val code: u32 = d.opcode.index;
+    if (code == opcode.ALLOCA.index) { ret; }
+    if (code == opcode.FUNC_ADDR.index) {
+        if (d.results.len != 1 || !emitter.used_only(e, d.results.data[0], opcode.CALL.index, 0)) { emitter.unselected(e, i); }
+        ret;
+    }
+    if (code == opcode.CALL.index) {
+        call(e, i, d);
+        ret;
+    }
+    if (code == opcode.LOAD.index) {
+        access.load(e, i, d);
+        ret;
+    }
+    if (code == opcode.STORE.index) {
+        access.store(e, i, d);
+        ret;
+    }
+    if (code == opcode.PTR_MEMBER.index) {
+        access.member(e, i, d);
+        ret;
+    }
+    if (code == opcode.PTR_INDEX.index) {
+        access.index(e, i, d);
+        ret;
+    }
+    if (access.atomic(code)) {
+        access.atomically(e, i, d);
+        ret;
+    }
+    if (code == opcode.FENCE.index) {
+        access.fence(e, d);
+        ret;
+    }
+    if (d.results.len == 0 || d.operands.len == 0) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val r: Value = d.results.data[0];
+    if (spirv_types.pointer(e.u, emitter.value_type(e, r))) {
+        if (code == opcode.DECLASSIFY.index) {
+            val p: opt[Pointer] = access.pointer_of(e, d.operands.data[0], i);
+            if (sel p.none) { ret; }
+            var q: Pointer = p.some;
+            q.id = e.ids.data[r.index];
+            emitter.copy(e, access.pointer_type(e, q), q.id, p.some.id);
+            e.pointers.data[r.index] = q;
+            ret;
+        }
+        if (code == opcode.SELECT.index) {
+            emitter.fail(e, Error.variable{emitter.at(e, i)});
+            ret;
+        }
+        emitter.unselected(e, i);
+        ret;
+    }
+    val t:    u32   = emitter.type_id(e, r);
+    val into: u32   = e.ids.data[r.index];
+    val x:    Value = d.operands.data[0];
+    if (code == opcode.DECLASSIFY.index) {
+        emitter.copy(e, t, into, emitter.id_of(e, x));
+        ret;
+    }
+    if (code == opcode.SELECT.index) {
+        emitter.three(e, gen_row_index.OPSELECT, t, into, emitter.id_of(e, x), emitter.id_of(e, d.operands.data[1]), emitter.id_of(e, d.operands.data[2]));
+        ret;
+    }
+    if (composite_op(code)) {
+        composite(e, i, d);
+        ret;
+    }
+    if (reduction(code)) {
+        reduce(e, i, d);
+        ret;
+    }
+    if (code == opcode.EXT_U.index || code == opcode.EXT_S.index || code == opcode.TRUNC.index) {
+        converted(e, i, d);
+        ret;
+    }
+    if (code == opcode.ITOF_S.index || code == opcode.ITOF_U.index) {
+        floated(e, d);
+        ret;
+    }
+    if (code == opcode.FTOI_S.index || code == opcode.FTOI_U.index) {
+        saturated(e, i, d);
+        ret;
+    }
+    if (code == opcode.FPROMOTE.index || code == opcode.FDEMOTE.index) {
+        emitter.one(e, gen_row_index.OPFCONVERT, t, into, emitter.id_of(e, x));
+        ret;
+    }
+    if (code == opcode.BITCAST.index) {
+        cast(e, i, d);
+        ret;
+    }
+    if (code == opcode.FCOPYSIGN.index) {
+        copysign(e, d);
+        ret;
+    }
+    if (code == opcode.BSWAP.index) {
+        swapped(e, i, d);
+        ret;
+    }
+    if (code == opcode.CLZ.index || code == opcode.CTZ.index) {
+        zeros(e, i, d);
+        ret;
+    }
+    if (code == opcode.MUL_HIGH_U.index || code == opcode.MUL_HIGH_S.index || code == opcode.MUL_HIGH_SU.index) {
+        high(e, i, d);
+        ret;
+    }
+    if (code == opcode.ADD_OV_S.index || code == opcode.ADD_OV_U.index || code == opcode.SUB_OV_S.index || code == opcode.SUB_OV_U.index || code == opcode.MUL_OV_S.index || code == opcode.MUL_OV_U.index) {
+        overflowed(e, i, d);
+        ret;
+    }
+    val xt:      Type = emitter.value_type(e, x);
+    val boolean: bool = spirv_types.boolean(e.u, xt);
+    val v:       u32  = emitter.id_of(e, x);
+    if (code == opcode.NOT.index) {
+        if (boolean) { emitter.one(e, gen_row_index.OPLOGICALNOT, t, into, v); }
+        or           { emitter.one(e, gen_row_index.OPNOT, t, into, v); }
+        ret;
+    }
+    if (code == opcode.NEG.index && !boolean) {
+        emitter.one(e, gen_row_index.OPSNEGATE, t, into, v);
+        ret;
+    }
+    if (code == opcode.NEG.index && boolean) {
+        emitter.copy(e, t, into, v);
+        ret;
+    }
+    if (code == opcode.POPCNT.index && !boolean) {
+        emitter.one(e, gen_row_index.OPBITCOUNT, t, into, v);
+        ret;
+    }
+    if (code == opcode.FNEG.index) {
+        emitter.one(e, gen_row_index.OPFNEGATE, t, into, v);
+        ret;
+    }
+    if (code == opcode.FORD.index || code == opcode.FUNO.index) {
+        val bt: u32 = emitter.bool_of(e, xt);
+        val a:  u32 = emitter.fresh(e);
+        val b:  u32 = emitter.fresh(e);
+        emitter.one(e, gen_row_index.OPISNAN, bt, a, v);
+        emitter.one(e, gen_row_index.OPISNAN, bt, b, emitter.id_of(e, d.operands.data[1]));
+        if (code == opcode.FUNO.index) {
+            emitter.two(e, gen_row_index.OPLOGICALOR, t, into, a, b);
+            ret;
+        }
+        val either: u32 = emitter.fresh(e);
+        emitter.two(e, gen_row_index.OPLOGICALOR, t, either, a, b);
+        emitter.one(e, gen_row_index.OPLOGICALNOT, t, into, either);
+        ret;
+    }
+    val unary: u32 = glsl_unary(code);
+    if (unary != emitter.NO_ROW) {
+        emitter.glsl_one(e, unary, t, into, v);
+        ret;
+    }
+    if (code == opcode.FMA.index) {
+        emitter.glsl_three(e, gen_row_index.OPEXTINST_GLSL_STD_450_FMA, t, into, v, emitter.id_of(e, d.operands.data[1]), emitter.id_of(e, d.operands.data[2]));
+        ret;
+    }
+    if (d.operands.len != 2) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val y: u32 = emitter.id_of(e, d.operands.data[1]);
+    if (code == opcode.FMINNUM.index) {
+        emitter.glsl_two(e, gen_row_index.OPEXTINST_GLSL_STD_450_NMIN, t, into, v, y);
+        ret;
+    }
+    if (code == opcode.FMAXNUM.index) {
+        emitter.glsl_two(e, gen_row_index.OPEXTINST_GLSL_STD_450_NMAX, t, into, v, y);
+        ret;
+    }
+    var row: u32 = float_row(code);
+    if (row == emitter.NO_ROW) {
+        if (boolean) { row = bool_row(code); }
+        or           { row = integer_row(code); }
+    }
+    if (row == emitter.NO_ROW) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    emitter.two(e, row, t, into, v, y);
+}
+
+# the blocks the region tree holds, and the loop headers among them
+fun mark(e: *Emitter, r: u32) {
+    if (r == NONE) { ret; }
+    val g: Region      = region.region(e.s, r);
+    val k: region.Kind = g.kind;
+    if (!(sel k.sequence) && g.block != NONE) { e.reached.data[g.block] = true; }
+    if (sel k.loop) {
+        e.bodies.data[g.block] = NONE;
+        val inner: u32 = g.child;
+        var rest:  u32 = NONE;
+        if (inner != NONE)                                         { rest = region.region(e.s, inner).next; }
+        if (g.latch == NONE || g.latch == g.block || rest == NONE) { e.cts.data[g.block] = 1; }
+    }
+    var c: u32 = g.child;
+    for (c != NONE) {
+        mark(e, c);
+        c = region.region(e.s, c).next;
+    }
+}
+
+fun analysed[T](e: *Emitter, got: res[*T, Why]) opt[*T] {
+    if (sel got.err) {
+        emitter.fail(e, Error.analysis{got.err});
+        ret opt[*T].none{};
+    }
+    ret opt[*T].some{got.ok};
+}
+
+fun filled(e: *Emitter, v: *vector.Vector[u32], n: usize, x: u32) {
+    var k: usize = 0;
+    for (k < n) {
+        push_u32(e, v, x);
+        k = k + 1;
+    }
+}
+
+# the code of one function: its OpFunction, its parameters and, for one it
+# defines, its blocks
+pub fun function(u: *Unit, f: Function) {
+    val node:     *FunctionNode = ?u.m.functions.data[f.index];
+    val b:        *Body         = ?node.body;
+    val sig:      *Signature    = unit.signature(u, f);
+    val id:       u32           = u.functions.data[f.index];
+    val declared: bool          = b.blocks.len == 0;
+    var section:  usize         = buffer.DEFINITIONS;
+    if (declared) { section = buffer.DECLARATIONS; }
+    var head: [4]Slot = [4]Slot{Slot.id{sig.result}, Slot.id{id}, unit.enumerant(NO_CONTROL), Slot.id{sig.type}};
+    unit.put(u, section, gen_row_index.OPFUNCTION, ?head[0], 4);
+    if (declared) {
+        var k: u32 = 0;
+        for (k < sig.params.len) {
+            var p: [2]Slot = [2]Slot{Slot.id{u.lists.data[sig.params.at + k]}, Slot.id{unit.fresh(u)}};
+            unit.put(u, section, gen_row_index.OPFUNCTIONPARAMETER, ?p[0], 2);
+            k = k + 1;
+        }
+        var end: [1]Slot = [1]Slot{Slot.none{}};
+        unit.put(u, section, gen_row_index.OPFUNCTIONEND, ?end[0], 0);
+        ret;
+    }
+    var e: Emitter = Emitter{
+        u:        u,
+        f:        f,
+        b:        b,
+        s:        nil,
+        ids:      vector.init[u32](u.a),
+        pointers: vector.init[Pointer](u.a),
+        labels:   vector.init[u32](u.a),
+        bodies:   vector.init[u32](u.a),
+        cts:      vector.init[u32](u.a),
+        reached:  vector.init[bool](u.a),
+        loops:    vector.init[Frame](u.a),
+        line:     0xFFFF_FFFF,
+    };
+    fin {
+        vector.dnit[u32](?e.ids);
+        vector.dnit[Pointer](?e.pointers);
+        vector.dnit[u32](?e.labels);
+        vector.dnit[u32](?e.bodies);
+        vector.dnit[u32](?e.cts);
+        vector.dnit[bool](?e.reached);
+        vector.dnit[Frame](?e.loops);
+    }
+    val s: opt[*Structure] = analysed[Structure](?e, analysis.structure_of(u.cache, f));
+    if (sel s.none) { ret; }
+    e.s = s.some;
+    var k: usize = 0;
+    for (k < b.values.len) {
+        push_u32(?e, ?e.ids, unit.fresh(u));
+        val pushed: res[usize, allocator.Error] = vector.push[Pointer](?e.pointers, emitter.UNKNOWN);
+        if (sel pushed.err) {
+            emitter.lost(?e, pushed.err);
+            ret;
+        }
+        k = k + 1;
+    }
+    filled(?e, ?e.labels, b.blocks.len, NO_ID);
+    filled(?e, ?e.bodies, b.blocks.len, NO_ID);
+    filled(?e, ?e.cts, b.blocks.len, NO_ID);
+    k = 0;
+    for (k < b.blocks.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[bool](?e.reached, false);
+        if (sel pushed.err) {
+            emitter.lost(?e, pushed.err);
+            ret;
+        }
+        k = k + 1;
+    }
+    if (!unit.ok(u)) { ret; }
+    mark(?e, region.root(s.some));
+    k = 0;
+    for (k < b.blocks.len) {
+        if (e.reached.data[k]) {
+            e.labels.data[k] = unit.fresh(u);
+            if (e.bodies.data[k] == NONE) { e.bodies.data[k] = unit.fresh(u); }
+            or                            { e.bodies.data[k] = e.labels.data[k]; }
+            if (e.cts.data[k] != NO_ID)   { e.cts.data[k] = unit.fresh(u); }
+        }
+        k = k + 1;
+    }
+    if (b.blocks.data[0].predecessors.len > 0 || e.bodies.data[0] != e.labels.data[0]) {
+        emitter.unstructured(?e);
+        ret;
+    }
+    val params: *vector.Vector[Value] = ?b.blocks.data[0].parameters;
+    k = 0;
+    for (k < params.len && unit.ok(u)) {
+        val v:       Value = params.data[k];
+        var t:       u32   = u.lists.data[sig.params.at + k::u32];
+        val pointee: u32   = u.lists.data[sig.pointees.at + k::u32];
+        if (pointee != NO_ID) {
+            val shape: res[types.Shape, types.Error] = types.shape(?u.m.types, emitter.value_type(?e, v));
+            var class: u32                           = 0;
+            if (sel shape.ok) {
+                val sh: types.Shape = shape.ok;
+                if (sel sh.pointer) { class = sh.pointer.space; }
+            }
+            e.pointers.data[v.index] = Pointer{id: e.ids.data[v.index], pointee: Type{index: pointee - 1}, key: unit_key(u, class, Type{index: pointee - 1}), class: class, known: true};
+        }
+        var p: [2]Slot = [2]Slot{Slot.id{t}, Slot.id{e.ids.data[v.index]}};
+        unit.put(u, buffer.DEFINITIONS, gen_row_index.OPFUNCTIONPARAMETER, ?p[0], 2);
+        k = k + 1;
+    }
+    sequence(?e, region.root(s.some));
+    var end: [1]Slot = [1]Slot{Slot.none{}};
+    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPFUNCTIONEND, ?end[0], 0);
+}
+
+# the layout a pointer parameter's pointee is held by: a block's where it is
+# a structure in a class that holds blocks, else its class's
+pub fun unit_key(u: *Unit, class: u32, pointee: Type) u32 {
+    val s: res[types.Shape, types.Error] = types.shape(?u.m.types, pointee);
+    if (sel s.ok) {
+        val k: types.Shape = s.ok;
+        if (sel k.structure) { ret spirv_types.variable_key(u, class); }
+    }
+    ret spirv_types.laid(u, class);
+}
