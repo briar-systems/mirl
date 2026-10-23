@@ -370,7 +370,6 @@ Limits:
 - A footprint masc leaves undecided, as a data directive with no `writes` clause, is taken as writing every register the view admits but the stack pointer, the convention's frame pointer and a zero register, as front ends assume a block leaves both pointers intact, and the memory analysis takes the block as declared. Its stack effect is taken as none.
 - An operand whose value selection holds in another class than its constraint's is refused (`Refusal.class`), and so is a symbolic immediate bound to an address, which the machine form carries no relocation kind for yet (`Refusal.symbolic`).
 - The machine form text prints an inline block as `asm` and its text, and its reader does not read one.
-- On x86 a block that spells a condition masc reads only in another spelling (`jnz`, `jz`, `setnz`, `cmovz` and the rest) is refused with masc's parse diagnostic until the masc that reads them (masc#469) is taken.
 - Legalisation does not rewrite an item's operands, so an operand of a type the target holds in no register, as a narrow or a wide integer, is refused at selection.
 
 
