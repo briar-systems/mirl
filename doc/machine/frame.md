@@ -27,11 +27,13 @@ A downward stack, from the canonical frame address (the stack pointer's value at
 2. the saved registers: the frame record at the row's offsets when the frame keeps its pointer, then every preserved register the function writes and the link register when anything writes it,
 3. the scaled area: every slot whose size is bytes per unit of a scale's multiplier, at an offset per unit, the area a multiple of the alignment per unit so every multiplier keeps it,
 4. the local slots, largest alignment first,
-5. the outgoing area at the stack pointer: the largest `offset + size` of the outgoing slots, and at least the shadow space when the function makes a call.
+5. the outgoing area at the stack pointer: the largest `offset + size` of the outgoing slots, and at least the shadow space when the function makes a call. Where a call passes a stack piece of scaled size or at an offset that scales, the area also has bytes per unit: the most any outgoing slot's offset and size per unit reach, rounded to the alignment. The stack pointer moves by that scaled part on its own, after the fixed parts in the prologue and before them in each epilogue.
+
+A call's stack pieces are addressed from the stack pointer at the call, each at its offset's fixed bytes plus its bytes per unit, as the convention placed it. Every slot above the outgoing area sits its scaled bytes per unit further from the stack pointer, so a fixed local is at its fixed depth plus the outgoing per-unit bytes, and the scaled area and the saves are past both.
 
 Each part is rounded so the stack pointer keeps the row's alignment at every call. A slot no operand names takes no space. Incoming slots are at the canonical frame address plus their offset.
 
-The frame keeps its pointer when the row always keeps it, or when the function allocates dynamically, moves its stack pointer by an instruction that is not a call or return, or has a local slot aligned past the stack's alignment, which the prologue then realigns. With a frame pointer every slot but the outgoing ones is addressed from it, except the local slots of a realigned frame, which are addressed from the realigned stack pointer. A realigned frame that also allocates dynamically needs a base register no row states, and is refused.
+The frame keeps its pointer when the row always keeps it, or when the function allocates dynamically, moves its stack pointer by an instruction that is not a call or return, has a local slot aligned past the stack's alignment, which the prologue then realigns, or is unwound and may have a slot that scales. With a frame pointer every slot but the outgoing ones is addressed from it, except the local slots of a realigned frame, which are addressed from the realigned stack pointer. A realigned frame that also allocates dynamically needs a base register no row states, and is refused.
 
 A leaf that keeps no pointer, allocates nothing dynamically, has no scaled area and fits the red zone never moves its stack pointer, and its saves and slots are below it.
 
@@ -69,7 +71,9 @@ An offset that scales is bytes fixed plus bytes per unit of one scale's multipli
 - `measured`: the register that measures the scale's quantity is read into a register, multiplied by the bytes per unit and added to the fixed part, as RVV's `vlenb`. The measuring register is masc's to name, as the scale's quantity's `register`.
 - `none`: the code forms none. `make` refuses a move at such an offset with `Refusal.scaled` before the code is asked.
 
-RISC-V states `measured` for the v registers' scale and `none` for the others, which a selection fixes.
+RISC-V states `measured` for the v registers' scale and `none` for the others, which a selection fixes. It forms such an offset in a temporary: `csrrs` reads `vlenb`, the register masc's `vlen` quantity names as measuring it, its CSR at the row's id position (a system register at a masc `id` operand stands as its number in its class), `slli` scales it by the offset's share of each byte read, a power of two, it is negated below the base, and the fixed part is added after. A share that is no power of two is refused `scaled`.
+
+A frame whose call stack is unwound and that may have a slot that scales (one of its own, or a virtual register of a class whose spill slot scales) keeps its frame pointer, so its canonical frame address is the frame pointer plus fixed bytes and no rule states a scaled offset. `keeps_pointer` answers the same before allocation, so the allocator leaves the pointer out.
 
 ## Call frame rules
 
@@ -85,11 +89,10 @@ RISC-V states `measured` for the v registers' scale and `none` for the others, w
 
 ## Limits
 
-- The RISC-V code forms no offset that scales: it states `measured` through `vlenb`, but masc's `vlen` quantity names no register that measures it and the machine form names no operand for a CSR. It also refuses an out-of-reach offset where it has no scratch register, as a spill mid-function past 2 KiB from its base.
+- The RISC-V code refuses an out-of-reach offset where it has no scratch register, as a spill mid-function past 2 KiB from its base, and a scaled offset with no temporary.
 - A call frame rule at an offset that scales is refused (`finish.Error.scaled`): mink's frame records state a scaled save only as one offset times a measuring register's value, and a scaled canonical frame address only as expression bytes, which mirl does not spell.
 - An offset scales by one scale, so a frame with slots of two scales, as SME's vector length and streaming vector length, is refused (`scales`).
 - The frame writes no probe and no `seh` shape. `lay` refuses each where the frame would need it.
 - A pair is two saves the layout already put side by side. The layout does not reorder or widen saves into pairs, so darwin's x19 to x28 and d8 to d15 are described compactly only where they land at the encoding's places, and by call frame information otherwise.
-- An incoming argument slot at an offset that scales is placed at the canonical frame address plus that offset. An outgoing one, or an outgoing slot whose size scales, is refused (`argument`): the frame lays its scaled area above the fixed locals and the outgoing area, and has no scaled area below them for a call's scaled stack arguments yet.
 - RISC-V states no whole register load or store of a register group, since the register file names no group as one register yet.
 - A debug binding or an asm block cannot name a slot yet, so an unnamed slot always leaves the frame.
