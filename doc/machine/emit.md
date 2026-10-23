@@ -74,7 +74,7 @@ The object is refused as `Error.unmapped` when masc finishes it with a relocatio
 
 ## Limits
 
-- mink's writers refuse an object with frame records (mink#201), so at the pinned mink no object with a framed function is written. PE and Mach-O images are gated by mink#70 and mink#73.
+- PE and Mach-O images are gated by mink#70 and mink#73. Objects carry their frame records on every format: mink lowers them to `.eh_frame` in ELF, `.pdata` and `.xdata` in COFF, and `__compact_unwind` with `__eh_frame` where needed in Mach-O.
 - `DW_AT_stmt_list` is offset 0 with no relocation, which holds for one unit per object.
 - The unit states `DW_LANG_C11`, since the IR names no source language.
 - A slot whose offset scales, salvage steps over a slot, and a slot of a realigned frame or the outgoing area are not stated, so the variable is optimised out there.

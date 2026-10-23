@@ -45,7 +45,7 @@ The mapping is the Arm ARM's and the C++ one compilers use. A read-modify-write 
 The table selects a NEON subset by lane width and by register size, a vector of at most 64 bits in a 64-bit arrangement and one of 128 in a 128-bit arrangement: integer `add`, `sub`, `mul`, `and`, `orr`, `eor`, `not` and `neg`, float `fadd`, `fsub`, `fmul`, `fdiv`, `fneg`, `fabs` and `fsqrt`, a splat by `dup`, and loads and stores of 16, 32, 64 and 128 bits. It selects these directly:
 
 - `smull` and `umull`: the product of two extensions of 64-bit vectors to twice their width, and `smull2` and `umull2` of the high halves of 128-bit vectors taken by a shuffle.
-- `smlal`, `umlal`, `smlal2` and `umlal2`: a sum of a value and such a product, the accumulator tied, where masc states the accumulator read and written (see the limits).
+- `smlal`, `umlal`, `smlal2` and `umlal2`: a sum of a value and such a product, the accumulator tied.
 - `addv`: a sum across the lanes, and `addp` for two lanes, moved to a general register by `umov` or `fmov`.
 - `saddlv` and `uaddlv`: a sum across the lanes of a vector extended to twice their width.
 
@@ -70,7 +70,6 @@ Some operations select only for the operands a base form covers.
 ## Limits
 
 - A load or store takes a base register and a constant offset: `ldr` and `str` with the scaled unsigned immediate, and `ldur` and `stur` with nine signed bits where that does not reach. The register offset form, `[base, index, lsl #n]`, is not selected: masc states its extend and shift as enumerants whose values the table would have to spell, and an index is added into the base first.
-- Mach-O's relocation kinds, Windows', and every ELF thread-local kind have no binding in masc yet, so a darwin address, any thread-local access and darwin's call are refused `unbound` when encoded. ELF TLS is masc#441, and the others wait on mink's neutral AArch64 relocation kinds and masc's rebinding of them.
-- masc states the roles of some rows other than the instruction does: integer stores' `Rt` written, float loads' `Rt` read, `stp` and `ldp` operands read and written, float data processing destinations read and written, and the accumulator of `smlal` and `umlal` written alone. Liveness reads masc's roles, so these rows mislead it until masc corrects them, which masc#456 does, taken at the next sync. A tie needs a row that reads and writes the position, so the multiply-accumulate rules hold only where masc states every accumulator so, and until then the product and the sum select apart.
+- masc states the destination of `scvtf` and `ucvtf` read and written, since FPCR.NEP set would merge the upper lanes, and masc's state takes no caller-fixed value for it. mach never sets NEP, but liveness keeps the old value of each such destination live until masc can be told so.
 - `aapcs64win` is not carried, since mink writes no PE image yet (mink#70).
 - Neither z nor p holds a value: SVE code generation is the vectorisation job's (#72). The frame code states their whole register loads and stores and their scaled steps.
