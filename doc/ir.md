@@ -301,6 +301,8 @@ The check asks masc through `mirl.ct`. The machine form's question of an instruc
 
 Both of masc's questions are asked under the build's context with the timing modes the guarantee assumes set, in one place, `mirl.ct.assumed` (mach#3872, "The guarantee"): `dit=on` on AArch64, where std sets PSTATE.DIT wherever the CPU has it, and `doitm=on` on x86-64, the data operand independent timing mode. On x86-64 only the operating system sets DOITM, and an AArch64 CPU without FEAT_DIT has no DIT, so on a system that does not set the mode the code still runs, without the guarantee the mode gives.
 
+masc classes each x86-64 row on Intel's list of data operand independent timing instructions as independent of its inputs under `doitm=on`, but for any input its class still names, so a secret may reach those inputs, and every other x86-64 row depends on all of its inputs. The walk carries secrecy across every register that overlaps another, so a secret seeded or written under one view is secret where any overlapping view reads it, as x86-64's `rdi` and `edi` or AArch64's `x` and `w` and `v`, `q`, `d` and `s`. mirl passes the walk no declassify points (`masc.walk.walk.NO_DECLASSIFIED`).
+
 Every function that requires constant time is checked at four sites, and every site reports the one record `mirl.ct.Refused`: masc's refusal (`masc.core.ct.Refusal`, worded once by masc), the function, and where in its code it stands.
 
 - A pass that cannot keep the requirement refuses with `Why.timing`, which carries masc's record, as the helpers legalisation refuses a copy or fill whose length is secret.
