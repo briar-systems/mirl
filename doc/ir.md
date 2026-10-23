@@ -343,15 +343,33 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 19 | `addressing` | past legalisation on a target that declares logical addressing, no instruction forms or reads an address as a number: no row whose address formation is arithmetic, which `ptr.add`, `ptrtoint` and `inttoptr` are |
 | 20 | `functions` | code names a function's address only through `func.addr`, and only on a target whose `functions` declaration is not `none`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
 | 21 | `convention` | every function type names no convention row, for the one its target's tuple names, or one of the convention rows its target states: its own and every other of its architecture whose requirements hold over its baseline |
+| 22 | `assembly` | every immediate an inline assembly block binds is a constant: an integer, or an address where the operand's constraint lets a symbol stand for it |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
 
 ## 9. Inline assembly items
 
-An inline assembly item is an opaque block of target assembly. masc, the assembler, parses it. It carries operand constraints, which say which values go in and out and in what kind of register or memory, and effects, which say what it reads, writes and clobbers. mirl treats the block as opaque, keeps its operands as ordinary values and effects as ordinary effects, and masc encodes it after register allocation.
+An inline assembly item is an `asm` instruction whose `block` immediate (`mirl.ir.assembly.Assembly`) holds a block of target assembly. masc, the assembler, reads the block. mirl never reads its instructions, and every pass sees the item only through what the block declares.
 
-The text form reserves the word `asm` for these items, and spells their block through masc's text form. This version of the library has no inline assembly item in the module, in the verifier or in the builder. The slot is reserved, and a front end that needs one today has none to build.
+A block is its text in the source dialect of the target's instruction set, its operands and what it declares it reads and writes of memory beyond its memory operands. The text names each operand as `{name}`. Each operand states its name, its role (`read`, `write` or `read_write`, masc's operand roles), its constraint (masc's `inline.Constraint`: a register class of the set's register file by its handle, `memory`, or an immediate of a number of bits, signed or unsigned, which a symbol may stand for) and the type of the value it binds.
+
+- An operand the block reads, and every memory and immediate operand, binds an operand of the instruction, in the order the block states them. A memory operand binds the address the block reaches memory through, and its role says whether the block reads or writes that memory. An immediate binds a constant (verifier rule 22).
+- An operand of a register class the block writes binds a result, in the order the block states them. A `read_write` operand binds one operand and one result of one type.
+- A block binds at most `mirl.ir.assembly.MOST_OPERANDS` (30) operands.
+
+The row reads and writes memory and is neither speculatable nor mergeable, so no pass removes, merges or moves an item by its row. The memory analysis gives an item one place for each memory operand, of no size it states, read or written as the operand's role says, and `anywhere` when the block declares `reads` or `writes`. `conflicts` compares every pair of places of two instructions, so two items compare at most 30 by 30 places, and an item against an opcode row at most 30 by 2.
+
+The register family owns the `asm` row, so a target of any other family, whose set masc reads no inline block in, refuses an item by declaration. Selection hands masc the block under the build's context: masc parses it, refusing it with its first diagnostic's wording, and answers its footprint. Each operand becomes a virtual register of its constraint's class (tied for `read_write`), an address based in the register its pointer is in, or the constant. The registers the block itself reads and writes are the instruction's implicit locations, so no value is live across a register the block writes, and the frame saves a preserved register the block writes. A block that changes the stack pointer makes the frame keep its frame pointer, and a frame whose convention row has none is refused (`lay.Error.pointer`). After allocation the handover gives masc each operand's location, and masc encodes the block at the builder's cursor. A constant-time function's code, an inline block's bytes among it, is walked by masc's walk after encoding.
+
+Limits:
+
+- A block whose control leaves it other than by a call is refused at selection. A block that calls leaves undefined what the default convention row's callee does.
+- A footprint masc leaves undecided, as a data directive with no `writes` clause, is taken as writing every register the view admits but the stack pointer and a zero register, and the memory analysis takes the block as declared. Its stack effect is taken as none.
+- An operand whose value selection holds in another class than its constraint's is refused (`Refusal.class`), and so is a symbolic immediate bound to an address, which the machine form carries no relocation kind for yet (`Refusal.symbolic`).
+- The machine form text prints an inline block as `asm` and its text, and its reader does not read one.
+- On x86 a block that spells a condition masc reads only in another spelling (`jnz`, `jz`, `setnz`, `cmovz` and the rest) is refused with masc's parse diagnostic until the masc that reads them (masc#469) is taken.
+- Legalisation does not rewrite an item's operands, so an operand of a type the target holds in no register, as a narrow or a wide integer, is refused at selection.
 
 
 ## 10. Where the rest is
