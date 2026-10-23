@@ -301,6 +301,8 @@ The check asks masc through `mirl.ct`. The machine form's question of an instruc
 
 Both of masc's questions are asked under the build's context with the timing modes the guarantee assumes set, in one place, `mirl.ct.assumed` (mach#3872, "The guarantee"): `dit=on` on AArch64, where std sets PSTATE.DIT wherever the CPU has it, and `doitm=on` on x86-64, the data operand independent timing mode. On x86-64 only the operating system sets DOITM, and an AArch64 CPU without FEAT_DIT has no DIT, so on a system that does not set the mode the code still runs, without the guarantee the mode gives.
 
+masc classes each x86-64 row on Intel's list of data operand independent timing instructions as independent of its inputs under `doitm=on`, but for any input its class still names, so a secret may reach those inputs, and every other x86-64 row depends on all of its inputs. The walk carries secrecy across every register that overlaps another, so a secret seeded or written under one view is secret where any overlapping view reads it, as x86-64's `rdi` and `edi` or AArch64's `x` and `w` and `v`, `q`, `d` and `s`. mirl passes the walk no declassify points (`masc.walk.walk.NO_DECLASSIFIED`).
+
 Every function that requires constant time is checked at four sites, and every site reports the one record `mirl.ct.Refused`: masc's refusal (`masc.core.ct.Refusal`, worded once by masc), the function, and where in its code it stands.
 
 - A pass that cannot keep the requirement refuses with `Why.timing`, which carries masc's record, as the helpers legalisation refuses a copy or fill whose length is secret.
@@ -311,7 +313,7 @@ Every function that requires constant time is checked at four sites, and every s
 
 ## 8. The verifier
 
-The verifier checks a module against the target it names. `mirl.verify.check(m)` assembles the target from the module's tuple, refused by the rule of assembly it breaks, and checks the module as it stands before legalisation, and `mirl.verify.against(m, t, stage)` checks against a given target at a given stage. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
+The verifier checks a module against the target it names. `mirl.verify.check(m)` assembles the target from the module's tuple, refused by the rule of assembly it breaks, and checks the module as it stands before legalisation, and `mirl.verify.against(m, t, ctx, stage)` checks against a given target at a given stage, laying types out under the context the build's selection opened, or `mirl.target.NO_BUILD` where no family opened one, so a stated offset is held to the alignment its member has under the vector registers the build meets. Both give ok, or the first rule the module breaks, or the allocator's refusal, which is never an answer of valid.
 
 The stage says how far the module has come through its schedule. `open` is any module before legalisation, so no rule that holds only of legal code applies to it. `legal` is a module past every legalisation, and carries a lookup of the region tree each function's structure analysis holds. The pass driver verifies a run as `open` until it reaches the last legalisation of its plan, and as `legal` from that pass's own verification on.
 
