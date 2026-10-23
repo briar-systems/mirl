@@ -114,7 +114,9 @@ An integer wider than the widest width in `widths.alu` (`mirl.target.widest`) is
 - An `i1` a store writes or a load reads is held in memory as the integer of its layout size, 0 or 1.
 - A variable bound to no more than the low word reads it from the low word. One bound to more than a word, which no one record can read from two words, is unavailable.
 
-A wide value at a function's entry, a call or a return is the abi legalisation's, which runs before it. A wide division, remainder or conversion to or from a float is the helpers legalisation's, which runs before it too and leaves a call of a helper (`mirl.legal.helper.takes`). A vector of wide lanes and a wide access through a logical address are refused.
+- A copy or fill whose length is a wide integer takes the low word of the length where the range analysis bounds the length within what a pointer reaches, and is refused otherwise.
+
+A wide value at a function's entry, a call or a return is the abi legalisation's, which runs before it. A wide division, remainder or conversion to or from a float is the helpers legalisation's, which runs before it too and leaves a call of a helper (`mirl.legal.helper.takes`). A multi-way branch on a wide selector is the compare chain's and an aggregate member of a wide integer the aggregate legalisation's. What is left is refused, each by its own reason: a vector of wide lanes, a wide access through a logical address, a wide atomic, since its words would not be atomic together, a copy or fill whose wide length no range fact bounds, and a reinterpretation between a wide integer and a float the build holds no unit for.
 
 ### Division, multiplication, float remainders, conversion and bulk memory
 
