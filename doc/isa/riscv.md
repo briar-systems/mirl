@@ -68,7 +68,7 @@ Where an extension is absent the rule for its row is dropped and a base form sta
 
 ## What the table does not select
 
-The declared operations are in `declared.mach`, each with the job that closes it. The walk in the table's test checks that every opcode of the ir has a rule, is declared, or is a float operation the helpers legalisation takes out on every build because no format the target holds computes it natively (`mirl.legal.helper.removes`), and only one of them.
+The declared operations are in `declared.mach`, each with the job that closes it. Every opcode of the ir has a rule, is declared, or is a float operation the helpers legalisation takes out on every build because no format the target holds computes it natively, and only one of them.
 
 - Vector operations. Without `v` the target holds vectors in no register and they are scalarised, and under `v` the table holds them in the vector registers but has no rule for them yet (vectorisation, #72).
 - `frem`, which no instruction does. The helpers legalisation calls the helper of its format in its place, since the RISC-V rows state no native `frem`, so it is not declared.

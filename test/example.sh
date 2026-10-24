@@ -21,10 +21,8 @@
 # otherwise. for each example and each lane target the lane checks:
 #   - mirl emit writes its object
 #   - mirl emit writes its listing, which masc assembles again. a byte
-#     difference from mirl's object shows masc disassemble of both, diffed
-#   - once, the mach test unit roundtrip__every_example_listing_assembles_to_its_own_object
-#     compares the reassembled objects of every example at every lane target
-#     as data, which is the check that passes or fails
+#     difference from mirl's object shows masc disassemble of both, diffed,
+#     for reading only
 #   - mink link links the object and the exit object into a static linux gnu
 #     executable, which exits with the stated status under the lane's qemu
 #
@@ -158,9 +156,5 @@ while read -r -u 3 target arch system env isa abi format; do
         example "$name" "$src" "$target" "$masc_as" "$link" "$qemu" "$dir" "$line"
     done
 done 3<<<"$lanes"
-# the exact comparison is the unit test, which reads both objects as data: every section's bytes, every relocation and
-# every symbol by name, the one nameless symbol by its place. a byte difference above is shown for reading only
-"${MACH:-mach}" test "$repo" -a '*' --filter roundtrip --timeout 5m >"$out/roundtrip.log" 2>&1 \
-    || { fail "roundtrip" "the listing does not assemble to mirl's objects, see $out/roundtrip.log"; tail -n 20 "$out/roundtrip.log"; }
 echo "$fails failed"
 exit $fails

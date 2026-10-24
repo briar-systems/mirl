@@ -63,5 +63,5 @@ A call leaves undefined what the convention row it runs under states for its cal
 - A literal is printed but not read back from the machine text.
 - No rule source makes a list or a literal yet. A member whose selection emits one builds that source. An address is built by `Source.address` (see select.md) and, in a loop, by a step's `address` source.
 - A call clobbers a register it keeps only in part, as lp64f's fs0 on a 64-bit float file, whole. A value whose view lies within the kept bits could stay there across the call, which needs liveness to read a clobber per view.
-- No RISC-V row states descriptor clobbers, since its table makes no TLSDESC call. The RISC-V test of a descriptor row is a row of its own.
+- No RISC-V row states descriptor clobbers, since its table makes no TLSDESC call.
 - A function under a row other than the default is refused, since the frame reads the default row.
