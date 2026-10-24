@@ -219,7 +219,7 @@ functions
   entry       = operand | immediate | target ;
   operand     = local | constant ;
   immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]"
-                     | "all" | places | symbol | block ) ;
+                     | "all" | places | symbol | block | op ) ;
   places      = "[" [ place { "," place } ] "]" ;
   place       = ( "register" uint uint | "stack" uint | "operand" uint )
                 ( "fixed" | "scaled" uint ) fill ;
@@ -231,6 +231,7 @@ functions
   bound       = name ":" ( "read" | "write" | "read_write" ) constraint type ;
   constraint  = "class" uint | "memory"
               | "immediate" uint ( "signed" | "unsigned" ) [ "symbolic" ] ;
+  op          = string string "[" [ types ] "]" [ "reads" ] [ "writes" ] ;
 
   `kept` marks a store or a fill whose write no pass may take away (see
   the specification's memory section). `bounded` marks a shift whose count is
@@ -288,6 +289,13 @@ functions
   the item's operands are the values the block binds, before the block:
   `%d = asm %x, i64 7, block "addi {d}, {a}, {k}" [d: write class 0 i64,
   a: read class 0 i64, k: read immediate 12 signed i64]`.
+
+  a target op is the `target.op` operation, or `target.op.memory` where it
+  touches memory, whose `op` immediate is the instruction set as its
+  target's catalog names it, the op as the set names it, the types of its
+  results in order, and `reads` and `writes` where it declares it touches
+  memory. the item's operands are the op's own, before the op:
+  `%r = target.op %x, op "GLSL.std.450" "Sqrt" [f32]`.
 
 debug table
 
