@@ -11,6 +11,9 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
 
 use std.collections.slice.Slice;
 use std.collections.vector;
@@ -20,6 +23,7 @@ use mo:         masc.core.operand;
 use mrow:       masc.core.row;
 use core_state: masc.core.state;
 
+use mirl.base.slice;
 use ia: mirl.ir.assembly;
 use mirl.ir.block.BlockData;
 use mirl.ir.constant.ConstantData;
@@ -43,8 +47,12 @@ use mirl.target.Catalog;
 use mirl.target.OpSet;
 use mirl.target.Ops;
 use mirl.target.Target;
+use mirl.target.Refused;
+use mirl.target.handle_of;
 use mirl.target.op_row;
 use mirl.target.op_set;
+use mirl.target.refusal;
+use mirl.target.supplies;
 use mirl.verify.failure.Found;
 use mirl.verify.failure.Run;
 use mirl.verify.failure.Where;
@@ -493,10 +501,92 @@ fun constant_shape(s: mo.Shape) bool {
     ret sel s.immediate || sel s.enumerant || sel s.literal;
 }
 
+# the bits of an integer constant value, none for any other value
+fun constant_word(m: *Module, b: *Body, v: Value) opt[u64] {
+    if (!defined(b, v)) { ret opt[u64].none{}; }
+    val def: Def = b.values.data[v.index].def;
+    if (!(sel def.constant)) { ret opt[u64].none{}; }
+    val got: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+    if (sel got.err) { ret opt[u64].none{}; }
+    val c: ConstantData = got.ok;
+    if (sel c.zero) { ret opt[u64].some{0}; }
+    if (sel c.integer) {
+        if (c.integer.words.size > 0) { ret opt[u64].some{c.integer.words.data[0]}; }
+    }
+    ret opt[u64].none{};
+}
+
+# whether a type is the handle kind an op's catalog names for one of its
+# row's operands, true where it names none
+fun handled(m: *Module, s: *OpSet, o: *Op, operand: u32, ty: Type) bool {
+    val kind: opt[str] = handle_of(s, o.name, operand);
+    if (sel kind.none) { ret true; }
+    val got: res[View, types.Error] = types.handle_kind(?m.types, ty);
+    if (sel got.err) { ret false; }
+    ret slice.same_view(got.ok, View{data: kind.some, len: str_len(kind.some)});
+}
+
+# a target op's operands as its row's own operands take them, the params of
+# an enumerant's members among them
+# ---
+# m:     the module
+# b:     the body the op is in
+# d:     the op
+# taken: how many of its operands are taken
+rec Binding {
+    m:     *Module;
+    b:     *Body;
+    d:     *InstructionData;
+    taken: usize;
+}
+
+# take the values one read operand of a row binds, and after an enumerant
+# the params of the members its value names, none when they bind, or why not
+fun take(g: *Binding, x: *mo.Operand) opt[str] {
+    if (!bindable(x.shape)) { ret opt[str].some{"a target op whose op's row has an operand of a shape no value binds"}; }
+    val left:  usize = g.d.operands.len - g.taken;
+    var count: usize = 1;
+    if (x.quantity == mo.VARIADIC)              { count = left; }
+    if (x.quantity == mo.OPTIONAL && left == 0) { count = 0; }
+    if (count > left) { ret opt[str].some{"a target op passing fewer operands than its op's row takes"}; }
+    var n: usize = 0;
+    for (n < count) {
+        val v: Value = g.d.operands.data[g.taken];
+        g.taken = g.taken + 1;
+        if (constant_shape(x.shape) && !immediate_constant(g.m, g.b, v, false)) { ret opt[str].some{"a target op passing a value where its op's row takes an integer constant"}; }
+        if (sel x.shape.enumerant) {
+            val why: opt[str] = take_params(g, x.shape.enumerant, v);
+            if (sel why.some) { ret why; }
+        }
+        n = n + 1;
+    }
+    ret opt[str].none{};
+}
+
+# take the params of the members an enumerant's value names, its member's or
+# a mask's in ascending bit order, as masc reads them
+fun take_params(g: *Binding, e: mo.Enumeration, v: Value) opt[str] {
+    val word: opt[u64] = constant_word(g.m, g.b, v);
+    if (sel word.none) { ret opt[str].none{}; }
+    if (word.some > 0xFFFF_FFFF || !mo.member(?e, word.some::u32)) { ret opt[str].some{"a target op passing an enumerant its op's row does not name"}; }
+    val value: u32 = word.some::u32;
+    val count: u32 = mo.param_count(?e, value);
+    var k:     u32 = 0;
+    for (k < count) {
+        val p: *mo.Operand = mo.param(?e, value, k);
+        if (p == nil) { ret opt[str].some{"a target op passing an enumerant its op's row does not name"}; }
+        val why: opt[str] = take(g, p);
+        if (sel why.some) { ret why; }
+        k = k + 1;
+    }
+    ret opt[str].none{};
+}
+
 # the rule a target op keeps against its op's row: the set and the op are in
-# its target's catalog, its operands and results are the ones the row's own
-# operands bind, its memory is what the row states, and the build, where one
-# is open, admits the row's requirement
+# its target's catalog and the catalog refuses neither, its operands and
+# results are the ones the row's own operands bind, each a handle of the kind
+# the catalog names where it names one, its memory is what the row states,
+# and the build, where one is open, admits the row's requirement
 fun op_of(run: *Run, fn: Function, k: Block, inst: Instruction) err[Found] {
     val m: *Module          = run.m;
     val b: *Body            = ?m.functions.data[fn.index].body;
@@ -505,51 +595,63 @@ fun op_of(run: *Run, fn: Function, k: Block, inst: Instruction) err[Found] {
     val imm: opcode.Immediate = d.immediates.data[0];
     if (!(sel imm.op)) { ret err[Found].ok{}; }
     val o:    *Op   = imm.op;
-    val at:   Where = at_op(m, fn, k, inst, o);
+    var at:   Where = at_op(m, fn, k, inst, o);
     val held: Ops   = run.target.caps.ops;
     if (sel held.none)       { ret broken(at, "a target op on a target whose catalog holds no instruction set"); }
     if (!(sel held.catalog)) { ret err[Found].ok{}; }
     val c:   *Catalog    = held.catalog;
     val set: opt[*OpSet] = op_set(c, o.set);
     if (sel set.none) { ret broken(at, "a target op naming an instruction set its target's catalog does not hold"); }
-    val found: opt[*mrow.Row] = op_row(c, set.some, o.name);
+    val s:       *OpSet          = set.some;
+    val refused: opt[*Refused]   = refusal(s, o.name);
+    if (sel refused.some) {
+        at.form = View{data: refused.some.form, len: str_len(refused.some.form)};
+        ret broken(at, "a target op naming an op the ir has a form of, which is written in its place");
+    }
+    val found: opt[*mrow.Row] = op_row(c, s, o.name);
     if (sel found.none) { ret broken(at, "a target op naming an op its instruction set does not hold"); }
     val r: *mrow.Row = found.some;
+    if (sel s.form.own) {
+        if (r.effect.control.transfer != me.NONE) { ret broken(at, "a target op naming an op that transfers control, which the ir's control flow states"); }
+        if (sel s.form.own.memory.missing) {
+            if (r.effect.memory.len == 0) { ret broken(at, "a target op naming an op whose row masc states no memory of yet, so it cannot be told from one that touches none"); }
+        }
+    }
     if (o.reads != row_touches(r, false) || o.writes != row_touches(r, true)) { ret broken(at, "a target op declaring memory its op's row does not state, or not declaring memory it does"); }
 
-    var taken:   usize = 0;
-    var given:   usize = 0;
-    var defined: usize = 0;
-    if (r.effect.values.defines != 0 && o.results.size > 0) { defined = 1; }
-    given = defined;
-    var j: u32 = set.some.supplied;
+    var g:       Binding = Binding{m: m, b: b, d: d, taken: 0};
+    var defined: usize   = 0;
+    if (r.effect.values.defines != 0 && o.results.size > 0) {
+        defined = 1;
+        if (!handled(m, s, o, r.effect.values.defines::u32 - 1, o.results.data[0])) { ret broken(at, "a target op whose result is not the handle kind its op's catalog names"); }
+    }
+    var given: usize = defined;
+    var j:     u32   = supplies(s, r);
     for (j < r.operands.len) {
-        val x: *mo.Operand = ?r.operands.at[j];
+        val x:     *mo.Operand = ?r.operands.at[j];
+        val start: usize       = g.taken;
         if (!bindable(x.shape)) { ret broken(at, "a target op whose op's row has an operand of a shape no value binds"); }
-        var count: usize = 1;
         if ((x.role & mo.READ) != 0) {
-            if (x.quantity == mo.VARIADIC)                            { count = d.operands.len - taken; }
-            if (x.quantity == mo.OPTIONAL && taken >= d.operands.len) { count = 0; }
-            if (taken + count > d.operands.len)                       { ret broken(at, "a target op passing fewer operands than its op's row takes"); }
-            var n: usize = 0;
-            for (n < count) {
-                if (constant_shape(x.shape) && !immediate_constant(m, b, d.operands.data[taken + n], false)) { ret broken(at, "a target op passing a value where its op's row takes an integer constant"); }
-                n = n + 1;
+            val why: opt[str] = take(?g, x);
+            if (sel why.some) { ret broken(at, why.some); }
+            if (g.taken > start) {
+                val ty: Type = b.values.data[d.operands.data[start].index].type;
+                if (!handled(m, s, o, j, ty)) { ret broken(at, "a target op passing a value that is not the handle kind its op's catalog names for the operand"); }
             }
         }
         if ((x.role & mo.WRITE) != 0) {
             if (given >= o.results.size) { ret broken(at, "a target op stating fewer results than its op's row gives"); }
-            if ((x.role & mo.READ) != 0 && count == 1) {
-                val ty: Type = b.values.data[d.operands.data[taken].index].type;
+            if ((x.role & mo.READ) != 0 && g.taken == start + 1) {
+                val ty: Type = b.values.data[d.operands.data[start].index].type;
                 if (!types.same(ty, o.results.data[given])) { ret broken(at, "a target op whose operand its op's row reads and writes is not of the type of the result it gives"); }
             }
+            if (!handled(m, s, o, j, o.results.data[given])) { ret broken(at, "a target op whose result is not the handle kind its op's catalog names"); }
             given = given + 1;
         }
-        if ((x.role & mo.READ) != 0) { taken = taken + count; }
         j = j + 1;
     }
-    if (taken != d.operands.len) { ret broken(at, "a target op passing more operands than its op's row takes"); }
-    if (given != o.results.size) { ret broken(at, "a target op stating more results than its op's row gives"); }
+    if (g.taken != d.operands.len) { ret broken(at, "a target op passing more operands than its op's row takes"); }
+    if (given != o.results.size)   { ret broken(at, "a target op stating more results than its op's row gives"); }
 
     val ctx: opt[*core_state.Context] = run.layout.ctx;
     if (sel ctx.some && !core_state.admits(ctx.some, r.requires)) { ret broken(at, "a target op whose op's row requires what the build's selection does not hold"); }
