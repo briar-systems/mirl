@@ -50,7 +50,7 @@ The pass schedule is split by what it reads. A neutral row (`mirl.pass.Row`) run
 
 ## Sharing a target
 
-An assembled target is read-only from `mirl.target.assemble` until `mirl.target.release`, and compiling reads it alone. Nothing on the compile path writes through a `*Target`, which holds pointers into mink's static architecture and system catalogs, the declarations, data facts, convention rows, baseline and addresses that `assemble` fixes, and the storage `assemble` took. Every per-compile state lives in the `Build` that `compile_in` opens on its own stack for each call and closes on exit: the basis and masc's context, the resolved convention rows, mink's format registry and the family's own state. Beside it `compile_in` also builds the families' owners index per call and releases it on exit. So one target can be shared by concurrent compiles, each with its own module and allocator, and mirl holds no module-level `var` outside `#[testing]`.
+An assembled target is read-only from `mirl.target.assemble` until `mirl.target.release`, and compiling reads it alone. Nothing on the compile path writes through a `*Target`, which holds pointers into mink's static architecture and system catalogs, the declarations, data facts, convention rows, baseline and addresses that `assemble` fixes, and the storage `assemble` took. Every per-compile state lives in the `Build` that `compile_in` opens on its own stack for each call and closes on exit: the basis and masc's context, the resolved convention rows, mink's format registry and the family's own state. Beside it `compile_in` also builds the families' owners index per call and releases it on exit. So one target can be shared by concurrent compiles, each with its own module and allocator, and mirl holds no module-level `var`.
 
 - a caller supplies per compile the module and an allocator that is the compile's own or safe to share,
 - `release` of a target happens only after every compile over it has returned,
@@ -176,7 +176,7 @@ Each helper is stated once, as ir text in the table of `mirl.legal.helper.table`
 - A float remainder is the dividend's magnitude less the divisor's magnitude scaled by each power of two from the largest exponent down, wherever it is no greater, one step for every exponent of the format down to the least subnormal's. Each difference is exact, since the scaled divisor is at least half of what is left, so the remainder never rounds. A subnormal divisor is scaled into the normal range first, the dividend's sign goes back on, and a nan, an infinite dividend or a zero divisor gives a nan, as the folder does. A format with no implicit leading bit is refused.
 - A format the target computes in none of, or whose exponent range a word or two cannot reach, is refused.
 
-The texts are filled in by substitution, so a test walks every row of the table at every width, format and address space a target row declares, delivers each helper and verifies the module (`mirl.legal.helper.deliver_test`). The float remainder is also run there instruction by instruction through the folder, at remainders worked out by hand. A text that a fill breaks fails mirl's own tests, never a user's build.
+The texts are filled in by substitution,.
 
 ## Float relaxations
 
