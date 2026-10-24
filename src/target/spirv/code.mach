@@ -26,6 +26,8 @@ use std.allocator;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
+use mo: masc.core.operand;
+use mrow: masc.core.row;
 use masc.isa.spirv.gen_row_index;
 
 use mirl.ir.cfg.graph.NONE;
@@ -40,6 +42,7 @@ use mirl.ir.instruction.Edge;
 use mirl.ir.instruction.InstructionData;
 use Spot: mirl.ir.instruction.Place;
 use mirl.ir.module;
+use mirl.ir.native.Op;
 use mirl.ir.opcode;
 use mirl.ir.opcode.Immediate;
 use types: mirl.ir.type;
@@ -51,6 +54,11 @@ use mirl.pass.failure.Why;
 use mirl.structure.region;
 use mirl.structure.region.Region;
 use mirl.structure.region.Structure;
+use mirl.target.capability.Catalog;
+use mirl.target.capability.OpSet;
+use mirl.target.capability.Ops;
+use mirl.target.capability.op_row;
+use mirl.target.capability.op_set;
 use mirl.target.spirv.access;
 use mirl.target.spirv.buffer;
 use mirl.target.spirv.buffer.Slot;
@@ -1027,6 +1035,122 @@ fun call(e: *Emitter, i: Instruction, d: *InstructionData) {
     }
 }
 
+# the bits of an integer constant value, none for any other value
+fun constant_bits(e: *Emitter, v: Value) opt[u64] {
+    val d: Def = e.b.values.data[v.index].def;
+    if (!(sel d.constant)) { ret opt[u64].none{}; }
+    val c: res[ConstantData, module.Error] = module.constant_data(e.u.m, d.constant);
+    if (sel c.err) { ret opt[u64].none{}; }
+    val data: ConstantData = c.ok;
+    if (sel data.zero) { ret opt[u64].some{0}; }
+    if (sel data.integer && data.integer.words.size > 0) { ret opt[u64].some{data.integer.words.data[0]}; }
+    ret opt[u64].none{};
+}
+
+# the slot a value takes for one operand of a target op's row: its id, the
+# pointer it is, or the integer constant it is for an immediate, an
+# enumerant or a number written inline
+fun op_operand(e: *Emitter, i: Instruction, x: *mo.Operand, v: Value) Slot {
+    if (sel x.shape.id) {
+        if (spirv_types.pointer(e.u, emitter.value_type(e, v))) {
+            val p: opt[Pointer] = access.pointer_of(e, v, i);
+            if (sel p.none) { ret Slot.none{}; }
+            ret Slot.id{p.some.id};
+        }
+        ret Slot.id{emitter.id_of(e, v)};
+    }
+    val bits: opt[u64] = constant_bits(e, v);
+    if (sel bits.none) {
+        emitter.unselected(e, i);
+        ret Slot.none{};
+    }
+    if (sel x.shape.immediate) { ret Slot.immediate{bits.some::i64}; }
+    if (sel x.shape.enumerant) { ret unit.enumerant(bits.some::u32); }
+    if (sel x.shape.literal) {
+        val width: u32 = spirv_types.bits_of(e.u, emitter.value_type(e, v));
+        ret Slot.literal{unit.words(e.u, bits.some, (width + 31) / 32)};
+    }
+    emitter.unselected(e, i);
+    ret Slot.none{};
+}
+
+# a target op: OpExtInst of its op's row, its result type and result, the
+# import of its set, made once, and then its own operands as the row states
+# them, a variadic one as a list and an optional one left out as none. the
+# row's requirement is the module's to declare, as every row's is
+fun targeted(e: *Emitter, i: Instruction, d: *InstructionData) {
+    var o: *Op = nil;
+    if (d.immediates.len > 0) {
+        val imm: Immediate = d.immediates.data[0];
+        if (sel imm.op) { o = imm.op; }
+    }
+    val held: Ops = e.u.t.caps.ops;
+    if (o == nil || !(sel held.catalog) || d.results.len > 1) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val c:   *Catalog    = held.catalog;
+    val set: opt[*OpSet] = op_set(c, o.set);
+    if (sel set.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val found: opt[*mrow.Row] = op_row(c, set.some, o.name);
+    if (sel found.none) {
+        emitter.unselected(e, i);
+        ret;
+    }
+    val r:    *mrow.Row = found.some;
+    var t:    u32       = 0;
+    var into: u32       = 0;
+    if (d.results.len == 1) {
+        val v: Value = d.results.data[0];
+        if (spirv_types.pointer(e.u, emitter.value_type(e, v))) {
+            emitter.unselected(e, i);
+            ret;
+        }
+        t    = emitter.type_id(e, v);
+        into = e.ids.data[v.index];
+    }
+    or {
+        t    = spirv_types.void(e.u);
+        into = emitter.fresh(e);
+    }
+    var slots: vector.Vector[Slot] = vector.init[Slot](e.u.a);
+    fin { vector.dnit[Slot](?slots); }
+    var listed: vector.Vector[Slot] = vector.init[Slot](e.u.a);
+    fin { vector.dnit[Slot](?listed); }
+    push_slot(e, ?slots, Slot.id{t});
+    push_slot(e, ?slots, Slot.id{into});
+    push_slot(e, ?slots, Slot.id{unit.import_of(e.u, o.set)});
+    var taken: usize = 0;
+    var j:     u32   = set.some.supplied;
+    for (j < r.operands.len && ok(e)) {
+        val x: *mo.Operand = ?r.operands.at[j];
+        if (x.quantity == mo.VARIADIC) {
+            vector.truncate[Slot](?listed, 0);
+            for (taken < d.operands.len && ok(e)) {
+                push_slot(e, ?listed, op_operand(e, i, x, d.operands.data[taken]));
+                taken = taken + 1;
+            }
+            push_slot(e, ?slots, Slot.list{unit.slots(e.u, listed.data, listed.len)});
+        }
+        or (taken >= d.operands.len) { push_slot(e, ?slots, Slot.none{}); }
+        or {
+            push_slot(e, ?slots, op_operand(e, i, x, d.operands.data[taken]));
+            taken = taken + 1;
+        }
+        j = j + 1;
+    }
+    if (!ok(e)) { ret; }
+    emitter.put(e, r.index, slots.data, slots.len);
+}
+
+fun push_slot(e: *Emitter, v: *vector.Vector[Slot], s: Slot) {
+    val pushed: res[usize, allocator.Error] = vector.push[Slot](v, s);
+    if (sel pushed.err) { emitter.lost(e, pushed.err); }
+}
+
 fun lane_list(e: *Emitter, d: *InstructionData, slot: usize) opt[Slice[u32]] {
     if (slot >= d.immediates.len) { ret opt[Slice[u32]].none{}; }
     val imm: Immediate = d.immediates.data[slot];
@@ -1132,6 +1256,10 @@ fun instruction(e: *Emitter, i: Instruction, d: *InstructionData) {
     }
     if (code == opcode.FENCE.index) {
         access.fence(e, d);
+        ret;
+    }
+    if (opcode.target_op(d.opcode)) {
+        targeted(e, i, d);
         ret;
     }
     if (d.results.len == 0 || d.operands.len == 0) {
