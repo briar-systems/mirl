@@ -12,6 +12,12 @@
 # a slot that a kept or volatile access touches stays in memory, so a kept
 # store or fill into it is never taken away.
 #
+# the walk is the optimisation's, over every slot of a scalar, pointer or
+# vector type, and a legalisation's, over the slots of a pointer type alone
+# where a target holds no pointer in memory. the legalisation merges no
+# pointer where paths join and gives no load a pointer no store left, and it
+# refuses a slot it cannot take out, naming the slot and why.
+#
 # it changes no branch and no address, so it keeps constant time.
 
 use std.types.bool.bool;
@@ -65,6 +71,8 @@ use mirl.ir.value.Declaration;
 use mirl.ir.value.Def;
 use mirl.pass.analysis;
 use mirl.pass.cache;
+use mirl.pass.failure.Kept;
+use mirl.pass.failure.Unpromoted;
 use mirl.pass.failure.Why;
 use mirl.pass.record.Context;
 use mirl.pass.record.Kind;
@@ -88,6 +96,29 @@ val STORE: u8 = 2;
 # ---
 # it keeps no analysis, since it may take unreached blocks out of the graph
 pub val PROMOTE: Pass = Pass{name: "promote", kind: Kind.optimise{}, scope: Scope.function{visit}, time: Time.keeps{}};
+
+# the slots a walk takes, and what it does with one it cannot
+# ---
+# every:    each slot of a scalar, pointer or vector type, leaving one it
+#           cannot take where it is
+# pointers: each slot of a pointer type, merging none where paths join and
+#           giving no load a pointer no store left, refusing one it cannot
+#           take
+pub tag Reach: u8 {
+    every;
+    pointers;
+}
+
+# what became of one slot
+# ---
+# skipped:  the walk does not take it
+# promoted: its memory was replaced by values
+# kept:     it stays in memory, for this reason
+tag Outcome: u8 {
+    skipped;
+    promoted;
+    kept: Kept;
+}
 
 # one slot being promoted
 # ---
@@ -198,14 +229,16 @@ fun tag_of(x: *Slot, i: Instruction) u8 {
     ret x.tag.data[i.index];
 }
 
-# whether the slot's address is only loaded from and stored to at its type,
-# and which instructions do so
-fun collect(x: *Slot) res[bool, Why] {
+# which instructions load from and store to the slot's address at its type,
+# or why the slot stays: its address is used otherwise, or a kept or volatile
+# access holds it
+fun collect(x: *Slot) res[opt[Kept], Why] {
     val uses: Slice[Instruction] = Slice[Instruction]{data: x.b.values.data[x.pointer.index].uses.data, size: x.b.values.data[x.pointer.index].uses.len};
     var n:    usize              = 0;
     for (n < uses.size) {
         val d: *InstructionData = ?x.b.instructions.data[uses.data[n].index];
-        if (!(sel d.place.placed) || d.metadata.flags.volatile || d.metadata.flags.kept) { ret res[bool, Why].ok{false}; }
+        if (!(sel d.place.placed))                             { ret res[opt[Kept], Why].ok{opt[Kept].some{Kept.escapes{}}}; }
+        if (d.metadata.flags.volatile || d.metadata.flags.kept) { ret res[opt[Kept], Why].ok{opt[Kept].some{Kept.held{}}}; }
         var kind: u8 = NOT;
         if (d.opcode.index == opcode.LOAD.index) {
             if (sel d.immediates.data[0].ty && types.same(d.immediates.data[0].ty, x.type)) { kind = LOAD; }
@@ -214,13 +247,13 @@ fun collect(x: *Slot) res[bool, Why] {
             val stored: Value = d.operands.data[1];
             if (stored.index != x.pointer.index && types.same(x.b.values.data[stored.index].type, x.type)) { kind = STORE; }
         }
-        if (kind == NOT) { ret res[bool, Why].ok{false}; }
+        if (kind == NOT) { ret res[opt[Kept], Why].ok{opt[Kept].some{Kept.escapes{}}}; }
         x.tag.data[uses.data[n].index] = kind;
         val r: err[Why] = add[Instruction](?x.members, uses.data[n]);
-        if (sel r.err) { ret res[bool, Why].err{r.err}; }
+        if (sel r.err) { ret res[opt[Kept], Why].err{r.err}; }
         n = n + 1;
     }
-    ret res[bool, Why].ok{true};
+    ret res[opt[Kept], Why].ok{opt[Kept].none{}};
 }
 
 fun release(x: *Slot) {
@@ -410,6 +443,16 @@ fun any_phi(x: *Slot) bool {
     ret false;
 }
 
+# whether a load reads the zero, as no store reaches it
+fun any_unstored(x: *Slot) bool {
+    var n: usize = 0;
+    for (n < x.loadval.len) {
+        if (x.loadval.data[n] == UNDEF) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
 fun zero_of(x: *Slot, ty: Type) res[Value, Why] {
     val c: res[Constant, module.Error] = module.add_constant(x.m, ConstantData.zero{ty});
     if (sel c.err) { ret res[Value, Why].err{Why.ir{c.err}}; }
@@ -447,7 +490,7 @@ fun apply(x: *Slot) err[Why] {
         if (sel named.err) { ret err[Why].err{Why.ir{named.err}}; }
         vars = named.ok;
     }
-    if (any_phi(x) || x.loadval.len > 0) {
+    if (any_phi(x) || any_unstored(x)) {
         val z: res[Value, Why] = zero_of(x, x.type);
         if (sel z.err) { ret err[Why].err{z.err}; }
         x.zero = z.ok;
@@ -596,15 +639,25 @@ fun shaped(x: *Slot, n: usize) err[Why] {
     ret filled[u32](x.s, n, UNDEF, ?x.result);
 }
 
-# promote one slot, or leave it where it is
-fun promote_one(c: *Context, dom: *Dominance, s: *allocator.Allocator, tag: *vector.Vector[u8], which: *vector.Vector[u32], f: Function, alloca: Instruction) res[bool, Why] {
+# whether a walk takes a slot of a type
+fun takes(r: Reach, k: types.Kind) bool {
+    if (sel r.pointers) { ret sel k.pointer; }
+    ret sel k.integer || sel k.float || sel k.pointer || sel k.vector;
+}
+
+fun stays(k: Kept) res[Outcome, Why] {
+    ret res[Outcome, Why].ok{Outcome.kept{k}};
+}
+
+# promote one slot, or say why it stays where it is
+fun promote_one(c: *Context, dom: *Dominance, s: *allocator.Allocator, tag: *vector.Vector[u8], which: *vector.Vector[u32], f: Function, alloca: Instruction, reach: Reach) res[Outcome, Why] {
     val got: res[*Body, module.Error] = module.body(c.m, f);
-    if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
+    if (sel got.err) { ret res[Outcome, Why].err{Why.ir{got.err}}; }
     val b:   *Body            = got.ok;
     val d:   *InstructionData = ?b.instructions.data[alloca.index];
     val imm: Immediate        = d.immediates.data[0];
-    if (!(sel d.place.placed)) { ret res[bool, Why].ok{false}; }
-    if (!(sel imm.ty))         { ret res[bool, Why].ok{false}; }
+    if (!(sel d.place.placed)) { ret res[Outcome, Why].ok{Outcome.skipped{}}; }
+    if (!(sel imm.ty))         { ret res[Outcome, Why].ok{Outcome.skipped{}}; }
     var x: Slot;
     x.m        = c.m;
     x.f        = f;
@@ -618,8 +671,8 @@ fun promote_one(c: *Context, dom: *Dominance, s: *allocator.Allocator, tag: *vec
     x.type     = imm.ty;
     x.bindings = d.metadata.bindings;
     val kind: res[types.Kind, types.Error] = types.kind(?c.m.types, x.type);
-    if (sel kind.err)                                                                             { ret res[bool, Why].err{Why.ir{module.Error.types{kind.err}}}; }
-    if (!(sel kind.ok.integer || sel kind.ok.float || sel kind.ok.pointer || sel kind.ok.vector)) { ret res[bool, Why].ok{false}; }
+    if (sel kind.err)           { ret res[Outcome, Why].err{Why.ir{module.Error.types{kind.err}}}; }
+    if (!takes(reach, kind.ok)) { ret res[Outcome, Why].ok{Outcome.skipped{}}; }
 
     x.members = vector.init[Instruction](s);
     x.loads   = vector.init[Instruction](s);
@@ -628,38 +681,80 @@ fun promote_one(c: *Context, dom: *Dominance, s: *allocator.Allocator, tag: *vec
     x.sval    = vector.init[u32](s);
     val n:    usize    = b.blocks.len;
     val made: err[Why] = shaped(?x, n);
-    if (sel made.err) { ret res[bool, Why].err{made.err}; }
+    if (sel made.err) { ret res[Outcome, Why].err{made.err}; }
     fin { release(?x); }
 
-    val ours: res[bool, Why] = collect(?x);
-    if (sel ours.err) { ret ours; }
-    if (!ours.ok)     { ret res[bool, Why].ok{false}; }
+    val ours: res[opt[Kept], Why] = collect(?x);
+    if (sel ours.err)     { ret res[Outcome, Why].err{ours.err}; }
+    if (sel ours.ok.some) { ret stays(ours.ok.some); }
     val scanned: err[Why] = scan(?x);
-    if (sel scanned.err) { ret res[bool, Why].err{scanned.err}; }
+    if (sel scanned.err) { ret res[Outcome, Why].err{scanned.err}; }
     x.secret = secret_slot(?x);
     val loadvals: err[Why] = filled[u32](s, x.loads.len, UNDEF, ?x.loadval);
-    if (sel loadvals.err) { ret res[bool, Why].err{loadvals.err}; }
+    if (sel loadvals.err) { ret res[Outcome, Why].err{loadvals.err}; }
     val storevals: err[Why] = filled[u32](s, x.stores.len, UNDEF, ?x.sval);
-    if (sel storevals.err) { ret res[bool, Why].err{storevals.err}; }
+    if (sel storevals.err) { ret res[Outcome, Why].err{storevals.err}; }
     val placed: err[Why] = place(?x);
-    if (sel placed.err)     { ret res[bool, Why].err{placed.err}; }
-    if (x.phi.data[0] != 0) { ret res[bool, Why].ok{false}; }
+    if (sel placed.err)                    { ret res[Outcome, Why].err{placed.err}; }
+    if (x.phi.data[0] != 0)                { ret stays(Kept.merged{}); }
+    if (sel reach.pointers && any_phi(?x)) { ret stays(Kept.merged{}); }
     val named: err[Why] = rename(?x);
-    if (sel named.err)      { ret res[bool, Why].err{named.err}; }
-    if (!keeps_secrecy(?x)) { ret res[bool, Why].ok{false}; }
+    if (sel named.err)                          { ret res[Outcome, Why].err{named.err}; }
+    if (sel reach.pointers && any_unstored(?x)) { ret stays(Kept.unstored{}); }
+    if (!keeps_secrecy(?x))                     { ret stays(Kept.secrecy{}); }
 
     val applied: err[Why] = apply(?x);
-    if (sel applied.err) { ret res[bool, Why].err{applied.err}; }
-    ret res[bool, Why].ok{true};
+    if (sel applied.err) { ret res[Outcome, Why].err{applied.err}; }
+    ret res[Outcome, Why].ok{Outcome.promoted{}};
+}
+
+# whether a block the walk reaches or not makes a slot the walk takes, so a
+# legalisation leaves a function with none as it is
+fun any_taken(m: *Module, b: *Body, reach: Reach) res[bool, Why] {
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            val list: *vector.Vector[Instruction] = ?b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                val d: *InstructionData = ?b.instructions.data[list.data[i].index];
+                if (d.opcode.index == opcode.ALLOCA.index) {
+                    val imm: Immediate = d.immediates.data[0];
+                    if (sel imm.ty) {
+                        val kind: res[types.Kind, types.Error] = types.kind(?m.types, imm.ty);
+                        if (sel kind.err)          { ret res[bool, Why].err{Why.ir{module.Error.types{kind.err}}}; }
+                        if (takes(reach, kind.ok)) { ret res[bool, Why].ok{true}; }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Why].ok{false};
 }
 
 fun visit(u: *Unit) res[bool, Why] {
+    ret walk(u, Reach.every{});
+}
+
+# promote the slots of one function a walk takes. the optimisation leaves a
+# slot it cannot take in memory, and the legalisation refuses it
+# ---
+# u:     the function
+# reach: the slots it takes
+# ret:   whether it changed the function, or why it refused it
+pub fun walk(u: *Unit, reach: Reach) res[bool, Why] {
     val c:   *Context                 = u.context;
     val got: res[*Body, module.Error] = module.body(c.m, u.f);
     if (sel got.err) { ret res[bool, Why].err{Why.ir{got.err}}; }
     val b:       *Body = got.ok;
     var changed: bool  = false;
-
+    if (sel reach.pointers) {
+        val any: res[bool, Why] = any_taken(c.m, b, reach);
+        if (sel any.err) { ret any; }
+        if (!any.ok)     { ret res[bool, Why].ok{false}; }
+    }
     val first: res[*Dominance, Why] = analysis.dominance_of(c.cache, u.f);
     if (sel first.err) { ret res[bool, Why].err{first.err}; }
     var tree:      *Dominance = first.ok;
@@ -680,8 +775,8 @@ fun visit(u: *Unit) res[bool, Why] {
         changed = true;
     }
 
-    var slots: vector.Vector[Instruction] = vector.init[Instruction](c.m.a);
-    fin { vector.dnit[Instruction](?slots); }
+    var found: vector.Vector[Instruction] = vector.init[Instruction](c.m.a);
+    fin { vector.dnit[Instruction](?found); }
     val order: Slice[u32] = dominance.order(tree);
     var n:     usize      = 0;
     for (n < order.size) {
@@ -689,14 +784,14 @@ fun visit(u: *Unit) res[bool, Why] {
         var i:    usize                       = 0;
         for (i < list.len) {
             if (b.instructions.data[list.data[i].index].opcode.index == opcode.ALLOCA.index) {
-                val r: err[Why] = add[Instruction](?slots, list.data[i]);
+                val r: err[Why] = add[Instruction](?found, list.data[i]);
                 if (sel r.err) { ret res[bool, Why].err{r.err}; }
             }
             i = i + 1;
         }
         n = n + 1;
     }
-    if (slots.len == 0) { ret res[bool, Why].ok{changed}; }
+    if (found.len == 0) { ret res[bool, Why].ok{changed}; }
 
     var tag:    vector.Vector[u8];
     var which:  vector.Vector[u32];
@@ -714,11 +809,14 @@ fun visit(u: *Unit) res[bool, Why] {
     arena.make(?scratch, ?ar);
 
     n = 0;
-    for (n < slots.len) {
+    for (n < found.len) {
         arena.reset(?ar);
-        val r: res[bool, Why] = promote_one(c, tree, ?scratch, ?tag, ?which, u.f, slots.data[n]);
-        if (sel r.err) { ret r; }
-        if (r.ok)      { changed = true; }
+        val r: res[Outcome, Why] = promote_one(c, tree, ?scratch, ?tag, ?which, u.f, found.data[n], reach);
+        if (sel r.err)         { ret res[bool, Why].err{r.err}; }
+        if (sel r.ok.promoted) { changed = true; }
+        if (sel r.ok.kept) {
+            if (sel reach.pointers) { ret res[bool, Why].err{Why.slot{Unpromoted{slot: found.data[n], kept: r.ok.kept}}}; }
+        }
         n = n + 1;
     }
     ret res[bool, Why].ok{changed};
