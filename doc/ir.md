@@ -6,7 +6,7 @@ The specification is split by subject.
 
 | document | subject |
 |---|---|
-| this file | the model, types, values, control flow, semantics, secrecy, the verifier's rules and inline assembly |
+| this file | the model, types, values, control flow, semantics, secrecy, the verifier's rules, inline assembly and target ops |
 | [ir/opcodes.md](ir/opcodes.md) | the opcode reference, generated from the opcode table |
 | [ir/text.md](ir/text.md) | the text form, its grammar and its version |
 | [ir/fold.md](ir/fold.md) | the constant folder |
@@ -350,6 +350,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 20 | `functions` | code names a function's address only through `func.addr`, and only on a target whose `functions` declaration is not `none`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
 | 21 | `convention` | every function type names no convention row, for the one its target's tuple names, or one of the convention rows its target states: its own and every other of its architecture whose requirements hold over its baseline |
 | 22 | `assembly` | every immediate an inline assembly block binds is a constant: an integer, or an address where the operand's constraint lets a symbol stand for it |
+| 23 | `op` | every target op names an instruction set its target's `ops` catalog holds and an op that set holds, refusing it by declaration on a target whose catalog holds no such set or op, and the refusal names both. It passes the operands and states the results the op's row binds: each of the row's own operands after the ones the target supplies takes the next operand where it reads and gives the next result where it writes, an optional one may be left out at the end and a variadic one takes the rest, an immediate, an enumerant and a number written inline take an integer constant, and a value the row defines is the op's first result or, where the op states none, a result the target gives no type. It declares that it reads and writes memory exactly as the row's accesses state, and where a build is open its selection admits the row's requirement |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
@@ -377,7 +378,23 @@ Limits:
 - Legalisation does not rewrite an item's operands, so an operand of a type the target holds in no register, as a narrow or a wide integer, is refused at selection.
 
 
-## 10. Where the rest is
+## 10. Target ops
+
+A target op is one instruction of an instruction set its target's catalog names: a `target.op` instruction, or `target.op.memory` where it touches memory, whose `op` immediate (`mirl.ir.native.Op`) names the set as the catalog names it, the op as the set names it, the types of its results and whether it reads and writes memory. It is how a front end reaches a target's own instruction, as GLSL.std.450's `Sqrt` or OpenCL.std's `fma`, and one form serves every family: the catalog is the target's `ops` declaration over masc's rows of the target's set, never a case of the ir.
+
+The op's row of masc's set states everything the verifier holds the item to (rule 23). The row's operands after the ones the target supplies itself are the op's own: each takes the next operand of the instruction where it reads and gives the next result where it writes, an optional one may be left out at the end, a variadic one takes the rest, and an immediate, an enumerant or a number written inline takes an integer constant. A value the row defines is the op's first result, or none, which the target gives no type. The item declares that it reads and writes memory exactly as the row's accesses state, and where a build is open its selection admits the row's requirement. masc states no type of an extended instruction's ids, so the types of the operands and results are the front end's, and the module the target writes is checked against them by the target's own validator.
+
+A target op of no memory is a function of its operands: its row is speculatable and mergeable, so it is merged, hoisted and removed as any pure operation is, and two are the same computation when they name one set and one op. A target op that touches memory is neither, and the memory analysis takes it as reading and writing anywhere as it declares, since which of its operands address memory is the catalog's to say and no pass reads the catalog. No fold evaluates either.
+
+A target whose catalog holds no instruction set, every register and webassembly target, refuses every target op by declaration, and one whose catalog holds no such set or op refuses it naming both. SPIR-V holds GLSL.std.450, NonSemantic.Shader.DebugInfo.100 and OpenCL.std, each an `OpExtInst` of the set's import whose result type, result and import come before the op's own operands, so the set imports once and the module declares what the op's row requires (see [ir/target.md](ir/target.md)).
+
+Limits:
+
+- SPIR-V's core instructions are no set of its catalog yet, so an op of them is refused by declaration.
+- Legalisation does not rewrite a target op's operands or results, so one of a format or width the target computes through lowering, as a binary16 value without `Float16`, is refused after it.
+
+
+## 11. Where the rest is
 
 - the opcode reference, [ir/opcodes.md](ir/opcodes.md)
 - the text form and its grammar, [ir/text.md](ir/text.md)
