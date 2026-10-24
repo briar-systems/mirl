@@ -169,7 +169,8 @@ constants
   constant    = type literal ;
   literal     = uint | "-" uint | "zero"
               | "{" [ constant { "," constant } ] "}"
-              | symbol [ ( "+" | "-" ) uint ] ;
+              | symbol [ ( "+" | "-" ) uint ]
+              | "spec" uint [ "-" ] uint ;
 
   a number of an integer type is its bits read unsigned, and a number of a
   float type is the bits of its encoding. `-` gives the two's complement of
@@ -177,7 +178,8 @@ constants
   64 bits in decimal and any other number in hex. `zero` is every bit zero.
   braces hold an aggregate's members, elements or lanes in order. a symbol
   is the address of a function or global plus a byte offset, of a pointer
-  type.
+  type. `spec` is a specialization constant of an integer or float type: its
+  id, at most 32 bits, and its default, a number as above: `i32 spec 0 64`.
 
 globals
 
