@@ -15,6 +15,11 @@ use std.types.size.usize;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
+use me:         masc.core.effect;
+use mo:         masc.core.operand;
+use mrow:       masc.core.row;
+use core_state: masc.core.state;
+
 use ia: mirl.ir.assembly;
 use mirl.ir.block.BlockData;
 use mirl.ir.constant.ConstantData;
@@ -29,12 +34,20 @@ use mirl.ir.instruction.InstructionData;
 use mirl.ir.instruction.Place;
 use mirl.ir.module;
 use mirl.ir.module.Module;
+use mirl.ir.native.Op;
 use mirl.ir.opcode;
 use types: mirl.ir.type;
+use mirl.ir.type.Type;
 use mirl.ir.value.Def;
+use mirl.target.Catalog;
+use mirl.target.OpSet;
+use mirl.target.Ops;
 use mirl.target.Target;
+use mirl.target.op_row;
+use mirl.target.op_set;
 use mirl.verify.failure.Found;
 use mirl.verify.failure.Run;
+use mirl.verify.failure.Where;
 use mirl.verify.failure.at_instruction;
 use mirl.verify.failure.broken;
 use mirl.verify.failure.in_block;
@@ -428,6 +441,136 @@ pub fun assembly(run: *Run) err[Found] {
                 var i: usize = 0;
                 for (i < d.instructions.len) {
                     val found: err[Found] = assembly_of(m, fn, Block{index: k::u32}, d.instructions.data[i]);
+                    if (sel found.err) { ret found; }
+                    i = i + 1;
+                }
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Found].ok{};
+}
+
+# where a target op stands, naming its set and its op
+fun at_op(m: *Module, fn: Function, k: Block, inst: Instruction, o: *Op) Where {
+    var w: Where = at_instruction(m, fn, k, inst);
+    w.set = o.set;
+    w.op  = o.name;
+    ret w;
+}
+
+# the role an access of a row's effect reads and writes memory in: its own,
+# or the role of the memory operand it is the access of
+fun access_role(r: *mrow.Row, a: *me.Access) mo.Role {
+    if (a.role != mo.NONE || a.operand::u32 >= r.operands.len) { ret a.role; }
+    ret r.operands.at[a.operand].role;
+}
+
+# whether a row's effect reads, or writes, memory, as its accesses state
+fun row_touches(r: *mrow.Row, write: bool) bool {
+    var want: mo.Role = mo.READ;
+    if (write) { want = mo.WRITE; }
+    var i: u32 = 0;
+    for (i < r.effect.memory.len) {
+        if ((access_role(r, ?r.effect.memory.at[i]) & want) != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether an operand of a row's own takes a value: a register or an id, or an
+# integer constant for an immediate, an enumerant or a number written inline,
+# and nothing for any other shape
+fun bindable(s: mo.Shape) bool {
+    if (sel s.register || sel s.id || sel s.immediate || sel s.enumerant) { ret true; }
+    if (sel s.literal)                                                    { ret s.literal.content == mo.NUMBER && s.literal.width_of == 0; }
+    ret false;
+}
+
+# whether an operand of a row's own is one the instruction gives a constant for
+fun constant_shape(s: mo.Shape) bool {
+    ret sel s.immediate || sel s.enumerant || sel s.literal;
+}
+
+# the rule a target op keeps against its op's row: the set and the op are in
+# its target's catalog, its operands and results are the ones the row's own
+# operands bind, its memory is what the row states, and the build, where one
+# is open, admits the row's requirement
+fun op_of(run: *Run, fn: Function, k: Block, inst: Instruction) err[Found] {
+    val m: *Module          = run.m;
+    val b: *Body            = ?m.functions.data[fn.index].body;
+    val d: *InstructionData = ?b.instructions.data[inst.index];
+    if (!opcode.target_op(d.opcode) || d.immediates.len == 0) { ret err[Found].ok{}; }
+    val imm: opcode.Immediate = d.immediates.data[0];
+    if (!(sel imm.op)) { ret err[Found].ok{}; }
+    val o:    *Op   = imm.op;
+    val at:   Where = at_op(m, fn, k, inst, o);
+    val held: Ops   = run.target.caps.ops;
+    if (sel held.none)       { ret broken(at, "a target op on a target whose catalog holds no instruction set"); }
+    if (!(sel held.catalog)) { ret err[Found].ok{}; }
+    val c:   *Catalog    = held.catalog;
+    val set: opt[*OpSet] = op_set(c, o.set);
+    if (sel set.none) { ret broken(at, "a target op naming an instruction set its target's catalog does not hold"); }
+    val found: opt[*mrow.Row] = op_row(c, set.some, o.name);
+    if (sel found.none) { ret broken(at, "a target op naming an op its instruction set does not hold"); }
+    val r: *mrow.Row = found.some;
+    if (o.reads != row_touches(r, false) || o.writes != row_touches(r, true)) { ret broken(at, "a target op declaring memory its op's row does not state, or not declaring memory it does"); }
+
+    var taken:   usize = 0;
+    var given:   usize = 0;
+    var defined: usize = 0;
+    if (r.effect.values.defines != 0 && o.results.size > 0) { defined = 1; }
+    given = defined;
+    var j: u32 = set.some.supplied;
+    for (j < r.operands.len) {
+        val x: *mo.Operand = ?r.operands.at[j];
+        if (!bindable(x.shape)) { ret broken(at, "a target op whose op's row has an operand of a shape no value binds"); }
+        var count: usize = 1;
+        if ((x.role & mo.READ) != 0) {
+            if (x.quantity == mo.VARIADIC)                            { count = d.operands.len - taken; }
+            if (x.quantity == mo.OPTIONAL && taken >= d.operands.len) { count = 0; }
+            if (taken + count > d.operands.len)                       { ret broken(at, "a target op passing fewer operands than its op's row takes"); }
+            var n: usize = 0;
+            for (n < count) {
+                if (constant_shape(x.shape) && !immediate_constant(m, b, d.operands.data[taken + n], false)) { ret broken(at, "a target op passing a value where its op's row takes an integer constant"); }
+                n = n + 1;
+            }
+        }
+        if ((x.role & mo.WRITE) != 0) {
+            if (given >= o.results.size) { ret broken(at, "a target op stating fewer results than its op's row gives"); }
+            if ((x.role & mo.READ) != 0 && count == 1) {
+                val ty: Type = b.values.data[d.operands.data[taken].index].type;
+                if (!types.same(ty, o.results.data[given])) { ret broken(at, "a target op whose operand its op's row reads and writes is not of the type of the result it gives"); }
+            }
+            given = given + 1;
+        }
+        if ((x.role & mo.READ) != 0) { taken = taken + count; }
+        j = j + 1;
+    }
+    if (taken != d.operands.len) { ret broken(at, "a target op passing more operands than its op's row takes"); }
+    if (given != o.results.size) { ret broken(at, "a target op stating more results than its op's row gives"); }
+
+    val ctx: opt[*core_state.Context] = run.layout.ctx;
+    if (sel ctx.some && !core_state.admits(ctx.some, r.requires)) { ret broken(at, "a target op whose op's row requires what the build's selection does not hold"); }
+    ret err[Found].ok{};
+}
+
+# every target op is an op of its target's catalog, binding what the op's row
+# binds and declaring the memory the row states
+pub fun ops(run: *Run) err[Found] {
+    val m: *Module = run.m;
+    var f: usize   = 0;
+    for (f < m.functions.len) {
+        val fn: Function = Function{index: f::u32};
+        val b:  *Body    = ?m.functions.data[f].body;
+        var k:  usize    = 0;
+        for (k < b.blocks.len) {
+            val d: *BlockData = ?b.blocks.data[k];
+            if (!d.erased) {
+                var i: usize = 0;
+                for (i < d.instructions.len) {
+                    val found: err[Found] = op_of(run, fn, Block{index: k::u32}, d.instructions.data[i]);
                     if (sel found.err) { ret found; }
                     i = i + 1;
                 }
