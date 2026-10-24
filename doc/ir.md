@@ -226,7 +226,7 @@ The ordered comparisons (`feq.o`, `fne.o`, `flt.o`, `fle.o`, `fgt.o`, `fge.o`) a
 
 ### 6.5 Memory
 
-`load` reads a value of the stated type from an address, `store` writes one, and each states the alignment the access may assume as an immediate. An alignment is a power of two. `alloca` gives the address of a stack slot of the stated type and alignment. `ptr.add` adds an integer byte count to an address.
+`load` reads a value of the stated type from an address, `store` writes one, and each states the alignment the access may assume as an immediate. An alignment is a power of two. `alloca` gives the address of a stack slot of the stated type and alignment. The pointer type it states is into the target's slot space (`mirl.target.record.slot_space`), which the target declares and is not always the default space: SPIR-V's is the Function storage class, and the verifier refuses an `alloca` whose pointer is into another. `ptr.add` adds an integer byte count to an address.
 
 `ptr.member` gives the address of a member of the structure at an address, the structure's type and the member's index stated as immediates. `ptr.index` gives the address of an element of the array at an address, the array's type stated and the element's index an integer operand read as signed. Neither reads memory, and neither checks the index against the array's count, so an index past it gives an address past the array as `ptr.add` would. The address is in the space of the one each takes.
 
@@ -334,7 +334,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 6 | `reference` | every id a block or instruction names is one its body holds and has not removed, every instruction is listed in exactly one block and placed in it, every operand and branch argument is defined, every result and parameter is defined by the instruction or block that lists it, and every opcode names a row |
 | 7 | `terminator` | every block ends in exactly one terminator, with none before it |
 | 8 | `edge` | every edge passes its target's parameters in count and type, and the entry block takes the signature's parameters, or one parameter per place once the abi legalisation has placed them |
-| 9 | `typing` | every instruction is an instance its opcode's row types, and its results are the number and types the row derives |
+| 9 | `typing` | every instruction is an instance its opcode's row types, and its results are the number and types the row derives, and an `alloca`'s pointer is into the target's slot space |
 | 10 | `secrecy` | every result is secret exactly as its row's secrecy rule gives, and no edge passes a secret value to a public parameter |
 | 11 | `dominance` | every use in a reached block is dominated by its definition, and so is every branch argument at its edge |
 | 12 | `debug` | every location, inlining site and binding that an instruction's metadata names is an entry of the debug table |
