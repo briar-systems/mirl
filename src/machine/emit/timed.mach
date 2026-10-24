@@ -16,14 +16,29 @@
 # division's trap guard that reads what it tests as public, at the byte of
 # the range it stands at.
 #
-# every call is walked as the walk takes one with no model of its callee
-# (`walk.NO_CALLS`), so a secret anything holds before a call makes every
-# register and address secret after it. the call sites emission marks are
-# not read yet.
+# each call site emission made is walked through a model of its callee made
+# from the convention of the callee's signature and the caller's frame, never
+# restated per target: the callee preserves the stack pointer, the frame
+# pointer and the registers the convention preserves whole, reads its
+# arguments from the registers the call reads beyond its operands and the
+# addressed frame locals a pointer argument may reach, writes its results,
+# the registers the convention clobbers and the link, and those locals, and
+# keeps the caller's frame from its lowest slot through the return address.
+# memory outside that may be written with what the callee computes, globals
+# included. a frame the walk cannot place from a fixed offset, as one the
+# prologue realigns or of scaled size, keeps nothing. the callee is checked
+# only where it is a function of the module this build walks for constant
+# time, as the constant-time helpers the legalisation delivers are, each of
+# whose parameters is secret and which reads no memory, and only for a call
+# reading none of the caller's frame, as its walk seeds no memory, a global
+# included. a secret reaching any other callee is refused by name.
 #
 # a refusal is masc's one record at the byte of the function's code it stands
 # at, and code the walk cannot follow on a set that classifies its rows is not
-# met either.
+# met either. code that holds only under a timing mode the runtime sets on
+# need, as aarch64's dit=on, needs it, and the object carries the mode's mark
+# (`mark`), while code that holds only under one the target's system does not
+# declare it can set is refused, naming the system.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -38,17 +53,28 @@ use std.allocator;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
 use mink.base.store.Bytes;
 use mink.base.table;
+use mink.base.table.Id;
 use mink.model.object;
 use mink.model.object.CtRange;
+use mink.model.symbol;
 
 use mct: mirl.ct;
+use mirl.ir.constant.ConstantData;
 use mirl.ir.function.Body;
 use mirl.ir.function.Entry;
 use mirl.ir.id;
+use ir_instruction: mirl.ir.instruction;
+use mirl.ir.module;
 use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Row;
 use mirl.ir.place.Placed;
+use types: mirl.ir.type;
+use mirl.ir.value.Def;
 use mirl.machine.class.Physical;
 use frame: mirl.machine.frame.record;
 use mf:    mirl.machine.function;
@@ -57,14 +83,23 @@ use mirl.machine.instruction.InstructionData;
 use mirl.machine.operand.Block;
 use mirl.machine.operand.Instruction;
 use mirl.machine.operand.Operand;
+use mirl.target.abi.convention;
+use mirl.target.abi.convention.Registers;
+use mirl.target.abi.convention.Resolved;
+use mirl.target.build;
 use mirl.target.build.Build;
 use mirl.target.layout;
 use mirl.target.layout.Layout;
 use mirl.target.record;
 use mirl.target.record.Target;
 
+use codec: masc.codec.walk;
+use masc.core.ct;
+use masc.core.effect;
+use masc.core.field;
 use mo: masc.core.operand;
 use rf: masc.core.register;
+use masc.core.requirement;
 use masc.core.state;
 use masc.walk.walk;
 
@@ -283,17 +318,473 @@ fun public(f: *Framed, r: *CtRange, points: Slice[Point], out: *vector.Vector[wa
     ret res[bool, allocator.Error].ok{true};
 }
 
+# a run of a model's registers or extents in the storage every model of a range shares
+rec Run {
+    first: u32;
+    len:   u32;
+}
+
+# one call model of a range, its runs into the shared storage, which moves until every model is made
+# ---
+# at:        the offset of the call from the range's start
+# checked:   whether the callee is checked constant time
+# callee:    the function the call names, none for one it reaches through a register
+# preserved: the registers it preserves
+# arguments: the registers it reads its arguments from
+# written:   the registers it writes
+# reads:     the extents of the caller's frame it may read
+# writes:    the extents of the caller's frame it may write
+# kept:      the extents of the caller's frame it keeps
+rec Model {
+    at:        u64;
+    checked:   bool;
+    callee:    opt[id.Function];
+    preserved: Run;
+    arguments: Run;
+    written:   Run;
+    reads:     Run;
+    writes:    Run;
+    kept:      Run;
+}
+
+# the storage of a range's call models
+# ---
+# models:  each model
+# ids:     every register the models name
+# extents: every extent the models name
+# calls:   the walk's model of each, made once the others are complete
+rec Models {
+    models:  vector.Vector[Model];
+    ids:     vector.Vector[rf.Id];
+    extents: vector.Vector[walk.Extent];
+    calls:   vector.Vector[walk.Call];
+}
+
+fun models_of(a: *allocator.Allocator) Models {
+    ret Models{models: vector.init[Model](a), ids: vector.init[rf.Id](a), extents: vector.init[walk.Extent](a), calls: vector.init[walk.Call](a)};
+}
+
+fun release_models(x: *Models) {
+    vector.dnit[Model](?x.models);
+    vector.dnit[rf.Id](?x.ids);
+    vector.dnit[walk.Extent](?x.extents);
+    vector.dnit[walk.Call](?x.calls);
+}
+
+# whether run `r` of `x.ids` holds a register sharing storage with `reg` of `file`, or `reg` itself
+fun holds(x: *Models, file: *rf.File, r: Run, reg: rf.Id) bool {
+    val row: opt[*rf.Register] = rf.row_of(file, reg);
+    var i:   u32               = 0;
+    for (i < r.len) {
+        val other: rf.Id = x.ids.data[(r.first + i)::usize];
+        if (other == reg) { ret true; }
+        if (sel row.some) {
+            val o: opt[*rf.Register] = rf.row_of(file, other);
+            if (sel o.some && rf.overlap(file, row.some, o.some)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# `reg` added to the run that began at `first` of `x.ids`, once: not when it is there already, when it is no row of
+# `file` or a zero register, or when it shares storage with a register of `apart`
+fun add(x: *Models, file: *rf.File, first: u32, reg: rf.Id, apart: Run) err[allocator.Error] {
+    if (reg == rf.NONE) { ret err[allocator.Error].ok{}; }
+    val row: opt[*rf.Register] = rf.row_of(file, reg);
+    if (sel row.none)                    { ret err[allocator.Error].ok{}; }
+    if ((row.some.flags & rf.ZERO) != 0) { ret err[allocator.Error].ok{}; }
+    if (holds(x, file, apart, reg))      { ret err[allocator.Error].ok{}; }
+    var i: usize = first::usize;
+    for (i < x.ids.len) {
+        if (x.ids.data[i] == reg) { ret err[allocator.Error].ok{}; }
+        i = i + 1;
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[rf.Id](?x.ids, reg);
+    if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+fun add_all(x: *Models, file: *rf.File, first: u32, regs: Slice[rf.Id], apart: Run) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < regs.size) {
+        val added: err[allocator.Error] = add(x, file, first, regs.data[i], apart);
+        if (sel added.err) { ret added; }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+fun ended(x: *Models, first: u32) Run {
+    ret Run{first: first, len: x.ids.len::u32 - first};
+}
+
+val NO_RUN: Run = Run{first: 0, len: 0};
+
+# whether `r` is none of `skip`
+fun kept_whole(r: rf.Id, skip: Slice[rf.Id]) bool {
+    var i: usize = 0;
+    for (i < skip.size) {
+        if (skip.data[i] == r) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# `reg` added as `add` adds it, where there is one
+fun add_some(x: *Models, file: *rf.File, first: u32, reg: opt[rf.Id], apart: Run) err[allocator.Error] {
+    if (sel reg.none) { ret err[allocator.Error].ok{}; }
+    ret add(x, file, first, reg.some, apart);
+}
+
+# the registers the call `d` reads beyond its operands, or with `write` writes, added as `add` adds them
+fun add_implied(x: *Models, file: *rf.File, first: u32, d: *InstructionData, write: bool, apart: Run) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < d.implicit.size) {
+        val at: Physical = d.implicit.data[i].location;
+        if (d.implicit.data[i].write == write) {
+            if (sel at.register) {
+                val added: err[allocator.Error] = add(x, file, first, at.register, apart);
+                if (sel added.err) { ret added; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the registers a callee under `regs` preserves, beside the caller's frame `l`: the stack pointer, the frame pointer and
+# every register the convention preserves whole
+fun preserved(x: *Models, file: *rf.File, regs: *Registers, l: *frame.Layout) res[Run, allocator.Error] {
+    val first: u32                  = x.ids.len::u32;
+    val sp:    err[allocator.Error] = add(x, file, first, l.stack, NO_RUN);
+    if (sel sp.err) { ret res[Run, allocator.Error].err{sp.err}; }
+    val fp: err[allocator.Error] = add(x, file, first, l.pointer, NO_RUN);
+    if (sel fp.err) { ret res[Run, allocator.Error].err{fp.err}; }
+    val stack: err[allocator.Error] = add_some(x, file, first, regs.stack, NO_RUN);
+    if (sel stack.err) { ret res[Run, allocator.Error].err{stack.err}; }
+    val pointer: err[allocator.Error] = add_some(x, file, first, regs.pointer, NO_RUN);
+    if (sel pointer.err) { ret res[Run, allocator.Error].err{pointer.err}; }
+    var i: usize = 0;
+    for (i < regs.preserved.size) {
+        val r: rf.Id = regs.preserved.data[i];
+        if (kept_whole(r, regs.partial)) {
+            val added: err[allocator.Error] = add(x, file, first, r, NO_RUN);
+            if (sel added.err) { ret res[Run, allocator.Error].err{added.err}; }
+        }
+        i = i + 1;
+    }
+    ret res[Run, allocator.Error].ok{ended(x, first)};
+}
+
+# the registers the call `d` reads beyond its operands, the locations its arguments travel in
+fun arguments(x: *Models, file: *rf.File, d: *InstructionData) res[Run, allocator.Error] {
+    val first: u32                  = x.ids.len::u32;
+    val added: err[allocator.Error] = add_implied(x, file, first, d, false, NO_RUN);
+    if (sel added.err) { ret res[Run, allocator.Error].err{added.err}; }
+    ret res[Run, allocator.Error].ok{ended(x, first)};
+}
+
+# the registers a callee under `regs` writes: its results, every register the convention clobbers, the link and what
+# the call `d` writes beyond its operands, none sharing storage with one it preserves
+fun written(x: *Models, file: *rf.File, regs: *Registers, d: *InstructionData, kept: Run) res[Run, allocator.Error] {
+    val first:   u32                  = x.ids.len::u32;
+    val results: err[allocator.Error] = add_all(x, file, first, regs.returning.registers, kept);
+    if (sel results.err) { ret res[Run, allocator.Error].err{results.err}; }
+    val clobbered: err[allocator.Error] = add_all(x, file, first, regs.clobbered, kept);
+    if (sel clobbered.err) { ret res[Run, allocator.Error].err{clobbered.err}; }
+    val link: err[allocator.Error] = add_some(x, file, first, regs.link, kept);
+    if (sel link.err) { ret res[Run, allocator.Error].err{link.err}; }
+    val implied: err[allocator.Error] = add_implied(x, file, first, d, true, kept);
+    if (sel implied.err) { ret res[Run, allocator.Error].err{implied.err}; }
+    ret res[Run, allocator.Error].ok{ended(x, first)};
+}
+
+# the register the caller's frame `l` is named off at a call and what it holds there as an offset from the canonical
+# frame address: the frame pointer where the frame keeps one, which nothing in the body moves, else the stack pointer
+# as the prologue left it. none for a frame of no fixed offset from there
+rec Based {
+    base: rf.Id;
+    at:   i64;
+}
+
+fun based(l: *frame.Layout) opt[Based] {
+    if (l.red != 0)                        { ret opt[Based].none{}; }
+    if (l.pointer != rf.NONE)              { ret opt[Based].some{Based{base: l.pointer, at: l.at}}; }
+    if (l.size.per != 0 || l.realign != 0) { ret opt[Based].none{}; }
+    ret opt[Based].some{Based{base: l.stack, at: -l.size.fixed}};
+}
+
+fun extent(x: *Models, e: walk.Extent) err[allocator.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[walk.Extent](?x.extents, e);
+    if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+# the caller's frame a callee keeps and the addressed frame locals it may read and write, a pointer argument reaching
+# them: `kept` from its lowest slot through the return address, and every addressed local into `touched`. all three
+# empty for a frame the walk cannot place from a fixed offset, so every byte may be read and written
+fun frame_of(x: *Models, f: *Framed, kept: *Run, touched: *Run) err[allocator.Error] {
+    @kept    = Run{first: x.extents.len::u32, len: 0};
+    @touched = @kept;
+    val code: *mf.Function  = f.code;
+    val l:    *frame.Layout = f.layout;
+    val got:  opt[Based]    = based(l);
+    if (sel got.none) { ret err[allocator.Error].ok{}; }
+    val b:   Based = got.some;
+    var low: i64   = -(l.entry::i64);
+    var i:   usize = 0;
+    for (i < code.slots.len) {
+        val s: mf.SlotData = code.slots.data[i];
+        if (sel s.area.local && i < l.slots.len) {
+            val p: frame.Place = l.slots.data[i];
+            if (sel p.at) {
+                val cfa: opt[i64] = from_cfa(code, l, i);
+                if (sel cfa.none)   { ret err[allocator.Error].ok{}; }
+                if (cfa.some < low) { low = cfa.some; }
+            }
+        }
+        i = i + 1;
+    }
+    if (low < 0) {
+        val made: err[allocator.Error] = extent(x, walk.Extent{base: b.base, offset: low - b.at, length: (-low)::u64});
+        if (sel made.err) { ret made; }
+    }
+    @kept    = Run{first: kept.first, len: x.extents.len::u32 - kept.first};
+    @touched = Run{first: x.extents.len::u32, len: 0};
+    i        = 0;
+    for (i < code.slots.len) {
+        val s: mf.SlotData = code.slots.data[i];
+        if (s.addressed && sel s.area.local) {
+            val cfa: opt[i64] = from_cfa(code, l, i);
+            if (sel cfa.some) {
+                val made: err[allocator.Error] = extent(x, walk.Extent{base: b.base, offset: cfa.some - b.at, length: s.size});
+                if (sel made.err) { ret made; }
+            }
+        }
+        i = i + 1;
+    }
+    @touched = Run{first: touched.first, len: x.extents.len::u32 - touched.first};
+    ret err[allocator.Error].ok{};
+}
+
+# whether `callee` is a function this build walks for constant time: one of the module that requires it and is among
+# those emitted, as the helpers the legalisation delivers are
+fun walked_callee(m: *Module, framed: Slice[Framed], callee: opt[id.Function]) bool {
+    if (sel callee.none)           { ret false; }
+    if (!requires(m, callee.some)) { ret false; }
+    var i: usize = 0;
+    for (i < framed.size) {
+        if (framed.data[i].function.index == callee.some.index) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the function a direct call `d` of an ir body `b` names, none for a call through a value
+fun called(m: *Module, b: *Body, d: *ir_instruction.InstructionData) opt[id.Function] {
+    if (d.operands.len == 0) { ret opt[id.Function].none{}; }
+    val def: Def = b.values.data[d.operands.data[0].index].def;
+    if (!(sel def.constant)) { ret opt[id.Function].none{}; }
+    val got: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+    if (sel got.err)           { ret opt[id.Function].none{}; }
+    if (!(sel got.ok.address)) { ret opt[id.Function].none{}; }
+    val s: id.Symbol = got.ok.address.symbol;
+    if (!(sel s.function)) { ret opt[id.Function].none{}; }
+    ret opt[id.Function].some{s.function};
+}
+
+# whether the body of function `f` reads no memory but through a direct call of a function that reads none either,
+# as the division helpers read none. no walk seeds memory outside a frame, a global included, so a callee whose walk
+# took memory as public may read none. `depth` bounds the calls followed, a cycle reading as memory read
+fun reads_none(m: *Module, f: id.Function, depth: usize) bool {
+    if (depth == 0) { ret false; }
+    val b: *Body = ?m.functions.data[f.index].body;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            val list: *vector.Vector[id.Instruction] = ?b.blocks.data[k].instructions;
+            var i:    usize                          = 0;
+            for (i < list.len) {
+                val d:   *ir_instruction.InstructionData = ?b.instructions.data[list.data[i].index];
+                val row: opt[*Row]                       = opcode.at(d.opcode);
+                if (sel row.none) { ret false; }
+                if (row.some.effects.reads) {
+                    val role: opcode.Role = row.some.operands[0].role;
+                    if (!(sel role.callee)) { ret false; }
+                    val callee: opt[id.Function] = called(m, b, d);
+                    if (sel callee.none)                        { ret false; }
+                    if (!requires(m, callee.some))              { ret false; }
+                    if (!reads_none(m, callee.some, depth - 1)) { ret false; }
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether a call of `callee` that may read the extents `reads` of the caller's frame takes a secret wherever it may
+# hold one: a callee this build walks, its walk taking a secret only in a parameter marked so and in no memory it
+# reads, as it seeds none. so every parameter is secret, the call reads none of the frame, and the callee reads no
+# memory, so none a caller made secret outside the frame it keeps, a global included, reaches it. masc's model states
+# a callee checked for every argument and read or for none, so this is the one place a call's acceptance is decided
+fun accepts(m: *Module, framed: Slice[Framed], callee: opt[id.Function], reads: Run) bool {
+    if (sel callee.none)                                  { ret false; }
+    if (!walked_callee(m, framed, callee))                { ret false; }
+    if (reads.len != 0)                                   { ret false; }
+    if (!reads_none(m, callee.some, m.functions.len + 1)) { ret false; }
+    val b:      *Body                    = ?m.functions.data[callee.some.index].body;
+    val params: *vector.Vector[id.Value] = ?b.blocks.data[0].parameters;
+    var j:      usize                    = 0;
+    for (j < params.len) {
+        if (!b.values.data[params.data[j].index].secret) { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# the convention row a call of `callee` is made under: the one its signature names, the default for one reached
+# through a register
+fun row_of(m: *Module, b: *Build, callee: opt[id.Function]) *Resolved {
+    if (sel callee.none) { ret build.default_row(b); }
+    val sig: res[types.Function, types.Error] = types.signature(?m.types, m.functions.data[callee.some.index].data.signature);
+    if (sel sig.err) { ret build.default_row(b); }
+    val row: opt[*Resolved] = build.under(b, sig.ok.convention);
+    if (sel row.some) { ret row.some; }
+    ret build.default_row(b);
+}
+
+# the transfer of instruction `ins` decoded from the code, its row's control under the rules its values meet, none when
+# they leave it undecided
+fun transfer_of(file: *rf.File, ins: *codec.Decoded) opt[effect.Transfer] {
+    val e: *effect.Effect = ins.inst.row.effect;
+    if (e == nil)                                { ret opt[effect.Transfer].some{effect.NONE}; }
+    if (e.control.rules.len == 0 || file == nil) { ret opt[effect.Transfer].some{e.control.transfer}; }
+    val got: effect.Answer[effect.Control] = effect.control(file, ins.inst.row.operands.at, e, mo.Values{at: ins.inst.values, len: ins.inst.count});
+    if (sel got.decided) { ret opt[effect.Transfer].some{got.decided.transfer}; }
+    ret opt[effect.Transfer].none{};
+}
+
+# the offset in `code` of the call site `s` starts at `from`: the first call, or for a tail call the first jump, among
+# the instructions of the sequence it is written in, none when no such instruction decodes there
+fun call_offset(a: *allocator.Allocator, code: *walk.Code, ctx: *state.Context, s: *Site, from: usize) res[opt[u64], allocator.Error] {
+    var store: vector.Vector[mo.Value] = vector.init[mo.Value](a);
+    fin { vector.dnit[mo.Value](?store); }
+    var alts: vector.Vector[requirement.Alternative] = vector.init[requirement.Alternative](a);
+    fin { vector.dnit[requirement.Alternative](?alts); }
+    var want: effect.Transfer = effect.CALL;
+    if (s.tail) { want = effect.JUMP; }
+    var at: usize = from;
+    var n:  u32   = 0;
+    for (n < s.steps && at < code.len) {
+        val got: res[codec.Decoded, field.Refusal] = codec.decode_grown(code.set.codec, ctx, code.data, code.len, at, ?store, ?alts);
+        if (sel got.err) {
+            if (sel got.err.cause.memory) { ret res[opt[u64], allocator.Error].err{got.err.cause.memory}; }
+            ret res[opt[u64], allocator.Error].ok{opt[u64].none{}};
+        }
+        var ins: codec.Decoded        = got.ok;
+        val t:   opt[effect.Transfer] = transfer_of(code.set.codec.registers, ?ins);
+        if (sel t.some && t.some == want) { ret res[opt[u64], allocator.Error].ok{opt[u64].some{at::u64}}; }
+        at = at + ins.len;
+        n  = n + 1;
+    }
+    ret res[opt[u64], allocator.Error].ok{opt[u64].none{}};
+}
+
+# the model of call site `s` of function `f` at offset `at` of its code, added to `x`
+fun model(x: *Models, m: *Module, b: *Build, framed: Slice[Framed], f: *Framed, s: *Site, at: u64) err[allocator.Error] {
+    val file: *rf.File   = b.basis.set.codec.registers;
+    val regs: *Registers = convention.held(row_of(m, b, s.callee));
+    if (regs == nil || file == nil) { ret err[allocator.Error].ok{}; }
+    val d:    *InstructionData          = mf.data(f.code, s.instruction);
+    val kept: res[Run, allocator.Error] = preserved(x, file, regs, f.layout);
+    if (sel kept.err) { ret err[allocator.Error].err{kept.err}; }
+    val args: res[Run, allocator.Error] = arguments(x, file, d);
+    if (sel args.err) { ret err[allocator.Error].err{args.err}; }
+    val wrote: res[Run, allocator.Error] = written(x, file, regs, d, kept.ok);
+    if (sel wrote.err) { ret err[allocator.Error].err{wrote.err}; }
+    var frame_kept: Run                  = NO_RUN;
+    var touched:    Run                  = NO_RUN;
+    val framed_at:  err[allocator.Error] = frame_of(x, f, ?frame_kept, ?touched);
+    if (sel framed_at.err) { ret framed_at; }
+    val one:    Model                       = Model{at: at, checked: accepts(m, framed, s.callee, touched), callee: s.callee, preserved: kept.ok, arguments: args.ok, written: wrote.ok, reads: touched, writes: touched, kept: frame_kept};
+    val pushed: res[usize, allocator.Error] = vector.push[Model](?x.models, one);
+    if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+fun registers_of(x: *Models, r: Run) walk.Registers {
+    if (r.len == 0) { ret walk.NO_REGISTERS; }
+    ret walk.Registers{at: ?x.ids.data[r.first::usize], len: r.len};
+}
+
+fun extents_of(x: *Models, r: Run) walk.Extents {
+    if (r.len == 0) { ret walk.NO_EXTENTS; }
+    ret walk.Extents{at: ?x.extents.data[r.first::usize], len: r.len};
+}
+
+# the walk's model of each model of `x`, once the storage they name moves no more
+fun complete(x: *Models) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < x.models.len) {
+        val o:      *Model                      = ?x.models.data[i];
+        val c:      walk.Call                   = walk.Call{at: o.at, checked: o.checked, preserved: registers_of(x, o.preserved), arguments: registers_of(x, o.arguments), reads: extents_of(x, o.reads), written: registers_of(x, o.written), writes: extents_of(x, o.writes), kept: extents_of(x, o.kept)};
+        val pushed: res[usize, allocator.Error] = vector.push[walk.Call](?x.calls, c);
+        if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the models of the call sites of `sites` in function `f`'s range `r` of `code`, into `x`. an offset where no call of
+# a site decodes, the first one, when one does not
+fun modeled(a: *allocator.Allocator, m: *Module, b: *Build, framed: Slice[Framed], f: *Framed, r: *CtRange, code: *walk.Code, sites: Slice[Site], x: *Models) res[opt[u64], allocator.Error] {
+    var timed: state.Context = mct.stated(?b.basis.context);
+    var i:     usize         = 0;
+    for (i < sites.size) {
+        val s: *Site = ?sites.data[i];
+        if (s.function.index == f.function.index) {
+            if (s.at.section.index != r.section.index || s.at.offset < r.start || s.at.offset >= r.end) { ret res[opt[u64], allocator.Error].ok{opt[u64].some{0}}; }
+            val from: u64                            = s.at.offset - r.start;
+            val got:  res[opt[u64], allocator.Error] = call_offset(a, code, ?timed, s, from::usize);
+            if (sel got.err)     { ret got; }
+            if (sel got.ok.none) { ret res[opt[u64], allocator.Error].ok{opt[u64].some{from}}; }
+            val made: err[allocator.Error] = model(x, m, b, framed, f, s, got.ok.some);
+            if (sel made.err) { ret res[opt[u64], allocator.Error].err{made.err}; }
+        }
+        i = i + 1;
+    }
+    val done: err[allocator.Error] = complete(x);
+    if (sel done.err) { ret res[opt[u64], allocator.Error].err{done.err}; }
+    ret res[opt[u64], allocator.Error].ok{opt[u64].none{}};
+}
+
+# the callee of the model at offset `at`, none for none or a call through a register
+fun callee_at(x: *Models, at: u64) opt[id.Function] {
+    var i: usize = 0;
+    for (i < x.models.len) {
+        if (x.models.data[i].at == at) { ret x.models.data[i].callee; }
+        i = i + 1;
+    }
+    ret opt[id.Function].none{};
+}
+
 fun unfollowed(f: id.Function, message: str, at: u64) res[opt[mct.Unmet], allocator.Error] {
     val unread: walk.Unread = walk.Unread{message: message, offset: at};
     ret res[opt[mct.Unmet], allocator.Error].ok{opt[mct.Unmet].some{mct.Unmet.unfollowed{mct.Unfollowed{function: f, unread: unread}}}};
 }
 
-# the walk of one range's bytes for function `f`, public again at its points of `points`
-fun walked(a: *allocator.Allocator, m: *Module, b: *Build, l: *Layout, o: *object.Object, r: *CtRange, f: *Framed, points: Slice[Point]) res[opt[mct.Unmet], allocator.Error] {
+# the walk of one range's bytes for function `f`, public again at its points of `points`, each call walked through
+# the model of its site of `sites`, the timing modes its code needs added to `needs`
+fun walked(a: *allocator.Allocator, m: *Module, b: *Build, t: *Target, l: *Layout, o: *object.Object, r: *CtRange, framed: Slice[Framed], f: *Framed, points: Slice[Point], sites: Slice[Site], needs: *mct.Needs) res[opt[mct.Unmet], allocator.Error] {
     var list: vector.Vector[walk.Seed] = vector.init[walk.Seed](a);
     fin { vector.dnit[walk.Seed](?list); }
     var lifted: vector.Vector[walk.Declassify] = vector.init[walk.Declassify](a);
     fin { vector.dnit[walk.Declassify](?lifted); }
+    var x: Models = models_of(a);
+    fin { release_models(?x); }
     val placed: res[bool, allocator.Error] = public(f, r, points, ?lifted);
     if (sel placed.err) { ret res[opt[mct.Unmet], allocator.Error].err{placed.err}; }
     if (!placed.ok)     { ret unfollowed(f.function, walk.MISPLACED, 0); }
@@ -303,17 +794,28 @@ fun walked(a: *allocator.Allocator, m: *Module, b: *Build, l: *Layout, o: *objec
     val s:     *object.Section = table.at[object.Section](?o.sections, r.section);
     val bytes: Bytes           = object.bytes(o, ?s.contents);
     if (r.end < r.start || r.end::usize > bytes.len) { ret unfollowed(f.function, walk.NOWHERE, 0); }
-    var code:     walk.Code                        = walk.Code{set: b.basis.set, data: ?bytes.data[r.start::usize], len: (r.end - r.start)::usize};
+    var code:   walk.Code                      = walk.Code{set: b.basis.set, data: ?bytes.data[r.start::usize], len: (r.end - r.start)::usize};
+    val called: res[opt[u64], allocator.Error] = modeled(a, m, b, framed, f, r, ?code, sites, ?x);
+    if (sel called.err)     { ret res[opt[mct.Unmet], allocator.Error].err{called.err}; }
+    if (sel called.ok.some) { ret unfollowed(f.function, walk.UNCALLED, called.ok.some); }
     var secrets:  walk.Secrets                     = walk.Secrets{at: list.data, len: list.len::u32};
     var declared: walk.Declassified                = walk.Declassified{at: lifted.data, len: lifted.len::u32};
-    val answer:   res[mct.Answer, allocator.Error] = mct.check(a, ?code, ?b.basis.context, ?secrets, ?declared, ?walk.NO_CALLS);
+    var calls:    walk.Calls                       = walk.Calls{at: x.calls.data, len: x.calls.len::u32};
+    val answer:   res[mct.Answer, allocator.Error] = mct.check(a, ?code, ?b.basis.context, ?secrets, ?declared, ?calls, record.system_caps(t));
     if (sel answer.err) { ret res[opt[mct.Unmet], allocator.Error].err{answer.err}; }
     val got: mct.Answer = answer.ok;
     if (sel got.refused) {
-        val refused: mct.Refused = mct.refused(f.function, mct.Where.offset{got.refused.offset}, got.refused.refusal);
+        var refused: mct.Refused = mct.refused(f.function, mct.Where.offset{got.refused.offset}, got.refused.refusal);
+        if (got.refused.refusal.reason == ct.UNCHECKED) { refused.callee = callee_at(?x, got.refused.offset); }
+        ret res[opt[mct.Unmet], allocator.Error].ok{opt[mct.Unmet].some{mct.Unmet.refused{refused}}};
+    }
+    if (sel got.undeclared) {
+        var refused: mct.Refused = mct.refused(f.function, mct.Where.offset{got.undeclared.offset}, got.undeclared.refusal);
+        refused.undeclared = opt[str].some{t.system.name};
         ret res[opt[mct.Unmet], allocator.Error].ok{opt[mct.Unmet].some{mct.Unmet.refused{refused}}};
     }
     if (sel got.unread) { ret res[opt[mct.Unmet], allocator.Error].ok{opt[mct.Unmet].some{mct.Unmet.unfollowed{mct.Unfollowed{function: f.function, unread: got.unread}}}}; }
+    if (sel got.held)   { @needs = @needs | got.held; }
     ret res[opt[mct.Unmet], allocator.Error].ok{opt[mct.Unmet].none{}};
 }
 
@@ -322,24 +824,27 @@ fun walked(a: *allocator.Allocator, m: *Module, b: *Build, l: *Layout, o: *objec
 # ---
 # a:      the allocator the walk takes
 # m:      the module
-# b:      the target's build, whose set and context the code was encoded under
-# t:      the target, whose layout sizes an incoming argument
+# b:      the target's build, whose set and context the code was encoded under and whose conventions model its calls
+# t:      the target, whose layout sizes an incoming argument and whose system declares the modes it sets on need
 # o:      the object
 # framed: the frame of each function emitted, in the order emitted
-# marks:  the declassify points and call sites emission made, the points read
+# marks:  the declassify points and call sites emission made
+# needs:  the timing modes the code needs, which the runtime sets on need (`mark`)
 # ret:    the first requirement not met, none when every one is, or why the walk had no storage
-pub fun check(a: *allocator.Allocator, m: *Module, b: *Build, t: *Target, o: *object.Object, framed: Slice[Framed], marks: *Marks) res[opt[mct.Unmet], allocator.Error] {
+pub fun check(a: *allocator.Allocator, m: *Module, b: *Build, t: *Target, o: *object.Object, framed: Slice[Framed], marks: *Marks, needs: *mct.Needs) res[opt[mct.Unmet], allocator.Error] {
     var l:      Layout       = layout.of(t, ?m.types, opt[*state.Context].some{?b.basis.context});
     val points: Slice[Point] = Slice[Point]{data: marks.points.data, size: marks.points.len};
+    val sites:  Slice[Site]  = Slice[Site]{data: marks.sites.data, size: marks.sites.len};
     val ranges: usize        = table.count[CtRange](?o.ct);
     var at:     usize        = 0;
     var i:      usize        = 0;
+    @needs = mct.NO_NEEDS;
     for (i < framed.size) {
         val f: *Framed = ?framed.data[i];
         if (requires(m, f.function)) {
             if (at >= ranges) { ret unfollowed(f.function, walk.NOWHERE, 0); }
             val r:   *CtRange                             = table.at[CtRange](?o.ct, table.nth[CtRange](at));
-            val one: res[opt[mct.Unmet], allocator.Error] = walked(a, m, b, ?l, o, r, f, points);
+            val one: res[opt[mct.Unmet], allocator.Error] = walked(a, m, b, t, ?l, o, r, framed, f, points, sites, needs);
             if (sel one.err)     { ret one; }
             if (sel one.ok.some) { ret one; }
             at = at + 1;
@@ -347,4 +852,21 @@ pub fun check(a: *allocator.Allocator, m: *Module, b: *Build, t: *Target, o: *ob
         i = i + 1;
     }
     ret res[opt[mct.Unmet], allocator.Error].ok{opt[mct.Unmet].none{}};
+}
+
+# the mark of each timing mode of `needs` added to object `o`, a local absolute symbol of value 1 the link reads, as
+# `__mach_needs_dit` (mach doc/language/secrecy.md, "PSTATE.DIT at run time")
+pub fun mark(o: *object.Object, needs: mct.Needs) err[Fail] {
+    var i: usize = 0;
+    for (i < mct.MODE_COUNT) {
+        val name: opt[str] = mct.mark(needs, i);
+        if (sel name.some) {
+            val named: res[Id[Name], Fail] = object.name_str(o, name.some);
+            if (sel named.err) { ret err[Fail].err{named.err}; }
+            val added: res[Id[object.Symbol], Fail] = object.add_symbol(o, object.Symbol{name: named.ok, binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT, kind: ?symbol.NOTYPE, def: object.Definition.absolute{1}});
+            if (sel added.err) { ret err[Fail].err{added.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
 }
