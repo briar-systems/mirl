@@ -148,6 +148,8 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `insert` | `aggregate`, `value` | `member` a member index | none | propagates |
 | `func.addr` | none | `function` a function of the module, `pointer` a type | none | propagates |
 | `asm` | any number of value operands | `block` an inline assembly block | none | propagates |
+| `target.op` | any number of value operands | `op` a target op | none | propagates |
+| `target.op.memory` | any number of value operands | `op` a target op | none | propagates |
 
 ### `add`
 
@@ -2194,6 +2196,32 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
   - `block` is a well formed block, and the tail operands are the values it binds, each operand it reads and each memory and immediate operand in order, of the types they state
 - results:
   - one result per register `block` writes, of the type its operand states, in order
+- effects: reads memory, writes memory
+- secrecy: propagates
+- vector: none
+
+### `target.op`
+
+- operands: any number of value operands
+- immediates: `op` a target op
+- targets: 0
+- typing:
+  - `op` names an instruction set and an op in it, states results of types values hold, and touches memory exactly when this row may. the tail operands are the op's, which the target's catalog checks
+- results:
+  - the results `op` states, in order
+- effects: speculatable, mergeable
+- secrecy: propagates
+- vector: none
+
+### `target.op.memory`
+
+- operands: any number of value operands
+- immediates: `op` a target op
+- targets: 0
+- typing:
+  - `op` names an instruction set and an op in it, states results of types values hold, and touches memory exactly when this row may. the tail operands are the op's, which the target's catalog checks
+- results:
+  - the results `op` states, in order
 - effects: reads memory, writes memory
 - secrecy: propagates
 - vector: none

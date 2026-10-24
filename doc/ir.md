@@ -6,7 +6,7 @@ The specification is split by subject.
 
 | document | subject |
 |---|---|
-| this file | the model, types, values, control flow, semantics, secrecy, the verifier's rules and inline assembly |
+| this file | the model, types, values, control flow, semantics, secrecy, the verifier's rules, inline assembly and target ops |
 | [ir/opcodes.md](ir/opcodes.md) | the opcode reference, generated from the opcode table |
 | [ir/text.md](ir/text.md) | the text form, its grammar and its version |
 | [ir/fold.md](ir/fold.md) | the constant folder |
@@ -229,7 +229,7 @@ The ordered comparisons (`feq.o`, `fne.o`, `flt.o`, `fle.o`, `fgt.o`, `fge.o`) a
 
 ### 6.5 Memory
 
-`load` reads a value of the stated type from an address, `store` writes one, and each states the alignment the access may assume as an immediate. An alignment is a power of two. `alloca` gives the address of a stack slot of the stated type and alignment. `ptr.add` adds an integer byte count to an address.
+`load` reads a value of the stated type from an address, `store` writes one, and each states the alignment the access may assume as an immediate. An alignment is a power of two. `alloca` gives the address of a stack slot of the stated type and alignment. The pointer type it states is into the target's slot space (`mirl.target.record.slot_space`), which the target declares and is not always the default space: SPIR-V's is the Function storage class, and the verifier refuses an `alloca` whose pointer is into another. `ptr.add` adds an integer byte count to an address.
 
 `ptr.member` gives the address of a member of the structure at an address, the structure's type and the member's index stated as immediates. `ptr.index` gives the address of an element of the array at an address, the array's type stated and the element's index an integer operand read as signed. Neither reads memory, and neither checks the index against the array's count, so an index past it gives an address past the array as `ptr.add` would. The address is in the space of the one each takes.
 
@@ -257,7 +257,7 @@ An atomic access is over integers only. `atomic.load` and `atomic.store` access 
 
 `vsplat` repeats a scalar into every lane of the stated vector type. `vbuild` builds a vector from one scalar per lane. `vextract` reads one lane and `vinsert` replaces one, each with a constant lane index immediate. `vshuffle` picks lanes of the two operands joined, by a lane list immediate with one index per lane of the result.
 
-The reductions take one vector and give a scalar of its lane type. The integer reductions (`reduce.add`, `reduce.mul`, `reduce.and`, `reduce.or`, `reduce.xor` and the signed and unsigned minimum and maximum) are exact. A float reduction states its order. A **sequential** reduction (`reduce.fadd.seq`, `reduce.fmul.seq`) combines the lanes one after another from the first, so the result is exactly the one that order gives. A **reassociable** reduction (`reduce.fadd.any`, `reduce.fmul.any`) combines the lanes in any order and grouping, so the result is any one such an order gives. The minimum and maximum reductions combine as `fmin`, `fmax`, `fminnum` and `fmaxnum` do.
+The reductions take one vector and give a scalar of its lane type. The integer reductions (`reduce.add`, `reduce.mul`, `reduce.and`, `reduce.or`, `reduce.xor` and the signed and unsigned minimum and maximum) are exact. A float reduction states its order. A **sequential** reduction (`reduce.fadd.seq`, `reduce.fmul.seq`) combines the lanes one after another from the first, so the result is exactly the one that order gives. A **reassociable** reduction (`reduce.fadd.any`, `reduce.fmul.any`) combines the lanes in any order and grouping, so the result is any one such an order gives. A sequential reduction becomes the reassociable one only where the build permits float reassociation ([target.md](ir/target.md), Float relaxations). The minimum and maximum reductions combine as `fmin`, `fmax`, `fminnum` and `fmaxnum` do.
 
 ### 6.7 Aggregates
 
@@ -339,7 +339,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 6 | `reference` | every id a block or instruction names is one its body holds and has not removed, every instruction is listed in exactly one block and placed in it, every operand and branch argument is defined, every result and parameter is defined by the instruction or block that lists it, and every opcode names a row |
 | 7 | `terminator` | every block ends in exactly one terminator, with none before it |
 | 8 | `edge` | every edge passes its target's parameters in count and type, and the entry block takes the signature's parameters, or one parameter per place once the abi legalisation has placed them |
-| 9 | `typing` | every instruction is an instance its opcode's row types, and its results are the number and types the row derives |
+| 9 | `typing` | every instruction is an instance its opcode's row types, and its results are the number and types the row derives, and an `alloca`'s pointer is into the target's slot space |
 | 10 | `secrecy` | every result is secret exactly as its row's secrecy rule gives, and no edge passes a secret value to a public parameter |
 | 11 | `dominance` | every use in a reached block is dominated by its definition, and so is every branch argument at its edge |
 | 12 | `debug` | every location, inlining site and binding that an instruction's metadata names is an entry of the debug table |
@@ -353,7 +353,8 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 | 20 | `functions` | code names a function's address only through `func.addr`, and only on a target whose `functions` declaration is not `none`, whose function immediate names a function of the module, and an address constant naming a function stands only as a call's callee, the function it calls with no offset |
 | 21 | `convention` | every function type names no convention row, for the one its target's tuple names, or one of the convention rows its target states: its own and every other of its architecture whose requirements hold over its baseline |
 | 22 | `assembly` | every immediate an inline assembly block binds is a constant: an integer, or an address where the operand's constraint lets a symbol stand for it |
-| 23 | `specialization` | every specialization constant agrees with every other of its id in its type and default, and stands on a target whose `specialization` is `native`, or `fold` before legalisation ends, and never on one whose `specialization` is `none` |
+| 23 | `op` | every target op names an instruction set its target's `ops` catalog holds and an op that set holds, refusing it by declaration on a target whose catalog holds no such set or op, and the refusal names both. It passes the operands and states the results the op's row binds: each of the row's own operands after the ones the target supplies takes the next operand where it reads and gives the next result where it writes, an optional one may be left out at the end and a variadic one takes the rest, an immediate, an enumerant and a number written inline take an integer constant, and a value the row defines is the op's first result or, where the op states none, a result the target gives no type. It declares that it reads and writes memory exactly as the row's accesses state, and where a build is open its selection admits the row's requirement |
+| 24 | `specialization` | every specialization constant agrees with every other of its id in its type and default, and stands on a target whose `specialization` is `native`, or `fold` before legalisation ends, and never on one whose `specialization` is `none` |
 
 A front end that gets one of these refusals reads its id here and looks at the rule's row in the table. Rule 9 reports that the opcode's row refuses the instance but not which of its typing rules failed. The checker, `mirl.ir.opcode.check`, gives that, and a front end can call it on the same instance for the precise error.
 
@@ -381,7 +382,23 @@ Limits:
 - Legalisation does not rewrite an item's operands, so an operand of a type the target holds in no register, as a narrow or a wide integer, is refused at selection.
 
 
-## 10. Where the rest is
+## 10. Target ops
+
+A target op is one instruction of an instruction set its target's catalog names: a `target.op` instruction, or `target.op.memory` where it touches memory, whose `op` immediate (`mirl.ir.native.Op`) names the set as the catalog names it, the op as the set names it, the types of its results and whether it reads and writes memory. It is how a front end reaches a target's own instruction, as GLSL.std.450's `Sqrt` or OpenCL.std's `fma`, and one form serves every family: the catalog is the target's `ops` declaration over masc's rows of the target's set, never a case of the ir.
+
+The op's row of masc's set states everything the verifier holds the item to (rule 23). The row's operands after the ones the target supplies itself are the op's own: each takes the next operand of the instruction where it reads and gives the next result where it writes, an optional one may be left out at the end, a variadic one takes the rest, and an immediate, an enumerant or a number written inline takes an integer constant. A value the row defines is the op's first result, or none, which the target gives no type. The item declares that it reads and writes memory exactly as the row's accesses state, and where a build is open its selection admits the row's requirement. masc states no type of an extended instruction's ids, so the types of the operands and results are the front end's, and the module the target writes is checked against them by the target's own validator.
+
+A target op of no memory is a function of its operands: its row is speculatable and mergeable, so it is merged, hoisted and removed as any pure operation is, and two are the same computation when they name one set and one op. A target op that touches memory is neither, and the memory analysis takes it as reading and writing anywhere as it declares, since which of its operands address memory is the catalog's to say and no pass reads the catalog. No fold evaluates either.
+
+A target whose catalog holds no instruction set, every register and webassembly target, refuses every target op by declaration, and one whose catalog holds no such set or op refuses it naming both. SPIR-V holds GLSL.std.450, NonSemantic.Shader.DebugInfo.100 and OpenCL.std, each an `OpExtInst` of the set's import whose result type, result and import come before the op's own operands, so the set imports once and the module declares what the op's row requires (see [ir/target.md](ir/target.md)).
+
+Limits:
+
+- SPIR-V's core instructions are no set of its catalog yet, so an op of them is refused by declaration.
+- Legalisation does not rewrite a target op's operands or results, so one of a format or width the target computes through lowering, as a binary16 value without `Float16`, is refused after it.
+
+
+## 11. Where the rest is
 
 - the opcode reference, [ir/opcodes.md](ir/opcodes.md)
 - the text form and its grammar, [ir/text.md](ir/text.md)
