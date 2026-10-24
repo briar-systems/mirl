@@ -153,7 +153,7 @@ types
   union       = "union" "{" [ types ] "}" ;
   signature   = "fun" "(" [ extended ] ")" "->" "(" [ extended ] ")" ;
   extended    = type [ "sext" | "zext" ] { "," type [ "sext" | "zext" ] } ;
-  handle      = "handle" "<" name ">" ;   ; the target's kind name
+  handle      = "handle" "<" name { "," ( uint | type ) } ">" ;  ; the target's kind name, then its operands, a word or a type each
   types       = type { "," type } ;
 
   `struct at` states every member's offset, and a plain `struct` leaves
