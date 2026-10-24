@@ -6,7 +6,7 @@ masc states every register's storage as pieces of a bank: the bank it is in, the
 of_register(regs, row)              # opt[Storage]
 of_class(regs, class)               # opt[Storage]
 of_group(regs, class, span)         # opt[Storage]
-shares(file, a, b)                  # bool
+sharing(overlaps, row)              # res[rf.Span, allocator.Error]
 kills(footprint, other)             # bool
 view(file, part, whole)             # opt[View]
 viewed(file, whole_id, part, view)  # opt[rf.Id]
@@ -17,6 +17,7 @@ A `Storage` is bits fixed plus bits per unit of one scale's multiplier, the shap
 
 - Liveness ends a value where a write kills it: an instruction writing a location also writes every location sharing its storage that masc's footprint says it leaves no bit of (`kills`). A write that keeps some bits, as an undisturbed tail, is a read as well.
 - A memory-backed class states only the bits of each cell, which share storage with nothing but themselves.
+- A tuple, a register of a pair class as RISC-V's x12:x13, holds no storage of its own: its storage is its members', laid end to end, and its class's width is theirs together (`of_register`). It shares storage with every row a member does, by masc's overlap index (`sharing`), so a value in x13 is live against the pair, and a call keeps it only when it keeps every member.
 
 ## Views
 
