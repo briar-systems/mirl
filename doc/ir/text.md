@@ -169,7 +169,8 @@ constants
   constant    = type literal ;
   literal     = uint | "-" uint | "zero"
               | "{" [ constant { "," constant } ] "}"
-              | symbol [ ( "+" | "-" ) uint ] ;
+              | symbol [ ( "+" | "-" ) uint ]
+              | "spec" uint [ "-" ] uint ;
 
   a number of an integer type is its bits read unsigned, and a number of a
   float type is the bits of its encoding. `-` gives the two's complement of
@@ -177,7 +178,8 @@ constants
   64 bits in decimal and any other number in hex. `zero` is every bit zero.
   braces hold an aggregate's members, elements or lanes in order. a symbol
   is the address of a function or global plus a byte offset, of a pointer
-  type.
+  type. `spec` is a specialization constant of an integer or float type: its
+  id, at most 32 bits, and its default, a number as above: `i32 spec 0 64`.
 
 globals
 
@@ -219,7 +221,7 @@ functions
   entry       = operand | immediate | target ;
   operand     = local | constant ;
   immediate   = word ( type | uint | ordering | "[" [ uint { "," uint } ] "]"
-                     | "all" | places | symbol | block ) ;
+                     | "all" | places | symbol | block | op ) ;
   places      = "[" [ place { "," place } ] "]" ;
   place       = ( "register" uint uint | "stack" uint | "operand" uint )
                 ( "fixed" | "scaled" uint ) fill ;
@@ -231,6 +233,7 @@ functions
   bound       = name ":" ( "read" | "write" | "read_write" ) constraint type ;
   constraint  = "class" uint | "memory"
               | "immediate" uint ( "signed" | "unsigned" ) [ "symbolic" ] ;
+  op          = string string "[" [ types ] "]" [ "reads" ] [ "writes" ] ;
 
   `kept` marks a store or a fill whose write no pass may take away (see
   the specification's memory section). `bounded` marks a shift whose count is
@@ -288,6 +291,13 @@ functions
   the item's operands are the values the block binds, before the block:
   `%d = asm %x, i64 7, block "addi {d}, {a}, {k}" [d: write class 0 i64,
   a: read class 0 i64, k: read immediate 12 signed i64]`.
+
+  a target op is the `target.op` operation, or `target.op.memory` where it
+  touches memory, whose `op` immediate is the instruction set as its
+  target's catalog names it, the op as the set names it, the types of its
+  results in order, and `reads` and `writes` where it declares it touches
+  memory. the item's operands are the op's own, before the op:
+  `%r = target.op %x, op "GLSL.std.450" "Sqrt" [f32]`.
 
 debug table
 
