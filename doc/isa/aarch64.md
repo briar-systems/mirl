@@ -59,7 +59,7 @@ The declared operations are in `declared.mach`, each with the job that closes it
 
 - Vector operations beyond the subset: `vbuild`, `vextract` and `vinsert`, whose lane is an immediate no source reads, a shuffle other than the high half a widening multiply takes, and every reduction but a sum (vectorisation, #72). A select of vectors and a vector of a lane count no arrangement holds are refused naming the instruction.
 - `frem`, `mem.copy`, `mem.fill` and the wide division, which the helpers legalisation takes out on every build, since AArch64 states none natively.
-- A call and a return, `ptr.member`, `ptr.index`, `switch`, `extract` and `insert`, as on RISC-V.
+- A call and a return, `ptr.member`, `ptr.index`, a sparse `switch`, `extract` and `insert`, as on RISC-V. A dense `switch` reaches selection indexed, with its cases 0 to its count less one over an x register, and branches through a jump table. `subs` and `b.hs` to the first target test the index against the count, or `movz`, `movk` and the register `subs` do when the count doesn't fit the immediate. `adrp` and `add` form the table's address, which reaches the function's own table under static, pie and pic alike. `add` scales the index to the pointer, then `ldr` loads the entry and `br` jumps through it. Every target begins with the table's landing, `bti j`, where the build holds BTI. A switch on a system with no address model stays a chain.
 
 Some operations select only for the operands a base form covers.
 
