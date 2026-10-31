@@ -102,11 +102,11 @@ example() {
     fi
     { printf '%s\n' "$line"; tail -n +2 "$src"; } >"$at.mirl"
     src=$at.mirl
-    if ! "$mirl" emit "$src" --body --checked --kind object >"$at.o" 2>"$at.emit"; then
+    if ! "$mirl" emit "$src" --body --checked -e object >"$at.o" 2>"$at.emit"; then
         fail "$target $name" "mirl emit refuses it: $(cat "$at.emit")"
         return
     fi
-    if ! "$mirl" emit "$src" --body --checked --kind listing >"$at.s" 2>"$at.emit"; then
+    if ! "$mirl" emit "$src" --body --checked -e listing >"$at.s" 2>"$at.emit"; then
         fail "$target $name" "mirl emit refuses its listing: $(cat "$at.emit")"
         return
     fi

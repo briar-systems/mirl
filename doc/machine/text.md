@@ -1,6 +1,6 @@
 # Machine form text
 
-`mirl.machine.text` prints a module's machine functions as text, as selection and allocation leave them, and `emit --kind machine` writes it. It is written for people reading the code generator's work and is never read back. The printer writes through the IR text form's printer, so the header, quoting, symbol names, debug entry names and an instruction's location, site and bindings are that form's. Registers, classes and instructions are spelled by the rows of the target's register file and catalog, so a row added to masc needs no change here.
+`mirl.machine.text` prints a module's machine functions as text, as selection and allocation leave them, and `emit -e machine` writes it. It is written for people reading the code generator's work and is never read back. The printer writes through the IR text form's printer, so the header, quoting, symbol names, debug entry names and an instruction's location, site and bindings are that form's. Registers, classes and instructions are spelled by the rows of the target's register file and catalog, so a row added to masc needs no change here.
 
 ```
 mirl.machine.text.print(w, m, isas, items)    # err[Error]
