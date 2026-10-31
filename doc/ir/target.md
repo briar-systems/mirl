@@ -338,7 +338,13 @@ A family defines its attributes in a **schema** (`mirl.target.Schema`): the fami
 
 A target's `attributes` declaration is the schema of its family, or none when it accepts no attribute. Verifier rule 5 refuses an attribute whose family word is not the schema's, whose name the schema has no entry for, attached to the other kind of symbol, with a datum of another kind, or that breaks its entry's rule, and `mirl.verify.module.unfit` gives which, a broken rule carrying its violation's row. The family word is the text spelling only: it is matched against the schema the target names and never looked up.
 
-The register family (`mirl.target.register.schema`) defines no attribute, since no register stage reads a fact only that family needs, so every register target refuses every attribute by name. The SPIR-V family (`mirl.target.spirv.schema`) defines its entry points and interface, every value checked against masc's enumerations of the SPIR-V grammar:
+The register family (`mirl.target.register.schema`) defines one attribute:
+
+| name | datum | on | what it states |
+|---|---|---|---|
+| `naked` | integer, 1 | function | the function is its body as written: selection moves none of its parameters, which arrive where the convention places them, and the frame lays no prologue, epilogue or save. The body holds only inline assembly items that bind nothing and the `unreachable` that ends each block, refused at selection otherwise, and a body that needs a frame slot is refused when the frame is laid |
+
+The SPIR-V family (`mirl.target.spirv.schema`) defines its entry points and interface, every value checked against masc's enumerations of the SPIR-V grammar:
 
 | name | on | datum | rule |
 | --- | --- | --- | --- |
