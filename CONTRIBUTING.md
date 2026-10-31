@@ -46,7 +46,7 @@ execution of the mach corpus, spirv-val, wasm-validate, llvm-dwarfdump and the
 timing-leak harness, run locally and never in CI. CI builds every target.
 
 IR text inputs live in `test/ir/` as `*.mirl` files. Each one is valid IR,
-verifier-clean. A file starts with its `target` line and has no version line,
+verifier-clean. A file starts with its `target` statement and has no version statement,
 which the commands read with `--body`, since the reader puts the library's own
 before it and no release touches the files.
 

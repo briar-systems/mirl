@@ -66,9 +66,9 @@ A union is a list of member types that overlap in storage. Every member is at of
 
 A function type has a list of parameter types and a list of result types. A function may have any number of results. A pointer to a function is an ordinary pointer, and a call states the signature it calls through.
 
-The integers are signless, but a convention extends a narrow integer by the signedness of the source type. Each parameter and each result of a function type may therefore state an **extension**: `sext` for sign extended, `zext` for zero extended, or none. Only an integer may state one. The extensions are part of the type, so `fun(i8 sext) -> ()` and `fun(i8 zext) -> ()` are different types, and a function and the call that states a signature carry them as data of that one type. The debug information keeps the signedness of its own types and is not derived from the extension.
+The integers are signless, but a convention extends a narrow integer by the signedness of the source type. Each parameter and each result of a function type may therefore state an **extension**: `sext` for sign extended, `zext` for zero extended, or none. Only an integer may state one. The extensions are part of the type, so `fun(i8 sext)` and `fun(i8 zext)` are different types, and a function and the call that states a signature carry them as data of that one type. The debug information keeps the signedness of its own types and is not derived from the extension.
 
-A function type may also name the **convention** row it is called under, after its results: `fun(i64) -> () convention sve`. A function of that type is entered and returned from under the row, and a call that states the type is made under it. The name is part of the type, so `fun() -> ()` and `fun() -> () convention sve` are different types. A type that names none is under the row of the convention its target's tuple names, which is the target's own and not a default of mirl's. A type may name any other convention of the architecture whose row's requirements hold over the baseline, and the verifier refuses a name the target states no row of.
+A function type may also name the **convention** row it is called under, in brackets after `fun`: `fun[sve](i64)`. A function of that type is entered and returned from under the row, and a call that states the type is made under it. The name is part of the type, so `fun()` and `fun[sve]()` are different types. A type that names none is under the row of the convention its target's tuple names, which is the target's own and not a default of mirl's. A type may name any other convention of the architecture whose row's requirements hold over the baseline, and the verifier refuses a name the target states no row of.
 
 ### 2.7 Target handles
 
@@ -78,7 +78,7 @@ The ir knows no kind by name. A target states each kind its family mints as a ro
 
 ### 2.8 Tagged unions
 
-A tagged union is not an IR type. A front end lowers one to a structure of a discriminant integer and a union of the payloads, for example `struct{i8, union{i32, i8}}`, and branches on the discriminant itself. This keeps the IR free of any source language's rules about what a tag means, and it lets the target's data layout place the parts. The debug table can still describe the lowered structure as a tagged union with its cases, so a debugger shows the source type (see [ir/debug.md](ir/debug.md)).
+A tagged union is not an IR type. A front end lowers one to a structure of a discriminant integer and a union of the payloads, for example a `rec` of an `i8` and a `uni` of an `i32` and an `i8`, and branches on the discriminant itself. This keeps the IR free of any source language's rules about what a tag means, and it lets the target's data layout place the parts. The debug table can still describe the lowered structure as a tagged union with its cases, so a debugger shows the source type (see [ir/debug.md](ir/debug.md)).
 
 
 ## 3. Values and constants
@@ -381,7 +381,7 @@ Limits:
 - A block whose control does not go on to the instruction after it (masc's `effect.falls`), or that leaves it by a jump, a return or a fault (`effect.FAULT`, as `ud2` or `udf`), even conditionally, is refused at selection (`Refusal.leaves`). mirl's IR states no block as not returning, so a faulting block stays refused. A block that calls leaves undefined what the default convention row's callee does. A block that traps and comes back (`effect.TRAP`, as `syscall`, `ecall` or `svc`) is admitted as one that falls through, writing the registers masc's footprint states the trap writes by the architecture, as `rcx` and `r11` of `syscall`, and its declared outputs and clobbers state what the handler's convention returns. Which trap returns is masc's to state, and mirl decides none.
 - A footprint masc leaves undecided, as a data directive with no `writes` clause, is taken as writing every register the view admits but the stack pointer, the convention's frame pointer and a zero register, as front ends assume a block leaves both pointers intact, and the memory analysis takes the block as declared. Its stack effect is taken as none.
 - An operand whose value selection holds in another class than its constraint's is refused (`Refusal.class`), and so is a symbolic immediate bound to an address, which the machine form carries no relocation kind for yet (`Refusal.symbolic`).
-- The machine form text prints an inline block as `asm` and its text, and its reader does not read one.
+- The machine form text prints an inline block as `asm` and its text.
 - Legalisation does not rewrite an item's operands, so an operand of a type the target holds in no register, as a narrow or a wide integer, is refused at selection.
 
 
