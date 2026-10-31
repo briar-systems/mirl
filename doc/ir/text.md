@@ -249,6 +249,9 @@ decorators
   #[tls(model)]             a global is thread-local under the model:
                             general_dynamic, local_dynamic, initial_exec,
                             local_exec
+  #[secret([o, n], ...)]    the byte ranges of a global that are secret, each
+                            its offset and length, at least one, ascending and
+                            none overlapping or touching the one before it
   #[oblivious]              the function must run in time independent of its
                             secret values
   #[convention(name)]       the calling convention of a function's signature,
@@ -271,13 +274,15 @@ decorators
 
 globals
 
-  global      = { decorator } [ "pub" ] ( "val" | "var" ) name ":" type "=" typed ";"
-              | { decorator } "ext" ( "val" | "var" ) name ":" type ";" ;
+  global      = { decorator } [ "pub" ] ( "val" | "var" ) name ":" [ "^" ] type "=" typed ";"
+              | { decorator } "ext" ( "val" | "var" ) name ":" [ "^" ] type ";" ;
 
   `val` states that the program never writes the global and `var` that it
   may. `ext` declares a global another module defines, which has no initial
   value, so its binding is one other objects may refer to: global, or weak
-  or unique by its decorator.
+  or unique by its decorator. `^` states the whole global secret, and
+  `#[secret]` the byte ranges of it that are, never both. its initial value
+  is public, as every constant is.
 
 functions
 
