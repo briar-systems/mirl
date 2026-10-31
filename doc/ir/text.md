@@ -243,6 +243,10 @@ decorators
                             word states local
   #[visibility(name)]       its visibility, by the name of mink's row:
                             protected, hidden, internal. default when left out
+  #[extensions(string, ...)] the extensions a function's code may use past
+                            the build's, each by the name the target's
+                            instruction set gives it, written after its
+                            visibility and only when it names one
   #[align(n)]               a global's alignment
   #[section(string, name)]  a global's section, its name and its kind by the
                             name of mink's section kind row
