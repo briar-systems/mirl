@@ -1,0 +1,722 @@
+# the lanes of a vector being legalised: where each value's lanes are, and how
+# a run of them is read or put together
+#
+# a vector type a unit the build meets holds whole stays one value. any other
+# is laid out by `mirl.target.vector.split`: in pieces a unit holds, lane order
+# kept, each remainder split again by its own count, and a lane no unit packs,
+# or a remainder of one lane, as a scalar of the lane type. a value split
+# holds parts, each a run of its lanes and the value holding them, and the
+# parts an operation gives need not be its type's layout, since a reader cuts
+# the run it wants from whatever parts there are. only a block parameter holds
+# the layout, and every edge into it passes the layout's runs.
+#
+# a run is read from the part holding it as that part, from a constant as the
+# constant run, from a held piece by a shuffle or a lane extract where a unit
+# computes one, and otherwise through a stack slot of the vector's type: the
+# parts covering the run are stored at their lanes' offsets, lanes being packed
+# in memory, and the run is loaded back. a held vector is put together from
+# parts by a build where a unit computes one, and otherwise through a slot the
+# same way, the later of two parts that cover a lane writing it. a vector a
+# function's boundary keeps whole on the first run, which no unit holds, is
+# read by a shuffle or an extract of it as it stands, and put together through
+# a slot, both of which the run after the abi legalisation takes apart. a slot
+# is read and written at offsets the type alone fixes, so nothing here branches
+# or reads a value to decide anything, and every value made reads as the
+# instruction it stands in for, its secrecy included.
+#
+# a failure is kept, the first one, and every call after it answers a stand-in,
+# as the builder does, so a rewrite reads it once at its end.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use core_state: masc.core.state;
+
+use folder: mirl.fold;
+use mirl.fold.word;
+use mirl.ir.constant.Bits;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Format;
+use mirl.ir.type.Type;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.opt.number;
+use mirl.pass.failure.Why;
+use targets: mirl.target;
+use mirl.target.Capabilities;
+use mirl.target.LaneType;
+use mirl.target.Layout;
+use mirl.target.Target;
+use mirl.target.Unit;
+use units: mirl.target.vector;
+
+# the most lane types one operation reads and gives
+pub val MOST_LANES: usize = 8;
+
+# a run of a vector's lanes
+# ---
+# from:   its first lane
+# count:  how many lanes it holds
+# scalar: it is one lane held as a scalar of the lane type, not as a vector
+pub rec Run {
+    from:   u32;
+    count:  u32;
+    scalar: bool;
+}
+
+# a run of a value's lanes and the value that holds it
+# ---
+# run:   the run
+# value: a vector of the run's lanes, or the scalar lane
+pub rec Part {
+    run:   Run;
+    value: Value;
+}
+
+# how a type is laid out
+# ---
+# unknown: not laid out yet
+# whole:   one value, which a unit holds or which is no vector
+# runs:    its runs in lane order
+pub tag Laid: u8 {
+    unknown;
+    whole;
+    runs: Slice[Run];
+}
+
+# a function whose vectors are being legalised
+# ---
+# site:    where its instructions are made, the scratch storage one rewrite's
+#          constants are read in
+# ctx:     the context the build's selection opened
+# caps:    the target's declarations
+# t:       the target
+# layout:  the data layout
+# keep:    storage the parts and layouts live in until the visit ends
+# parts:   the parts of each value split so far, by its index, empty for one
+#          not split
+# layouts: the layout of each type asked of, by its index
+# spills:  the slots the open rewrite stored a value to, read again for its
+#          other runs
+# failed:  the first failure
+pub rec Work {
+    site:    Site;
+    ctx:     opt[*core_state.Context];
+    caps:    *Capabilities;
+    t:       *Target;
+    layout:  Layout;
+    keep:    *allocator.Allocator;
+    parts:   vector.Vector[Slice[Part]];
+    layouts: vector.Vector[Laid];
+    spills:  vector.Vector[Spill];
+    failed:  opt[Why];
+}
+
+# a value the open rewrite stored to a slot
+# ---
+# of:    the value
+# at:    the slot
+# align: the slot's alignment
+pub rec Spill {
+    of:    Value;
+    at:    Value;
+    align: u64;
+}
+
+# start a rewrite of origin, which stands at an index of a block: what is made
+# goes ahead of it, and no slot of an earlier rewrite is read again, since it
+# may not stand ahead of this one
+pub fun open(w: *Work, origin: Instruction, k: Block, index: u32) {
+    vector.clear[Spill](?w.spills);
+    emit.open(?w.site, origin, k, index);
+}
+
+# a stand-in value, answered after a failure
+fun stand() Value {
+    ret Value{index: 0};
+}
+
+# keep the first failure
+pub fun fail(w: *Work, why: Why) {
+    val first: bool = sel w.failed.none;
+    if (first) { w.failed = opt[Why].some{why}; }
+}
+
+# the end of one rewrite: ok, or its first failure, the builder's included
+pub fun finished(w: *Work) err[Why] {
+    if (sel w.failed.some) { ret err[Why].err{w.failed.some}; }
+    ret emit.done(?w.site);
+}
+
+fun refused(w: *Work, e: units.Error) {
+    if (sel e.condition) {
+        fail(w, Why.condition{e.condition});
+        ret;
+    }
+    fail(w, Why.reason{"a vector unit whose width, lanes or operations the target leaves unstated, or whose scaled width the build binds no quantity to"});
+}
+
+fun types_failed(w: *Work, e: types.Error) {
+    fail(w, Why.ir{module.Error.types{e}});
+}
+
+# the type of a value
+pub fun type_of(w: *Work, x: Value) Type {
+    ret w.site.b.values.data[x.index].type;
+}
+
+# the vector a type is, none for any other type
+pub fun vector_of(w: *Work, ty: Type) opt[types.Vector] {
+    val s: res[types.Shape, types.Error] = types.shape(?w.site.m.types, ty);
+    if (sel s.err) {
+        types_failed(w, s.err);
+        ret opt[types.Vector].none{};
+    }
+    if (sel s.ok.vector) { ret opt[types.Vector].some{s.ok.vector}; }
+    ret opt[types.Vector].none{};
+}
+
+# the type a shape interns as
+pub fun intern(w: *Work, s: types.Shape) Type {
+    val ty: res[Type, types.Error] = types.intern(?w.site.m.types, s);
+    if (sel ty.err) {
+        types_failed(w, ty.err);
+        ret Type{index: 0};
+    }
+    ret ty.ok;
+}
+
+# the vector type of a count of lanes of a lane type, or the lane type for a
+# scalar run
+pub fun run_type(w: *Work, lane: Type, count: u32, scalar: bool) Type {
+    if (scalar) { ret lane; }
+    ret intern(w, types.Shape.vector{types.Vector{lanes: count, element: lane}});
+}
+
+# the integer type of a width
+pub fun integer(w: *Work, width: u32) Type {
+    ret intern(w, types.Shape.integer{types.Integer{width: width}});
+}
+
+# the bits of a lane type: an integer's width, a float's format width and a
+# pointer's size, zero for any other
+pub fun lane_bits(w: *Work, lane: Type) u32 {
+    val s: res[types.Shape, types.Error] = types.shape(?w.site.m.types, lane);
+    if (sel s.err)        { ret 0; }
+    if (sel s.ok.integer) { ret s.ok.integer.width; }
+    if (sel s.ok.float) {
+        val r: opt[types.Row] = types.row(s.ok.float.format);
+        if (sel r.some) { ret r.some.width; }
+        ret 0;
+    }
+    if (sel s.ok.pointer) {
+        val size: res[u64, targets.Error] = targets.size(?w.layout, lane, types.DEFAULT_SPACE);
+        if (sel size.ok) { ret (size.ok * 8)::u32; }
+    }
+    ret 0;
+}
+
+# the lane type of the target's declarations an ir lane type is, a float's
+# format written to `format`, which must outlive the answer. none for a lane
+# type no unit can pack, as a pointer
+fun lane_type(w: *Work, lane: Type, format: *Format) opt[LaneType] {
+    val s: res[types.Shape, types.Error] = types.shape(?w.site.m.types, lane);
+    if (sel s.err) {
+        types_failed(w, s.err);
+        ret opt[LaneType].none{};
+    }
+    if (sel s.ok.integer) { ret opt[LaneType].some{LaneType.integer{s.ok.integer.width}}; }
+    if (sel s.ok.float) {
+        @format = s.ok.float.format;
+        ret opt[LaneType].some{LaneType.float{format}};
+    }
+    ret opt[LaneType].none{};
+}
+
+# lay out a vector type
+fun lay(w: *Work, v: types.Vector) Laid {
+    var f:    Format;
+    val lane: opt[LaneType]      = lane_type(w, v.element, ?f);
+    var out:  vector.Vector[Run] = vector.init[Run](w.keep);
+    var from: u32                = 0;
+    var left: u32                = v.lanes;
+    for (left > 0 && sel w.failed.none) {
+        var n: u32 = 0;
+        if (sel lane.some) {
+            val s: res[units.Split, units.Error] = units.split(w.ctx, w.caps, lane.some, left);
+            if (sel s.err) {
+                refused(w, s.err);
+                ret Laid.whole{};
+            }
+            if (sel s.ok.pieces) {
+                n = s.ok.pieces.lanes;
+                if (n > left) { n = left; }
+            }
+        }
+        if (n == v.lanes) { ret Laid.whole{}; }
+        var r: Run = Run{from: from, count: 1, scalar: true};
+        if (n >= 2) { r = Run{from: from, count: n, scalar: false}; }
+        val pushed: res[usize, allocator.Error] = vector.push[Run](?out, r);
+        if (sel pushed.err) {
+            fail(w, Why.alloc{pushed.err});
+            ret Laid.whole{};
+        }
+        from = from + r.count;
+        left = left - r.count;
+    }
+    ret Laid.runs{Slice[Run]{data: out.data, size: out.len}};
+}
+
+# how a type is laid out, whole for one that is no vector
+pub fun laid(w: *Work, ty: Type) Laid {
+    val at: usize = ty.index::usize;
+    if (at < w.layouts.len) {
+        val known: Laid = w.layouts.data[at];
+        if (!(sel known.unknown)) { ret known; }
+    }
+    var now: Laid              = Laid.whole{};
+    val v:   opt[types.Vector] = vector_of(w, ty);
+    if (sel v.some)        { now = lay(w, v.some); }
+    if (sel w.failed.some) { ret now; }
+    for (w.layouts.len <= at) {
+        val pushed: res[usize, allocator.Error] = vector.push[Laid](?w.layouts, Laid.unknown{});
+        if (sel pushed.err) {
+            fail(w, Why.alloc{pushed.err});
+            ret now;
+        }
+    }
+    w.layouts.data[at] = now;
+    ret now;
+}
+
+# whether a type is held whole: a vector a unit holds, or no vector
+pub fun held(w: *Work, ty: Type) bool {
+    val l: Laid = laid(w, ty);
+    ret sel l.whole;
+}
+
+# the runs of a type's layout, one whole run for a held vector
+pub fun runs_of(w: *Work, ty: Type) Slice[Run] {
+    val l: Laid = laid(w, ty);
+    if (sel l.runs) { ret l.runs; }
+    val v: opt[types.Vector] = vector_of(w, ty);
+    var n: u32               = 1;
+    if (sel v.some) { n = v.some.lanes; }
+    val one: res[*Run, allocator.Error] = allocator.zallocate[Run](w.keep, 1);
+    if (sel one.err) {
+        fail(w, Why.alloc{one.err});
+        ret Slice[Run]{data: nil, size: 0};
+    }
+    one.ok[0] = Run{from: 0, count: n, scalar: false};
+    ret Slice[Run]{data: one.ok, size: 1};
+}
+
+# whether a unit the build meets computes an operation over packed lanes at a
+# count, holding that many lanes of every lane type the operation reads and
+# gives
+# ---
+# code:  the operation
+# lane:  the lane type of the vector it reads
+# to:    the lane type a conversion gives, lane for any other operation
+# count: the lanes of each vector it reads and gives
+# lanes: every lane type it reads and gives, at most MOST_LANES
+pub fun packed(w: *Work, code: Opcode, lane: Type, to: Type, count: u32, lanes: Slice[Type]) bool {
+    val v: targets.Vectors = w.caps.vectors;
+    if (!(sel v.units))          { ret false; }
+    if (lanes.size > MOST_LANES) { ret false; }
+    var fa: Format;
+    var fb: Format;
+    val a:  opt[LaneType] = lane_type(w, lane, ?fa);
+    val b:  opt[LaneType] = lane_type(w, to, ?fb);
+    if (sel a.none) { ret false; }
+    if (sel b.none) { ret false; }
+    var fs: [8]Format;
+    var ls: [8]LaneType;
+    var k:  usize = 0;
+    for (k < lanes.size) {
+        val l: opt[LaneType] = lane_type(w, lanes.data[k], ?fs[k]);
+        if (sel l.none) { ret false; }
+        ls[k] = l.some;
+        k     = k + 1;
+    }
+    var i: usize = 0;
+    for (i < v.units.size) {
+        val u:  *Unit                  = ?v.units.data[i];
+        val ok: res[bool, units.Error] = units.native(w.ctx, u, code, a.some, b.some);
+        if (sel ok.err) {
+            refused(w, ok.err);
+            ret false;
+        }
+        var all: bool = ok.ok;
+        k = 0;
+        for (all && k < lanes.size) {
+            val h: res[bool, units.Error] = units.holds(w.ctx, u, ls[k], count);
+            if (sel h.err) {
+                refused(w, h.err);
+                ret false;
+            }
+            all = h.ok;
+            k   = k + 1;
+        }
+        if (all) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether a unit computes an operation that reads and gives only one lane type
+pub fun packed_at(w: *Work, code: Opcode, lane: Type, count: u32) bool {
+    var one: [1]Type = [1]Type{lane};
+    ret packed(w, code, lane, lane, count, Slice[Type]{data: ?one[0], size: 1});
+}
+
+# room for n parts that live until the visit ends
+pub fun fresh(w: *Work, n: usize) Slice[Part] {
+    if (n == 0) { ret Slice[Part]{data: nil, size: 0}; }
+    val got: res[*Part, allocator.Error] = allocator.zallocate[Part](w.keep, n);
+    if (sel got.err) {
+        fail(w, Why.alloc{got.err});
+        ret Slice[Part]{data: nil, size: 0};
+    }
+    ret Slice[Part]{data: got.ok, size: n};
+}
+
+# record the parts a value is split into
+pub fun hold(w: *Work, x: Value, parts: Slice[Part]) {
+    for (w.parts.len <= x.index::usize) {
+        val pushed: res[usize, allocator.Error] = vector.push[Slice[Part]](?w.parts, Slice[Part]{data: nil, size: 0});
+        if (sel pushed.err) {
+            fail(w, Why.alloc{pushed.err});
+            ret;
+        }
+    }
+    w.parts.data[x.index] = parts;
+}
+
+# the parts a value was split into, empty when it was not
+pub fun parts_of(w: *Work, x: Value) Slice[Part] {
+    if (x.index::usize >= w.parts.len) { ret Slice[Part]{data: nil, size: 0}; }
+    ret w.parts.data[x.index];
+}
+
+# the constant run of a constant vector, none for a value that is no constant
+fun constant_run(w: *Work, x: Value, lane: Type, r: Run) opt[Value] {
+    val def: Def = w.site.b.values.data[x.index].def;
+    if (!(sel def.constant)) { ret opt[Value].none{}; }
+    val got: res[opt[folder.Value], Why] = number.read(w.site.m, w.site.b, w.site.scratch, x);
+    if (sel got.err) {
+        fail(w, got.err);
+        ret opt[Value].some{stand()};
+    }
+    if (sel got.ok.none) { ret opt[Value].none{}; }
+    val all: Slice[Bits] = got.ok.some.lanes;
+    if ((r.from + r.count)::usize > all.size) { ret opt[Value].none{}; }
+    val some: folder.Value    = folder.Value{type: run_type(w, lane, r.count, r.scalar), lanes: Slice[Bits]{data: ?all.data[r.from], size: r.count::usize}};
+    val made: res[Value, Why] = number.place(w.site.m, w.site.f, w.site.scratch, some);
+    if (sel made.err) {
+        fail(w, made.err);
+        ret opt[Value].some{stand()};
+    }
+    ret opt[Value].some{made.ok};
+}
+
+# make an instruction and give its first result
+fun made(w: *Work, code: Opcode, operands: Slice[Value], immediates: Slice[Immediate]) Value {
+    val i: Instruction = emit.make(?w.site, code, operands, immediates);
+    ret emit.result(?w.site, i, 0);
+}
+
+# lane i of a vector, by the ir's extract
+fun extract(w: *Work, x: Value, i: u32) Value {
+    var ops: [1]Value     = [1]Value{x};
+    var imm: [1]Immediate = [1]Immediate{Immediate.lane{i}};
+    ret made(w, opcode.VEXTRACT, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+# a vector of type ty of lanes from..from+count of a vector, by the ir's shuffle
+fun shuffle(w: *Work, x: Value, ty: Type, from: u32, count: u32) Value {
+    val list: res[*u32, allocator.Error] = allocator.zallocate[u32](w.site.scratch, count::usize);
+    if (sel list.err) {
+        fail(w, Why.alloc{list.err});
+        ret stand();
+    }
+    var k: u32 = 0;
+    for (k < count) {
+        list.ok[k] = from + k;
+        k          = k + 1;
+    }
+    ret shuffle_of(w, x, x, ty, Slice[u32]{data: list.ok, size: count::usize});
+}
+
+# a vector of type ty of the lanes a list names of two vectors, by the ir's
+# shuffle
+pub fun shuffle_of(w: *Work, a: Value, b: Value, ty: Type, lanes: Slice[u32]) Value {
+    var ops: [2]Value     = [2]Value{a, b};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.lanes{lanes}};
+    ret made(w, opcode.VSHUFFLE, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 2});
+}
+
+# a vector of type ty of scalar lanes, by the ir's build
+pub fun build(w: *Work, ty: Type, lanes: Slice[Value]) Value {
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{ty}};
+    ret made(w, opcode.VBUILD, lanes, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+# the bytes a lane takes in memory, the lanes of a vector being packed
+fun lane_size(w: *Work, lane: Type) u64 {
+    val size: res[u64, targets.Error] = targets.size(?w.layout, lane, types.DEFAULT_SPACE);
+    if (sel size.err) {
+        fail(w, Why.reason{"the data layout states no size of a vector's lane"});
+        ret 1;
+    }
+    ret size.ok;
+}
+
+# the alignment an access at a byte offset from an aligned address may assume
+pub fun aligned_at(align: u64, offset: u64) u64 {
+    if (offset == 0) { ret align; }
+    val low: u64 = offset & (0 - offset);
+    if (low < align) { ret low; }
+    ret align;
+}
+
+# the address at a byte offset from an address
+pub fun at_offset(w: *Work, address: Value, offset: u64) Value {
+    if (offset == 0) { ret address; }
+    val size: res[u64, targets.Error] = targets.size(?w.layout, type_of(w, address), types.DEFAULT_SPACE);
+    if (sel size.err) {
+        fail(w, Why.reason{"the data layout states no size of a pointer"});
+        ret address;
+    }
+    val by: res[Value, Why] = emit.constant(?w.site, integer(w, (size.ok * 8)::u32), word.small(offset));
+    if (sel by.err) {
+        fail(w, by.err);
+        ret address;
+    }
+    ret emit.binary(?w.site, opcode.PTR_ADD, address, by.ok);
+}
+
+# a load of a type at an address, with the flags of the access it stands for
+pub fun load(w: *Work, address: Value, ty: Type, align: u64, flags: Flags) Value {
+    var ops: [1]Value     = [1]Value{address};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{align}};
+    emit.flags(?w.site, flags);
+    val x: Value = made(w, opcode.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+    emit.flags(?w.site, NO_FLAGS);
+    ret x;
+}
+
+# a store of a value at an address, with the flags of the access it stands for
+pub fun store(w: *Work, address: Value, x: Value, align: u64, flags: Flags) {
+    var ops: [2]Value     = [2]Value{address, x};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+    emit.flags(?w.site, flags);
+    emit.make(?w.site, opcode.STORE, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 1});
+    emit.flags(?w.site, NO_FLAGS);
+}
+
+# a slot of the target's stack slot space for a type, ahead of the rewrite,
+# and its alignment
+pub fun slot(w: *Work, ty: Type, align: *u64) Value {
+    val got:   res[u64, targets.Error] = targets.align(?w.layout, ty, types.DEFAULT_SPACE);
+    val space: res[u32, targets.Error] = targets.slot_space(w.t);
+    if (sel got.err) {
+        fail(w, Why.reason{"the data layout states no alignment of a vector"});
+        ret stand();
+    }
+    if (sel space.err) {
+        fail(w, Why.reason{"the target states no address space for its stack slots"});
+        ret stand();
+    }
+    val pointer: Type = intern(w, types.Shape.pointer{types.Pointer{space: space.ok}});
+    @align = got.ok;
+    var imm: [3]Immediate = [3]Immediate{Immediate.ty{ty}, Immediate.ty{pointer}, Immediate.alignment{got.ok}};
+    ret made(w, opcode.ALLOCA, Slice[Value]{data: nil, size: 0}, Slice[Immediate]{data: ?imm[0], size: 3});
+}
+
+# store parts into memory at an address, each at its first lane's offset, in
+# order, so a later part writes a lane an earlier one covers
+pub fun store_parts(w: *Work, address: Value, align: u64, lane: Type, parts: Slice[Part], flags: Flags) {
+    val size: u64   = lane_size(w, lane);
+    var i:    usize = 0;
+    for (i < parts.size && sel w.failed.none) {
+        val off: u64 = parts.data[i].run.from::u64 * size;
+        store(w, at_offset(w, address, off), parts.data[i].value, aligned_at(align, off), flags);
+        i = i + 1;
+    }
+}
+
+# a run read back from a slot of a vector's type its parts are stored to,
+# the slot of the open rewrite that holds a value already where one is named
+fun through_slot(w: *Work, of: opt[Value], whole: Type, lane: Type, parts: Slice[Part], r: Run) Value {
+    var align: u64   = 1;
+    var at:    Value = stand();
+    var found: bool  = false;
+    if (sel of.some) {
+        var i: usize = 0;
+        for (i < w.spills.len) {
+            if (w.spills.data[i].of.index == of.some.index) {
+                at    = w.spills.data[i].at;
+                align = w.spills.data[i].align;
+                found = true;
+            }
+            i = i + 1;
+        }
+    }
+    if (!found) {
+        val made: Value = slot(w, whole, ?align);
+        store_parts(w, made, align, lane, parts, NO_FLAGS);
+        at = made;
+        if (sel of.some) {
+            val pushed: res[usize, allocator.Error] = vector.push[Spill](?w.spills, Spill{of: of.some, at: made, align: align});
+            if (sel pushed.err) { fail(w, Why.alloc{pushed.err}); }
+        }
+    }
+    val off: u64 = r.from::u64 * lane_size(w, lane);
+    ret load(w, at_offset(w, at, off), run_type(w, lane, r.count, r.scalar), aligned_at(align, off), NO_FLAGS);
+}
+
+# a run of a held piece whose lane 0 is lane base of the whole, by a shuffle
+# or an extract where a unit computes one, and otherwise through a slot of the
+# piece's type
+fun from_piece(w: *Work, piece: Value, base: u32, lane: Type, r: Run) Value {
+    val ty: Type              = type_of(w, piece);
+    val v:  opt[types.Vector] = vector_of(w, ty);
+    if (sel v.none) { ret stand(); }
+    val rel: Run = Run{from: r.from - base, count: r.count, scalar: r.scalar};
+    if (rel.from == 0 && rel.count == v.some.lanes && !rel.scalar)                                                          { ret piece; }
+    if (rel.scalar && packed_at(w, opcode.VEXTRACT, lane, v.some.lanes))                                                    { ret extract(w, piece, rel.from); }
+    if (!rel.scalar && packed_at(w, opcode.VSHUFFLE, lane, v.some.lanes) && packed_at(w, opcode.VSHUFFLE, lane, rel.count)) { ret shuffle(w, piece, run_type(w, lane, rel.count, false), rel.from, rel.count); }
+    var one: [1]Part = [1]Part{Part{run: Run{from: 0, count: v.some.lanes, scalar: false}, value: piece}};
+    ret through_slot(w, opt[Value].some{piece}, ty, lane, Slice[Part]{data: ?one[0], size: 1}, rel);
+}
+
+# the run of a value's lanes from..from+count, a vector of them or the scalar
+# lane where the run is scalar
+# ---
+# x: the value, a vector
+# r: the run, within its lanes
+pub fun run(w: *Work, x: Value, r: Run) Value {
+    if (sel w.failed.some) { ret stand(); }
+    val ty: Type              = type_of(w, x);
+    val v:  opt[types.Vector] = vector_of(w, ty);
+    if (sel v.none) {
+        fail(w, Why.reason{"a run of lanes asked of a value that is no vector"});
+        ret stand();
+    }
+    val lane:  Type        = v.some.element;
+    val parts: Slice[Part] = parts_of(w, x);
+    if (parts.size == 0) {
+        val c: opt[Value] = constant_run(w, x, lane, r);
+        if (sel c.some)                                          { ret c.some; }
+        if (r.from == 0 && r.count == v.some.lanes && !r.scalar) { ret x; }
+        if (held(w, ty))                                         { ret from_piece(w, x, 0, lane, r); }
+        if (r.scalar)                                            { ret extract(w, x, r.from); }
+        ret shuffle(w, x, run_type(w, lane, r.count, false), r.from, r.count);
+    }
+    var i: usize = 0;
+    for (i < parts.size) {
+        val p: Run = parts.data[i].run;
+        if (p.from == r.from && p.count == r.count && p.scalar == r.scalar) { ret parts.data[i].value; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < parts.size) {
+        val p: Run = parts.data[i].run;
+        if (p.from <= r.from && r.from + r.count <= p.from + p.count) {
+            if (!p.scalar) { ret from_piece(w, parts.data[i].value, p.from, lane, r); }
+            if (r.scalar)  { ret parts.data[i].value; }
+        }
+        i = i + 1;
+    }
+    if (!r.scalar && packed_at(w, opcode.VBUILD, lane, r.count)) {
+        val each: res[*Value, allocator.Error] = allocator.zallocate[Value](w.site.scratch, r.count::usize);
+        if (sel each.err) {
+            fail(w, Why.alloc{each.err});
+            ret stand();
+        }
+        var k: u32 = 0;
+        for (k < r.count) {
+            each.ok[k] = run(w, x, Run{from: r.from + k, count: 1, scalar: true});
+            k          = k + 1;
+        }
+        ret build(w, run_type(w, lane, r.count, false), Slice[Value]{data: each.ok, size: r.count::usize});
+    }
+    ret through_slot(w, opt[Value].some{x}, ty, lane, parts, r);
+}
+
+# whether parts are each one scalar lane, lanes 0 to n - 1 in order
+fun scalars(parts: Slice[Part], n: u32) bool {
+    if (parts.size != n::usize) { ret false; }
+    var i: usize = 0;
+    for (i < parts.size) {
+        if (!parts.data[i].run.scalar || parts.data[i].run.from != i::u32) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a whole value of a vector type put together from parts that cover its
+# lanes, the later of two covering a lane giving it: the one part where it
+# covers them all, a build of scalar lanes where a unit computes one, and
+# otherwise through a slot of the type
+# ---
+# ty:    the vector type
+# parts: the parts, at least one
+pub fun assemble(w: *Work, ty: Type, parts: Slice[Part]) Value {
+    if (sel w.failed.some) { ret stand(); }
+    val v: opt[types.Vector] = vector_of(w, ty);
+    if (sel v.none) {
+        fail(w, Why.reason{"a vector asked to be put together of a type that is no vector"});
+        ret stand();
+    }
+    val lane: Type = v.some.element;
+    if (parts.size == 1) {
+        val p: Run = parts.data[0].run;
+        if (p.from == 0 && p.count == v.some.lanes && !p.scalar) { ret parts.data[0].value; }
+    }
+    if (held(w, ty) && scalars(parts, v.some.lanes) && packed_at(w, opcode.VBUILD, lane, v.some.lanes)) {
+        val each: res[*Value, allocator.Error] = allocator.zallocate[Value](w.site.scratch, parts.size);
+        if (sel each.err) {
+            fail(w, Why.alloc{each.err});
+            ret stand();
+        }
+        var k: usize = 0;
+        for (k < parts.size) {
+            each.ok[k] = parts.data[k].value;
+            k          = k + 1;
+        }
+        ret build(w, ty, Slice[Value]{data: each.ok, size: parts.size});
+    }
+    ret through_slot(w, opt[Value].none{}, ty, lane, parts, Run{from: 0, count: v.some.lanes, scalar: false});
+}
+
+# the parts of a value by a type's layout: the runs it holds each read from it
+pub fun cut(w: *Work, x: Value, layout: Slice[Run]) Slice[Part] {
+    val out: Slice[Part] = fresh(w, layout.size);
+    var i:   usize       = 0;
+    for (i < out.size && sel w.failed.none) {
+        out.data[i] = Part{run: layout.data[i], value: run(w, x, layout.data[i])};
+        i           = i + 1;
+    }
+    ret out;
+}
