@@ -15,6 +15,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.types.view.View;
 
+use std.allocator;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
@@ -48,11 +49,13 @@ use mirl.target.OpSet;
 use mirl.target.Ops;
 use mirl.target.Refused;
 use mirl.target.Target;
+use target_basis: mirl.target.basis;
 use mirl.target.handle_of;
 use mirl.target.op_row;
 use mirl.target.op_set;
 use mirl.target.refusal;
 use mirl.target.supplies;
+use mirl.verify.failure.Broken;
 use mirl.verify.failure.Found;
 use mirl.verify.failure.Run;
 use mirl.verify.failure.Where;
@@ -584,12 +587,120 @@ fun take_params(g: *Binding, e: mo.Enumeration, v: Value) opt[str] {
     ret opt[str].none{};
 }
 
+# a set of extensions functions name past the build's, opened once
+# ---
+# names:   the names of the function that opened it
+# widened: the build's selection widened by them, and its context
+rec Opened {
+    names:   Slice[View];
+    widened: target_basis.Widened;
+}
+
+# the contexts the op rule checks target ops under in one walk
+# ---
+# a:      the allocator each opened set comes from
+# t:      the target
+# build:  the context the build's selection opened, none where no build is open
+# opened: each distinct set of extensions a function names past the build's
+# ctx:    the context of the function walked, none before its first target op
+#         reads it
+# read:   whether `ctx` has been read for the function walked
+rec Scopes {
+    a:      *allocator.Allocator;
+    t:      *Target;
+    build:  opt[*core_state.Context];
+    opened: vector.Vector[*Opened];
+    ctx:    opt[*core_state.Context];
+    read:   bool;
+}
+
+# whether two lists of extension names, each naming any name once, name the
+# same extensions in any order
+fun same_names(x: Slice[View], y: Slice[View]) bool {
+    if (x.size != y.size) { ret false; }
+    var i: usize = 0;
+    for (i < x.size) {
+        var held: bool  = false;
+        var j:    usize = 0;
+        for (j < y.size && !held) {
+            held = slice.same_view(x.data[i], y.data[j]);
+            j    = j + 1;
+        }
+        if (!held) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# give back every set a walk opened
+fun close_scopes(sc: *Scopes) {
+    var i: usize = 0;
+    for (i < sc.opened.len) {
+        target_basis.narrow(?sc.opened.data[i].widened);
+        allocator.deallocate[Opened](sc.a, sc.opened.data[i], 1);
+        i = i + 1;
+    }
+    vector.dnit[*Opened](?sc.opened);
+}
+
+# the context a function's target ops are checked under: the build's, or
+# the one its extensions past the build's open, each distinct set opened once
+# in a walk. none where no build is open
+# ---
+# at:  where the target op that reads it stands, which a refusal names
+# ret: the context, or the allocator's refusal, or why the set was not
+#      opened: a name the instruction set does not know, named, or as
+#      `target_basis.widen` refuses
+fun scope_of(sc: *Scopes, m: *Module, fn: Function, at: Where) res[opt[*core_state.Context], Found] {
+    if (sc.read) { ret res[opt[*core_state.Context], Found].ok{sc.ctx}; }
+    val names: Slice[View]         = m.functions.data[fn.index].data.extensions;
+    var build: *core_state.Context = nil;
+    if (sel sc.build.some) { build = sc.build.some; }
+    if (build == nil || names.size == 0) {
+        sc.ctx  = sc.build;
+        sc.read = true;
+        ret res[opt[*core_state.Context], Found].ok{sc.ctx};
+    }
+    var i: usize = 0;
+    for (i < sc.opened.len) {
+        if (same_names(sc.opened.data[i].names, names)) {
+            sc.ctx  = opt[*core_state.Context].some{?sc.opened.data[i].widened.context};
+            sc.read = true;
+            ret res[opt[*core_state.Context], Found].ok{sc.ctx};
+        }
+        i = i + 1;
+    }
+    val made: res[*Opened, allocator.Error] = allocator.allocate[Opened](sc.a, 1);
+    if (sel made.err) { ret res[opt[*core_state.Context], Found].err{Found.alloc{made.err}}; }
+    val o:       *Opened                 = made.ok;
+    val widened: err[target_basis.Error] = target_basis.widen_context(?o.widened, sc.a, sc.t, build, names);
+    if (sel widened.err) {
+        allocator.deallocate[Opened](sc.a, o, 1);
+        val e: target_basis.Error = widened.err;
+        if (sel e.alloc) { ret res[opt[*core_state.Context], Found].err{Found.alloc{e.alloc}}; }
+        var where: Where = at;
+        if (sel e.named) { where.extension = e.named; }
+        ret res[opt[*core_state.Context], Found].err{Found.broken{Broken{at: where, what: target_basis.fact(e)}}};
+    }
+    o.names = names;
+    val pushed: res[usize, allocator.Error] = vector.push[*Opened](?sc.opened, o);
+    if (sel pushed.err) {
+        target_basis.narrow(?o.widened);
+        allocator.deallocate[Opened](sc.a, o, 1);
+        ret res[opt[*core_state.Context], Found].err{Found.alloc{pushed.err}};
+    }
+    sc.ctx  = opt[*core_state.Context].some{?o.widened.context};
+    sc.read = true;
+    ret res[opt[*core_state.Context], Found].ok{sc.ctx};
+}
+
 # the rule a target op keeps against its op's row: the set and the op are in
 # its target's catalog and the catalog refuses neither, its operands and
 # results are the ones the row's own operands bind, each a handle of the kind
 # the catalog names where it names one, its memory is what the row states,
-# and the build, where one is open, admits the row's requirement
-fun op_of(run: *Run, fn: Function, k: Block, inst: Instruction) err[Found] {
+# and the build, where one is open, admits the row's requirement under the
+# selection the function's own extensions widen it to
+fun op_of(run: *Run, sc: *Scopes, fn: Function, k: Block, inst: Instruction) err[Found] {
     val m: *Module          = run.m;
     val b: *Body            = ?m.functions.data[fn.index].body;
     val d: *InstructionData = ?b.instructions.data[inst.index];
@@ -655,26 +766,32 @@ fun op_of(run: *Run, fn: Function, k: Block, inst: Instruction) err[Found] {
     if (g.taken != d.operands.len) { ret broken(at, "a target op passing more operands than its op's row takes"); }
     if (given != o.results.size)   { ret broken(at, "a target op stating more results than its op's row gives"); }
 
-    val ctx: opt[*core_state.Context] = run.layout.ctx;
-    if (sel ctx.some && !core_state.admits(ctx.some, r.requires)) { ret broken(at, "a target op whose op's row requires what the build's selection does not hold"); }
+    val ctx: res[opt[*core_state.Context], Found] = scope_of(sc, m, fn, at);
+    if (sel ctx.err)                                                    { ret err[Found].err{ctx.err}; }
+    if (sel ctx.ok.some && !core_state.admits(ctx.ok.some, r.requires)) { ret broken(at, "a target op whose op's row requires what the function's selection does not hold"); }
     ret err[Found].ok{};
 }
 
 # every target op is an op of its target's catalog, binding what the op's row
-# binds and declaring the memory the row states
+# binds and declaring the memory the row states, and admitted by the build's
+# selection widened by its function's own extensions
 pub fun ops(run: *Run) err[Found] {
-    val m: *Module = run.m;
-    var f: usize   = 0;
+    val m:  *Module = run.m;
+    var sc: Scopes  = Scopes{a: m.a, t: run.target, build: run.layout.ctx, opened: vector.init[*Opened](m.a), ctx: opt[*core_state.Context].none{}, read: false};
+    fin { close_scopes(?sc); }
+    var f: usize = 0;
     for (f < m.functions.len) {
         val fn: Function = Function{index: f::u32};
         val b:  *Body    = ?m.functions.data[f].body;
-        var k:  usize    = 0;
+        sc.ctx  = opt[*core_state.Context].none{};
+        sc.read = false;
+        var k: usize = 0;
         for (k < b.blocks.len) {
             val d: *BlockData = ?b.blocks.data[k];
             if (!d.erased) {
                 var i: usize = 0;
                 for (i < d.instructions.len) {
-                    val found: err[Found] = op_of(run, fn, Block{index: k::u32}, d.instructions.data[i]);
+                    val found: err[Found] = op_of(run, ?sc, fn, Block{index: k::u32}, d.instructions.data[i]);
                     if (sel found.err) { ret found; }
                     i = i + 1;
                 }
