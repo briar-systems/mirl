@@ -150,6 +150,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `asm` | any number of value operands | `block` an inline assembly block | none | propagates |
 | `target.op` | any number of value operands | `op` a target op | none | propagates |
 | `target.op.memory` | any number of value operands | `op` a target op | none | propagates |
+| `atomic.cmpxchg.words` | `address`, then any number of value operands | `success` a memory ordering, `failure` a memory ordering | none | declared |
 
 ### `add`
 
@@ -2224,5 +2225,23 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
   - the results `op` states, in order
 - effects: reads memory, writes memory
 - secrecy: propagates
+- vector: none
+
+### `atomic.cmpxchg.words`
+
+- operands: `address`, then any number of value operands
+- immediates: `success` a memory ordering, `failure` a memory ordering
+- targets: 0
+- typing:
+  - `address` is a pointer
+  - the tail operands are an even count of at least two integers of one width, the expected words and then as many desired words, each low word first
+  - `success` is one of relaxed, acquire, release, acq_rel, seq_cst
+  - `failure` is one of relaxed, acquire, seq_cst
+- results:
+  - one result of the tail's word type per word of its first half, in order
+  - one result of i1, or of a vector of i1 with the lanes of `address` when it is a vector
+- effects: reads memory, writes memory
+  - traps when the address in `address` cannot be accessed
+- secrecy: declared
 - vector: none
 

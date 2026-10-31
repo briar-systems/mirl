@@ -10,11 +10,11 @@
 # mirl must be built: mach build . -a cli. git must be on the path, and the
 # masc and mink programs are built as test/ct/tools.sh says.
 #
-# each case is a test/ct/case/*.mirl body, a function @probe(i64) -> (i64)
+# each case is a test/ct/case/*.mirl body, a function probe(i64) i64
 # that requires constant time and takes its input as a secret, and its line
-# "; batch <n>" states how many calls one batch times, 1 for a case that probes
+# "# batch <n>" states how many calls one batch times, 1 for a case that probes
 # addresses, since a larger batch averages one cache miss away. it is put
-# after the host lane's target line and before test/ct/driver.mirl, compiled
+# after the host lane's target statement and before test/ct/driver.mirl, compiled
 # by mirl, and linked by mink with test/ct/clock-<arch>.s, which masc
 # assembles. the driver times $ROUNDS rounds (20000 by default), each one
 # batch of the fixed input 0 and one of a drawn input, in alternating order.

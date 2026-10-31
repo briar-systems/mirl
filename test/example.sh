@@ -11,20 +11,18 @@
 # (mach by default). $MASC and $MINK name built ones instead.
 #
 # the input set is every test/example/*.mirl, each a body whose first line is
-# its target line and whose line "; exits <n>: ..." states the status its
+# its target statement and whose line "# exits <n>: ..." states the status its
 # program exits with, and the __mirl_exit every start stub calls, which masc
 # assembles for each lane target: test/example/exit-<arch>.s where one is
 # written for its architecture, test/example/exit.s, RISC-V's, otherwise. the lane targets are the
 # lines `mirl lanes` writes, the one list of tuples mirl.target.lane holds. an
-# example is built for each by a copy whose target line spells that target's
+# example is built for each by a copy whose target statement spells that target's
 # tuple and is its only change, so an example states nothing a lane target lays out
 # otherwise. for each example and each lane target the lane checks:
 #   - mirl emit writes its object
 #   - mirl emit writes its listing, which masc assembles again. a byte
-#     difference from mirl's object shows masc disassemble of both, diffed
-#   - once, the mach test unit roundtrip__every_example_listing_assembles_to_its_own_object
-#     compares the reassembled objects of every example at every lane target
-#     as data, which is the check that passes or fails
+#     difference from mirl's object shows masc disassemble of both, diffed,
+#     for reading only
 #   - mink link links the object and the exit object into a static linux gnu
 #     executable, which exits with the stated status under the lane's qemu
 #
@@ -92,12 +90,12 @@ fail() { echo "FAIL $1: $2"; fails=$((fails + 1)); }
 
 # build and run the example `$1` at `$2` for the lane target `$3`, which masc
 # reads as `$4`, mink link links under the flags `$5` and `$6` runs, into
-# `$7`, its target line `$8`
+# `$7`, its target statement `$8`
 example() {
     local name=$1 src=$2 target=$3 masc_as=$4 link=$5 qemu=$6 dir=$7 line=$8
     local at="$dir/$name"
     local expect status
-    expect=$(sed -n 's/^; exits \([0-9][0-9]*\):.*/\1/p' "$src")
+    expect=$(sed -n 's/^# exits \([0-9][0-9]*\):.*/\1/p' "$src")
     if [ -z "$expect" ]; then
         fail "$target $name" "states no exit status"
         return
@@ -137,9 +135,9 @@ example() {
 }
 
 while read -r -u 3 target arch system env isa abi format; do
-    line="target \"$arch\" \"$system\" \"$env\" \"$abi\" \"$isa\""
-    masc_as="-t $arch --isa $isa --abi $abi --format $format"
-    link="--kind static --format $format --arch $arch --system $system --env $env"
+    line="target { arch: \"$arch\", sys: \"$system\", env: \"$env\", abi: \"$abi\", isa: \"$isa\" };"
+    masc_as="--arch $arch --isa $isa --abi $abi --format $format"
+    link="--kind static --format $format --arch $arch --sys $system --env $env"
     qemu=qemu-$arch
     dir=$out/$target
     mkdir -p "$dir" || exit 2
@@ -151,16 +149,12 @@ while read -r -u 3 target arch system env isa abi format; do
     fi
     for src in "$here"/example/*.mirl; do
         name=$(basename "$src" .mirl)
-        if ! head -n 1 "$src" | grep -qx 'target "[^"]*" "[^"]*" "[^"]*" "[^"]*" "[^"]*"'; then
-            fail "$target $name" "its first line is no target line"
+        if ! head -n 1 "$src" | grep -qx 'target { arch: "[^"]*", sys: "[^"]*", env: "[^"]*", abi: "[^"]*", isa: "[^"]*" };'; then
+            fail "$target $name" "its first line is no target statement"
             continue
         fi
         example "$name" "$src" "$target" "$masc_as" "$link" "$qemu" "$dir" "$line"
     done
 done 3<<<"$lanes"
-# the exact comparison is the unit test, which reads both objects as data: every section's bytes, every relocation and
-# every symbol by name, the one nameless symbol by its place. a byte difference above is shown for reading only
-"${MACH:-mach}" test "$repo" -a '*' --filter roundtrip --timeout 5m >"$out/roundtrip.log" 2>&1 \
-    || { fail "roundtrip" "the listing does not assemble to mirl's objects, see $out/roundtrip.log"; tail -n 20 "$out/roundtrip.log"; }
 echo "$fails failed"
 exit $fails
