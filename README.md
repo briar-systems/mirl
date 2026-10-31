@@ -34,5 +34,4 @@ mirl builds with mach 6.10.1 or later.
 ```
 mach dep pull .
 mach build .
-mach test . -a '*'
 ```

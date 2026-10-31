@@ -20,44 +20,35 @@ mach build .
 The library artifact is `mirl`, whose entry is `src/lib/mirl.mach`, and the
 program is `cli`, whose entry is `src/bin/mirl.mach`. `mach build .` builds the
 library, and `mach build . -a cli` writes the program to
-`out/linux-x86_64/debug/bin/mirl` on a Linux x86_64 host. The `tests` artifact,
-whose entry is `src/lib/tests.mach`, reaches the test modules no module of the
-library can register without importing itself, since mach refuses a circular
-import.
+`out/linux-x86_64/debug/bin/mirl` on a Linux x86_64 host.
 
 Dependencies are `[dep.<name>]` tables in `mach.toml`, and the exact commit of
 each is the committed gitlink under `dep/`. There is no lock file.
 `mach dep pull .` realizes the committed pins and `mach dep update` moves them.
 
 
-## Testing and formatting
+## Formatting
 
 ```bash
-mach test . -a '*'
 mach fmt --check .
 ```
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened.
 
-Unit tests cover the pieces that can be tested directly, each once, at the
-layer that owns it. A table is checked by one test that walks its rows. There
-are no regression tests: a defect is fixed in the code, and a test is added
-only when the behaviour had no coverage. Unit tests of a pass or a stage are
-written as IR or machine form text in and text out. Checks that need outside
-tools, such as differential execution of the mach corpus, spirv-val,
-wasm-validate, llvm-dwarfdump and the timing-leak harness, run locally and
-never in CI. CI builds every target and runs the unit tests.
 
+## Checks
 
-IR text test inputs live in `test/ir/` as `*.mirl` files. Each one is valid IR,
-verifier-clean. One test reads every file there, verifies the module it parses,
-prints it, parses that text and compares the two modules, so a file added for any
-job is part of the round trip and of the verifier. A file starts with its `target`
-line and has no version line, since the reader puts the library's own before it
-and no release touches the files. `mach test` runs in the directory it was started from and not at the
-project root, so the walk finds `test/ir` only when `mach test` is run from
-the root, as above.
+mirl has no unit tests. It is held correct by the calling conventions and the
+object and debug format specifications its rules cite, never by agreement with
+another compiler. Checks that need outside tools, such as differential
+execution of the mach corpus, spirv-val, wasm-validate, llvm-dwarfdump and the
+timing-leak harness, run locally and never in CI. CI builds every target.
+
+IR text inputs live in `test/ir/` as `*.mirl` files. Each one is valid IR,
+verifier-clean. A file starts with its `target` statement and has no version statement,
+which the commands read with `--body`, since the reader puts the library's own
+before it and no release touches the files.
 
 
 ## Branching

@@ -27,11 +27,11 @@
 #     (test/ct/harness.sh) judge.
 #
 # the corpus is test/ct/case/*.mirl, the functions that require constant time,
-# each a function @probe(i64) -> (i64) whose input is secret, which must run
+# each a function probe(i64) i64 whose input is secret, which must run
 # clean, and test/ct/leak/*.mirl, planted leaks that do not require constant
 # time, so mirl compiles them, each stating its channel on its line
-# "; channel <control|memory|latency>", which every analyzer that covers the
-# channel must flag. a case is put after the lane's target line, compiled by
+# "# channel <control|memory|latency>", which every analyzer that covers the
+# channel must flag. a case is put after the lane's target statement, compiled by
 # mirl and linked by mink with test/ct/oracle-<arch>.s, which masc assembles
 # and which calls @probe once with the secret. a finding names the case, the
 # analyzer and the analyzer's report, beside the program in the run's

@@ -58,19 +58,19 @@ lane_of() {
     esac
 }
 
-# the number a case states on its line `; <word> <n>`, `$2` when it states none
+# the number a case states on its line `# <word> <n>`, `$2` when it states none
 stated() {
     local n
-    n=$(sed -n "s/^; $1 \\([0-9][0-9]*\\)\$/\\1/p" "$3" | head -n 1)
+    n=$(sed -n "s/^# $1 \\([0-9][0-9]*\\)\$/\\1/p" "$3" | head -n 1)
     echo "${n:-$2}"
 }
 
-# the word a case states on its line `; <word> <w>`
+# the word a case states on its line `# <word> <w>`
 said() {
-    sed -n "s/^; $1 \\([a-z][a-z]*\\)\$/\\1/p" "$2" | head -n 1
+    sed -n "s/^# $1 \\([a-z][a-z]*\\)\$/\\1/p" "$2" | head -n 1
 }
 
-# build the program `$1`, a module text whose first line is its target line,
+# build the program `$1`, a module text whose first line is its target statement,
 # for the lane `$2` (`lane_of`'s line), linked with the host objects `$3...`.
 # what mirl, masc and mink say lands beside it, and the reason a step refused
 # is on stdout when it does
@@ -83,7 +83,7 @@ program() {
         echo "mirl emit refuses it: $(cat "$at.emit")"
         return 1
     fi
-    if ! "$mink" link "$at.o" "$@" -o "$at" --kind static --format "$format" --arch "$arch" --system "$system" --env "$env" 2>"$at.link"; then
+    if ! "$mink" link "$at.o" "$@" -o "$at" --kind static --format "$format" --arch "$arch" --sys "$system" --env "$env" 2>"$at.link"; then
         echo "the link is refused: $(cat "$at.link")"
         return 1
     fi
@@ -94,12 +94,12 @@ program() {
 assemble() {
     local _ arch system env isa abi format
     read -r _ arch system env isa abi format <<<"$2"
-    "$masc" assemble "$1" -t "$arch" --isa "$isa" --abi "$abi" --format "$format" -o "$3"
+    "$masc" assemble "$1" --arch "$arch" --isa "$isa" --abi "$abi" --format "$format" -o "$3"
 }
 
-# the target line of the lane `$1`
+# the target statement of the lane `$1`
 target_line() {
     local _ arch system env isa abi format
     read -r _ arch system env isa abi format <<<"$1"
-    printf 'target "%s" "%s" "%s" "%s" "%s"\n' "$arch" "$system" "$env" "$abi" "$isa"
+    printf 'target { arch: "%s", sys: "%s", env: "%s", abi: "%s", isa: "%s" };\n' "$arch" "$system" "$env" "$abi" "$isa"
 }
