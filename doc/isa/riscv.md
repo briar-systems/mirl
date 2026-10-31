@@ -70,7 +70,7 @@ Where an extension is absent the rule for its row is dropped and a base form sta
 
 The declared operations are in `declared.mach`, each with the job that closes it. Every opcode of the ir has a rule, is declared, or is a float operation the helpers legalisation takes out on every build because no format the target holds computes it natively, and only one of them.
 
-- Vector operations. Without `v` the target holds vectors in no register and they are scalarised, and under `v` the table holds them in the vector registers but has no rule for them yet (vectorisation, #72).
+- Vector operations. The vector legalisation takes every vector lane by lane, without `v` since the target holds vectors in no register, and under `v` since the unit's lanes are not packed until the table has rules for them (#469).
 - `frem`, which no instruction does. The helpers legalisation calls the helper of its format in its place, since the RISC-V rows state no native `frem`, so it is not declared.
 - `mem.copy` and `mem.fill`, which no instruction does. The helpers legalisation turns each into a call of a helper, or a kept fill into a loop of kept stores, before selection (see [target](../ir/target.md)).
 - A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
