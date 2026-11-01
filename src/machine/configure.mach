@@ -10,8 +10,11 @@
 # one whose state its operands decide leaves it unknown. a part of the
 # establishing instruction the set leaves to a scratch register takes an
 # allowed register the convention clobbers or the frame saves that holds no
-# value there. every other instruction is copied, and the call frame facts and
-# origins follow the instructions they name.
+# value there. where none is free, an allowed register of the stack
+# pointer's class the part admits is saved to one of the frame's emergency
+# slots before the establishing instruction and restored after it. every
+# other instruction is copied, and the call frame facts and origins follow
+# the instructions they name.
 #
 # nothing here names a set: the establishing row and its parts are the set's
 # StateRules, read as data, and the states are masc's.
@@ -39,9 +42,14 @@ use mirl.machine.alloc.live.Segment;
 use mirl.machine.alloc.location;
 use mirl.machine.alloc.location.Locations;
 use mirl.machine.class.Physical;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Admitted;
+use mirl.machine.frame.code.Emit;
+use mirl.machine.frame.code.Refusal;
 use mirl.machine.frame.record;
 use mirl.machine.frame.record.Fact;
 use mirl.machine.frame.record.Framed;
+use mirl.machine.frame.scavenge;
 use mirl.machine.function;
 use mirl.machine.function.Function;
 use mirl.machine.instruction;
@@ -95,17 +103,21 @@ pub rec StateRules {
 # clobbered: the registers a call clobbers, which a function writes freely
 # allowed:   the locations the allocator was allowed to assign
 # rules:     how the set establishes its state, nil for a set with none
+# code:      the target's frame code bound to the selection, which saves and
+#            restores a register scavenged for a scratch
 pub rec Request {
     at:        *Locations;
     context:   *core_state.Context;
     clobbered: Slice[rf.Id];
     allowed:   Slice[Physical];
     rules:     *StateRules;
+    code:      *Admitted;
 }
 
 # why a state was not established
 # ---
-# scratch: an instruction before which no candidate register is free
+# scratch: an instruction before which no candidate register is free and
+#          none is left to scavenge through the frame's emergency slots
 # shape:   the rules state a part their row's operand does not admit, or
 #          parts of another count than its operands
 # hooks:   an instruction states a state of a set with no configuration hooks
@@ -128,12 +140,15 @@ pub rec Refused {
 # unlocated: a register the locations do not hold
 # made:      the function's maker refused an instruction or a block
 # state:     an instruction's state was refused
+# code:      the frame code refused the save or restore of a scavenged
+#            register
 pub tag Error: u8 {
     alloc:     allocator.Error;
     live:      live.Error;
     unlocated: location.Unlocated;
     made:      function.Error;
     state:     Refused;
+    code:      Refusal;
 }
 
 # what one function's insertion works with
@@ -229,25 +244,81 @@ fun scratch(w: *Writer, rr: *mo.Register, at: Instruction) opt[rf.Id] {
     ret opt[rf.Id].none{};
 }
 
+# an allowed register of the stack pointer's class register position `rr`
+# admits that shares storage with none of some others, none when every one
+# does
+fun scavenged(w: *Writer, rr: *mo.Register, others: Slice[rf.Id]) opt[rf.Id] {
+    val stack: rf.Id = w.src.layout.stack;
+    if (stack == rf.NONE) { ret opt[rf.Id].none{}; }
+    var i: usize = 0;
+    for (i < w.r.allowed.size) {
+        val p: Physical = w.r.allowed.data[i];
+        if (sel p.register) {
+            val r: rf.Id = p.register;
+            if (rf.class_of(r) == rf.class_of(stack) && mo.find(rr.classes, rf.class_of(r)) >= 0 && scavenge.apart(w.r.at, r, others)) { ret opt[rf.Id].some{r}; }
+        }
+        i = i + 1;
+    }
+    ret opt[rf.Id].none{};
+}
+
+# the scratch registers the establishing instruction of a set's rules takes
+# ---
+# rules: the rules, nil for a set with none
+# ret:   how many of its parts are scratches
+pub fun scratches(rules: *StateRules) u32 {
+    if (rules == nil) { ret 0; }
+    var n: u32 = 0;
+    var k: u32 = 0;
+    for (k < rules.parts.len) {
+        val part: Part = rules.parts.at[k];
+        if (sel part.scratch) { n = n + 1; }
+        k = k + 1;
+    }
+    ret n;
+}
+
 # the metadata of an instruction the insertion makes, its source position the
 # one of the instruction it stands before
 fun made_for(md: Metadata) Metadata {
     ret Metadata{location: md.location, site: md.site, flags: metadata.NO_FLAGS, secret: false, bindings: metadata.UNBOUND};
 }
 
-# the establishing instruction for state `st` before instruction `at`
+# the establishing instruction for state `st` before instruction `at`, each
+# scratch part a free candidate, or else a register scavenged through the
+# frame's emergency slots, saved before it and restored after it
 fun establish(w: *Writer, b: Block, at: Instruction, d: *InstructionData, st: vstate.State) err[Error] {
     val rules: *StateRules = w.r.rules;
     val row:   *rows.Row   = rules.row;
     if (rules.parts.len != row.operands.len || row.operands.len > rows.MAX_OPERANDS) { ret refuse(at, Reason.shape{}); }
-    var ops: [rows.MAX_OPERANDS]Operand;
-    var k:   u32 = 0;
+    # the fixed parts, then the registers scavenged, which none scavenged may share storage with
+    var others: [rows.MAX_OPERANDS]rf.Id;
+    var fixed:  usize = 0;
+    var k:      u32   = 0;
+    for (k < row.operands.len) {
+        val part: Part = rules.parts.at[k];
+        if (sel part.fixed) {
+            others[fixed] = part.fixed;
+            fixed         = fixed + 1;
+        }
+        k = k + 1;
+    }
+    var taken: usize = 0;
+    var ops:   [rows.MAX_OPERANDS]Operand;
+    k = 0;
     for (k < row.operands.len) {
         val part: Part        = rules.parts.at[k];
         val ro:   *mo.Operand = ?row.operands.at[k];
         if (sel part.scratch) {
             if (!(sel ro.shape.register)) { ret refuse(at, Reason.shape{}); }
-            val free: opt[rf.Id] = scratch(w, ?ro.shape.register, at);
+            var free: opt[rf.Id] = scratch(w, ?ro.shape.register, at);
+            if (sel free.none && taken < w.src.layout.reserved.len) {
+                free = scavenged(w, ?ro.shape.register, Slice[rf.Id]{data: ?others[0], size: fixed + taken});
+                if (sel free.some) {
+                    others[fixed + taken] = free.some;
+                    taken                 = taken + 1;
+                }
+            }
             if (sel free.none) { ret refuse(at, Reason.scratch{}); }
             ops[k] = Operand.physical{Physical.register{free.some}};
         }
@@ -255,8 +326,15 @@ fun establish(w: *Writer, b: Block, at: Instruction, d: *InstructionData, st: vs
         or                  { ops[k] = Operand.immediate{st.config.bits:~i64}; }
         k = k + 1;
     }
+    var e:     Emit         = Emit{admitted: w.r.code, f: w.out, block: b, metadata: made_for(d.metadata), stack: w.src.layout.stack, scratches: code.NO_SCRATCH, scratch: opt[rf.Id].none{}};
+    var saved: Slice[rf.Id] = code.NO_SCRATCH;
+    if (taken > 0) { saved = Slice[rf.Id]{data: ?others[fixed], size: taken}; }
+    val kept: err[Refusal] = scavenge.preserve(?e, ?w.src.layout, saved, false);
+    if (sel kept.err) { ret err[Error].err{Error.code{kept.err}}; }
     val made: res[Instruction, function.Error] = function.append(w.out, b, Opcode.row{row}, Slice[Operand]{data: ?ops[0], size: row.operands.len::usize}, made_for(d.metadata), false, vstate.NONE);
     if (sel made.err) { ret made_err(made.err); }
+    val back: err[Refusal] = scavenge.preserve(?e, ?w.src.layout, saved, true);
+    if (sel back.err) { ret err[Error].err{Error.code{back.err}}; }
     w.current = opt[vstate.State].some{st};
     ret err[Error].ok{};
 }
