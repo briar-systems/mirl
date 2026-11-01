@@ -54,7 +54,7 @@ The frame writes `probe: none`, `page` through a helper, `pair_saves` and `apart
 
 ## The written function
 
-The function is made anew through its maker. The prologue opens the entry block, and an epilogue comes before every exit, a return or a jump to a symbol. A `dynamic` pseudo becomes the size rounded up to the alignment taken off the stack pointer, with the block just above the outgoing area. An `address` pseudo becomes the slot's base plus its offset. A `spill` or `reload` is copied through, a copy of one pair, for the lowering of copies to make the target's store or load of the slot's size under a scratch that liveness shows free there (doc/machine/copy.md). The saves are the same stores and loads at slots the frame adds after the function's own.
+The function is made anew through its maker. The prologue opens the entry block, and an epilogue comes before every exit, a return or a jump to a symbol. A `dynamic` pseudo becomes the size rounded up to the alignment taken off the stack pointer, with the block just above the outgoing area. A `spill`, `reload` or `address` pseudo is copied through, for the lowering of copies to make the target's store or load of the slot's size, or the add of the slot's offset to its base, under a scratch that liveness shows free there (doc/machine/copy.md). The saves are the same stores and loads at slots the frame adds after the function's own.
 
 The instructions come from the target's frame code (`Code`): `add`, `mask`, `sub`, `store` and `load`, each appending rows of masc's catalog. `mirl.target.register.riscv.isa.FRAME` is RISC-V's. Every move is made through `code.make`, which gives the code the first scratch it is offered under which every instruction of the move stands against its row's register constraints, trying each by making the move into a function of its own, and refuses with `Refusal.constrained` when none does (doc/machine/constraint.md).
 
@@ -90,7 +90,7 @@ A frame whose call stack is unwound and that may have a slot that scales (one of
 
 ## Limits
 
-- The RISC-V code refuses an out-of-reach offset where it has no scratch register, as a spill or reload past 2 KiB from its base, or any spill or reload of a v register off its base, where no register of the stack pointer's class is free, and a scaled offset with no temporary.
+- The RISC-V code refuses an out-of-reach offset where it has no scratch register, as a spill, reload or slot address past 2 KiB from its base, or any spill or reload of a v register off its base, where no register of the stack pointer's class is free, and a scaled offset with no temporary.
 - A call frame rule at an offset that scales is refused (`finish.Error.scaled`): mink's frame records state a scaled save only as one offset times a measuring register's value, and a scaled canonical frame address only as expression bytes, which mirl does not spell.
 - An offset scales by one scale, so a frame with slots of two scales, as SME's vector length and streaming vector length, is refused (`scales`).
 - A probe of a dynamic allocation is not written, so `lay` refuses a dynamic allocation under a row that probes.
