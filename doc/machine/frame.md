@@ -95,5 +95,4 @@ A frame whose call stack is unwound and that may have a slot that scales (one of
 - An offset scales by one scale, so a frame with slots of two scales, as SME's vector length and streaming vector length, is refused (`scales`).
 - A probe of a dynamic allocation is not written, so `lay` refuses a dynamic allocation under a row that probes.
 - A pair is two saves the layout already put side by side. The layout does not reorder or widen saves into pairs, so darwin's x19 to x28 and d8 to d15 are described compactly only where they land at the encoding's places, and by call frame information otherwise.
-- RISC-V states no whole register load or store of a register group, since the register file names no group as one register yet.
 - A debug binding or an asm block cannot name a slot yet, so an unnamed slot always leaves the frame.
