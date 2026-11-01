@@ -79,7 +79,7 @@ program() {
     shift 2
     local _ arch system env isa abi format
     read -r _ arch system env isa abi format <<<"$lane"
-    if ! "$mirl" emit "$src" --body --checked --kind object >"$at.o" 2>"$at.emit"; then
+    if ! "$mirl" emit "$src" --body --checked -e object >"$at.o" 2>"$at.emit"; then
         echo "mirl emit refuses it: $(cat "$at.emit")"
         return 1
     fi
