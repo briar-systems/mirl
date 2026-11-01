@@ -51,6 +51,8 @@ The table selects a NEON subset by lane width and by register size, a vector of 
 - `addv`: a sum across the lanes, and `addp` for two lanes, moved to a general register by `umov` or `fmov`.
 - `saddlv` and `uaddlv`: a sum across the lanes of a vector extended to twice their width.
 
+The NEON unit's operation rows (`AARCH64_OPERATIONS`) state what the table selects on its own, so the vector legalisation leaves those packed and takes every other lane by lane. An extension and a shuffle are selected only inside the patterns above, so the unit states no row of them and the legalisation takes them lane by lane, which the patterns then do not match until the table selects them on their own (#468).
+
 ## Cost
 
 A cost is two for each instruction an expansion emits, with a multiply counting three, a divide twelve and a loop twelve. It is one less for each instruction the pattern covers and one less when the rule takes its constant operand as an immediate.
@@ -59,7 +61,7 @@ A cost is two for each instruction an expansion emits, with a multiply counting 
 
 The declared operations are in `declared.mach`, each with the job that closes it.
 
-- Vector operations beyond the subset: `vbuild`, `vextract` and `vinsert`, whose lane is an immediate no source reads, a shuffle other than the high half a widening multiply takes, and every reduction but a sum (vectorisation, #72). A select of vectors and a vector of a lane count no arrangement holds are refused naming the instruction.
+- Vector operations beyond the subset: `vbuild`, `vextract`, `vinsert`, a shuffle and every reduction but a sum, which no row of the NEON unit states, so the vector legalisation takes them lane by lane (#468). A vector of a lane count no arrangement holds is refused naming the instruction.
 - `frem`, `mem.copy`, `mem.fill` and the wide division, which the helpers legalisation takes out on every build, since AArch64 states none natively.
 - A call and a return, `ptr.member`, `ptr.index`, a sparse `switch`, `extract` and `insert`, as on RISC-V. A dense `switch` reaches selection indexed, with its cases 0 to its count less one over an x register, and branches through a jump table. `subs` and `b.hs` to the first target test the index against the count, or `movz`, `movk` and the register `subs` do when the count doesn't fit the immediate. `adrp` and `add` form the table's address, which reaches the function's own table under static, pie and pic alike. `add` scales the index to the pointer, then `ldr` loads the entry and `br` jumps through it. Every target begins with the table's landing, `bti j`, where the build holds BTI. A switch on a system with no address model stays a chain.
 
