@@ -246,9 +246,9 @@ decorators
                             the build's, each by the name the target's
                             instruction set gives it, written after its
                             visibility and only when it names one
-  #[align(n)]               a global's alignment
-  #[section(string, name)]  a global's section, its name and its kind by the
-                            name of mink's section kind row
+  #[align(n)]               a global's alignment, or a function's entry's
+  #[section(string, name)]  a global's or a function's section, its name and
+                            its kind by the name of mink's section kind row
   #[tls(model)]             a global is thread-local under the model:
                             general_dynamic, local_dynamic, initial_exec,
                             local_exec
@@ -264,6 +264,9 @@ decorators
                             per entry parameter
   #[volatile] #[kept]       an instruction's flags
   #[bounded] #[checked]
+  #[public]                 a load or an atomic access states the memory it
+                            reads public, where its results do not state it
+                            secret
   #[secret]                 an instruction's metadata states its results
                             secret where its row's secrecy does not, or it has
                             none
@@ -271,9 +274,10 @@ decorators
   `kept` marks a store or a fill whose write no pass may take away (see the
   specification's memory section). `bounded` marks a shift whose count is
   below its operand's width. `checked` marks a division whose zero divisor,
-  signed overflow and quotient that does not fit are tested before it. a
-  reader refuses a decorator mirl does not know on an item it does not
-  apply to.
+  signed overflow and quotient that does not fit are tested before it.
+  `public` and a secret result are how an access states its secrecy, and one
+  with neither is unstated. a reader refuses a decorator mirl does not know
+  on an item it does not apply to.
 
 globals
 

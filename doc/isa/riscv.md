@@ -22,6 +22,20 @@ An integer narrower than the register is held sign extended to the register, as 
 - A float to integer conversion rounds toward zero and saturates, as the ir states, and gives 0 for a nan. `fcvt.w`, `fcvt.wu`, `fcvt.l` and `fcvt.lu` with the `rtz` rounding mode saturate but give the maximum for a nan, so the result is masked with `feq` of the operand with itself, negated to all ones or zero. A destination narrower than 32 bits converts at 32 bits and clamps the result with no branch: a signed one tests the range by adding the half range and comparing unsigned, chooses the minimum or maximum by the sign through a mask, and merges it with `xor` and `and`, and an unsigned one sets every bit where the value is past the range and masks to the width. A condition takes `slt` or `sltu` of the 32 bit result.
 - A kept store selects to a store row that carries the mark. The instructions around it, such as a constant's materialisation, do not.
 
+## Vectors
+
+Under `v` a vector of up to the least VLEN the build's `zvl` extensions allow is held in one `v` register at LMUL 1, lane 0 in the low bits and the bits above it undefined (RVV 1.0, section 4.5). The rules are in `mirl.target.register.riscv.lanes`. A vector length the hardware chooses is never one a fixed-length vector has, so every rule sets its own: it begins with `vsetivli x0, n, vtype`, or `addi` and `vsetvli x0, t, vtype` where `n` does not fit five bits, `n` the vector's lane count, and every vector instruction after it states that vtype, so the configure step finds it in force and inserts nothing (section 6). The vtype is LMUL 1, tail and mask agnostic, with an insert's tail undisturbed and a narrowing's LMUL fractional. No rule is masked.
+
+- A load or a store is `vle` or `vse` at the lane width where the access is aligned to a lane, and `vle8` or `vse8` of the vector's bytes otherwise, since a misaligned element may trap (section 7.3).
+- Integer `add`, `sub`, `mul`, `and`, `or` and `xor` are the `.vv` forms, `neg` is `vrsub.vx` from `x0` and `not` is `vxor.vi` with -1. Float `fadd`, `fsub`, `fmul`, `fdiv`, `fsqrt`, `fminnum` and `fmaxnum` are `vfadd`, `vfsub`, `vfmul`, `vfdiv`, `vfsqrt`, `vfmin` and `vfmax`, `fneg` and `fabs` are `vfsgnjn` and `vfsgnjx` of the operand with itself, and `fma` is `vfmacc` with the addend tied.
+- `ext.s` and `ext.u` are `vsext` and `vzext` by 2, 4 or 8, and `trunc` is `vnsrl.wi` by zero once per halving at LMUL 1/2, 1/4 and 1/8.
+- `vsplat` is `vmv.v.x` or `vfmv.v.f`. `vextract` is `vmv.x.s` or `vfmv.f.s` of lane 0, after `vslidedown` of any other lane. `vinsert` is `vmv.s.x` or `vfmv.s.f` into lane 0 of the vector, tied, or into a temporary that `vslideup` writes into the lane under a vector length of the lane plus one (section 16).
+- A reduction is `vredsum`, `vredand`, `vredor`, `vredxor`, `vredmin`, `vredmax`, `vredminu`, `vredmaxu`, `vfredusum`, `vfredosum`, `vfredmin` or `vfredmax` with its seed in lane 0 of a register: the vector itself for an idempotent operation, and otherwise zero, or negative zero for a float sum, made by `vmv.s.x` and `vfsgnjn`, which is mirl's choice of identity. `vfredosum` adds in lane order from the seed as `reduce.fadd.seq` does (section 14.3). A reduction of one lane is that lane.
+- A reinterpretation between two vectors and a declassification is `vmv1r.v`, and one between a vector and an integer or float of its size is `vmv.x.s`, `vmv.s.x`, `vfmv.f.s` or `vfmv.s.f` at an element as wide as both.
+- A splat, an extract, an insert and a reduction of 64-bit integers move a lane through a general register, so the unit packs them on RV64 alone.
+
+The V unit holds no mask yet (`masks` is `none`), so a comparison and a select of vectors are taken lane by lane.
+
 ## Calls, returns and addresses
 
 The abi legalisation puts every call, entry and return in piece form before selection, and the engine places the pieces (see [selection](../machine/select.md)). The table supplies the forms.
@@ -70,7 +84,7 @@ Where an extension is absent the rule for its row is dropped and a base form sta
 
 The declared operations are in `declared.mach`, each with the job that closes it. Every opcode of the ir has a rule, is declared, or is a float operation the helpers legalisation takes out on every build because no format the target holds computes it natively, and only one of them.
 
-- Vector operations. The vector legalisation takes every vector lane by lane, without `v` since the target holds vectors in no register, and under `v` since the unit's lanes are not packed until the table has rules for them (#469).
+- `vbuild` and `vshuffle`, which RVV makes only from a vector of indices (`vrgather`) that no rule builds, the product reductions, which RVV has no instruction for, and `reduce.fmin` and `reduce.fmax`, since `vfredmin` and `vfredmax` give the other operand for a NaN where the IR's IEEE minimum and maximum give a NaN. The V unit states no row of them, so the vector legalisation takes them lane by lane. Without `v` the target holds vectors in no register and takes every vector lane by lane.
 - `frem`, which no instruction does. The helpers legalisation calls the helper of its format in its place, since the RISC-V rows state no native `frem`, so it is not declared.
 - `mem.copy` and `mem.fill`, which no instruction does. The helpers legalisation turns each into a call of a helper, or a kept fill into a loop of kept stores, before selection (see [target](../ir/target.md)).
 - A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
