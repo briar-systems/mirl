@@ -246,9 +246,9 @@ decorators
                             the build's, each by the name the target's
                             instruction set gives it, written after its
                             visibility and only when it names one
-  #[align(n)]               a global's alignment
-  #[section(string, name)]  a global's section, its name and its kind by the
-                            name of mink's section kind row
+  #[align(n)]               a global's alignment, or a function's entry's
+  #[section(string, name)]  a global's or a function's section, its name and
+                            its kind by the name of mink's section kind row
   #[tls(model)]             a global is thread-local under the model:
                             general_dynamic, local_dynamic, initial_exec,
                             local_exec

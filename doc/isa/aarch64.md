@@ -44,14 +44,22 @@ A compare and exchange of two words, which the wide legalisation makes of a 128-
 
 ## Vectors
 
-The table selects a NEON subset by lane width and by register size, a vector of at most 64 bits in a 64-bit arrangement and one of 128 in a 128-bit arrangement: integer `add`, `sub`, `mul`, `and`, `orr`, `eor`, `not` and `neg`, float `fadd`, `fsub`, `fmul`, `fdiv`, `fneg`, `fabs` and `fsqrt`, a splat by `dup`, and loads and stores of 16, 32, 64 and 128 bits. It selects these directly:
+The table selects NEON by lane width and by register size, a vector of at most 64 bits in a 64-bit arrangement and one of 128 in a 128-bit arrangement: integer `add`, `sub`, `mul`, `and`, `orr`, `eor`, `not` and `neg`, float `fadd`, `fsub`, `fmul`, `fdiv`, `fneg`, `fabs` and `fsqrt`, a splat by `dup`, and loads and stores of 16, 32, 64 and 128 bits. A vector narrower than its register leaves the bytes above it undefined, so no rule reads a lane past the vector's. It selects these directly:
 
 - `smull` and `umull`: the product of two extensions of 64-bit vectors to twice their width, and `smull2` and `umull2` of the high halves of 128-bit vectors taken by a shuffle.
 - `smlal`, `umlal`, `smlal2` and `umlal2`: a sum of a value and such a product, the accumulator tied.
 - `addv`: a sum across the lanes, and `addp` for two lanes, moved to a general register by `umov` or `fmov`.
 - `saddlv` and `uaddlv`: a sum across the lanes of a vector extended to twice their width.
+- `sxtl` and `uxtl` (`sshll` and `ushll` by zero): an extension of each lane to twice its width, and `sxtl2` and `uxtl2` of the high half of a 128-bit vector a shuffle takes.
 
-The NEON unit's operation rows (`AARCH64_OPERATIONS`) state what the table selects on its own, so the vector legalisation leaves those packed and takes every other lane by lane. An extension and a shuffle are selected only inside the patterns above, so the unit states no row of them and the legalisation takes them lane by lane, which the patterns then do not match until the table selects them on their own (#468).
+The lane rules are in `mirl.target.register.aarch64.lanes`. A lane's index and a shuffle's lanes are the root's immediates, which computed sources turn into the immediates of the instructions.
+
+- `vextract` is `umov` to a general register, or the scalar `dup` of a float lane. `vinsert` is `ins`, the vector tied. `vbuild` is `dup` of the first lane and `ins` of each other.
+- `vshuffle` is `dup` by lane for a broadcast, `ext` for consecutive lanes of one operand or of the two joined, `zip1`, `zip2`, `uzp1`, `uzp2`, `trn1` and `trn2` for those permutations of two whole vectors, and `rev16`, `rev32` and `rev64` for a reversal within groups. Any other is `tbl` on one operand and `tbx` on the other, by selectors built in a general register by `movz` and `movk` and moved across.
+- An integer reduction is `addv`, `smaxv`, `sminv`, `umaxv` or `uminv` where NEON has one, the pairwise form for two 32-bit lanes, and otherwise a tree that folds the upper half of what is left onto the lower by `ext`. A reduction of two doublewords NEON has no form for is taken in the general registers, a minimum or maximum by `cmp` and `csel`.
+- A reassociable float sum is `faddp`. A sequential one adds the lanes in order, `faddp` giving the first lane plus the second as `fadd` does. A float product of either order is `fmul` by element, lane after lane. A float minimum or maximum is `fminp`, `fmaxp`, `fminv` or `fmaxv`, which combine as `fmin` and `fmax` do.
+
+The NEON unit's operation rows (`AARCH64_OPERATIONS`) state what the table selects on its own, so the vector legalisation leaves those packed and takes every other lane by lane.
 
 ## Cost
 
@@ -61,7 +69,7 @@ A cost is two for each instruction an expansion emits, with a multiply counting 
 
 The declared operations are in `declared.mach`, each with the job that closes it.
 
-- Vector operations beyond the subset: `vbuild`, `vextract`, `vinsert`, a shuffle and every reduction but a sum, which no row of the NEON unit states, so the vector legalisation takes them lane by lane (#468). A vector of a lane count no arrangement holds is refused naming the instruction.
+- `reduce.fminnum` and `reduce.fmaxnum`: `fminnmv` and `fmaxnmv` give a NaN for a signalling NaN lane where the IR's opcodes give the other operand, so no row of the NEON unit states them and the vector legalisation takes them lane by lane. A vector of a lane count no arrangement holds is refused naming the instruction.
 - `frem`, `mem.copy`, `mem.fill` and the wide division, which the helpers legalisation takes out on every build, since AArch64 states none natively.
 - A call and a return, `ptr.member`, `ptr.index`, a sparse `switch`, `extract` and `insert`, as on RISC-V. A dense `switch` reaches selection indexed, with its cases 0 to its count less one over an x register, and branches through a jump table. `subs` and `b.hs` to the first target test the index against the count, or `movz`, `movk` and the register `subs` do when the count doesn't fit the immediate. `adrp` and `add` form the table's address, which reaches the function's own table under static, pie and pic alike. `add` scales the index to the pointer, then `ldr` loads the entry and `br` jumps through it. Every target begins with the table's landing, `bti j`, where the build holds BTI. A switch on a system with no address model stays a chain.
 
