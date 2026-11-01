@@ -252,6 +252,8 @@ decorators
   #[tls(model)]             a global is thread-local under the model:
                             general_dynamic, local_dynamic, initial_exec,
                             local_exec
+  #[debug(name)]            the debug variable a global is, by its name in
+                            the debug table, a variable with no parameter
   #[secret([o, n], ...)]    the byte ranges of a global that are secret, each
                             its offset and length, at least one, ascending and
                             none overlapping or touching the one before it
