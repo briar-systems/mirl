@@ -1,17 +1,26 @@
-# the frame slots a function reads that a constant-time caller may pass it secrets past
+# the frame slots a function reads that its own walk or a constant-time caller's may take a secret past
 #
-# a callee's walk follows the stores it makes to its own frame, below its
-# caller's stack pointer, so a read of a slot holds what the callee stored
-# there. three things break that, and a slot any of them reaches is not
-# readable: its address escaping, as an operand of anything but a load's or a
-# store's address or the base of a `ptr.add`, `ptr.member` or `ptr.index`,
-# since then another party may write it unseen; a secret offset moving its
-# address, a secret address as any other; and a read no whole store reaches
-# on some path from the entry, which reads stale stack an earlier frame may
-# have left a secret in, while the walk seeds no frame memory. the last is a
-# backward problem over the graph view: a load of a slot no store of the
-# block covers before it reads it, a store of the slot's whole type at its
-# own address writes it, and a slot live into the entry is read stale.
+# a function's walk follows the stores it makes to its own frame, below its
+# caller's stack pointer, so a read of a slot holds what the function stored
+# there. three things break that. a slot whose address escapes, as an operand
+# of anything but a load's or a store's address or the base of a `ptr.add`,
+# `ptr.member` or `ptr.index`, may be written by another party unseen, and a
+# secret offset moving its address is a secret address as any other: those
+# slots are escaped. a read no store reaches on some path from the entry reads
+# stale stack an earlier frame may have left a secret in, while the walk seeds
+# no frame memory: that slot is stale. a slot either reaches is not readable,
+# so a callee reading one may read its caller's secrets, and a constant-time
+# function whose own frame has a stale slot is refused, as its walk takes the
+# stale read as public.
+#
+# the stale part is a backward problem over the graph view, of the parts of
+# each slot that is not escaped: the members of a structure and the elements
+# of an array of at most `MOST`, one part for any other slot. a store of the
+# slot's whole type at its own address writes every part, a store of a part's
+# type at the part's own `ptr.member` or constant `ptr.index` of the slot
+# writes that part, as a front end writes a literal member by member, and a
+# load of a part's type there reads that part, any other load of the slot
+# reading every part. a part live into the entry is read stale.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -26,6 +35,7 @@ use std.collections.slice.Slice;
 use std.collections.vector;
 
 use mirl.base.slice;
+use secret_globals: mirl.ct.global;
 use mirl.ir.cfg.flow;
 use mirl.ir.cfg.graph;
 use mirl.ir.cfg.graph.Graph;
@@ -45,14 +55,19 @@ use types: mirl.ir.type;
 use mirl.ir.type.Type;
 use mirl.ir.value.Def;
 
-# the slots of one function, one bit per instruction of its body, set where the
-# instruction is an alloca whose slot is not readable
+# the most elements an array slot is split into parts by, a larger one being one part
+pub val MOST: u32 = 1024;
+
+# the slots of one function, one bit per instruction of its body in each set, set where the instruction is an alloca
+# whose slot is so. a slot of either set is not readable
 # ---
-# words: the words of the set
-# bad:   the set
+# words:   the words of each set
+# escaped: the slots whose address escapes or a secret offset moves
+# stale:   the slots not escaped that some path from the entry reads before any store writes them
 pub rec Slots {
-    words: u32;
-    bad:   vector.Vector[u64];
+    words:   u32;
+    escaped: vector.Vector[u64];
+    stale:   vector.Vector[u64];
 }
 
 # the alloca address `v` of body `b` is formed from and whether every offset
@@ -60,6 +75,34 @@ pub rec Slots {
 rec Traced {
     slot:   u32;
     public: bool;
+}
+
+# a part of a slot and the type it holds
+rec Piece {
+    at: u32;
+    ty: Type;
+}
+
+# what of its slot an address reaches
+# ---
+# whole:   the slot's own address
+# part:    the address of one part, its own `ptr.member` or constant `ptr.index` of the slot
+# unknown: any other address of the slot
+tag Reach: u8 {
+    whole;
+    part: Piece;
+    unknown;
+}
+
+# the parts of every slot of a body, the first bit of each alloca's and their count, by instruction
+# ---
+# words: the words of a block's set of parts
+# first: the first part of each alloca
+# count: the parts of each alloca, none for any other instruction
+rec Parts {
+    words: u32;
+    first: vector.Vector[u32];
+    count: vector.Vector[u32];
 }
 
 fun bit(s: *vector.Vector[u64], base: usize, n: u32) bool {
@@ -98,24 +141,152 @@ fun traced(b: *Body, v: Value) opt[Traced] {
     ret opt[Traced].none{};
 }
 
-# the type alloca `slot` allocates, none where its immediate states none
-fun allocated(b: *Body, slot: u32) opt[Type] {
-    val d: *InstructionData = ?b.instructions.data[slot::usize];
-    if (d.immediates.len == 0) { ret opt[Type].none{}; }
-    val imm: Immediate = d.immediates.data[0];
+# the type immediate `i` of instruction `d` holds, none for none
+fun type_at(d: *InstructionData, i: usize) opt[Type] {
+    if (i >= d.immediates.len) { ret opt[Type].none{}; }
+    val imm: Immediate = d.immediates.data[i];
     if (sel imm.ty) { ret opt[Type].some{imm.ty}; }
     ret opt[Type].none{};
 }
 
-# whether store `d` writes the whole of `slot`, at its own address, a value of its type
-fun covers(b: *Body, d: *InstructionData, slot: u32) bool {
-    if (d.operands.len < 2) { ret false; }
-    val def: Def = b.values.data[d.operands.data[0].index].def;
-    if (!(sel def.result))                    { ret false; }
-    if (def.result.instruction.index != slot) { ret false; }
+# the type alloca `slot` allocates, none where its immediate states none
+fun allocated(b: *Body, slot: u32) opt[Type] {
+    ret type_at(?b.instructions.data[slot::usize], 0);
+}
+
+# the parts a slot of type `ty` is split into: a structure's members and an array's elements, up to `MOST`, and 0 for
+# a slot that is one part
+fun split(m: *Module, ty: opt[Type]) u32 {
+    if (sel ty.none) { ret 0; }
+    val k: res[types.Kind, types.Error] = types.kind(?m.types, ty.some);
+    if (sel k.err) { ret 0; }
+    if (sel k.ok.structure) {
+        val list: res[Slice[Type], types.Error] = types.members(?m.types, ty.some);
+        if (sel list.err)               { ret 0; }
+        if (list.ok.size > MOST::usize) { ret 0; }
+        ret list.ok.size::u32;
+    }
+    if (sel k.ok.array) {
+        val n: res[u64, types.Error] = types.count(?m.types, ty.some);
+        if (sel n.err)        { ret 0; }
+        if (n.ok > MOST::u64) { ret 0; }
+        ret n.ok::u32;
+    }
+    ret 0;
+}
+
+# the type part `at` of a slot of type `ty` holds, none where it states none
+fun part_type(m: *Module, ty: Type, at: u32) opt[Type] {
+    val k: res[types.Kind, types.Error] = types.kind(?m.types, ty);
+    if (sel k.err) { ret opt[Type].none{}; }
+    if (sel k.ok.structure) {
+        val list: res[Slice[Type], types.Error] = types.members(?m.types, ty);
+        if (sel list.err)              { ret opt[Type].none{}; }
+        if (at::usize >= list.ok.size) { ret opt[Type].none{}; }
+        ret opt[Type].some{list.ok.data[at::usize]};
+    }
+    val e: res[Type, types.Error] = types.element(?m.types, ty);
+    if (sel e.err) { ret opt[Type].none{}; }
+    ret opt[Type].some{e.ok};
+}
+
+# what of `slot` address `v` of body `b` reaches
+fun reach(m: *Module, b: *Body, v: Value, slot: u32) Reach {
+    val def: Def = b.values.data[v.index].def;
+    if (!(sel def.result))                    { ret Reach.unknown{}; }
+    if (def.result.instruction.index == slot) { ret Reach.whole{}; }
+    val d: *InstructionData = ?b.instructions.data[def.result.instruction.index];
+    if (d.operands.len == 0) { ret Reach.unknown{}; }
+    val base: Def = b.values.data[d.operands.data[0].index].def;
+    if (!(sel base.result))                    { ret Reach.unknown{}; }
+    if (base.result.instruction.index != slot) { ret Reach.unknown{}; }
     val ty: opt[Type] = allocated(b, slot);
-    if (sel ty.none) { ret false; }
-    ret types.same(ty.some, b.values.data[d.operands.data[1].index].type);
+    val on: opt[Type] = type_at(d, 0);
+    if (sel ty.none)                   { ret Reach.unknown{}; }
+    if (sel on.none)                   { ret Reach.unknown{}; }
+    if (!types.same(ty.some, on.some)) { ret Reach.unknown{}; }
+    val parts: u32 = split(m, ty);
+    var at:    i64 = -1;
+    if (d.opcode.index == opcode.PTR_MEMBER.index && d.immediates.len > 1) {
+        val imm: Immediate = d.immediates.data[1];
+        if (sel imm.member) { at = imm.member::i64; }
+    }
+    or (d.opcode.index == opcode.PTR_INDEX.index && d.operands.len == 2) {
+        val index: opt[i64] = secret_globals.constant_of(m, b, d.operands.data[1]);
+        if (sel index.some) { at = index.some; }
+    }
+    if (at < 0 || at >= parts::i64) { ret Reach.unknown{}; }
+    val held: opt[Type] = part_type(m, ty.some, at::u32);
+    if (sel held.none) { ret Reach.unknown{}; }
+    ret Reach.part{Piece{at: at::u32, ty: held.some}};
+}
+
+# the parts of every alloca of body `b` of `m`, or the allocator's refusal
+fun parts_of(a: *allocator.Allocator, m: *Module, b: *Body, p: *Parts) err[allocator.Error] {
+    var failed: err[allocator.Error] = slice.fill[u32](?p.first, b.instructions.len, 0);
+    if (!(sel failed.err)) { failed = slice.fill[u32](?p.count, b.instructions.len, 0); }
+    if (sel failed.err)    { ret failed; }
+    var total: u32   = 0;
+    var k:     usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            val list: *vector.Vector[Instruction] = ?b.blocks.data[k].instructions;
+            var i:    usize                       = 0;
+            for (i < list.len) {
+                val n: u32 = list.data[i].index;
+                if (b.instructions.data[n].opcode.index == opcode.ALLOCA.index) {
+                    var parts: u32 = split(m, allocated(b, n));
+                    if (parts == 0) { parts = 1; }
+                    p.first.data[n] = total;
+                    p.count.data[n] = parts;
+                    total           = total + parts;
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    p.words = (total + 63) / 64;
+    ret err[allocator.Error].ok{};
+}
+
+# a read of `slot` through `v` by load `d` at block set `base`: each part it reads that the block has not written yet
+fun read(m: *Module, b: *Body, p: *Parts, d: *InstructionData, v: Value, slot: u32, base: usize, gen: *vector.Vector[u64], kill: *vector.Vector[u64]) {
+    val first: u32   = p.first.data[slot::usize];
+    val r:     Reach = reach(m, b, v, slot);
+    if (sel r.part) {
+        if (d.results.len > 0 && types.same(r.part.ty, b.values.data[d.results.data[0].index].type)) {
+            if (!bit(kill, base, first + r.part.at)) { set(gen, base, first + r.part.at); }
+            ret;
+        }
+    }
+    var n: u32 = 0;
+    for (n < p.count.data[slot::usize]) {
+        if (!bit(kill, base, first + n)) { set(gen, base, first + n); }
+        n = n + 1;
+    }
+}
+
+# a write of `slot` through `v` by store `d` at block set `base`: every part a store of the whole slot writes, or the
+# one part a store of its type at its own address writes
+fun wrote(m: *Module, b: *Body, p: *Parts, d: *InstructionData, v: Value, slot: u32, base: usize, kill: *vector.Vector[u64]) {
+    if (d.operands.len < 2) { ret; }
+    val first: u32   = p.first.data[slot::usize];
+    val held:  Type  = b.values.data[d.operands.data[1].index].type;
+    val r:     Reach = reach(m, b, v, slot);
+    if (sel r.whole) {
+        val ty: opt[Type] = allocated(b, slot);
+        if (sel ty.none)                { ret; }
+        if (!types.same(ty.some, held)) { ret; }
+        var n: u32 = 0;
+        for (n < p.count.data[slot::usize]) {
+            set(kill, base, first + n);
+            n = n + 1;
+        }
+    }
+    or (sel r.part) {
+        if (types.same(r.part.ty, held)) { set(kill, base, first + r.part.at); }
+    }
 }
 
 # whether operand `k` of `d` is a use of a slot's address that keeps it within the body
@@ -126,13 +297,13 @@ fun kept(d: *InstructionData, row: *Row, k: usize) bool {
     ret sel row.operands[k].role.address;
 }
 
-# mark every slot an escaping or secretly moved address reaches, and gather each
-# block's stale reads and whole stores
-fun scan(b: *Body, words: u32, bad: *vector.Vector[u64], gen: *vector.Vector[u64], kill: *vector.Vector[u64]) {
+# mark every slot an escaping or secretly moved address reaches, and gather each block's stale reads and writes of
+# the parts of the slots
+fun scan(m: *Module, b: *Body, p: *Parts, escaped: *vector.Vector[u64], gen: *vector.Vector[u64], kill: *vector.Vector[u64]) {
     var k: usize = 0;
     for (k < b.blocks.len) {
         if (!b.blocks.data[k].erased) {
-            val base: usize                       = k * words::usize;
+            val base: usize                       = k * p.words::usize;
             val list: *vector.Vector[Instruction] = ?b.blocks.data[k].instructions;
             var i:    usize                       = 0;
             for (i < list.len) {
@@ -140,14 +311,15 @@ fun scan(b: *Body, words: u32, bad: *vector.Vector[u64], gen: *vector.Vector[u64
                 val row: opt[*Row]        = opcode.at(d.opcode);
                 var j:   usize            = 0;
                 for (j < d.operands.len) {
-                    val t: opt[Traced] = traced(b, d.operands.data[j]);
+                    val v: Value       = d.operands.data[j];
+                    val t: opt[Traced] = traced(b, v);
                     if (sel t.some) {
                         var held: bool = t.some.public;
-                        if (sel row.some)                                                                { held = held && kept(d, row.some, j); }
-                        or                                                                               { held = false; }
-                        if (!held)                                                                       { set(bad, 0, t.some.slot); }
-                        or (d.opcode.index == opcode.LOAD.index && !bit(kill, base, t.some.slot))        { set(gen, base, t.some.slot); }
-                        or (d.opcode.index == opcode.STORE.index && j == 0 && covers(b, d, t.some.slot)) { set(kill, base, t.some.slot); }
+                        if (sel row.some)                                   { held = held && kept(d, row.some, j); }
+                        or                                                  { held = false; }
+                        if (!held)                                          { set(escaped, 0, t.some.slot); }
+                        or (d.opcode.index == opcode.LOAD.index)            { read(m, b, p, d, v, t.some.slot, base, gen, kill); }
+                        or (d.opcode.index == opcode.STORE.index && j == 0) { wrote(m, b, p, d, v, t.some.slot, base, kill); }
                     }
                     j = j + 1;
                 }
@@ -158,7 +330,13 @@ fun scan(b: *Body, words: u32, bad: *vector.Vector[u64], gen: *vector.Vector[u64
     }
 }
 
-# the slots of function `f` of `m` and which of them are not readable
+# give back the storage of a function's slots
+pub fun release(s: *Slots) {
+    vector.dnit[u64](?s.escaped);
+    vector.dnit[u64](?s.stale);
+}
+
+# the slots of function `f` of `m`, which are escaped and which stale
 # ---
 # a:   the allocator the result takes
 # m:   the module
@@ -169,31 +347,36 @@ pub fun of(a: *allocator.Allocator, m: *Module, f: Function) res[Slots, Error] {
     if (sel got.err) { ret res[Slots, Error].err{got.err}; }
     val b:     *Body              = got.ok;
     val words: u32                = (b.instructions.len::u32 + 63) / 64;
-    val size:  usize              = b.blocks.len * words::usize;
-    var s:     Slots              = Slots{words: words, bad: vector.init[u64](a)};
+    var s:     Slots              = Slots{words: words, escaped: vector.init[u64](a), stale: vector.init[u64](a)};
+    var p:     Parts              = Parts{words: 0, first: vector.init[u32](a), count: vector.init[u32](a)};
     var gen:   vector.Vector[u64] = vector.init[u64](a);
     var kill:  vector.Vector[u64] = vector.init[u64](a);
     var into:  vector.Vector[u64] = vector.init[u64](a);
     var out:   vector.Vector[u64] = vector.init[u64](a);
     var order: vector.Vector[u32] = vector.init[u32](a);
     fin {
+        vector.dnit[u32](?p.first);
+        vector.dnit[u32](?p.count);
         vector.dnit[u64](?gen);
         vector.dnit[u64](?kill);
         vector.dnit[u64](?into);
         vector.dnit[u64](?out);
         vector.dnit[u32](?order);
     }
-    var failed: err[allocator.Error] = slice.fill[u64](?s.bad, words::usize, 0);
+    var failed: err[allocator.Error] = parts_of(a, m, b, ?p);
+    val size:   usize                = b.blocks.len * p.words::usize;
+    if (!(sel failed.err)) { failed = slice.fill[u64](?s.escaped, words::usize, 0); }
+    if (!(sel failed.err)) { failed = slice.fill[u64](?s.stale, words::usize, 0); }
     if (!(sel failed.err)) { failed = slice.fill[u64](?gen, size, 0); }
     if (!(sel failed.err)) { failed = slice.fill[u64](?kill, size, 0); }
     if (!(sel failed.err)) { failed = slice.fill[u64](?into, size, 0); }
     if (!(sel failed.err)) { failed = slice.fill[u64](?out, size, 0); }
     if (!(sel failed.err)) { failed = slice.fill[u32](?order, b.blocks.len, 0); }
     if (sel failed.err) {
-        vector.dnit[u64](?s.bad);
+        release(?s);
         ret res[Slots, Error].err{Error.alloc{failed.err}};
     }
-    scan(b, words, ?s.bad, ?gen, ?kill);
+    scan(m, b, ?p, ?s.escaped, ?gen, ?kill);
     var n: usize = 0;
     for (n < b.blocks.len) {
         order.data[n] = n::u32;
@@ -201,23 +384,29 @@ pub fun of(a: *allocator.Allocator, m: *Module, f: Function) res[Slots, Error] {
     }
     val made: res[Graph, Error] = view.of(m, f);
     if (sel made.err) {
-        vector.dnit[u64](?s.bad);
+        release(?s);
         ret res[Slots, Error].err{made.err};
     }
     var g: Graph = made.ok;
-    flow.backward(?g, Slice[u32]{data: order.data, size: order.len}, flow.Sets{words: words, gen: ?gen, kill: ?kill, live_in: ?into, live_out: ?out});
+    flow.backward(?g, Slice[u32]{data: order.data, size: order.len}, flow.Sets{words: p.words, gen: ?gen, kill: ?kill, live_in: ?into, live_out: ?out});
     graph.dnit(?g);
-    var w: usize = 0;
-    for (w < words::usize) {
-        if (b.blocks.len > 0) { s.bad.data[w] = s.bad.data[w] | into.data[w]; }
-        w = w + 1;
+    if (b.blocks.len == 0) { ret res[Slots, Error].ok{s}; }
+    var i: usize = 0;
+    for (i < b.instructions.len) {
+        val slot: u32 = i::u32;
+        if (p.count.data[i] != 0 && !bit(?s.escaped, 0, slot)) {
+            var k: u32 = 0;
+            for (k < p.count.data[i]) {
+                if (bit(?into, 0, p.first.data[i] + k)) {
+                    set(?s.stale, 0, slot);
+                    k = p.count.data[i];
+                }
+                or { k = k + 1; }
+            }
+        }
+        i = i + 1;
     }
     ret res[Slots, Error].ok{s};
-}
-
-# give back the storage of a function's slots
-pub fun release(s: *Slots) {
-    vector.dnit[u64](?s.bad);
 }
 
 # whether address `v` of body `b` reads a readable slot of `s`, at public offsets
@@ -225,5 +414,20 @@ pub fun readable(s: *Slots, b: *Body, v: Value) bool {
     val t: opt[Traced] = traced(b, v);
     if (sel t.none)     { ret false; }
     if (!t.some.public) { ret false; }
-    ret !bit(?s.bad, 0, t.some.slot);
+    ret !bit(?s.escaped, 0, t.some.slot) && !bit(?s.stale, 0, t.some.slot);
+}
+
+# the first alloca of `s` whose slot is stale, by its instruction, none when no slot is
+pub fun stale(s: *Slots) opt[u32] {
+    var w: usize = 0;
+    for (w < s.words::usize) {
+        val word: u64 = s.stale.data[w];
+        if (word != 0) {
+            var n: u32 = 0;
+            for (((word >> n::u64) & 1) == 0) { n = n + 1; }
+            ret opt[u32].some{(w::u32 * 64) + n};
+        }
+        w = w + 1;
+    }
+    ret opt[u32].none{};
 }
