@@ -1,0 +1,1016 @@
+# the aarch64 lane rules: build, shuffle, extract, insert and the reductions
+# beyond a sum, the guards they read and the immediates they compute
+#
+# a vector of 2, 4, 8 or 16 bytes is held in the low bytes of a v register and
+# the bytes above it are undefined, so a rule reads no lane past the vector's
+# and a build or a shuffle may write any. a lane's index and a shuffle's lanes
+# are the root's immediates, which the computed sources turn into the lane
+# immediates of umov, ins and dup, the byte count of ext, and the selector tbl
+# looks each byte of its result up by. a selector is built in a general
+# register by movz and movk and moved across, as the table builds every other
+# constant an expansion needs.
+#
+# a shuffle that is a broadcast of one lane is dup, one that takes consecutive
+# lanes of one operand or of the two joined is ext, the interleavings and
+# deinterleavings of whole vectors are zip, uzp and trn, a reversal within
+# groups is rev16, rev32 or rev64, and any other is tbl on one operand and tbx
+# on the other, so a shuffle of every lane type and count is selected. an
+# integer reduction is addv, smaxv, sminv, umaxv or uminv across the lanes
+# where neon has one, the pairwise form for two lanes of 32 bits, and
+# otherwise a tree that folds the upper half of what is left onto the lower by
+# ext. a reduction of two doublewords that neon has no form for is taken in
+# the general registers. a reassociable float sum is faddp, a float product
+# fmul by element, and a sequential one adds or multiplies the lanes in order,
+# faddp giving the first lane plus the second as fadd does. a float minimum or
+# maximum is fminp or fminv, which combine as fmin and fmax do. fminnm and
+# fmaxnm give a nan for a signalling nan operand where fminnum and fmaxnum
+# give the other operand, so neither reduces packed.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.collections.slice.Slice;
+
+use masc.isa.aarch64.gen_register;
+use masc.isa.aarch64.gen_row;
+
+use mirl.ir.id;
+use mirl.ir.instruction.InstructionData;
+use ir: mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.rule.Class;
+use types: mirl.ir.type;
+use mirl.ir.type.format;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.select.match;
+use mirl.machine.select.rule.Emit;
+use mirl.machine.select.rule.Match;
+use mirl.machine.select.rule.NO_IMPLIED;
+use mirl.machine.select.rule.Node;
+use mirl.machine.select.rule.Ref;
+use mirl.machine.select.rule.Scratch;
+use mirl.machine.select.rule.Slot;
+use mirl.machine.select.rule.Source;
+use mirl.machine.select.rule.Sources;
+use mirl.machine.select.rule.Test;
+use mirl.machine.select.rule.Tie;
+use mirl.machine.select.rule.Width;
+
+# the lanes of a vector: how many and the bits of each, zero for a value
+# that is no vector
+rec Lanes {
+    count: u32;
+    bits:  u32;
+}
+
+fun lanes_of(mt: *Match, v: opt[id.Value]) Lanes {
+    val none: Lanes = Lanes{count: 0, bits: 0};
+    if (sel v.none) { ret none; }
+    val s: res[types.Shape, types.Error] = match.shape(mt, v.some);
+    if (sel s.err) { ret none; }
+    val sh: types.Shape = s.ok;
+    if (!(sel sh.vector)) { ret none; }
+    val e: res[types.Shape, types.Error] = types.shape(?mt.module.types, sh.vector.element);
+    if (sel e.err) { ret none; }
+    val es:   types.Shape = e.ok;
+    var bits: u32         = 0;
+    if (sel es.integer) { bits = es.integer.width; }
+    or (sel es.float) {
+        val r: opt[types.Row] = types.row(es.float.format);
+        if (sel r.none) { ret none; }
+        bits = r.some.width;
+    }
+    ret Lanes{count: sh.vector.lanes, bits: bits};
+}
+
+fun bytes_of(l: Lanes) u64 {
+    ret l.count::u64 * l.bits::u64 / 8;
+}
+
+fun operand_bytes(mt: *Match) u64 {
+    ret bytes_of(lanes_of(mt, match.operand(mt, Slot{node: 0, index: 0})));
+}
+
+fun result_bytes(mt: *Match) u64 {
+    ret bytes_of(lanes_of(mt, match.result(mt, Slot{node: 0, index: 0})));
+}
+
+# the root reads a vector of 2, 4, 8 or 16 bytes
+pub fun operand_2(mt: *Match) bool {
+    ret operand_bytes(mt) == 2;
+}
+
+pub fun operand_4(mt: *Match) bool {
+    ret operand_bytes(mt) == 4;
+}
+
+pub fun operand_8(mt: *Match) bool {
+    ret operand_bytes(mt) == 8;
+}
+
+pub fun operand_16(mt: *Match) bool {
+    ret operand_bytes(mt) == 16;
+}
+
+# the root gives a vector of 2, 4, 8 or 16 bytes
+pub fun result_2(mt: *Match) bool {
+    ret result_bytes(mt) == 2;
+}
+
+pub fun result_4(mt: *Match) bool {
+    ret result_bytes(mt) == 4;
+}
+
+pub fun result_8(mt: *Match) bool {
+    ret result_bytes(mt) == 8;
+}
+
+pub fun result_16(mt: *Match) bool {
+    ret result_bytes(mt) == 16;
+}
+
+fun immediate(x: u64) opt[i64] {
+    ret opt[i64].some{x:~i64};
+}
+
+# the lane the root names, the immediate of umov, ins and dup
+pub fun lane(mt: *Match) opt[i64] {
+    val d: *InstructionData = match.instruction(mt, 0);
+    var i: usize            = 0;
+    for (i < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[i];
+        if (sel imm.lane) { ret immediate(imm.lane::u64); }
+        i = i + 1;
+    }
+    ret opt[i64].none{};
+}
+
+# a shuffle the root states: its lanes, the lanes of each operand and of its
+# result, and the bits of a lane
+rec Shuffle {
+    list:    Slice[u32];
+    inputs:  u32;
+    outputs: u32;
+    bits:    u32;
+}
+
+fun shuffle_of(mt: *Match) opt[Shuffle] {
+    val d:    *InstructionData = match.instruction(mt, 0);
+    var list: Slice[u32]       = Slice[u32]{data: nil, size: 0};
+    var i:    usize            = 0;
+    for (i < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[i];
+        if (sel imm.lanes) { list = imm.lanes; }
+        i = i + 1;
+    }
+    val from: Lanes = lanes_of(mt, match.operand(mt, Slot{node: 0, index: 0}));
+    val to:   Lanes = lanes_of(mt, match.result(mt, Slot{node: 0, index: 0}));
+    if (from.count == 0 || to.count == 0 || to.bits == 0 || to.bits % 8 != 0) { ret opt[Shuffle].none{}; }
+    if (from.bits != to.bits || list.size != to.count::usize)                 { ret opt[Shuffle].none{}; }
+    if (bytes_of(from) > 16 || bytes_of(to) > 16)                             { ret opt[Shuffle].none{}; }
+    ret opt[Shuffle].some{Shuffle{list: list, inputs: from.count, outputs: to.count, bits: to.bits}};
+}
+
+fun input_bytes(s: *Shuffle) u64 {
+    ret s.inputs::u64 * s.bits::u64 / 8;
+}
+
+fun output_bytes(s: *Shuffle) u64 {
+    ret s.outputs::u64 * s.bits::u64 / 8;
+}
+
+# which operand lane i of the result comes from, 0 or 1, and its lane there
+fun side(s: *Shuffle, i: u32) u32 {
+    if (s.list.data[i] < s.inputs) { ret 0; }
+    ret 1;
+}
+
+fun from(s: *Shuffle, i: u32) u32 {
+    val at: u32 = s.list.data[i];
+    if (at < s.inputs) { ret at; }
+    ret at - s.inputs;
+}
+
+# whether a result of this many bytes is written by a 64-bit arrangement
+# (wide false) or needs the 128-bit one (wide true)
+fun fits(bytes: u64, wide: bool) bool {
+    if (wide) { ret bytes > 8; }
+    ret bytes > 0 && bytes <= 8;
+}
+
+# the lane of one operand every lane of the result is, none where the lanes
+# differ or another operand gives one
+fun broadcast(mt: *Match, which: u32) opt[u32] {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret opt[u32].none{}; }
+    val s:  Shuffle = got.some;
+    val at: u32     = from(?s, 0);
+    var i:  u32     = 0;
+    for (i < s.outputs) {
+        if (side(?s, i) != which || from(?s, i) != at) { ret opt[u32].none{}; }
+        i = i + 1;
+    }
+    ret opt[u32].some{at};
+}
+
+fun dup(mt: *Match, which: u32, wide: bool) bool {
+    if (!fits(result_bytes(mt), wide)) { ret false; }
+    val at: opt[u32] = broadcast(mt, which);
+    ret sel at.some;
+}
+
+# a broadcast of a lane of the first or the second operand, into a result of
+# at most 8 bytes or of 16
+pub fun dup_a_8(mt: *Match) bool {
+    ret dup(mt, 0, false);
+}
+
+pub fun dup_a_16(mt: *Match) bool {
+    ret dup(mt, 0, true);
+}
+
+pub fun dup_b_8(mt: *Match) bool {
+    ret dup(mt, 1, false);
+}
+
+pub fun dup_b_16(mt: *Match) bool {
+    ret dup(mt, 1, true);
+}
+
+# the lane dup broadcasts
+pub fun dup_lane_a(mt: *Match) opt[i64] {
+    val at: opt[u32] = broadcast(mt, 0);
+    if (sel at.none) { ret opt[i64].none{}; }
+    ret immediate(at.some::u64);
+}
+
+pub fun dup_lane_b(mt: *Match) opt[i64] {
+    val at: opt[u32] = broadcast(mt, 1);
+    if (sel at.none) { ret opt[i64].none{}; }
+    ret immediate(at.some::u64);
+}
+
+# the first of the consecutive lanes of one operand the result is, none where
+# it is not such a run
+fun run(s: *Shuffle, which: u32) opt[u32] {
+    val at: u32 = from(s, 0);
+    var i:  u32 = 0;
+    for (i < s.outputs) {
+        if (side(s, i) != which || from(s, i) != at + i) { ret opt[u32].none{}; }
+        i = i + 1;
+    }
+    ret opt[u32].some{at};
+}
+
+# a run of one operand's lanes moved to the bottom by ext of the operand with
+# itself, in the 64-bit form for an operand of at most 8 bytes and the 128-bit
+# one for 16. the run lies within the operand, so ext reads no undefined byte
+fun ext_one(mt: *Match, which: u32, wide: bool) bool {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret false; }
+    val s: Shuffle = got.some;
+    if (!fits(input_bytes(?s), wide)) { ret false; }
+    val at: opt[u32] = run(?s, which);
+    ret sel at.some;
+}
+
+pub fun ext_a_8(mt: *Match) bool {
+    ret ext_one(mt, 0, false);
+}
+
+pub fun ext_a_16(mt: *Match) bool {
+    ret ext_one(mt, 0, true);
+}
+
+pub fun ext_b_8(mt: *Match) bool {
+    ret ext_one(mt, 1, false);
+}
+
+pub fun ext_b_16(mt: *Match) bool {
+    ret ext_one(mt, 1, true);
+}
+
+fun ext_bytes(mt: *Match, which: u32) opt[i64] {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret opt[i64].none{}; }
+    val s:  Shuffle  = got.some;
+    val at: opt[u32] = run(?s, which);
+    if (sel at.none) { ret opt[i64].none{}; }
+    ret immediate((at.some * s.bits / 8)::u64);
+}
+
+# the bytes ext moves the run down by
+pub fun ext_a_bytes(mt: *Match) opt[i64] {
+    ret ext_bytes(mt, 0);
+}
+
+pub fun ext_b_bytes(mt: *Match) opt[i64] {
+    ret ext_bytes(mt, 1);
+}
+
+# the first of the consecutive lanes of the two operands joined the result
+# is, operands of exactly 8 or 16 bytes, so ext of the two in the form of
+# that size joins them as the shuffle does
+fun span(mt: *Match, bytes: u64) opt[u32] {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret opt[u32].none{}; }
+    val s: Shuffle = got.some;
+    if (input_bytes(?s) != bytes || output_bytes(?s) > bytes) { ret opt[u32].none{}; }
+    val at: u32 = s.list.data[0];
+    var i:  u32 = 0;
+    for (i < s.outputs) {
+        if (s.list.data[i] != at + i) { ret opt[u32].none{}; }
+        i = i + 1;
+    }
+    ret opt[u32].some{at * s.bits / 8};
+}
+
+pub fun ext_ab_8(mt: *Match) bool {
+    val at: opt[u32] = span(mt, 8);
+    ret sel at.some;
+}
+
+pub fun ext_ab_16(mt: *Match) bool {
+    val at: opt[u32] = span(mt, 16);
+    ret sel at.some;
+}
+
+pub fun ext_ab_bytes(mt: *Match) opt[i64] {
+    val low: opt[u32] = span(mt, 8);
+    if (sel low.some) { ret immediate(low.some::u64); }
+    val high: opt[u32] = span(mt, 16);
+    if (sel high.none) { ret opt[i64].none{}; }
+    ret immediate(high.some::u64);
+}
+
+# the lane of the two operands joined that lane i of a zip1, zip2, uzp1,
+# uzp2, trn1 or trn2 of operands of n lanes gives
+fun permuted(kind: u32, i: u32, n: u32) u32 {
+    val even: bool = i % 2 == 0;
+    if (kind == 0) {
+        if (even) { ret i / 2; }
+        ret n + i / 2;
+    }
+    if (kind == 1) {
+        if (even) { ret n / 2 + i / 2; }
+        ret n + n / 2 + i / 2;
+    }
+    if (kind == 2) { ret 2 * i; }
+    if (kind == 3) { ret 2 * i + 1; }
+    if (kind == 4) {
+        if (even) { ret i; }
+        ret n + i - 1;
+    }
+    if (even) { ret i + 1; }
+    ret n + i;
+}
+
+# a shuffle of two vectors of exactly 8 or 16 bytes into one of the same
+# type, lane for lane the permutation `kind` gives
+fun perm(mt: *Match, kind: u32, bytes: u64) bool {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret false; }
+    val s: Shuffle = got.some;
+    if (s.outputs != s.inputs || s.inputs < 2 || input_bytes(?s) != bytes) { ret false; }
+    var i: u32 = 0;
+    for (i < s.outputs) {
+        if (s.list.data[i] != permuted(kind, i, s.inputs)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun zip1_8(mt: *Match) bool {
+    ret perm(mt, 0, 8);
+}
+
+pub fun zip1_16(mt: *Match) bool {
+    ret perm(mt, 0, 16);
+}
+
+pub fun zip2_8(mt: *Match) bool {
+    ret perm(mt, 1, 8);
+}
+
+pub fun zip2_16(mt: *Match) bool {
+    ret perm(mt, 1, 16);
+}
+
+pub fun uzp1_8(mt: *Match) bool {
+    ret perm(mt, 2, 8);
+}
+
+pub fun uzp1_16(mt: *Match) bool {
+    ret perm(mt, 2, 16);
+}
+
+pub fun uzp2_8(mt: *Match) bool {
+    ret perm(mt, 3, 8);
+}
+
+pub fun uzp2_16(mt: *Match) bool {
+    ret perm(mt, 3, 16);
+}
+
+pub fun trn1_8(mt: *Match) bool {
+    ret perm(mt, 4, 8);
+}
+
+pub fun trn1_16(mt: *Match) bool {
+    ret perm(mt, 4, 16);
+}
+
+pub fun trn2_8(mt: *Match) bool {
+    ret perm(mt, 5, 8);
+}
+
+pub fun trn2_16(mt: *Match) bool {
+    ret perm(mt, 5, 16);
+}
+
+# a reversal of the first operand's lanes within each group of `group` bytes,
+# in the 64-bit form for an operand of at most 8 bytes and the 128-bit one
+# for 16, each lane of the result one the operand holds
+fun reversed(mt: *Match, group: u32, wide: bool) bool {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret false; }
+    val s: Shuffle = got.some;
+    if (!fits(input_bytes(?s), wide) || !fits(output_bytes(?s), wide)) { ret false; }
+    val per: u32 = group * 8 / s.bits;
+    if (per < 2) { ret false; }
+    var i: u32 = 0;
+    for (i < s.outputs) {
+        val want: u32 = i / per * per + (per - 1 - i % per);
+        if (want >= s.inputs || s.list.data[i] != want) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun rev16_8(mt: *Match) bool {
+    ret reversed(mt, 2, false);
+}
+
+pub fun rev16_16(mt: *Match) bool {
+    ret reversed(mt, 2, true);
+}
+
+pub fun rev32_8(mt: *Match) bool {
+    ret reversed(mt, 4, false);
+}
+
+pub fun rev32_16(mt: *Match) bool {
+    ret reversed(mt, 4, true);
+}
+
+pub fun rev64_8(mt: *Match) bool {
+    ret reversed(mt, 8, false);
+}
+
+pub fun rev64_16(mt: *Match) bool {
+    ret reversed(mt, 8, true);
+}
+
+# every lane of the result comes from one operand
+fun single(mt: *Match, which: u32) bool {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret false; }
+    val s: Shuffle = got.some;
+    var i: u32     = 0;
+    for (i < s.outputs) {
+        if (side(?s, i) != which) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun looked_up(mt: *Match, wide: bool) bool {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    ret sel got.some && fits(result_bytes(mt), wide);
+}
+
+# a shuffle tbl looks up in one operand, a result of at most 8 bytes or of 16
+pub fun single_a_8(mt: *Match) bool {
+    ret single(mt, 0) && looked_up(mt, false);
+}
+
+pub fun single_a_16(mt: *Match) bool {
+    ret single(mt, 0) && looked_up(mt, true);
+}
+
+pub fun single_b_8(mt: *Match) bool {
+    ret single(mt, 1) && looked_up(mt, false);
+}
+
+pub fun single_b_16(mt: *Match) bool {
+    ret single(mt, 1) && looked_up(mt, true);
+}
+
+# a shuffle tbl and tbx look up in both operands
+pub fun pair_8(mt: *Match) bool {
+    ret looked_up(mt, false);
+}
+
+pub fun pair_16(mt: *Match) bool {
+    ret looked_up(mt, true);
+}
+
+# a sixteen-bit chunk of a doubleword of the selector tbl and tbx look one
+# operand's bytes up by: the byte of that operand each byte of the result
+# is, and 0xff, which tbl gives zero for and tbx leaves as it was, for a byte
+# the other operand gives or no lane holds
+fun selector(mt: *Match, which: u32, doubleword: u32, chunk: u32) opt[i64] {
+    val got: opt[Shuffle] = shuffle_of(mt);
+    if (sel got.none) { ret opt[i64].none{}; }
+    val s:      Shuffle = got.some;
+    val each:   u32     = s.bits / 8;
+    var picked: u64     = 0;
+    var b:      u32     = 0;
+    for (b < 8) {
+        val j:    u32 = doubleword * 8 + b;
+        val i:    u32 = j / each;
+        var byte: u32 = 0xff;
+        if (i < s.outputs && side(?s, i) == which) { byte = from(?s, i) * each + j % each; }
+        picked = picked | (byte::u64 << (8 * b)::u64);
+        b      = b + 1;
+    }
+    ret immediate((picked >> (16 * chunk)::u64) & 0xffff);
+}
+
+pub fun sel_a_low_0(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 0, 0);
+}
+
+pub fun sel_a_low_1(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 0, 1);
+}
+
+pub fun sel_a_low_2(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 0, 2);
+}
+
+pub fun sel_a_low_3(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 0, 3);
+}
+
+pub fun sel_b_low_0(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 0, 0);
+}
+
+pub fun sel_b_low_1(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 0, 1);
+}
+
+pub fun sel_b_low_2(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 0, 2);
+}
+
+pub fun sel_b_low_3(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 0, 3);
+}
+
+pub fun sel_a_high_0(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 1, 0);
+}
+
+pub fun sel_a_high_1(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 1, 1);
+}
+
+pub fun sel_a_high_2(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 1, 2);
+}
+
+pub fun sel_a_high_3(mt: *Match) opt[i64] {
+    ret selector(mt, 0, 1, 3);
+}
+
+pub fun sel_b_high_0(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 1, 0);
+}
+
+pub fun sel_b_high_1(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 1, 1);
+}
+
+pub fun sel_b_high_2(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 1, 2);
+}
+
+pub fun sel_b_high_3(mt: *Match) opt[i64] {
+    ret selector(mt, 1, 1, 3);
+}
+
+pub val N_EXT_S:              [1]Node = [1]Node{Node{opcode: ir.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_S_VSHUFFLEP0O0: [2]Node = [2]Node{Node{opcode: ir.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: ir.VSHUFFLE, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_U:              [1]Node = [1]Node{Node{opcode: ir.EXT_U, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_U_VSHUFFLEP0O0: [2]Node = [2]Node{Node{opcode: ir.EXT_U, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: ir.VSHUFFLE, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_ADD:         [1]Node = [1]Node{Node{opcode: ir.REDUCE_ADD, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_AND:         [1]Node = [1]Node{Node{opcode: ir.REDUCE_AND, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FADD_ANY:    [1]Node = [1]Node{Node{opcode: ir.REDUCE_FADD_ANY, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FADD_SEQ:    [1]Node = [1]Node{Node{opcode: ir.REDUCE_FADD_SEQ, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FMAX:        [1]Node = [1]Node{Node{opcode: ir.REDUCE_FMAX, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FMIN:        [1]Node = [1]Node{Node{opcode: ir.REDUCE_FMIN, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FMUL_ANY:    [1]Node = [1]Node{Node{opcode: ir.REDUCE_FMUL_ANY, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FMUL_SEQ:    [1]Node = [1]Node{Node{opcode: ir.REDUCE_FMUL_SEQ, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_MUL:         [1]Node = [1]Node{Node{opcode: ir.REDUCE_MUL, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_OR:          [1]Node = [1]Node{Node{opcode: ir.REDUCE_OR, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_SMAX:        [1]Node = [1]Node{Node{opcode: ir.REDUCE_SMAX, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_SMIN:        [1]Node = [1]Node{Node{opcode: ir.REDUCE_SMIN, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_UMAX:        [1]Node = [1]Node{Node{opcode: ir.REDUCE_UMAX, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_UMIN:        [1]Node = [1]Node{Node{opcode: ir.REDUCE_UMIN, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_XOR:         [1]Node = [1]Node{Node{opcode: ir.REDUCE_XOR, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_VBUILD:             [1]Node = [1]Node{Node{opcode: ir.VBUILD, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_VEXTRACT:           [1]Node = [1]Node{Node{opcode: ir.VEXTRACT, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_VINSERT:            [1]Node = [1]Node{Node{opcode: ir.VINSERT, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_VSHUFFLE:           [1]Node = [1]Node{Node{opcode: ir.VSHUFFLE, parent: 0, operand: 0, result: 0, constants: 0}};
+
+pub val T_O00_LFD:  [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: true, width: Width.any{}}};
+pub val T_O00_LFS:  [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: true, width: Width.any{}}};
+pub val T_O00_LW16: [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true, width: Width.any{}}};
+pub val T_O00_LW32: [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true, width: Width.any{}}};
+pub val T_O00_LW64: [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true, width: Width.any{}}};
+pub val T_O00_LW8:  [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true, width: Width.any{}}};
+pub val T_X00_LFD:  [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: true, width: Width.any{}}};
+pub val T_X00_LFS:  [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: true, width: Width.any{}}};
+pub val T_X00_LW16: [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true, width: Width.any{}}};
+pub val T_X00_LW32: [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true, width: Width.any{}}};
+pub val T_X00_LW64: [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true, width: Width.any{}}};
+pub val T_X00_LW8:  [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true, width: Width.any{}}};
+pub val T_X00_VEC:  [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false, width: Width.any{}}};
+
+val S_G0_CSEL_A_HIGH_0_L0:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_high_0}, Source.literal{0}};
+val S_G0_CSEL_A_HIGH_1_L16:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_high_1}, Source.literal{16}};
+val S_G0_CSEL_A_HIGH_2_L32:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_high_2}, Source.literal{32}};
+val S_G0_CSEL_A_HIGH_3_L48:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_high_3}, Source.literal{48}};
+val S_G0_CSEL_A_LOW_0_L0:      [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_low_0}, Source.literal{0}};
+val S_G0_CSEL_A_LOW_1_L16:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_low_1}, Source.literal{16}};
+val S_G0_CSEL_A_LOW_2_L32:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_low_2}, Source.literal{32}};
+val S_G0_CSEL_A_LOW_3_L48:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_a_low_3}, Source.literal{48}};
+val S_G0_CSEL_B_HIGH_0_L0:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_high_0}, Source.literal{0}};
+val S_G0_CSEL_B_HIGH_1_L16:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_high_1}, Source.literal{16}};
+val S_G0_CSEL_B_HIGH_2_L32:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_high_2}, Source.literal{32}};
+val S_G0_CSEL_B_HIGH_3_L48:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_high_3}, Source.literal{48}};
+val S_G0_CSEL_B_LOW_0_L0:      [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_low_0}, Source.literal{0}};
+val S_G0_CSEL_B_LOW_1_L16:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_low_1}, Source.literal{16}};
+val S_G0_CSEL_B_LOW_2_L32:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_low_2}, Source.literal{32}};
+val S_G0_CSEL_B_LOW_3_L48:     [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.computed{sel_b_low_3}, Source.literal{48}};
+val S_G0_V00:                  [2]Source = [2]Source{Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.value{Slot{node: 0, index: 0}}};
+val S_G3_V00_L1:               [3]Source = [3]Source{Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+val S_Q1_G0:                   [2]Source = [2]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}};
+val S_Q1_L1_G0:                [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.literal{1}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}};
+val S_Q1_Q1_Q2:                [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}};
+val S_Q1_V00:                  [2]Source = [2]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}};
+val S_Q1_V00_L2:               [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{2}};
+val S_Q1_V00_L3:               [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{3}};
+val S_Q1_V00_Q2:               [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}};
+val S_Q1_V00_V00:              [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}};
+val S_Q2_Q1_Q1_L1:             [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.literal{1}};
+val S_Q2_Q1_Q1_L2:             [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.literal{2}};
+val S_Q2_Q1_Q1_L4:             [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.literal{4}};
+val S_Q2_V00_V00_L1:           [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+val S_Q2_V00_V00_L2:           [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{2}};
+val S_Q2_V00_V00_L4:           [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{4}};
+val S_Q2_V00_V00_L8:           [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{8}};
+val S_R_G0_G3_L0_L0:           [5]Source = [5]Source{Source.result{0}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.literal{0}, Source.literal{0}};
+val S_R_G0_G3_L11:             [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.literal{11}};
+val S_R_G0_G3_L12:             [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.literal{12}};
+val S_R_G0_G3_L3:              [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.literal{3}};
+val S_R_G0_G3_L8:              [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.literal{8}};
+val S_R_G0_G3_XZR:             [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.fixed{gen_register.XZR}};
+val S_R_L10_V010:              [3]Source = [3]Source{Source.result{0}, Source.literal{10}, Source.value{Slot{node: 0, index: 10}}};
+val S_R_L11_V011:              [3]Source = [3]Source{Source.result{0}, Source.literal{11}, Source.value{Slot{node: 0, index: 11}}};
+val S_R_L12_V012:              [3]Source = [3]Source{Source.result{0}, Source.literal{12}, Source.value{Slot{node: 0, index: 12}}};
+val S_R_L13_V013:              [3]Source = [3]Source{Source.result{0}, Source.literal{13}, Source.value{Slot{node: 0, index: 13}}};
+val S_R_L14_V014:              [3]Source = [3]Source{Source.result{0}, Source.literal{14}, Source.value{Slot{node: 0, index: 14}}};
+val S_R_L15_V015:              [3]Source = [3]Source{Source.result{0}, Source.literal{15}, Source.value{Slot{node: 0, index: 15}}};
+val S_R_L1_V01:                [3]Source = [3]Source{Source.result{0}, Source.literal{1}, Source.value{Slot{node: 0, index: 1}}};
+val S_R_L1_V01_L0:             [4]Source = [4]Source{Source.result{0}, Source.literal{1}, Source.value{Slot{node: 0, index: 1}}, Source.literal{0}};
+val S_R_L2_V02:                [3]Source = [3]Source{Source.result{0}, Source.literal{2}, Source.value{Slot{node: 0, index: 2}}};
+val S_R_L2_V02_L0:             [4]Source = [4]Source{Source.result{0}, Source.literal{2}, Source.value{Slot{node: 0, index: 2}}, Source.literal{0}};
+val S_R_L3_V03:                [3]Source = [3]Source{Source.result{0}, Source.literal{3}, Source.value{Slot{node: 0, index: 3}}};
+val S_R_L3_V03_L0:             [4]Source = [4]Source{Source.result{0}, Source.literal{3}, Source.value{Slot{node: 0, index: 3}}, Source.literal{0}};
+val S_R_L4_V04:                [3]Source = [3]Source{Source.result{0}, Source.literal{4}, Source.value{Slot{node: 0, index: 4}}};
+val S_R_L5_V05:                [3]Source = [3]Source{Source.result{0}, Source.literal{5}, Source.value{Slot{node: 0, index: 5}}};
+val S_R_L6_V06:                [3]Source = [3]Source{Source.result{0}, Source.literal{6}, Source.value{Slot{node: 0, index: 6}}};
+val S_R_L7_V07:                [3]Source = [3]Source{Source.result{0}, Source.literal{7}, Source.value{Slot{node: 0, index: 7}}};
+val S_R_L8_V08:                [3]Source = [3]Source{Source.result{0}, Source.literal{8}, Source.value{Slot{node: 0, index: 8}}};
+val S_R_L9_V09:                [3]Source = [3]Source{Source.result{0}, Source.literal{9}, Source.value{Slot{node: 0, index: 9}}};
+val S_R_Q1:                    [2]Source = [2]Source{Source.result{0}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}};
+val S_R_Q1_L0:                 [3]Source = [3]Source{Source.result{0}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}, Source.literal{0}};
+val S_R_R_Q1:                  [3]Source = [3]Source{Source.result{0}, Source.result{0}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}};
+val S_R_R_V00_L2:              [4]Source = [4]Source{Source.result{0}, Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.literal{2}};
+val S_R_R_V00_L3:              [4]Source = [4]Source{Source.result{0}, Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.literal{3}};
+val S_R_V00:                   [2]Source = [2]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}};
+val S_R_V00_CDUP_LANE_A:       [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.computed{dup_lane_a}};
+val S_R_V00_CLANE:             [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.computed{lane}};
+val S_R_V00_L0:                [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.literal{0}};
+val S_R_V00_Q1:                [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}};
+val S_R_V00_V00_CEXT_A_BYTES:  [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.computed{ext_a_bytes}};
+val S_R_V00_V00_L1:            [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+val S_R_V00_V01:               [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 1}}};
+val S_R_V00_V01_CEXT_AB_BYTES: [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 1}}, Source.computed{ext_ab_bytes}};
+val S_R_V01_CDUP_LANE_B:       [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 1}}, Source.computed{dup_lane_b}};
+val S_R_V01_Q1:                [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 1}}, Source.scratch{Scratch{index: 1, class: ?gen_register.CLASSES[gen_register.V_CLASS]}}};
+val S_R_V01_V01_CEXT_B_BYTES:  [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 1}}, Source.value{Slot{node: 0, index: 1}}, Source.computed{ext_b_bytes}};
+val S_R_V10_L0:                [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 1, index: 0}}, Source.literal{0}};
+val S_T_CLANE_V01:             [3]Source = [3]Source{Source.tied{Tie{result: 0, value: Slot{node: 0, index: 0}}}, Source.computed{lane}, Source.value{Slot{node: 0, index: 1}}};
+val S_T_CLANE_V01_L0:          [4]Source = [4]Source{Source.tied{Tie{result: 0, value: Slot{node: 0, index: 0}}}, Source.computed{lane}, Source.value{Slot{node: 0, index: 1}}, Source.literal{0}};
+val S_XZR_G0_G3_L0_L0:         [5]Source = [5]Source{Source.fixed{gen_register.XZR}, Source.scratch{Scratch{index: 0, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.scratch{Scratch{index: 3, class: ?gen_register.CLASSES[gen_register.X_CLASS]}}, Source.literal{0}, Source.literal{0}};
+
+pub val E_EXT_S_VSHUFFLE_W16:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.SSHLL_ASIMDSHF_L_2_4S_8H}, operands: Sources{at: ?S_R_V10_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_S_VSHUFFLE_W32:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.SSHLL_ASIMDSHF_L_2_2D_4S}, operands: Sources{at: ?S_R_V10_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_S_VSHUFFLE_W8:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.SSHLL_ASIMDSHF_L_2_8H_16B}, operands: Sources{at: ?S_R_V10_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_S_W16:             [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.SSHLL_ASIMDSHF_L__4S_4H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_S_W32:             [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.SSHLL_ASIMDSHF_L__2D_2S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_S_W8:              [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.SSHLL_ASIMDSHF_L__8H_8B}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_U_VSHUFFLE_W16:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.USHLL_ASIMDSHF_L_2_4S_8H}, operands: Sources{at: ?S_R_V10_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_U_VSHUFFLE_W32:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.USHLL_ASIMDSHF_L_2_2D_4S}, operands: Sources{at: ?S_R_V10_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_U_VSHUFFLE_W8:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.USHLL_ASIMDSHF_L_2_8H_16B}, operands: Sources{at: ?S_R_V10_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_U_W16:             [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.USHLL_ASIMDSHF_L__4S_4H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_U_W32:             [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.USHLL_ASIMDSHF_L__2D_2S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_EXT_U_W8:              [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.USHLL_ASIMDSHF_L__8H_8B}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_ADD_W16_2:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_ADD_W16_4:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ADD_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_ADD_W32_4:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_ADD_W64_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_ADD_W8_2:       [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ADD_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_ADD_W8_4:       [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ADD_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ADD_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W16_16:     [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W16_2:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W16_4:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W16_8:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W32_16:     [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W32_4:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W32_8:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W64_16:     [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_64_LOG_SHIFT}, operands: Sources{at: ?S_R_G0_G3_L0_L0[0], len: 5}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W64_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W8_16:      [9]Emit  = [9]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W8_2:       [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W8_4:       [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_AND_W8_8:       [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.AND_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_ANY_FD_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FADDP_ASISDPAIR_ONLY_SD_D_2D}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_ANY_FD_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_D_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_ANY_FS_16: [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.FADDP_ASIMDSAME_ONLY_4S}, operands: Sources{at: ?S_Q1_V00_V00[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FADDP_ASISDPAIR_ONLY_SD_S_2S}, operands: Sources{at: ?S_R_Q1[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_ANY_FS_4:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_S_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_ANY_FS_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FADDP_ASISDPAIR_ONLY_SD_S_2S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_SEQ_FD_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FADDP_ASISDPAIR_ONLY_SD_D_2D}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_SEQ_FD_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_D_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_SEQ_FS_16: [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.FADDP_ASISDPAIR_ONLY_SD_S_2S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.DUP_ASISDONE_ONLY_S_S}, operands: Sources{at: ?S_Q1_V00_L2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FADD_S_FLOATDP2}, operands: Sources{at: ?S_R_R_Q1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.DUP_ASISDONE_ONLY_S_S}, operands: Sources{at: ?S_Q1_V00_L3[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FADD_S_FLOATDP2}, operands: Sources{at: ?S_R_R_Q1[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_SEQ_FS_4:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_S_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FADD_SEQ_FS_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FADDP_ASISDPAIR_ONLY_SD_S_2S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMAX_FD_16:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMAXP_ASISDPAIR_ONLY_SD_D_2D}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMAX_FD_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_D_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMAX_FS_16:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMAXV_ASIMDALL_ONLY_SD}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMAX_FS_4:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_S_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMAX_FS_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMAXP_ASISDPAIR_ONLY_SD_S_2S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMIN_FD_16:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMINP_ASISDPAIR_ONLY_SD_D_2D}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMIN_FD_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_D_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMIN_FS_16:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMINV_ASIMDALL_ONLY_SD}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMIN_FS_4:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_S_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMIN_FS_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMINP_ASISDPAIR_ONLY_SD_S_2S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_ANY_FD_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_D_D}, operands: Sources{at: ?S_R_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_ANY_FD_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_D_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_ANY_FS_16: [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_R_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_R_V00_L3[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_ANY_FS_4:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_S_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_ANY_FS_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_SEQ_FD_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_D_D}, operands: Sources{at: ?S_R_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_SEQ_FD_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_D_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_SEQ_FS_16: [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_R_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_R_V00_L3[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_SEQ_FS_4:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_S_FLOATDP1}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_REDUCE_FMUL_SEQ_FS_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.FMUL_ASISDELEM_R_SD_S_S}, operands: Sources{at: ?S_R_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W16_16:     [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W16_2:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W16_4:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W16_8:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W32_16:     [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_2S}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_2S}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W32_4:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W32_8:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_2S}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W64_16:     [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MADD_64A_DP_3SRC}, operands: Sources{at: ?S_R_G0_G3_XZR[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W64_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W8_16:      [9]Emit  = [9]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W8_2:       [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W8_4:       [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_MUL_W8_8:       [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MUL_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W16_16:      [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W16_2:       [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W16_4:       [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W16_8:       [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W32_16:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W32_4:       [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W32_8:       [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W64_16:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_64_LOG_SHIFT}, operands: Sources{at: ?S_R_G0_G3_L0_L0[0], len: 5}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W64_8:       [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W8_16:       [9]Emit  = [9]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W8_2:        [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W8_4:        [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_OR_W8_8:        [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.ORR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W16_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMAXV_ASIMDALL_ONLY_H_8H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W16_2:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W16_4:     [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMAX_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W16_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMAXV_ASIMDALL_ONLY_H_4H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W32_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMAXV_ASIMDALL_ONLY_S_4S}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W32_4:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W32_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMAXP_ASIMDSAME_ONLY_2S}, operands: Sources{at: ?S_Q1_V00_V00[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W64_16:    [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SUBS_64_ADDSUB_SHIFT}, operands: Sources{at: ?S_XZR_G0_G3_L0_L0[0], len: 5}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.CSEL_64_CONDSEL}, operands: Sources{at: ?S_R_G0_G3_L12[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W64_8:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W8_16:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMAXV_ASIMDALL_ONLY_B_16B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W8_2:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMAX_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W8_4:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMAX_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMAX_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMAX_W8_8:      [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMAXV_ASIMDALL_ONLY_B_8B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W16_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMINV_ASIMDALL_ONLY_H_8H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W16_2:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W16_4:     [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMIN_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W16_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMINV_ASIMDALL_ONLY_H_4H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W32_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMINV_ASIMDALL_ONLY_S_4S}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W32_4:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W32_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMINP_ASIMDSAME_ONLY_2S}, operands: Sources{at: ?S_Q1_V00_V00[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W64_16:    [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SUBS_64_ADDSUB_SHIFT}, operands: Sources{at: ?S_XZR_G0_G3_L0_L0[0], len: 5}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.CSEL_64_CONDSEL}, operands: Sources{at: ?S_R_G0_G3_L11[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W64_8:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W8_16:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMINV_ASIMDALL_ONLY_B_16B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W8_2:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMIN_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W8_4:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMIN_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SMIN_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_SMIN_W8_8:      [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.SMINV_ASIMDALL_ONLY_B_8B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W16_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMAXV_ASIMDALL_ONLY_H_8H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W16_2:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W16_4:     [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMAX_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W16_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMAXV_ASIMDALL_ONLY_H_4H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W32_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMAXV_ASIMDALL_ONLY_S_4S}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W32_4:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W32_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMAXP_ASIMDSAME_ONLY_2S}, operands: Sources{at: ?S_Q1_V00_V00[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W64_16:    [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SUBS_64_ADDSUB_SHIFT}, operands: Sources{at: ?S_XZR_G0_G3_L0_L0[0], len: 5}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.CSEL_64_CONDSEL}, operands: Sources{at: ?S_R_G0_G3_L8[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W64_8:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W8_16:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMAXV_ASIMDALL_ONLY_B_16B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W8_2:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMAX_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W8_4:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMAX_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMAX_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMAX_W8_8:      [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMAXV_ASIMDALL_ONLY_B_8B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W16_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMINV_ASIMDALL_ONLY_H_8H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W16_2:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W16_4:     [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMIN_ASIMDSAME_ONLY_4H}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W16_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMINV_ASIMDALL_ONLY_H_4H}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W32_16:    [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMINV_ASIMDALL_ONLY_S_4S}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W32_4:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W32_8:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMINP_ASIMDSAME_ONLY_2S}, operands: Sources{at: ?S_Q1_V00_V00[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W64_16:    [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.SUBS_64_ADDSUB_SHIFT}, operands: Sources{at: ?S_XZR_G0_G3_L0_L0[0], len: 5}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.CSEL_64_CONDSEL}, operands: Sources{at: ?S_R_G0_G3_L3[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W64_8:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W8_16:     [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMINV_ASIMDALL_ONLY_B_16B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W8_2:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMIN_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W8_4:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMIN_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMIN_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_UMIN_W8_8:      [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.UMINV_ASIMDALL_ONLY_B_8B}, operands: Sources{at: ?S_Q1_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W16_16:     [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W16_2:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W16_4:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W16_8:      [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W32_16:     [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W32_4:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W32_8:      [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W64_16:     [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.FMOV_64D_FLOAT2INT}, operands: Sources{at: ?S_G0_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_G3_V00_L1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_64_LOG_SHIFT}, operands: Sources{at: ?S_R_G0_G3_L0_L0[0], len: 5}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W64_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W8_16:      [9]Emit  = [9]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_Q2_V00_V00_L8[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W8_2:       [3]Emit  = [3]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W8_4:       [5]Emit  = [5]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_REDUCE_XOR_W8_8:       [7]Emit  = [7]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_V00_V00_L4[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_V00_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L2[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_Q2_Q1_Q1_L1[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.EOR_ASIMDSAME_ONLY_8B}, operands: Sources{at: ?S_Q1_Q1_Q2[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_Q1_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_FD_16:          [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IV_V_D}, operands: Sources{at: ?S_R_L1_V01_L0[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VBUILD_FD_8:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_FS_16:          [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_4S_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IV_V_S}, operands: Sources{at: ?S_R_L1_V01_L0[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IV_V_S}, operands: Sources{at: ?S_R_L2_V02_L0[0], len: 4}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IV_V_S}, operands: Sources{at: ?S_R_L3_V03_L0[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VBUILD_FS_4:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2S_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_FS_8:           [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2S_S}, operands: Sources{at: ?S_R_V00_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IV_V_S}, operands: Sources{at: ?S_R_L1_V01_L0[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W16_16:         [8]Emit  = [8]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_8H_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L2_V02[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L3_V03[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L4_V04[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L5_V05[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L6_V06[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L7_V07[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W16_2:          [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_4H_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W16_4:          [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_4H_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W16_8:          [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_4H_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L2_V02[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_R_L3_V03[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W32_16:         [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_4S_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_S_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_S_W}, operands: Sources{at: ?S_R_L2_V02[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_S_W}, operands: Sources{at: ?S_R_L3_V03[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W32_4:          [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_2S_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W32_8:          [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_2S_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_S_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W64_16:         [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_2D_X}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_D_X}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W64_8:          [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_2D_X}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W8_16:          [16]Emit = [16]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_16B_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L2_V02[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L3_V03[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L4_V04[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L5_V05[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L6_V06[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L7_V07[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L8_V08[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L9_V09[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L10_V010[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L11_V011[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L12_V012[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L13_V013[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L14_V014[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L15_V015[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W8_2:           [2]Emit  = [2]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_8B_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W8_4:           [4]Emit  = [4]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_8B_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L2_V02[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L3_V03[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VBUILD_W8_8:           [8]Emit  = [8]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DR_R_8B_W}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L1_V01[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L2_V02[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L3_V03[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L4_V04[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L5_V05[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L6_V06[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_R_L7_V07[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VEXTRACT_FD:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASISDONE_ONLY_D_D}, operands: Sources{at: ?S_R_V00_CLANE[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VEXTRACT_FS:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASISDONE_ONLY_S_S}, operands: Sources{at: ?S_R_V00_CLANE[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VEXTRACT_W16:          [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_H}, operands: Sources{at: ?S_R_V00_CLANE[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VEXTRACT_W32:          [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_S}, operands: Sources{at: ?S_R_V00_CLANE[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VEXTRACT_W64:          [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_X_X}, operands: Sources{at: ?S_R_V00_CLANE[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VEXTRACT_W8:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UMOV_ASIMDINS_W_W_B}, operands: Sources{at: ?S_R_V00_CLANE[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VINSERT_FD:            [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IV_V_D}, operands: Sources{at: ?S_T_CLANE_V01_L0[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VINSERT_FS:            [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IV_V_S}, operands: Sources{at: ?S_T_CLANE_V01_L0[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VINSERT_W16:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_H_W}, operands: Sources{at: ?S_T_CLANE_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VINSERT_W32:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_S_W}, operands: Sources{at: ?S_T_CLANE_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VINSERT_W64:           [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_D_X}, operands: Sources{at: ?S_T_CLANE_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VINSERT_W8:            [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_B_W}, operands: Sources{at: ?S_T_CLANE_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_FD_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_FD_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_FS_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_4S_S}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_FS_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2S_S}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W16_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_8H_H}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W16_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_4H_H}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W32_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_4S_S}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W32_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2S_S}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W64_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W64_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W8_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_16B_B}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_A_W8_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_8B_B}, operands: Sources{at: ?S_R_V00_CDUP_LANE_A[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_FD_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_FD_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_FS_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_4S_S}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_FS_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2S_S}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W16_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_8H_H}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W16_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_4H_H}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W32_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_4S_S}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W32_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2S_S}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W64_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W64_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_2D_D}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W8_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_16B_B}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_DUP_B_W8_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.DUP_ASIMDINS_DV_V_8B_B}, operands: Sources{at: ?S_R_V01_CDUP_LANE_B[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_EXT_AB_16:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_R_V00_V01_CEXT_AB_BYTES[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_EXT_AB_8:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_R_V00_V01_CEXT_AB_BYTES[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_EXT_A_16:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_R_V00_V00_CEXT_A_BYTES[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_EXT_A_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_R_V00_V00_CEXT_A_BYTES[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_EXT_B_16:     [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_16B}, operands: Sources{at: ?S_R_V01_V01_CEXT_B_BYTES[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_EXT_B_8:      [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.EXT_ASIMDEXT_ONLY_8B}, operands: Sources{at: ?S_R_V01_V01_CEXT_B_BYTES[0], len: 4}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV16_W8_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV16_ASIMDMISC_R_16B}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV16_W8_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV16_ASIMDMISC_R_8B}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV32_W16_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV32_ASIMDMISC_R_8H}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV32_W16_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV32_ASIMDMISC_R_4H}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV32_W8_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV32_ASIMDMISC_R_16B}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV32_W8_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV32_ASIMDMISC_R_8B}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_FS_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_4S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_FS_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_2S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_W16_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_8H}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_W16_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_4H}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_W32_16: [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_4S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_W32_8:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_2S}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_W8_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_16B}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_REV64_W8_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.REV64_ASIMDMISC_R_8B}, operands: Sources{at: ?S_R_V00[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TBL_A_16:     [11]Emit = [11]Emit{Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_D_X}, operands: Sources{at: ?S_Q1_L1_G0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBL_ASIMDTBL_L1_1_16B}, operands: Sources{at: ?S_R_V00_Q1[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TBL_A_8:      [6]Emit  = [6]Emit{Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBL_ASIMDTBL_L1_1_8B}, operands: Sources{at: ?S_R_V00_Q1[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TBL_B_16:     [11]Emit = [11]Emit{Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_D_X}, operands: Sources{at: ?S_Q1_L1_G0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBL_ASIMDTBL_L1_1_16B}, operands: Sources{at: ?S_R_V01_Q1[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TBL_B_8:      [6]Emit  = [6]Emit{Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBL_ASIMDTBL_L1_1_8B}, operands: Sources{at: ?S_R_V01_Q1[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TBL_TBX_16:   [22]Emit = [22]Emit{Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_HIGH_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_D_X}, operands: Sources{at: ?S_Q1_L1_G0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBL_ASIMDTBL_L1_1_16B}, operands: Sources{at: ?S_R_V00_Q1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_HIGH_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.INS_ASIMDINS_IR_R_D_X}, operands: Sources{at: ?S_Q1_L1_G0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBX_ASIMDTBL_L1_1_16B}, operands: Sources{at: ?S_R_V01_Q1[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TBL_TBX_8:    [12]Emit = [12]Emit{Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_A_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBL_ASIMDTBL_L1_1_8B}, operands: Sources{at: ?S_R_V00_Q1[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVZ_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_0_L0[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_1_L16[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_2_L32[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.MOVK_64_MOVEWIDE}, operands: Sources{at: ?S_G0_CSEL_B_LOW_3_L48[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.FMOV_D64_FLOAT2INT}, operands: Sources{at: ?S_Q1_G0[0], len: 2}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{gen_row.TBX_ASIMDTBL_L1_1_8B}, operands: Sources{at: ?S_R_V01_Q1[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_FD_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_FS_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_FS_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_W16_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_8H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_W16_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_4H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_W32_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_W32_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_W64_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_W8_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_16B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN1_W8_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN1_ASIMDPERM_ONLY_8B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_FD_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_FS_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_FS_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_W16_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_8H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_W16_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_4H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_W32_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_W32_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_W64_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_W8_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_16B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_TRN2_W8_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.TRN2_ASIMDPERM_ONLY_8B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_FD_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_FS_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_FS_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_W16_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_8H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_W16_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_4H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_W32_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_W32_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_W64_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_W8_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_16B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP1_W8_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP1_ASIMDPERM_ONLY_8B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_FD_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_FS_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_FS_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_W16_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_8H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_W16_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_4H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_W32_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_W32_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_W64_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_W8_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_16B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_UZP2_W8_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.UZP2_ASIMDPERM_ONLY_8B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_FD_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_FS_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_FS_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_W16_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_8H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_W16_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_4H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_W32_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_W32_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_W64_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_W8_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_16B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP1_W8_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP1_ASIMDPERM_ONLY_8B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_FD_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_FS_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_FS_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_W16_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_8H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_W16_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_4H}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_W32_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_4S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_W32_8:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_2S}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_W64_16:  [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_2D}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_W8_16:   [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_16B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
+pub val E_VSHUFFLE_ZIP2_W8_8:    [1]Emit  = [1]Emit{Emit{opcode: Opcode.row{gen_row.ZIP2_ASIMDPERM_ONLY_8B}, operands: Sources{at: ?S_R_V00_V01[0], len: 3}, implied: NO_IMPLIED}};
