@@ -8,8 +8,10 @@
 # stands. a target declares those forms and the pass reads them. a front end
 # may also write the high half as the low W bits of the exact product shifted
 # down by W, the product being the multiply of the two operands extended to 2W
-# bits, each by sign or by zeros. a target that has a form for it, or a native
-# multiply at 2W, selects that pattern as it stands.
+# bits, each by sign or by zeros. where the target has a form for it the pass
+# writes the pattern as that form, and a target with a native multiply at 2W
+# selects the pattern as it stands. the instructions a rewritten pattern was
+# made of go where nothing else reads them.
 #
 # where a target has neither, and multiplies natively at W, the pass builds the
 # high half from four multiplies of the half width pieces of the operands,
@@ -19,8 +21,8 @@
 # a target does not multiply natively are not this pass's: an integer wider than
 # the register is split by the wide integer legalisation, one narrower than
 # the arithmetic widths is widened by the narrow integer legalisation, and one
-# with no multiply calls a helper. a vector is scalarised first. the
-# instructions a pattern was made of stay for dead code removal.
+# with no multiply calls a helper. a vector no unit multiplies is taken lane
+# by lane by the vector legalisation first.
 #
 # the construction is shifts, masks, adds and multiplies, with no branch and no
 # memory access, so it keeps constant time, and its secrecy is that of the
@@ -36,11 +38,13 @@ use std.types.size.usize;
 
 use std.allocator;
 use std.allocator.arena;
+use std.collections.vector;
 
 use folder: mirl.fold;
 use mirl.fold.algebra;
 use mirl.fold.algebra.Op;
 use mirl.fold.word;
+use mirl.ir.body;
 use mirl.ir.function.Body;
 use mirl.ir.id.Block;
 use mirl.ir.id.Instruction;
@@ -72,21 +76,10 @@ use mirl.target.Sign;
 # never touches an edge or a block
 pub val MULTIPLY_FORMS: Pass = Pass{name: "multiply forms", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
 
-# whether the high half of a product at some width the target multiplies at is
-# one the target computes no form of, for some way of reading the operands
+# whether the target multiplies at some width, where a high half is either a
+# form it computes, which a pattern is written as, or one it builds
 fun wanted(g: *Ground) bool {
-    val a: *Arithmetic = ?g.t.caps.arithmetic;
-    if (!(sel a.multiply.widths)) { ret false; }
-    var i: usize = 0;
-    for (i < a.multiply.widths.size) {
-        var s: usize = 0;
-        for (s < $length_of(target.Signs)) {
-            if (!target.computes_high(a, a.multiply.widths.data[i], target.SIGNS[s])) { ret true; }
-            s = s + 1;
-        }
-        i = i + 1;
-    }
-    ret false;
+    ret sel g.t.caps.arithmetic.multiply.widths;
 }
 
 # the instructions a pattern of the high half is made of, above its truncation
@@ -131,10 +124,12 @@ pub rec Found {
 # site:    the function being rewritten
 # caps:    the target's arithmetic declarations
 # changed: the function was changed
+# taken:   the instructions of each pattern rewritten, which go once unused
 rec Work {
     site:    Site;
     caps:    *Arithmetic;
     changed: bool;
+    taken:   vector.Vector[Instruction];
 }
 
 # the placed instruction that defines a value
@@ -232,7 +227,8 @@ pub fun high(s: *Site, t: *InstructionData) res[opt[Found], Why] {
 }
 
 # the high multiply an instruction is, by its opcode's algebra, none when it is
-# not one or is a vector, which is scalarised first
+# not one or is a vector, which the vector legalisation takes lane by lane
+# first where no unit computes it
 fun stated(s: *Site, t: *InstructionData) res[opt[High], Why] {
     val none: res[opt[High], Why] = res[opt[High], Why].ok{opt[High].none{}};
     val op:   Op                  = op_of(t);
@@ -333,9 +329,67 @@ fun rebuild(w: *Work, k: Block, n: u32, i: Instruction) res[u32, Why] {
     if (sel found.err)     { ret res[u32, Why].err{found.err}; }
     if (sel found.ok.none) { ret res[u32, Why].ok{0}; }
     val f: High = found.ok.some.high;
-    if (target.reaches_high(w.caps, f.lane.bits, sign_of(f))) { ret res[u32, Why].ok{0}; }
-    if (!target.holds(w.caps.multiply, f.lane.bits))          { ret res[u32, Why].ok{0}; }
-    ret split(w, k, n, i, f);
+    if (target.holds(w.caps.multiply, f.lane.bits * 2) && !target.computes_high(w.caps, f.lane.bits, sign_of(f))) { ret res[u32, Why].ok{0}; }
+    if (!target.computes_high(w.caps, f.lane.bits, sign_of(f)) && !target.holds(w.caps.multiply, f.lane.bits))    { ret res[u32, Why].ok{0}; }
+    var made: res[u32, Why] = res[u32, Why].ok{0};
+    if (target.computes_high(w.caps, f.lane.bits, sign_of(f))) { made = stated_as(w, k, n, i, f); }
+    or                                                         { made = split(w, k, n, i, f); }
+    if (sel made.err)                                          { ret made; }
+    val parts: Parts          = found.ok.some.parts;
+    val four:  [4]Instruction = [4]Instruction{parts.shift, parts.product, parts.left, parts.right};
+    var p:     usize          = 0;
+    for (p < 4) {
+        val pushed: res[usize, allocator.Error] = vector.push[Instruction](?w.taken, four[p]);
+        if (sel pushed.err) { ret res[u32, Why].err{Why.alloc{pushed.err}}; }
+        p = p + 1;
+    }
+    ret made;
+}
+
+# erase each instruction a rewritten pattern was made of that nothing reads,
+# since selection meets every instruction left in the body
+fun clear(w: *Work, c: *Context, u: *Unit) err[Why] {
+    var t: usize = 0;
+    for (t < w.taken.len) {
+        val x:      Instruction      = w.taken.data[t];
+        val d:      *InstructionData = ?w.site.b.instructions.data[x.index];
+        var unused: bool             = !(sel d.place.erased);
+        var r:      usize            = 0;
+        for (r < d.results.len) {
+            if (w.site.b.values.data[d.results.data[r].index].uses.len != 0) { unused = false; }
+            r = r + 1;
+        }
+        if (unused) {
+            val gone: err[module.Error] = body.erase(c.m, u.f, x);
+            if (sel gone.err) { ret err[Why].err{Why.ir{gone.err}}; }
+        }
+        t = t + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# the pattern of a high half the target computes a form of, written as that
+# form in the slot of its truncation, a mixed one with its signed operand first
+fun stated_as(w: *Work, k: Block, n: u32, i: Instruction, f: High) res[u32, Why] {
+    val s:   *Site         = ?w.site;
+    var lhs: Value         = f.lhs;
+    var rhs: Value         = f.rhs;
+    var op:  opcode.Opcode = opcode.MUL_HIGH_U;
+    if (f.lhs_s && f.rhs_s) { op = opcode.MUL_HIGH_S; }
+    or (f.lhs_s || f.rhs_s) {
+        op = opcode.MUL_HIGH_SU;
+        if (f.rhs_s) {
+            lhs = f.rhs;
+            rhs = f.lhs;
+        }
+    }
+    emit.open(s, i, k, n);
+    emit.close(s, i);
+    emit.binary(s, op, lhs, rhs);
+    val built: err[Why] = emit.done(s);
+    if (sel built.err) { ret res[u32, Why].err{built.err}; }
+    w.changed = true;
+    ret res[u32, Why].ok{s.made};
 }
 
 # build the high halves of one function
@@ -351,7 +405,8 @@ fun visit(u: *Unit) res[bool, Why] {
     var scratch: allocator.Allocator;
     arena.make(?scratch, ?ar);
 
-    var w: Work  = Work{site: emit.init(c.m, u.f, got.ok, ?scratch), caps: ?c.t.caps.arithmetic, changed: false};
+    var w: Work = Work{site: emit.init(c.m, u.f, got.ok, ?scratch), caps: ?c.t.caps.arithmetic, changed: false, taken: vector.init[Instruction](c.m.a)};
+    fin { vector.dnit[Instruction](?w.taken); }
     var k: usize = 0;
     for (k < got.ok.blocks.len) {
         if (!got.ok.blocks.data[k].erased) {
@@ -366,5 +421,7 @@ fun visit(u: *Unit) res[bool, Why] {
         }
         k = k + 1;
     }
+    val cleared: err[Why] = clear(?w, c, u);
+    if (sel cleared.err) { ret res[bool, Why].err{cleared.err}; }
     ret res[bool, Why].ok{w.changed};
 }

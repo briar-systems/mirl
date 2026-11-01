@@ -25,7 +25,6 @@ Two modules are equal when they say the same thing, up to the naming and orderin
 Equality is **insensitive** to
 
 - the order of functions and of globals, each paired with the one of the same symbol name in the other module,
-- the order and repetition of exports, compared as a set of symbols,
 - the order of a symbol's attributes, compared as a multiset,
 - type ids and the names of types and their members, since a type is compared by its structure, and an interned type that nothing names is not compared,
 - constant ids, their order and repetition, since a constant is compared by what it is,
@@ -238,17 +237,26 @@ decorators
   ident is the family, the rest its name, and its one argument the datum, a
   number, a list of numbers or a string: `#[spirv.execution_mode(17)]`.
 
-  #[export]                 the module exports the symbol
+  #[export]                 a shared image exports the symbol by its name
   #[weak] #[unique]         its binding, which `pub` states global and no
                             word states local
   #[visibility(name)]       its visibility, by the name of mink's row:
                             protected, hidden, internal. default when left out
-  #[align(n)]               a global's alignment
-  #[section(string, name)]  a global's section, its name and its kind by the
-                            name of mink's section kind row
+  #[extensions(string, ...)] the extensions a function's code may use past
+                            the build's, each by the name the target's
+                            instruction set gives it, written after its
+                            visibility and only when it names one
+  #[align(n)]               a global's alignment, or a function's entry's
+  #[section(string, name)]  a global's or a function's section, its name and
+                            its kind by the name of mink's section kind row
   #[tls(model)]             a global is thread-local under the model:
                             general_dynamic, local_dynamic, initial_exec,
                             local_exec
+  #[debug(name)]            the debug variable a global is, by its name in
+                            the debug table, a variable with no parameter
+  #[secret([o, n], ...)]    the byte ranges of a global that are secret, each
+                            its offset and length, at least one, ascending and
+                            none overlapping or touching the one before it
   #[oblivious]              the function must run in time independent of its
                             secret values
   #[convention(name)]       the calling convention of a function's signature,
@@ -258,6 +266,9 @@ decorators
                             per entry parameter
   #[volatile] #[kept]       an instruction's flags
   #[bounded] #[checked]
+  #[public]                 a load or an atomic access states the memory it
+                            reads public, where its results do not state it
+                            secret
   #[secret]                 an instruction's metadata states its results
                             secret where its row's secrecy does not, or it has
                             none
@@ -265,19 +276,22 @@ decorators
   `kept` marks a store or a fill whose write no pass may take away (see the
   specification's memory section). `bounded` marks a shift whose count is
   below its operand's width. `checked` marks a division whose zero divisor,
-  signed overflow and quotient that does not fit are tested before it. a
-  reader refuses a decorator mirl does not know on an item it does not
-  apply to.
+  signed overflow and quotient that does not fit are tested before it.
+  `public` and a secret result are how an access states its secrecy, and one
+  with neither is unstated. a reader refuses a decorator mirl does not know
+  on an item it does not apply to.
 
 globals
 
-  global      = { decorator } [ "pub" ] ( "val" | "var" ) name ":" type "=" typed ";"
-              | { decorator } "ext" ( "val" | "var" ) name ":" type ";" ;
+  global      = { decorator } [ "pub" ] ( "val" | "var" ) name ":" [ "^" ] type "=" typed ";"
+              | { decorator } "ext" ( "val" | "var" ) name ":" [ "^" ] type ";" ;
 
   `val` states that the program never writes the global and `var` that it
   may. `ext` declares a global another module defines, which has no initial
   value, so its binding is one other objects may refer to: global, or weak
-  or unique by its decorator.
+  or unique by its decorator. `^` states the whole global secret, and
+  `#[secret]` the byte ranges of it that are, never both. its initial value
+  is public, as every constant is.
 
 functions
 

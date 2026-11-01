@@ -3,14 +3,16 @@
 masc states every register's storage as pieces of a bank: the bank it is in, the bit range its pieces take at each multiplier of its scale, and what a write through it leaves in the rest of the bank. `footprint.of` answers what an instruction reads, writes and kills over those facts, and `register.within` answers where one register lies in another. `mirl.machine.storage` is the one place the machine form asks them.
 
 ```
-of_register(regs, row)              # opt[Storage]
-of_class(regs, class)               # opt[Storage]
-of_group(regs, class, span)         # opt[Storage]
-sharing(overlaps, row)              # res[rf.Span, allocator.Error]
-kills(footprint, other)             # bool
-view(file, part, whole)             # opt[View]
-viewed(file, whole_id, part, view)  # opt[rf.Id]
-view_kills(file, view, extend)      # bool
+of_register(regs, row)                # opt[Storage]
+of_class(regs, class)                 # opt[Storage]
+of_group(regs, class, span)           # opt[Storage]
+sharing(overlaps, row)                # res[rf.Span, allocator.Error]
+kills(footprint, other)               # bool
+view(file, part, whole)               # opt[View]
+viewed(file, whole_id, part, view)    # opt[rf.Id]
+view_kills(file, view, extend)        # bool
+lies(file, part_id, whole_id)         # opt[rf.Placement]
+counterpart(file, part_id, from, to)  # opt[rf.Id]
 ```
 
 A `Storage` is bits fixed plus bits per unit of one scale's multiplier, the shape of masc's scaled widths, folded through the selection so a scale the selection fixes is a fixed size. The locations' sharing, liveness and its kills, the allocation checker, copy lowering, the spiller and the frame read a location's storage, its views and its groups here, and no other module restates one.
@@ -21,7 +23,9 @@ A `Storage` is bits fixed plus bits per unit of one scale's multiplier, the shap
 
 ## Views
 
-A view is a class every register of which lies in exactly one register of another class at one placement, at every legal multiplier, with every register of that class holding exactly one of it, as x86's `eax` in the low 32 bits of `rax` or AArch64's `d0` in the low 64 of `v0`. `storage.view(file, part, whole)` finds it from masc's `within`, and is none where any register lies within none or two, or the placements differ.
+A view is a class every register of which lies in exactly one register of another class at one placement, at every legal multiplier, with every register of that class holding exactly one of it, as x86's `eax` in the low 32 bits of `rax` or AArch64's `d0` in the low 64 of `v0`. `storage.view(file, part, whole)` reads it from masc's view table, and is none where any register lies within none or two, or the placements differ between registers or follow no one line across the multipliers.
+
+A placement is masc's `register.Placement`: its offset, width, stride and count are each a fixed part plus a part per unit of one slot's multiplier, so a row that scales, as a RISC-V register pair, a vector group `vg2`, `vg4` or `vg8` or an SVE `p` register within `pn`, has one placement within its whole, as `v1` lies one VLEN into `vg2.v0` whatever VLEN is. `storage.lies(file, part, whole)` answers that placement (masc's `lies`), and two placements are one when they agree at every multiplier (masc's `same_placement`), which `viewed` and `counterpart` compare by over masc's lying lists. A tuple lies within itself and within any row holding its members as one contiguous run, as `vg2.v2` lies within `vg4.v0` two registers in. Arithmetic on a placement's bits resolves it at one multiplier first (masc's `resolve`, the multiplier `register.multiplier` of the selection's view), and so does a comparison across two slots. A fraction of one register, as a RISC-V EMUL of 1/2, is a smaller part per unit, but no row of masc's file states one yet.
 
 - An operand at a register position whose classes admit a view of a virtual register's class may name that virtual register (`instruction.viewing`). No move is made between the views: the rewrite names the register of the view within the virtual register's location (`storage.viewed`), and the checker holds the rewritten operand to it. A position admitting a tuple class's members alone takes a virtual register of it the same way, by the first member of its location (`instruction.Through.member`, `instruction.viewed_in`), as `vadd.vv` under m2 names `vg2.v4` by `v4`. A copy or a parallel copy names any member of a virtual register of a tuple class, a member operand (`operand.Member`, `instruction.member_viewing`), and reads or writes that member of its location: a pair is made from its words by one parallel copy writing every member, which ends the pair's value, and taken apart by one reading them. A copy writing only some members reads the pair as well, since it keeps the rest. A view at a position a row fixes is refused, since the fixed register is the view's and not the location.
 - A write through a view that keeps bits of the whole, as `al`, is also a read of the value. One whose stated extension overwrites the whole, as `eax`'s zeroing write, ends it (`view_kills`, masc's `overwrites`).
