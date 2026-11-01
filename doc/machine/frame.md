@@ -3,13 +3,14 @@
 `mirl.machine.frame` lays out the stack frame of an allocated register machine function, saves the callee-saved registers it writes, writes its prologue and epilogues in the shape the convention row states, and states its call frame information as mink's frame records, the rules masc's CFI calls take. It reads every frame fact from the target's convention row and from masc's rows, and names no architecture.
 
 ```
-frame(a, ?allocation, Request{convention: ?resolved, at: ?locations}, ?code)   # res[Framed, Error]
-lay(a, f, used, request)                                                     # res[Plan, lay.Error]
+frame(a, ?allocation, Request{convention: ?resolved, at: ?locations}, ?code, Need{allowed, configured})   # res[Framed, Error]
+lay(a, f, used, request, reserve)                                            # res[Plan, lay.Error]
+needed(a, f, ?plan, ?code, request, need)                                    # res[u32, scavenge.Error]
 finish(a, f, ?plan, ?code)                                                   # res[Framed, finish.Error]
 keeps_pointer(a, f, request)                                                 # res[bool, lay.Error]
 ```
 
-`frame` is `lay` then `finish`. `keeps_pointer` answers before allocation whether the frame will keep its frame pointer, so the allowed set leaves it out.
+`frame` is `lay` then `finish`, laid out again with the emergency slots `scavenge.needed` counts until it holds as many as it needs (below). `keeps_pointer` answers before allocation whether the frame will keep its frame pointer, so the allowed set leaves it out.
 
 ## What it reads
 
@@ -24,9 +25,9 @@ keeps_pointer(a, f, request)                                                 # r
 A downward stack, from the canonical frame address (the stack pointer's value at the call) down:
 
 1. the return address, where the row says a call pushes it,
-2. the saved registers: the frame record at the row's offsets when the frame keeps its pointer, then every preserved register the function writes and the link register when anything writes it,
+2. the saved registers: the frame record at the row's offsets when the frame keeps its pointer, then every preserved register the function writes and the link register when anything writes it, then the emergency slots of a frame that keeps its pointer,
 3. the scaled area: every slot whose size is bytes per unit of a scale's multiplier, at an offset per unit, the area a multiple of the alignment per unit so every multiplier keeps it,
-4. the local slots, largest alignment first,
+4. the local slots, largest alignment first, and below them the emergency slots of a frame that keeps no pointer,
 5. the outgoing area at the stack pointer: the largest `offset + size` of the outgoing slots, and at least the shadow space when the function makes a call. Where a call passes a stack piece of scaled size or at an offset that scales, the area also has bytes per unit: the most any outgoing slot's offset and size per unit reach, rounded to the alignment. The stack pointer moves by that scaled part on its own, after the fixed parts in the prologue and before them in each epilogue.
 
 A call's stack pieces are addressed from the stack pointer at the call, each at its offset's fixed bytes plus its bytes per unit, as the convention placed it. Every slot above the outgoing area sits its scaled bytes per unit further from the stack pointer, so a fixed local is at its fixed depth plus the outgoing per-unit bytes, and the scaled area and the saves are past both.
@@ -36,6 +37,12 @@ Each part is rounded so the stack pointer keeps the row's alignment at every cal
 The frame keeps its pointer when the row always keeps it, or when the function allocates dynamically, moves its stack pointer by an instruction that is not a call or return, has a local slot aligned past the stack's alignment, which the prologue then realigns, or is unwound and may have a slot that scales. With a frame pointer every slot but the outgoing ones is addressed from it, except the local slots of a realigned frame, which are addressed from the realigned stack pointer. A realigned frame that also allocates dynamically needs a base register no row states, and is refused.
 
 A leaf that keeps no pointer, allocates nothing dynamically, has no scaled area and fits the red zone never moves its stack pointer, and its saves and slots are below it.
+
+## Emergency slots
+
+A move of the frame code that needs a scratch is offered the registers liveness shows free there. Where too few are free, `scavenge.make` saves the fewest allowed registers of the stack pointer's class the move names none of to the frame's emergency slots, offers them beside the free ones, and restores them after the move, as LLVM's register scavenger does. The configuration step's establishing instruction scavenges its scratch the same way (doc/machine/storage.md). Each emergency slot holds one register of the stack pointer's class at a fixed offset the frame code reaches with no scratch: below the saves off the frame pointer, or at the bottom of the locals off the stack pointer when the frame keeps no pointer, so their own saves and restores take none.
+
+A frame reserves them only where it could need them. `scavenge.needed` takes, at each instruction, the fewest scratches the frame code takes for its slot accesses and addresses, up to `Code.most`, and for an instruction stating a configuration state the scratches its establishing instruction takes, less the allowed registers of the stack pointer's class a call clobbers or the frame saves that liveness of the allocated function shows free there, and counts the most at any. A parallel copy counts none free, since its own values may take them. A frame whose moves all stand under the registers free reserves none and pays nothing.
 
 ## The prologue's shape
 
@@ -90,7 +97,8 @@ A frame whose call stack is unwound and that may have a slot that scales (one of
 
 ## Limits
 
-- The RISC-V code refuses an out-of-reach offset where it has no scratch register, as a spill, reload or slot address past 2 KiB from its base, or any spill or reload of a v register off its base, where no register of the stack pointer's class is free, and a scaled offset with no temporary.
+- The RISC-V code refuses an out-of-reach offset where it has no scratch register and none can be scavenged, as when the emergency slot itself lies past 2 KiB from its base, or above a scaled outgoing area in a frame that keeps no pointer.
+- A copy between two slots goes through a free location (doc/machine/copy.md) and never scavenges one, so where none is free it is refused `Reason.scratch`.
 - A call frame rule at an offset that scales is refused (`finish.Error.scaled`): mink's frame records state a scaled save only as one offset times a measuring register's value, and a scaled canonical frame address only as expression bytes, which mirl does not spell.
 - An offset scales by one scale, so a frame with slots of two scales, as SME's vector length and streaming vector length, is refused (`scales`).
 - A probe of a dynamic allocation is not written, so `lay` refuses a dynamic allocation under a row that probes.
