@@ -25,7 +25,6 @@ Two modules are equal when they say the same thing, up to the naming and orderin
 Equality is **insensitive** to
 
 - the order of functions and of globals, each paired with the one of the same symbol name in the other module,
-- the order and repetition of exports, compared as a set of symbols,
 - the order of a symbol's attributes, compared as a multiset,
 - type ids and the names of types and their members, since a type is compared by its structure, and an interned type that nothing names is not compared,
 - constant ids, their order and repetition, since a constant is compared by what it is,
@@ -238,7 +237,7 @@ decorators
   ident is the family, the rest its name, and its one argument the datum, a
   number, a list of numbers or a string: `#[spirv.execution_mode(17)]`.
 
-  #[export]                 the module exports the symbol
+  #[export]                 a shared image exports the symbol by its name
   #[weak] #[unique]         its binding, which `pub` states global and no
                             word states local
   #[visibility(name)]       its visibility, by the name of mink's row:
