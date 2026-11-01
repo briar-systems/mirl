@@ -1,12 +1,12 @@
 # AArch64 selection rules
 
-`mirl.target.register.aarch64.isa.TABLE` is the selection table for AArch64 under AAPCS64 and darwinpcs (see [selection](../machine/select.md)). It is static data, and names rows of masc's AArch64 catalog by the handles masc publishes for them (`gen_row.ADD_64_ADDSUB_SHIFT`), so mirl never encodes and never invents an instruction. Its record in `mirl.target.register.isa` joins it, the frame code, the moves and the loops to masc's set.
+`mirl.target.register.aarch64.isa.TABLE` is the selection table for AArch64 under AAPCS64, darwinpcs and aapcs64win (see [selection](../machine/select.md)). It is static data, and names rows of masc's AArch64 catalog by the handles masc publishes for them (`gen_row.ADD_64_ADDSUB_SHIFT`), so mirl never encodes and never invents an instruction. Its record in `mirl.target.register.isa` joins it, the frame code, the moves and the loops to masc's set.
 
 ## What it reads
 
 - The register is 64 bits. A rule's type tests state the width against it, `register` for a doubleword and `part{2}` for a word, so a word takes the w form of a row and a doubleword the x form.
 - The extensions come from the target's selection. A rule emits rows and the engine drops a rule whose row masc does not admit, so LSE's atomics, CSSC's `ctz`, `cnt` and the SVE whole register rows are each a row's requirement and never a branch in the table. FP and SIMD are the baseline both rows require.
-- The object format comes from the target's record. A symbol is reached through ELF's relocation kinds or Mach-O's, each address rule's hook reading the format, so no rule names a system.
+- The object format comes from the target's record. A symbol is reached through ELF's relocation kinds, Mach-O's or COFF's, each address rule's hook reading the format, so no rule names a system.
 - Every register and class is a handle masc generates (`gen_register.X_CLASS`, `gen_register.XZR`), so no file here holds a position in masc's register file.
 
 ## Values
@@ -23,10 +23,10 @@ A float of either width and a vector live in a v register. With FPCR.DN clear, a
 
 ## Calls, returns and addresses
 
-- A call to a symbol is `bl` under `call26` on ELF and `branch26` on Mach-O. A call through a register is `blr`. A return is `ret` of the convention's link register, a `link` source.
+- A call to a symbol is `bl` under `call26` on ELF and COFF and `branch26` on Mach-O. A call through a register is `blr`. A return is `ret` of the convention's link register, a `link` source.
 - An `alloca` is the `address` pseudo of a frame slot of its type.
-- The address of a symbol follows the target's relocation model. A symbol not preemptible is `adrp` and `add` (`page21`, `lo12_add`), and a preemptible one `adrp` and a load from the global offset table (`got_page21`, `got_lo12`). Mach-O's are `page21` and `pageoff12`, and `got_load_page21` and `got_load_pageoff12`. `func.addr` takes the same pairs.
-- A thread-local variable follows the access the model declares. Local exec is `mrs` of `tpidr_el0` and two adds (`tlsle_add_tprel_hi12`, `tlsle_add_tprel_lo12_nc`). Initial exec loads the offset from the global offset table. A descriptor access is the TLSDESC sequence, `adrp`, `ldr` of the resolver, `add` into x0 and `blr`, a call to the descriptor (`Callee.descriptor`), which leaves only the registers the row states for it undefined, then `mrs` and `add`. Darwin's variable access loads the thunk from its descriptor and calls it with the descriptor in x0, which gives the address back in x0. Local exec keeps an address's offset past its variable in its relocations. A global offset table load and every other access take the symbol at its start and add the offset after, an `add` or `sub` of twelve bits or an `add` of a register `movz` and `movk` fill ([select.md](../machine/select.md)).
+- The address of a symbol follows the target's relocation model. A symbol not preemptible is `adrp` and `add` (`page21`, `lo12_add`), and a preemptible one `adrp` and a load from the global offset table (`got_page21`, `got_lo12`). Mach-O's are `page21` and `pageoff12`, and `got_load_page21` and `got_load_pageoff12`. A PE image resolves every symbol at link time, so COFF's is always `page21` and `lo12_add`. `func.addr` takes the same pairs.
+- A thread-local variable follows the access the model declares. Local exec is `mrs` of `tpidr_el0` and two adds (`tlsle_add_tprel_hi12`, `tlsle_add_tprel_lo12_nc`). Initial exec loads the offset from the global offset table. A descriptor access is the TLSDESC sequence, `adrp`, `ldr` of the resolver, `add` into x0 and `blr`, a call to the descriptor (`Callee.descriptor`), which leaves only the registers the row states for it undefined, then `mrs` and `add`. Darwin's variable access loads the thunk from its descriptor and calls it with the descriptor in x0, which gives the address back in x0. Windows' indexed access is `adrp` and `ldr` of the index from `_tls_index`, `ldr` of the TEB's ThreadLocalStoragePointer at `[x18, #0x58]`, `ldr` of the module's block at the index with the register offset form, and two adds of the variable's offset in its section (`secrel_hi12`, `secrel_lo12_add`). Local exec keeps an address's offset past its variable in its relocations. A global offset table load and every other access take the symbol at its start and add the offset after, an `add` or `sub` of twelve bits or an `add` of a register `movz` and `movk` fill ([select.md](../machine/select.md)).
 
 ## Atomics
 
@@ -81,7 +81,7 @@ Some operations select only for the operands a base form covers.
 
 ## Limits
 
-- A load or store takes a base register and a constant offset: `ldr` and `str` with the scaled unsigned immediate, and `ldur` and `stur` with nine signed bits where that does not reach. The register offset form, `[base, index, lsl #n]`, is not selected: masc states its extend and shift as enumerants whose values the table would have to spell, and an index is added into the base first.
+- A load or store takes a base register and a constant offset: `ldr` and `str` with the scaled unsigned immediate, and `ldur` and `stur` with nine signed bits where that does not reach. The register offset form, `[base, index, lsl #n]`, is selected only in windows' thread-local sequence, spelling masc's enumerant values: elsewhere an index is added into the base first.
 - masc states the destination of `scvtf` and `ucvtf` read and written, since FPCR.NEP set would merge the upper lanes, and masc's state takes no caller-fixed value for it. mach never sets NEP, but liveness keeps the old value of each such destination live until masc can be told so.
-- `aapcs64win` is not carried, since mink writes no PE image yet (mink#70).
+- Under `aapcs64win` a function that allocates dynamically is refused, as on windows x64, since its probe of each page is not written. Every frame keeps the frame pointer, and a frame whose saves would set it more than 2040 bytes above the stack pointer, past what the arm64 unwind codes state, is refused.
 - Neither z nor p holds a value: SVE code generation is the vectorisation job's (#72). The frame code states their whole register loads and stores and their scaled steps.
