@@ -122,6 +122,7 @@ use mirl.target.layout;
 use mirl.target.layout.Layout;
 use target_record: mirl.target.record;
 use mirl.target.record.Target;
+use register_schema: mirl.target.register.schema;
 
 use masc.core.effect;
 use mo:         masc.core.operand;
@@ -257,6 +258,8 @@ pub rec Unmatched {
 #            stands before it
 # assembly:  an inline assembly item whose block masc refused, or whose
 #            operands the machine form does not bind
+# naked:     an instruction of a naked function other than an inline
+#            assembly item that binds nothing or an unreachable
 pub tag Error: u8 {
     alloc:     allocator.Error;
     module:    module.Error;
@@ -280,6 +283,7 @@ pub tag Error: u8 {
     undecided: Undecided;
     unchecked: id.Instruction;
     assembly:  Assembled;
+    naked:     id.Instruction;
 }
 
 # a machine instruction selection made whose transfer is undecided
@@ -955,6 +959,8 @@ rec Move {
 # consumed:  per ir instruction, whether a pattern covers it and it emits nothing
 # shared:    per ir instruction, how many node slots of chosen later patterns cover it and read its
 #            operands, so the values it reads are kept in registers
+# leaves:    per ir instruction, how many chosen patterns read a result of it in a register through
+#            a node they cover and leave standing, so it is emitted however its own uses are covered
 # position:  per ir instruction of the current block, its place in the block
 # impure:    per place of the current block, how many instructions before it
 #            trap or touch memory
@@ -977,6 +983,10 @@ rec Move {
 # firsts:    per ir instruction, the first machine instruction made with it as
 #            the root of a rule, NONE for one made with none
 # stored:    the variables bound to the storage of a slot selection made
+# frames:    per ir instruction, the frame slot made for it as an alloca, NONE
+#            for none yet
+# naked:     the function states `naked`, so its body is only blocks that bind
+#            nothing and its parameters stay where the convention places them
 rec State {
     s:         *Selector;
     ctx:       *core_state.Context;
@@ -996,6 +1006,7 @@ rec State {
     blocks:    vector.Vector[u32];
     consumed:  vector.Vector[bool];
     shared:    vector.Vector[u32];
+    leaves:    vector.Vector[u32];
     position:  vector.Vector[u32];
     impure:    vector.Vector[u32];
     choices:   vector.Vector[Choice];
@@ -1007,17 +1018,21 @@ rec State {
     todo:      vector.Vector[u32];
     firsts:    vector.Vector[u32];
     stored:    vector.Vector[Stored];
+    frames:    vector.Vector[u32];
+    naked:     bool;
 }
 
 fun drop_state(st: *State) {
     vector.dnit[u32](?st.firsts);
     vector.dnit[Stored](?st.stored);
+    vector.dnit[u32](?st.frames);
     vector.dnit[u32](?st.registers);
     vector.dnit[bool](?st.secret);
     vector.dnit[u32](?st.held);
     vector.dnit[u32](?st.blocks);
     vector.dnit[bool](?st.consumed);
     vector.dnit[u32](?st.shared);
+    vector.dnit[u32](?st.leaves);
     vector.dnit[u32](?st.position);
     vector.dnit[u32](?st.impure);
     vector.dnit[Choice](?st.choices);
@@ -2122,8 +2137,9 @@ fun lay_table(st: *State, b: u32, md: Metadata) res[Instruction, Error] {
 
 # the frame slot an alloca asks for: its type's size, in the space the target
 # states for its frame slots, at its alignment, addressed since the alloca's
-# result is its address
+# result is its address. it is made once, however many operands name it
 fun slot_for(st: *State, root: id.Instruction) res[u32, Error] {
+    if (st.frames.data[root.index] != NONE) { ret res[u32, Error].ok{st.frames.data[root.index]}; }
     val d:     *InstructionData = instruction(st, root);
     var ty:    Type             = Type{index: 0};
     var align: u64              = 1;
@@ -2154,6 +2170,7 @@ fun slot_for(st: *State, root: id.Instruction) res[u32, Error] {
         if (sel kept.err) { ret res[u32, Error].err{Error.alloc{kept.err}}; }
         b = b + 1;
     }
+    st.frames.data[root.index] = got.ok.index;
     ret res[u32, Error].ok{got.ok.index};
 }
 
@@ -2366,6 +2383,7 @@ fun enter(st: *State, b: u32) err[Error] {
     }
     val placed: err[allocator.Error] = mf.place_entry(st.out, Slice[Placed]{data: e.placed.data, size: e.placed.len});
     if (sel placed.err) { ret err[Error].err{Error.alloc{placed.err}}; }
+    if (st.naked)       { ret err[Error].ok{}; }
     var i: usize = 0;
     for (i < params.len && i < e.placed.len) {
         val md:  Metadata   = Metadata{location: opt[Location].none{}, site: opt[Site].none{}, flags: NO_FLAGS, secret: false, bindings: UNBOUND};
@@ -2651,7 +2669,7 @@ fun read_by_matches(st: *State, x: id.Instruction) bool {
         uses = uses + value(st, xd.results.data[k]).uses.len;
         k    = k + 1;
     }
-    ret uses != 0 && st.shared.data[x.index]::usize == uses;
+    ret uses != 0 && st.shared.data[x.index]::usize == uses && st.leaves.data[x.index] == 0;
 }
 
 # whether an instruction is a division without the checked mark that the
@@ -2694,6 +2712,29 @@ fun tested(st: *State, c: *Choice) err[Error] {
     ret err[Error].ok{};
 }
 
+# count each instruction whose result node `n` of a choice reads in a register:
+# the node stands, so the choice repeats it, and an operand no child node of it
+# in the choice defines is a register the repeat reads beside the node's own use
+fun leaf_reads(st: *State, c: *Choice, n: u32) {
+    val r:  *Rule            = ?st.s.isa.table.rules.at[c.rule];
+    val xd: *InstructionData = instruction(st, c.found.nodes[n]);
+    var j:  usize            = 0;
+    for (j < xd.operands.len) {
+        val d: *ValueData = value(st, xd.operands.data[j]);
+        if (sel d.def.result) {
+            val at:      id.Instruction = d.def.result.instruction;
+            var covered: bool           = false;
+            var m:       u32            = 1;
+            for (m < c.found.count) {
+                if (r.nodes.at[m].parent::u32 == n && c.found.nodes[m].index == at.index) { covered = true; }
+                m = m + 1;
+            }
+            if (!covered) { st.leaves.data[at.index] = st.leaves.data[at.index] + 1; }
+        }
+        j = j + 1;
+    }
+}
+
 # choose a rule for every instruction of an ir block, its last first
 fun choose_block(st: *State, k: id.Block) err[Error] {
     val list: *vector.Vector[id.Instruction] = ?st.body.blocks.data[k.index].instructions;
@@ -2716,6 +2757,7 @@ fun choose_block(st: *State, k: id.Block) err[Error] {
         i = i - 1;
         val at: id.Instruction = list.data[i];
         if (st.shared.data[at.index] != 0 && read_by_matches(st, at)) { st.consumed.data[at.index] = true; }
+        if (only_bound(st, at))                                       { st.consumed.data[at.index] = true; }
         if (instruction(st, at).opcode.index == ir.ASM.index) {
             var held: Choice = Choice{rule: NONE, found: unmatched_match(st), consumes: 0};
             held.found.nodes[0] = at;
@@ -2732,7 +2774,10 @@ fun choose_block(st: *State, k: id.Block) err[Error] {
             var n: u32 = 1;
             for (n < c.found.count) {
                 if (((c.consumes >> n) & 1) != 0) { st.consumed.data[c.found.nodes[n].index] = true; }
-                or                                { st.shared.data[c.found.nodes[n].index] = st.shared.data[c.found.nodes[n].index] + 1; }
+                or {
+                    st.shared.data[c.found.nodes[n].index] = st.shared.data[c.found.nodes[n].index] + 1;
+                    leaf_reads(st, ?c, n);
+                }
                 n = n + 1;
             }
             val p: res[usize, allocator.Error] = vector.push[Choice](?st.choices, c);
@@ -2796,10 +2841,62 @@ fun bound_immediate(st: *State, v: id.Value, c: inline.Immediate) res[opt[i64], 
     ret res[opt[i64], Error].ok{opt[i64].some{x}};
 }
 
+# whether instruction `x` is an alloca whose address only inline assembly
+# items bind, each as a memory operand, so its slot is made where they bind it
+# and no register ever holds the address
+fun only_bound(st: *State, x: id.Instruction) bool {
+    val xd: *InstructionData = instruction(st, x);
+    if (xd.opcode.index != ir.ALLOCA.index || xd.results.len != 1) { ret false; }
+    val v:    id.Value   = xd.results.data[0];
+    val uses: *ValueData = value(st, v);
+    if (uses.uses.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < uses.uses.len) {
+        if (!memory_only(st, uses.uses.data[i], v)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether every operand of instruction `user` that reads `v` is an inline
+# assembly item's memory operand
+fun memory_only(st: *State, user: id.Instruction, v: id.Value) bool {
+    val d: *InstructionData = instruction(st, user);
+    if (d.opcode.index != ir.ASM.index || d.immediates.len == 0) { ret false; }
+    val imm: Immediate = d.immediates.data[0];
+    if (!(sel imm.assembly)) { ret false; }
+    val blk: *ia.Assembly = imm.assembly;
+    var arg: usize        = 0;
+    var k:   usize        = 0;
+    for (k < blk.operands.size) {
+        val o:     *ia.Operand       = ?blk.operands.data[k];
+        val c:     inline.Constraint = o.constraint;
+        var reads: bool              = true;
+        if (sel c.class) { reads = (o.role & mo.READ) != 0; }
+        if (reads) {
+            if (arg >= d.operands.len)                                    { ret false; }
+            if (d.operands.data[arg].index == v.index && !(sel c.memory)) { ret false; }
+            arg = arg + 1;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the alloca whose address `v` is, none for a value of any other definition
+fun allocated(st: *State, v: id.Value) opt[id.Instruction] {
+    val d: *ValueData = value(st, v);
+    if (!(sel d.def.result)) { ret opt[id.Instruction].none{}; }
+    val x: id.Instruction = d.def.result.instruction;
+    if (instruction(st, x).opcode.index != ir.ALLOCA.index) { ret opt[id.Instruction].none{}; }
+    ret opt[id.Instruction].some{x};
+}
+
 # an inline assembly item emitted into block `b` as one instruction of the
 # block masc parsed: each operand of the block at a virtual register of its
-# class, tied where it reads and writes one, an address based in the
-# register its pointer is in, or the constant it binds, and what the block
+# class, tied where it reads and writes one, the frame slot of an alloca it
+# reaches memory through, an address based in the register any other pointer
+# is in, or the constant it binds, and what the block
 # itself reads and writes as the instruction's implicit locations. a block
 # that calls leaves undefined what a callee under the function's own row does
 fun assemble(st: *State, b: u32, at: id.Instruction, md: Metadata) err[Error] {
@@ -2850,6 +2947,15 @@ fun assemble(st: *State, b: u32, at: id.Instruction, md: Metadata) err[Error] {
             or                                  { ops[k] = Operand.virtual{Virtual{index: dest}}; }
         }
         or (sel c.memory) {
+            val local: opt[id.Instruction] = allocated(st, d.operands.data[arg]);
+            if (sel local.some) {
+                val got: res[u32, Error] = slot_for(st, local.some);
+                if (sel got.err) { ret err[Error].err{got.err}; }
+                arg    = arg + 1;
+                ops[k] = Operand.slot{FrameSlot{index: got.ok}};
+                k      = k + 1;
+                cnt;
+            }
             val r: res[u32, Error] = value_register(st, b, d.operands.data[arg], at, md);
             if (sel r.err) { ret err[Error].err{r.err}; }
             arg    = arg + 1;
@@ -2996,7 +3102,33 @@ fun place_points(st: *State) err[Error] {
     ret err[Error].ok{};
 }
 
+# refuse a naked function whose body is more than inline blocks that bind
+# nothing and the terminator that ends it, since it has no frame to hold a value in
+fun bare(st: *State) err[Error] {
+    var k: usize = 0;
+    for (k < st.body.blocks.len) {
+        if (!st.body.blocks.data[k].erased) {
+            val list: *vector.Vector[id.Instruction] = ?st.body.blocks.data[k].instructions;
+            var i:    usize                          = 0;
+            for (i < list.len) {
+                val d:    *InstructionData = instruction(st, list.data[i]);
+                val code: u32              = d.opcode.index;
+                val ends: bool             = code == ir.UNREACHABLE.index;
+                val held: bool             = code == ir.ASM.index && d.operands.len == 0 && d.results.len == 0;
+                if (!ends && !held) { ret err[Error].err{Error.naked{list.data[i]}}; }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
 fun run(st: *State) err[Error] {
+    if (st.naked) {
+        val held: err[Error] = bare(st);
+        if (sel held.err) { ret held; }
+    }
     val values: err[Error] = grow(?st.registers, st.body.values.len, NONE);
     if (sel values.err) { ret values; }
     val places: err[Error] = grow(?st.position, st.body.instructions.len, 0);
@@ -3005,8 +3137,12 @@ fun run(st: *State) err[Error] {
     if (sel eaten.err) { ret eaten; }
     val read: err[Error] = grow(?st.shared, st.body.instructions.len, 0);
     if (sel read.err) { ret read; }
+    val leafed: err[Error] = grow(?st.leaves, st.body.instructions.len, 0);
+    if (sel leafed.err) { ret leafed; }
     val first: err[Error] = grow(?st.firsts, st.body.instructions.len, NONE);
     if (sel first.err) { ret first; }
+    val framed: err[Error] = grow(?st.frames, st.body.instructions.len, NONE);
+    if (sel framed.err) { ret framed; }
     var k: usize = 0;
     for (k < st.body.blocks.len) {
         if (st.body.blocks.data[k].erased) {
@@ -3075,6 +3211,7 @@ pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls, context:
         blocks:    vector.init[u32](s.a),
         consumed:  vector.init[bool](s.a),
         shared:    vector.init[u32](s.a),
+        leaves:    vector.init[u32](s.a),
         position:  vector.init[u32](s.a),
         impure:    vector.init[u32](s.a),
         choices:   vector.init[Choice](s.a),
@@ -3086,6 +3223,8 @@ pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls, context:
         todo:      vector.init[u32](s.a),
         firsts:    vector.init[u32](s.a),
         stored:    vector.init[Stored](s.a),
+        frames:    vector.init[u32](s.a),
+        naked:     register_schema.naked(m, f),
     };
     val ran: err[Error] = run(?st);
     drop_state(?st);
