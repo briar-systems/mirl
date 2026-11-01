@@ -36,6 +36,8 @@ Under `v` a vector of up to the least VLEN the build's `zvl` extensions allow is
 
 The V unit holds no mask yet (`masks` is `none`), so a comparison and a select of vectors are taken lane by lane.
 
+A vector wider than the least VLEN splits into vectors of one register rather than being held whole as a group of `vg2`, `vg4` or `vg8` at LMUL 2, 4 or 8. masc places every group within itself and within each wider group holding it, and every member within its group, at every VLEN (see [storage](../machine/storage.md)), so holding a wide vector as one group needs only the rules at those LMULs and no storage fact. A narrowing reads, and a widening writes, its fractional EMUL operand as a whole register, since masc's file states no row of a fraction of one, so two such values never share a register. No rule reads one member of a group or a register pair yet.
+
 ## Calls, returns and addresses
 
 The abi legalisation puts every call, entry and return in piece form before selection, and the engine places the pieces (see [selection](../machine/select.md)). The table supplies the forms.

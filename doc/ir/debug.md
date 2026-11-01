@@ -48,6 +48,8 @@ A binding ties a source variable to the code. It holds the variable's source nam
 - **Storage.** An instruction whose result addresses the variable's storage, such as the `alloca` of a stack slot, names the binding in its metadata. Bindings are attached there as a list. `bindings(m, list)` makes a list of bindings that instructions can share, and a list never changes once made. The empty list is always the first.
 - **Value.** A value binding record at a program point gives the variable a value from that point on.
 
+A global is described by a binding too. `GlobalData.debug` names the variable it is, with no parameter position, or none when no source describes it, and `mirl.ir.module.describe_global` sets it on a global already added. The text form spells it `#[debug(v)]` on the global.
+
 ## Value binding records
 
 A record stands at a point of a block: just before one of its instructions, or at the block's entry, which is the point before its first instruction and how a block parameter gets one. It names a binding and what it reads, which is an operand and a salvage expression over it, or `unavailable`. The operand is any value of the function: an instruction result, a block parameter or a constant. A binding has to be at a point rather than on a value, since a value has no "from here on". After `x = y`, with `y` defined earlier, a binding on `y` would make `x` read as `y` before the assignment, and a constant has no point of definition at all.
@@ -78,6 +80,16 @@ Selection gives each record a machine record (`mirl.machine.point.Point`) before
 ### DWARF
 
 `mirl.debug.dwarf.write` writes one DWARF 5 compile unit for the module through masc's builder. The unit's `DW_AT_language` is the code of the source language the module states, and a unit of a module that states none has no `DW_AT_language`. A language states its own code. Of mirl's rows, one DWARF has a standard code for is written with it, `c` as `DW_LANG_C11` (`0x1d`). One it has none for takes a code from the user range, chosen once here and never reused: `mach` is `0x804d`, `DW_LANG_lo_user` with the low byte `M`. Strings, addresses, location lists and range lists are indexed forms with their bases in the unit. Each type of the debug table is an entry whose byte size and member offsets the layout routine gives, a tagged union is a structure of its discriminant and a `DW_TAG_variant_part` of its cases, and a function is a subprogram whose frame base is the canonical frame address. A variable's location list has an entry per range, of `DW_OP_reg`/`DW_OP_breg`, `DW_OP_fbreg`, or a constant with `DW_OP_stack_value`, the salvage steps over it, and `DW_OP_piece` or `DW_OP_bit_piece` per piece. Code inlined at a site is a `DW_TAG_inlined_subroutine` of the callee's abstract entry, at the call's file and line.
+
+A global the debug table describes is a `DW_TAG_variable` at the unit's scope, of its name, type, `DW_AT_external` (set unless its binding is local) and its declaration's file and line. One the module defines is located at its address, `DW_OP_addrx`. A thread-local is located at its offset in its thread's block followed by `DW_OP_form_tls_address`, and one another unit defines is `DW_AT_declaration` with no location. How a thread-local's offset is written is a row of the producer's format table, `mirl.debug.dwarf.FORMATS`, one per object format beside its section names.
+
+| format | thread-local offset |
+|---|---|
+| ELF | the first of `DTPOFF64` on a doubleword (R_X86_64_DTPOFF64, R_AARCH64_TLS_DTPREL64, R_RISCV_TLS_DTPREL64), i386's `DTPOFF32` (R_386_TLS_LDO_32) or `DTPOFF32_DYN` (R_RISCV_TLS_DTPREL32) on a word that masc's set relocates a datum by on the architecture, as `DW_OP_const8u` or `DW_OP_const4u` |
+| COFF | `SECREL32` on a word, the offset in the image's `.tls` |
+| Mach-O | the address of the variable's TLV descriptor, a datum of an address's width |
+
+A thread-local whose offset the row, or masc's set on the architecture, states no form for is written with no `DW_AT_location`, which a debugger reads as unknown. A description never refuses a module. A format with no row gets no debug sections.
 
 ### Salvage expressions
 
@@ -125,4 +137,4 @@ An instruction's metadata record names the location it was built for, the site i
 
 ## What the verifier holds
 
-Verifier rule 12, `debug`, requires that every location, site and binding list named by an instruction's metadata is an entry of the module's debug table. Rule 13, `binding`, requires that every value binding record stands before an instruction of its block, in the order of their points, names a variable of the debug table, and reads a value the body defines through an expression that applies to its type, and that the value dominates the record's point when the entry reaches its block.
+Verifier rule 12, `debug`, requires that every location, site and binding list named by an instruction's metadata is an entry of the module's debug table, and that every global's debug binding is a variable of the table with no parameter position. Rule 13, `binding`, requires that every value binding record stands before an instruction of its block, in the order of their points, names a variable of the debug table, and reads a value the body defines through an expression that applies to its type, and that the value dominates the record's point when the entry reaches its block.
