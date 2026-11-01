@@ -404,7 +404,7 @@ debug table
               | "var" ident "=" string ":" ident "at" ident [ "parameter" uint ] ";" ;
   shape       = "base" "(" encoding "," uint ")"
               | ( "structure" | "union" ) "(" type ")" members
-              | "tagged" "(" type ")" ( "open" | "discriminant" dmember "payload" uint
+              | "tagged" "(" type ")" ( "open" | "discriminant" dmember [ "payload" uint ]
                 "{" [ case { "," case } ] "}" )
               | "enumeration" ( "open" | "(" ident ")" "{" [ enumerator { "," enumerator } ] "}" )
               | "array" ( "open" | "(" ident "," uint ")" )
@@ -423,7 +423,7 @@ debug table
   anonymous) and its shape: a structure or union is the ir type it is laid
   out as and its members, each a source name, a debug type and the field of
   the layout it is laid out as, a tagged union its layout, discriminant,
-  payload field and cases, an enumeration its base type and values, an
+  payload field when it has one and cases, an enumeration its base type and values, an
   array its element and count, a pointer the key of its pointee and a
   function its parameters and results. `open` is an entry declared and not
   yet defined. a variable is its source name, debug type, declaring
