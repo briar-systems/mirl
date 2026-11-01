@@ -1,6 +1,6 @@
 # Copies
 
-`mirl.machine.copy` turns every `pseudo copy` and `parallel_copy` of a framed register machine function into the target's moves. It runs after the frame, where every operand is a location or a placed slot, and before block layout. It names no instruction: the set states its moves as data.
+`mirl.machine.copy` turns every `pseudo copy`, `parallel_copy`, `spill` and `reload` of a framed register machine function into the target's moves, and every `address` into the frame code's add of the slot's place to its base. It runs after the frame, where every operand is a location or a placed slot, and before block layout. It names no instruction: the set states its moves as data.
 
 ```
 index(a, ?table, ?locations, ?registers)          # res[Index, move.Error]
@@ -20,7 +20,7 @@ A set's `Table` lists its moves and its swaps. A `Move` names the class it write
 ## The lowering
 
 - A copy whose destination is the location it reads disappears, and so does that pair of a parallel copy.
-- A move between two registers or cells is the set's move for their classes. Between a register and a slot it is the frame code's load or store at the slot's place and size, as the frame expands a spill or reload (doc/machine/frame.md).
+- A move between two registers or cells is the set's move for their classes. Between a register and a slot it is the frame code's load or store at the slot's place and size. A `spill` or `reload` is lowered here as a copy of one pair, the frame copying it through (doc/machine/frame.md), so its load or store is offered every free register as its scratch like any other. An `address` is the frame code's add of the slot's place to its base into its destination, offered the same scratches.
 - Between two memory locations, slots or cells, of one storage through the selection, it is two moves through a free location that holds the whole value, chosen by the value's storage and never from a fixed class: a register the frame code both loads and stores at a slot's size, or a location the set moves a cell into and back out of exactly. One function, `holds`, makes that choice for every free location the lowering takes, so a value saved to break a cycle goes where it fits the same way. Two memory locations of different storage are refused, since no move between them states how the value changes size.
 - Where no free location holds the value, a copy between two slots of a fixed size is split into exact parts through one free register, at offsets into both slots. Each part is the widest the frame code both loads and stores that register at, no more than the bytes left and no wider than the alignment both slots keep at its offset, so an RV64 copy of 16 bytes is two `ld` and `sd` pairs and an RV32 copy of 8 bytes two `lw` and `sw` pairs. No move takes fewer bytes than the slots hold. A value no location holds and no split moves is refused.
 - The pairs of a parallel copy are ordered by the storage each one touches, as masc states which registers share storage: a pair is written once no other pending pair reads a location that shares storage with its destination. A pair whose source and destination share part of their storage is its single move, which reads before it writes. Two pairs whose destinations share storage are refused, since no order writes both.
