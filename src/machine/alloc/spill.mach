@@ -15,6 +15,13 @@
 # after, for a write. every instruction is made through the function's own
 # maker, so it is checked against its row as any other.
 #
+# a value in pieces whose every write is a slot address is made again, never
+# stored: its write stores nothing, each run of reads starts with a slot
+# address of that slot into its piece where a reload would stand, and no
+# slot is made for it. so a frame local's address never passes through
+# memory, and every access of the local stays off a register the frame sets
+# from the stack or frame pointer, as a constant-time walk places it.
+#
 # an inserted instruction keeps the source location and site of the one it
 # serves, and is secret when any write of the value it carries is, so a
 # spill never launders a secret into a public slot.
@@ -87,6 +94,9 @@ pub val OWN: u8 = 2;
 # no instruction of the input
 pub val NONE: u32 = 0xffffffff;
 
+# more than one slot address, or a write of another kind, writes a value
+val MANY: u32 = 0xfffffffe;
+
 # why a form was not built
 # ---
 # alloc:   the allocator refused storage
@@ -155,6 +165,7 @@ rec Build {
     at:       *Locations;
     clobbers: *Lists[u32];
     slots:    vector.Vector[u32];
+    remade:   vector.Vector[u32];
     secret:   vector.Vector[bool];
     current:  vector.Vector[u32];
     open:     vector.Vector[u32];
@@ -284,6 +295,14 @@ fun insert(list: *vector.Vector[Insert], op: Pseudo, dest: Operand, src: Operand
     ret pushed(vector.push[Insert](list, Insert{op: op, dest: dest, src: src, value: value}));
 }
 
+# the instruction that gives a piece of value `v` into `dest`: a slot address of the slot it addresses for a value
+# made again, else a reload from its own slot
+fun reload(b: *Build, dest: u32, v: u32) err[Error] {
+    val slot: u32 = b.remade.data[v];
+    if (slot != NONE) { ret insert(?b.pre, pseudo.ADDRESS, virtual_operand(dest), Operand.slot{Slot{index: slot}}, v); }
+    ret insert(?b.pre, pseudo.RELOAD, virtual_operand(dest), slot_operand(b, v), v);
+}
+
 # the value a read of an input virtual register reads in the form
 fun read(b: *Build, i: Instruction, k: u32, v: u32, tied: bool) res[u32, Error] {
     val own: bool = plan.owns(b.p, i, k, false);
@@ -298,14 +317,14 @@ fun read(b: *Build, i: Instruction, k: u32, v: u32, tied: bool) res[u32, Error] 
     if (own) {
         val t: res[u32, Error] = fresh(b, OWN, v);
         if (sel t.err) { ret t; }
-        val ins: err[Error] = insert(?b.pre, pseudo.RELOAD, virtual_operand(t.ok), slot_operand(b, v), v);
+        val ins: err[Error] = reload(b, t.ok, v);
         if (sel ins.err) { ret res[u32, Error].err{ins.err}; }
         ret t;
     }
     if (b.current.data[v] == NONE) {
         val p: res[u32, Error] = fresh(b, PIECE, v);
         if (sel p.err) { ret p; }
-        val ins: err[Error] = insert(?b.pre, pseudo.RELOAD, virtual_operand(p.ok), slot_operand(b, v), v);
+        val ins: err[Error] = reload(b, p.ok, v);
         if (sel ins.err) { ret res[u32, Error].err{ins.err}; }
         val o: err[Error] = pushed(vector.push[u32](?b.open, v));
         if (sel o.err) { ret res[u32, Error].err{o.err}; }
@@ -333,8 +352,10 @@ fun write(b: *Build, i: Instruction, k: u32, v: u32) res[u32, Error] {
     }
     val t: res[u32, Error] = fresh(b, OWN, v);
     if (sel t.err) { ret t; }
-    val ins: err[Error] = insert(?b.post, pseudo.SPILL, slot_operand(b, v), virtual_operand(t.ok), v);
-    if (sel ins.err) { ret res[u32, Error].err{ins.err}; }
+    if (b.remade.data[v] == NONE) {
+        val ins: err[Error] = insert(?b.post, pseudo.SPILL, slot_operand(b, v), virtual_operand(t.ok), v);
+        if (sel ins.err) { ret res[u32, Error].err{ins.err}; }
+    }
     val e: err[Error] = pushed(vector.push[u32](?b.ends, v));
     if (sel e.err) { ret res[u32, Error].err{e.err}; }
     ret t;
@@ -583,6 +604,79 @@ fun secrecy(b: *Build) {
     }
 }
 
+# a write of input virtual register `v`: `slot` for one by a slot address of that slot, NONE for any other
+fun wrote(b: *Build, v: u32, slot: u32) {
+    val was: u32 = b.remade.data[v];
+    if (was == MANY) { ret; }
+    if (slot == NONE || (was != NONE && was != slot)) {
+        b.remade.data[v] = MANY;
+        ret;
+    }
+    b.remade.data[v] = slot;
+}
+
+# the slot each input virtual register addresses when its every write is a slot address of that slot, NONE for one
+# with any other write
+fun remade(b: *Build) {
+    var k: usize = 0;
+    for (k < b.src.blocks.len) {
+        val list: Slice[Instruction] = function.instructions(b.src, Block{index: k::u32});
+        var i:    usize              = 0;
+        for (i < list.size) {
+            val d:    *InstructionData = function.data(b.src, list.data[i]);
+            val op:   Opcode           = d.opcode;
+            var slot: u32              = NONE;
+            if (sel op.pseudo) {
+                if (op.pseudo == pseudo.ADDRESS && d.operands.size == 2) {
+                    val at: Operand = d.operands.data[1];
+                    if (sel at.slot) { slot = at.slot.index; }
+                }
+            }
+            val count: u32 = d.operands.size::u32;
+            var n:     u32 = 0;
+            for (n < count) {
+                val o:      Operand = d.operands.data[n];
+                val writes: bool    = (instruction.stated_role(b.src.set, d, n) & mo.WRITE) != 0;
+                var by:     u32     = NONE;
+                if (n == 0) { by = slot; }
+                if (sel o.virtual) {
+                    if (writes) { wrote(b, o.virtual.index, by); }
+                }
+                if (sel o.member) {
+                    if (writes) { wrote(b, o.member.virtual.index, NONE); }
+                }
+                if (sel o.tied) {
+                    val dest: Register = o.tied.dest;
+                    if (sel dest.virtual) { wrote(b, dest.virtual.index, NONE); }
+                }
+                if (sel o.list) {
+                    val first: Register = o.list.first;
+                    if (sel first.virtual) {
+                        if (writes) { wrote(b, first.virtual.index, NONE); }
+                    }
+                }
+                if (sel o.address) {
+                    val base: opt[Register] = o.address.base;
+                    if (sel base.some) {
+                        val r: Register = base.some;
+                        if (sel r.virtual) {
+                            if (operand.writes_back(o.address)) { wrote(b, r.virtual.index, NONE); }
+                        }
+                    }
+                }
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    var v: usize = 0;
+    for (v < b.remade.len) {
+        if (b.remade.data[v] == MANY) { b.remade.data[v] = NONE; }
+        v = v + 1;
+    }
+}
+
 # the form's virtual registers, slots and blocks before any instruction
 fun frame(b: *Build) err[Error] {
     var v: usize = 0;
@@ -605,7 +699,7 @@ fun frame(b: *Build) err[Error] {
     }
     v = 0;
     for (v < b.src.virtuals.len) {
-        if (b.p.modes.data[v] == plan.PIECES) {
+        if (b.p.modes.data[v] == plan.PIECES && b.remade.data[v] == NONE) {
             val c:   Class    = b.src.virtuals.data[v];
             val key: opt[u32] = location.key(b.at, c);
             if (sel key.none) { ret err[Error].err{Error.class{Virtual{index: v::u32}}}; }
@@ -630,10 +724,12 @@ fun frame(b: *Build) err[Error] {
 
 fun run(b: *Build) err[Error] {
     var failed: err[allocator.Error] = slice.fill[u32](?b.slots, b.src.virtuals.len, NONE);
+    keep(?failed, slice.fill[u32](?b.remade, b.src.virtuals.len, NONE));
     keep(?failed, slice.fill[bool](?b.secret, b.src.virtuals.len, false));
     keep(?failed, slice.fill[u32](?b.current, b.src.virtuals.len, NONE));
     if (sel failed.err) { ret alloc_err(failed.err); }
     secrecy(b);
+    remade(b);
     val framed: err[Error] = frame(b);
     if (sel framed.err) { ret framed; }
     var k: usize = 0;
@@ -676,6 +772,7 @@ pub fun build(a: *allocator.Allocator, src: *Function, p: *Plan, at: *Locations,
         at:       at,
         clobbers: clobbers,
         slots:    vector.init[u32](a),
+        remade:   vector.init[u32](a),
         secret:   vector.init[bool](a),
         current:  vector.init[u32](a),
         open:     vector.init[u32](a),
@@ -688,6 +785,7 @@ pub fun build(a: *allocator.Allocator, src: *Function, p: *Plan, at: *Locations,
     var done:      err[Error] = inherited;
     if (!(sel inherited.err)) { done = run(?b); }
     vector.dnit[u32](?b.slots);
+    vector.dnit[u32](?b.remade);
     vector.dnit[bool](?b.secret);
     vector.dnit[u32](?b.current);
     vector.dnit[u32](?b.open);
