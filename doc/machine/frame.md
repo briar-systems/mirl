@@ -98,7 +98,7 @@ A frame whose call stack is unwound and that may have a slot that scales (one of
 ## Limits
 
 - The RISC-V code refuses an out-of-reach offset where it has no scratch register and none can be scavenged.
-- A copy between two slots of scaled size borrows no register, since an emergency slot holds one of the stack pointer's class, so where no location is free it is refused `Reason.scratch`.
+- A copy between two slots of scaled size with no free location borrows the first allowed register of another kind that both loads and stores the value whole, through an emergency slot of that kind in the scaled area, its save and restore scavenging through slots of the stack pointer's class (`scavenge.scaled_need`). Where no allowed register holds it whole, it is refused `Reason.scratch`.
 - A call frame rule at an offset that scales is refused (`finish.Error.scaled`): mink's frame records state a scaled save only as one offset times a measuring register's value, and a scaled canonical frame address only as expression bytes, which mirl does not spell.
 - An offset scales by one scale, so a frame with slots of two scales, as SME's vector length and streaming vector length, is refused (`scales`).
 - A probe of a dynamic allocation is not written, so `lay` refuses a dynamic allocation under a row that probes.
