@@ -4,8 +4,9 @@
 # - the return address a call pushed, where the row says a call pushes it
 # - the saved registers: the frame record at the offsets the row states when
 #   the frame keeps its pointer, then every other callee-saved register the
-#   function writes, each at its own slot, then the fixed emergency slots of
-#   a frame that keeps its pointer and reserves them
+#   function writes, each at its own slot of the width the row keeps it at,
+#   then the fixed emergency slots of a frame that keeps its pointer and
+#   reserves them
 # - the scaled area: the slots whose size scales, each at an offset per unit
 #   of the scale's multiplier, the area's size per unit a multiple of the
 #   stack's alignment so every multiplier keeps it: the saves, then the
@@ -71,10 +72,14 @@ use mirl.machine.instruction;
 use mirl.machine.operand.Slot;
 use mirl.machine.storage;
 use mirl.machine.storage.Storage;
+use mirl.target.abi.convention;
+use mirl.target.abi.convention.Convention;
 use mirl.target.abi.convention.Frame;
 use mirl.target.abi.convention.Keeper;
+use mirl.target.abi.convention.Kept;
 use mirl.target.abi.convention.Linked;
 use mirl.target.abi.convention.Page;
+use mirl.target.abi.convention.Part;
 use mirl.target.abi.convention.Probe;
 use mirl.target.abi.convention.Prologue;
 use mirl.target.abi.convention.Record;
@@ -85,6 +90,7 @@ use mirl.target.abi.convention.Unwind;
 use mirl.target.abi.convention.held;
 
 use rf: masc.core.register;
+use mink.model.frame;
 
 # what the frame reads beside the function
 # ---
@@ -175,11 +181,14 @@ pub rec Bank {
 # depth:    for a fixed slot, the bytes from the canonical frame address down
 #           to it, and for a scaled one its bytes per unit below the saves
 # scaled:   whether it is in the scaled area
+# width:    the bytes of it an unwinder restores from a fixed slot, as mink's
+#           frame records state a save's width
 pub rec Spot {
     register: rf.Id;
     slot:     u32;
     depth:    u64;
     scaled:   bool;
+    width:    u16;
 }
 
 # a laid out frame and what writing it needs
@@ -384,13 +393,46 @@ fun realigns(f: *Function, align: u64) bool {
     ret false;
 }
 
-fun push_spot(p: *Plan, reg: rf.Id, s: SlotData) err[Error] {
+# a register saved in a slot of the frame's own, at the width its row keeps it
+fun push_spot(p: *Plan, regs: *rf.Available, row: *Convention, reg: rf.Id) err[Error] {
+    val got: res[SlotData, Error] = kept_slot(regs, row, reg);
+    if (sel got.err) { ret err[Error].err{got.err}; }
+    val s:    SlotData                    = got.ok;
     val slot: u32                         = p.added.len::u32;
     val a:    res[usize, allocator.Error] = vector.push[SlotData](?p.added, s);
     if (sel a.err) { ret err[Error].err{alloc_err(a.err)}; }
-    val b: res[usize, allocator.Error] = vector.push[Spot](?p.spots, Spot{register: reg, slot: slot, depth: 0, scaled: s.per != 0});
+    val spot: Spot                        = Spot{register: reg, slot: slot, depth: 0, scaled: s.per != 0, width: unwound(row, reg, s)};
+    val b:    res[usize, allocator.Error] = vector.push[Spot](?p.spots, spot);
     if (sel b.err) { ret err[Error].err{alloc_err(b.err)}; }
     ret err[Error].ok{};
+}
+
+# the slot a register is saved in: the low part a row keeps of a preserved
+# register narrower than the register through the selection, as aapcs64's d8
+# of v8, so the frame code moves it at that width, and all of it otherwise
+fun kept_slot(regs: *rf.Available, row: *Convention, reg: rf.Id) res[SlotData, Error] {
+    val whole: res[SlotData, Error] = save_slot(regs, reg);
+    if (sel whole.err) { ret whole; }
+    val k: opt[Kept] = convention.kept_of(row, reg);
+    if (sel k.none) { ret whole; }
+    val part: Part = k.some.bits;
+    if (!(sel part.low)) { ret whole; }
+    val low: u64 = part.low::u64;
+    if (low % 8 != 0)                                  { ret res[SlotData, Error].err{Error.storage{reg}}; }
+    if (whole.ok.per == 0 && low >= whole.ok.size * 8) { ret whole; }
+    ret res[SlotData, Error].ok{spill.slot_of(Storage{fixed: low, per: 0, scale: 0})};
+}
+
+# the width an unwinder restores of a register saved in a fixed slot, as
+# mink's frame records state it: frame.NATURAL where the slot holds the part
+# the architecture's own convention keeps, and the slot's bytes where the row
+# keeps more. a scaled save's rule states no width
+fun unwound(row: *Convention, reg: rf.Id, s: SlotData) u16 {
+    val k: opt[Kept] = convention.kept_of(row, reg);
+    if (sel k.none)                        { ret frame.NATURAL; }
+    if (k.some.natural == 0 || s.per != 0) { ret frame.NATURAL; }
+    if (s.size * 8 == k.some.natural::u64) { ret frame.NATURAL; }
+    ret s.size::u16;
 }
 
 fun save_slot(regs: *rf.Available, reg: rf.Id) res[SlotData, Error] {
@@ -663,15 +705,11 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
     }
     if (linked && sel frame.link.stack && chain.link != 0 - word::i64) { ret res[bool, Error].err{Error.record{}}; }
     if (kept) {
-        val s: res[SlotData, Error] = save_slot(regs.context.view, fp);
-        if (sel s.err) { ret res[bool, Error].err{s.err}; }
-        val pushed: err[Error] = push_spot(p, fp, s.ok);
+        val pushed: err[Error] = push_spot(p, regs.context.view, conv.row, fp);
         if (sel pushed.err) { ret res[bool, Error].err{pushed.err}; }
     }
     if (save_link) {
-        val s: res[SlotData, Error] = save_slot(regs.context.view, link);
-        if (sel s.err) { ret res[bool, Error].err{s.err}; }
-        val pushed: err[Error] = push_spot(p, link, s.ok);
+        val pushed: err[Error] = push_spot(p, regs.context.view, conv.row, link);
         if (sel pushed.err) { ret res[bool, Error].err{pushed.err}; }
     }
     var i: usize = 0;
@@ -684,9 +722,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
             save = wrote.ok;
         }
         if (save) {
-            val s: res[SlotData, Error] = save_slot(regs.context.view, reg);
-            if (sel s.err) { ret res[bool, Error].err{s.err}; }
-            val pushed: err[Error] = push_spot(p, reg, s.ok);
+            val pushed: err[Error] = push_spot(p, regs.context.view, conv.row, reg);
             if (sel pushed.err) { ret res[bool, Error].err{pushed.err}; }
         }
         i = i + 1;
@@ -936,7 +972,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
             or        { at_ = place(Base.stack{}, total - d - shift, whole, scale); }
         }
         vector.push[Place](?p.layout.slots, at_);
-        val pushed: res[usize, allocator.Error] = vector.push[Save](?p.layout.saves, Save{register: sp.register, slot: Slot{index: (f.slots.len + sp.slot::usize)::u32}, offset: cfa});
+        val pushed: res[usize, allocator.Error] = vector.push[Save](?p.layout.saves, Save{register: sp.register, slot: Slot{index: (f.slots.len + sp.slot::usize)::u32}, offset: cfa, width: sp.width});
         if (sel pushed.err) { ret res[bool, Error].err{alloc_err(pushed.err)}; }
         k = k + 1;
     }
