@@ -85,7 +85,7 @@ A frame whose call stack is unwound and that may have a slot that scales (one of
 
 ## Call frame rules
 
-`Framed.facts` lists each rule beside the instruction that makes it true, before or after it, as mink's frame record (`mink.model.frame.Rule`), the value masc's builder takes through `cfi`: the canonical frame address as a register plus an offset (`def_cfa`, `.cfi_def_cfa`), a register saved at an offset from it (`offset`, `.cfi_offset`), a register restored (`restore`, `.cfi_restore`), and the `remember` and `restore_state` pair around each epilogue. Each register is numbered by masc's DWARF column under the build's context, and a register the column does not number is refused (`unnumbered`). mirl spells no CFI byte: mink owns the bytes of every encoding.
+`Framed.facts` lists each rule beside the instruction that makes it true, before or after it, as mink's frame record (`mink.model.frame.Rule`), the value masc's builder takes through `cfi`: the canonical frame address as a register plus an offset (`def_cfa`, `.cfi_def_cfa`), a register saved at an offset from it (`offset`, `.cfi_offset`), a register restored (`restore`, `.cfi_restore`), and the `remember` and `restore_state` pair around each epilogue. Under `seh` and `seh_arm64`, whose codes state the prologue alone and no rule past it, the rules stop at the prologue: a `prologue_end` mark follows its last instruction, and an epilogue states no rule. Each register is numbered by masc's DWARF column under the build's context, and a register the column does not number is refused (`unnumbered`). mirl spells no CFI byte: mink owns the bytes of every encoding.
 
 ## How the other rows fit
 
