@@ -252,7 +252,7 @@ A target declares the conventions its calls are made under in `convention`: its 
 | `word` | the bits of one argument word |
 | `floats` | the widest float passed in float registers, or none |
 | `passing`, `returning` | the argument and result registers by masc's register handles, each class in the order taken |
-| `preserved` | the registers a callee preserves, each `Kept{register, bits}` with `bits` whole or its low part, as RISC-V keeps FLEN bits of `fs0` to `fs11` |
+| `preserved` | the registers a callee preserves, each `Kept{register, bits, natural}` with `bits` whole or its low part, as RISC-V keeps FLEN bits of `fs0` to `fs11`, which a callee that writes it saves, and `natural` the bits the architecture's own convention keeps where the row keeps more, 0 otherwise |
 | `reserved` | the registers no call clobbers and nothing allocates |
 | `stack` | none, or a stack in memory with its alignment at a call, its red zone, its shadow space, where a call leaves the return address (`link`), its frame pointer with the frame record it heads (`pointer`) and where the stack pointer lives (`pointer_home`: a register, or a global symbol as wasm's `__stack_pointer`) |
 | `indirect` | what carries the address of a result passed by reference, and where a callee hands it back |
@@ -262,7 +262,7 @@ A target declares the conventions its calls are made under in `convention`: its 
 | `packing` | whether stack arguments take word slots or pack at their own size and alignment |
 | `tail` | the rule that says whether a call of an assignment may be a tail call |
 
-A row is resolved once per build (`mirl.target.abi.resolve`). A row with a register file is resolved against a masc selection of it, which looks its names up, groups the argument and result registers by class and computes the registers a call clobbers, and its `Resolved` holds those `registers`. A preserved register the row keeps only in part where the selection's register is wider is preserved for a callee, which saves it whole, and clobbered for a caller, and a row that keeps more bits than the register has is refused. A row with no register file resolves with no selection and holds no registers. A build resolves every row of its target, the default first.
+A row is resolved once per build (`mirl.target.abi.resolve`). A row with a register file is resolved against a masc selection of it, which looks its names up, groups the argument and result registers by class and computes the registers a call clobbers, and its `Resolved` holds those `registers`. A preserved register the row keeps only in part where the selection's register is wider is preserved for a callee, which saves the part it keeps, and clobbered for a caller, and a row that keeps more bits than the register has is refused. A row with no register file resolves with no selection and holds no registers. A build resolves every row of its target, the default first.
 
 ```
 val c: *Convention = mirl.target.abi.of(target);                                  # res[*Convention, Error], the default
