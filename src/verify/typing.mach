@@ -7,9 +7,9 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
-use std.types.string.str;
 
 use std.allocator;
 use std.collections.slice.Slice;
@@ -28,11 +28,13 @@ use mirl.ir.opcode;
 use types: mirl.ir.type;
 use mirl.ir.type.Type;
 use mirl.target.record;
+use mirl.verify.failure.Broken;
 use mirl.verify.failure.Found;
 use mirl.verify.failure.Run;
 use mirl.verify.failure.at_instruction;
 use mirl.verify.failure.broken;
 use mirl.verify.failure.exhausted;
+use mirl.verify.failure.walks;
 
 # what the checker made of an instruction
 # ---
@@ -45,11 +47,27 @@ tag Reading: u8 {
     typed:   bool;
 }
 
-# read an instruction to the checker, pushing its result types to out
-fun read(m: *Module, f: Function, d: *InstructionData, out: *vector.Vector[Type]) Reading {
-    val b:   *Body                            = ?m.functions.data[f.index].body;
-    val sig: res[types.Function, types.Error] = types.signature(?m.types, m.functions.data[f.index].data.signature);
+# the storage a walk reads every instruction into, taken once and reused
+# ---
+# out:     the result types the checker derives
+# tys:     the operand types, then each edge's argument and parameter types
+# secrets: whether each operand is secret
+# edges:   each edge's arguments and parameters, as slices of tys
+rec Scratch {
+    out:     vector.Vector[Type];
+    tys:     vector.Vector[Type];
+    secrets: vector.Vector[bool];
+    edges:   vector.Vector[opcode.Edge];
+}
+
+# read an instruction of body `b`, whose function's signature is `sig`, to the
+# checker, its result types left in the scratch's out
+fun read(m: *Module, b: *Body, sig: res[types.Function, types.Error], d: *InstructionData, s: *Scratch) Reading {
     if (sel sig.err) { ret Reading.refused{opcode.Error.types{sig.err}}; }
+    vector.truncate[Type](?s.out, 0);
+    vector.truncate[Type](?s.tys, 0);
+    vector.truncate[bool](?s.secrets, 0);
+    vector.truncate[opcode.Edge](?s.edges, 0);
 
     var total: usize = d.operands.len;
     var e:     usize = 0;
@@ -57,61 +75,54 @@ fun read(m: *Module, f: Function, d: *InstructionData, out: *vector.Vector[Type]
         total = total + d.edges.data[e].arguments.len + b.blocks.data[d.edges.data[e].block.index].parameters.len;
         e     = e + 1;
     }
-    var tys:     vector.Vector[Type]        = vector.init[Type](m.a);
-    var secrets: vector.Vector[bool]        = vector.init[bool](m.a);
-    var edges:   vector.Vector[opcode.Edge] = vector.init[opcode.Edge](m.a);
-    fin {
-        vector.dnit[Type](?tys);
-        vector.dnit[bool](?secrets);
-        vector.dnit[opcode.Edge](?edges);
-    }
-    val room: res[usize, allocator.Error] = vector.reserve[Type](?tys, total);
+    # the edges' slices point into tys, so it takes all its room before any
+    val room: res[usize, allocator.Error] = vector.reserve[Type](?s.tys, total);
     if (sel room.err) { ret Reading.alloc{room.err}; }
-    val marks: res[usize, allocator.Error] = vector.reserve[bool](?secrets, d.operands.len);
+    val marks: res[usize, allocator.Error] = vector.reserve[bool](?s.secrets, d.operands.len);
     if (sel marks.err) { ret Reading.alloc{marks.err}; }
-    val held: res[usize, allocator.Error] = vector.reserve[opcode.Edge](?edges, d.edges.len);
+    val held: res[usize, allocator.Error] = vector.reserve[opcode.Edge](?s.edges, d.edges.len);
     if (sel held.err) { ret Reading.alloc{held.err}; }
 
     var i: usize = 0;
     for (i < d.operands.len) {
-        vector.push[Type](?tys, b.values.data[d.operands.data[i].index].type);
-        vector.push[bool](?secrets, b.values.data[d.operands.data[i].index].secret);
+        vector.push[Type](?s.tys, b.values.data[d.operands.data[i].index].type);
+        vector.push[bool](?s.secrets, b.values.data[d.operands.data[i].index].secret);
         i = i + 1;
     }
     e = 0;
     for (e < d.edges.len) {
         val edge:   *Edge                 = ?d.edges.data[e];
         val params: *vector.Vector[Value] = ?b.blocks.data[edge.block.index].parameters;
-        val first:  usize                 = tys.len;
+        val first:  usize                 = s.tys.len;
         var j:      usize                 = 0;
         for (j < edge.arguments.len) {
-            vector.push[Type](?tys, b.values.data[edge.arguments.data[j].index].type);
+            vector.push[Type](?s.tys, b.values.data[edge.arguments.data[j].index].type);
             j = j + 1;
         }
-        val second: usize = tys.len;
+        val second: usize = s.tys.len;
         j = 0;
         for (j < params.len) {
-            vector.push[Type](?tys, b.values.data[params.data[j].index].type);
+            vector.push[Type](?s.tys, b.values.data[params.data[j].index].type);
             j = j + 1;
         }
-        vector.push[opcode.Edge](?edges, opcode.Edge{
-            arguments:  Slice[Type]{data: ?tys.data[first], size: second - first},
-            parameters: Slice[Type]{data: ?tys.data[second], size: tys.len - second},
+        vector.push[opcode.Edge](?s.edges, opcode.Edge{
+            arguments:  Slice[Type]{data: ?s.tys.data[first], size: second - first},
+            parameters: Slice[Type]{data: ?s.tys.data[second], size: s.tys.len - second},
         });
         e = e + 1;
     }
 
     var inst: opcode.Instance;
-    inst.operands   = Slice[Type]{data: tys.data, size: d.operands.len};
-    inst.secret     = Slice[bool]{data: secrets.data, size: secrets.len};
+    inst.operands   = Slice[Type]{data: s.tys.data, size: d.operands.len};
+    inst.secret     = Slice[bool]{data: s.secrets.data, size: s.secrets.len};
     inst.declared   = d.metadata.secret;
     inst.kept       = d.metadata.flags.kept;
     inst.bounded    = d.metadata.flags.bounded;
     inst.checked    = d.metadata.flags.checked;
     inst.immediates = Slice[opcode.Immediate]{data: d.immediates.data, size: d.immediates.len};
-    inst.edges      = Slice[opcode.Edge]{data: edges.data, size: edges.len};
+    inst.edges      = Slice[opcode.Edge]{data: s.edges.data, size: s.edges.len};
     inst.returns    = sig.ok.results;
-    val checked: res[bool, opcode.Error] = opcode.check(?m.types, d.opcode, inst, out);
+    val checked: res[bool, opcode.Error] = opcode.check(?m.types, d.opcode, inst, ?s.out);
     if (sel checked.err) {
         if (sel checked.err.alloc) { ret Reading.alloc{checked.err.alloc}; }
         ret Reading.refused{checked.err};
@@ -119,18 +130,20 @@ fun read(m: *Module, f: Function, d: *InstructionData, out: *vector.Vector[Type]
     ret Reading.typed{checked.ok};
 }
 
-# whether an instruction's stored results are the row's, in number, type and
-# for secrecy whether each is marked as the row's rule gives
-fun holds(secrecy: bool, b: *Body, d: *InstructionData, out: *vector.Vector[Type], secret: bool) bool {
-    if (!secrecy) {
-        if (d.results.len != out.len) { ret false; }
-        var i: usize = 0;
-        for (i < out.len) {
-            if (!types.same(b.values.data[d.results.data[i].index].type, out.data[i])) { ret false; }
-            i = i + 1;
-        }
-        ret true;
+# whether an instruction's stored results are the row's, in number and type
+fun typed_as(b: *Body, d: *InstructionData, out: *vector.Vector[Type]) bool {
+    if (d.results.len != out.len) { ret false; }
+    var i: usize = 0;
+    for (i < out.len) {
+        if (!types.same(b.values.data[d.results.data[i].index].type, out.data[i])) { ret false; }
+        i = i + 1;
     }
+    ret true;
+}
+
+# whether each of an instruction's results is marked secret as the row's rule
+# gives, and no edge passes a secret value to a public parameter
+fun secret_as(b: *Body, d: *InstructionData, secret: bool) bool {
     var i: usize = 0;
     for (i < d.results.len) {
         if (b.values.data[d.results.data[i].index].secret != secret) { ret false; }
@@ -165,38 +178,55 @@ fun slotted(run: *Run, d: *InstructionData) bool {
     ret false;
 }
 
-fun mismatch(secrecy: bool) str {
-    if (secrecy) { ret "secrecy that is not what its row's rule gives"; }
-    ret "results that are not the ones its row derives";
+fun scratch(m: *Module) Scratch {
+    ret Scratch{out: vector.init[Type](m.a), tys: vector.init[Type](m.a), secrets: vector.init[bool](m.a), edges: vector.init[opcode.Edge](m.a)};
 }
 
-# walk every walked instruction through the checker, holding its results to
-# the row's types or to its secrecy
-fun walk(run: *Run, secrecy: bool) err[Found] {
-    val m:   *Module             = run.m;
-    var out: vector.Vector[Type] = vector.init[Type](m.a);
-    fin { vector.dnit[Type](?out); }
-    var f: usize = 0;
+fun release(s: *Scratch) {
+    vector.dnit[Type](?s.out);
+    vector.dnit[Type](?s.tys);
+    vector.dnit[bool](?s.secrets);
+    vector.dnit[opcode.Edge](?s.edges);
+}
+
+# walk every walked instruction through the checker once, holding its results
+# to the row's types, and keeping the first whose secrecy is not the row's for
+# the secrecy rule, which a typing fault anywhere comes before
+fun walk(run: *Run) err[Found] {
+    val m: *Module = run.m;
+    var s: Scratch = scratch(m);
+    fin { release(?s); }
+    run.secrecy = opt[Broken].none{};
+    var faulted: bool  = false;
+    var f:       usize = 0;
     for (f < m.functions.len) {
-        val fn: Function = Function{index: f::u32};
-        val b:  *Body    = ?m.functions.data[f].body;
-        var k:  usize    = 0;
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val fn:  Function                         = Function{index: f::u32};
+        val b:   *Body                            = ?m.functions.data[f].body;
+        val sig: res[types.Function, types.Error] = types.signature(?m.types, m.functions.data[f].data.signature);
+        var k:   usize                            = 0;
         for (k < b.blocks.len) {
             val id: Block      = Block{index: k::u32};
             val bd: *BlockData = ?b.blocks.data[k];
-            if (!bd.erased) {
-                var i: usize = 0;
-                for (i < bd.instructions.len) {
-                    val inst: Instruction      = bd.instructions.data[i];
-                    val d:    *InstructionData = ?b.instructions.data[inst.index];
-                    vector.truncate[Type](?out, 0);
-                    val r: Reading = read(m, fn, d, ?out);
-                    if (sel r.alloc)                                         { ret exhausted(r.alloc); }
-                    if (sel r.refused)                                       { ret broken(at_instruction(m, fn, id, inst), "an instance its opcode's row refuses"); }
-                    if (sel r.typed && !holds(secrecy, b, d, ?out, r.typed)) { ret broken(at_instruction(m, fn, id, inst), mismatch(secrecy)); }
-                    if (sel r.typed && !secrecy && !slotted(run, d))         { ret broken(at_instruction(m, fn, id, inst), "a stack slot whose pointer is not into the target's slot space"); }
-                    i = i + 1;
+            var i:  usize      = 0;
+            for (!bd.erased && i < bd.instructions.len) {
+                val inst: Instruction      = bd.instructions.data[i];
+                val d:    *InstructionData = ?b.instructions.data[inst.index];
+                val r:    Reading          = read(m, b, sig, d, ?s);
+                if (sel r.alloc)             { ret exhausted(r.alloc); }
+                if (sel r.refused)           { ret broken(at_instruction(m, fn, id, inst), "an instance its opcode's row refuses"); }
+                if (!typed_as(b, d, ?s.out)) { ret broken(at_instruction(m, fn, id, inst), "results that are not the ones its row derives"); }
+                if (!slotted(run, d))        { ret broken(at_instruction(m, fn, id, inst), "a stack slot whose pointer is not into the target's slot space"); }
+                if (!faulted) {
+                    if (sel r.typed && !secret_as(b, d, r.typed)) {
+                        run.secrecy = opt[Broken].some{Broken{at: at_instruction(m, fn, id, inst), what: "secrecy that is not what its row's rule gives"}};
+                        faulted     = true;
+                    }
                 }
+                i = i + 1;
             }
             k = k + 1;
         }
@@ -205,12 +235,15 @@ fun walk(run: *Run, secrecy: bool) err[Found] {
     ret err[Found].ok{};
 }
 
-# every walked instruction is an instance its opcode's row types, giving the results it holds
+# every walked instruction is an instance its opcode's row types, giving the
+# results it holds, each read once for this rule and the secrecy rule
 pub fun typing(run: *Run) err[Found] {
-    ret walk(run, false);
+    ret walk(run);
 }
 
-# every result is secret exactly when its row's secrecy rule says, and no edge passes a secret value to a public parameter
+# every result is secret exactly when its row's secrecy rule says, and no edge
+# passes a secret value to a public parameter, as the typing rule's walk found
 pub fun secrecy(run: *Run) err[Found] {
-    ret walk(run, true);
+    if (sel run.secrecy.some) { ret err[Found].err{Found.broken{run.secrecy.some}}; }
+    ret err[Found].ok{};
 }
