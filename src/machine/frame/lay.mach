@@ -6,13 +6,14 @@
 #   the frame keeps its pointer, then every other callee-saved register the
 #   function writes, each at its own slot of the width the row keeps it at,
 #   then the fixed emergency slots of a frame that keeps its pointer and
-#   reserves them
+#   reaches them there
 # - the scaled area: the slots whose size scales, each at an offset per unit
 #   of the scale's multiplier, the area's size per unit a multiple of the
 #   stack's alignment so every multiplier keeps it: the saves, then the
 #   emergency slots of a kind that scales, then the local slots
 # - the local slots, largest alignment first, below them the fixed emergency
-#   slots of a frame that keeps no pointer and reserves them
+#   slots of any other frame that reserves them, those of the stack pointer's
+#   kind lowest
 # - the outgoing area at the stack pointer: the largest stack argument of any
 #   call, and at least the row's shadow space when there is a call, in fixed
 #   bytes and, where a call passes a stack piece of scaled size or at an
@@ -32,6 +33,11 @@
 # call. a leaf that keeps no frame pointer and fits the row's red zone takes it
 # and never moves the stack pointer. incoming stack arguments are at the
 # canonical frame address plus their offsets.
+#
+# every emergency slot of the stack pointer's kind lies where the frame code
+# reaches it with no scratch, as the frame code itself answers: off the frame
+# pointer, or off the stack pointer where that alone reaches, and a frame
+# that keeps no pointer keeps one where neither reaches
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -55,6 +61,10 @@ use mirl.machine.alloc.spill;
 use mirl.machine.class;
 use mirl.machine.class.Physical;
 use mirl.machine.constraint.Constrained;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Access;
+use mirl.machine.frame.code.Admitted;
+use mirl.machine.frame.code.Step;
 use mirl.machine.frame.record;
 use mirl.machine.frame.record.Address;
 use mirl.machine.frame.record.Base;
@@ -99,11 +109,14 @@ use mink.model.frame;
 # helper:     the module's symbol for the routine the row's prologue calls to
 #             probe, none where it calls none or the module declares none
 # naked:      the function states `naked`, so its body is laid as written
+# code:       the target's frame code bound to the function's selection,
+#             whose reach places the emergency slots
 pub rec Request {
     convention: *Resolved;
     at:         *Locations;
     helper:     opt[id.Symbol];
     naked:      bool;
+    code:       *Admitted;
 }
 
 # why a frame was not laid out
@@ -126,6 +139,13 @@ pub rec Request {
 # scales:    slots scaled by more than one scale
 # storage:   a register to save whose storage is no slot's size
 # reach:     a frame larger than an offset holds
+# unkept:    the frame code reaches the frame's emergency slots of the stack
+#            pointer's kind with no scratch only off the frame pointer, which
+#            the allocation took, so the function is allocated again with it
+#            withheld
+# unreached: an emergency slot of the stack pointer's kind the frame code
+#            reaches with no scratch from no base, the frame pointer kept,
+#            by the slot: its offset is past the code's range from either
 # undecided: an instruction whose transfer or touched turns on an operand that
 #            names no register
 # ungrouped: an instruction whose grouping is refused, and why
@@ -158,6 +178,8 @@ pub tag Error: u8 {
     scales;
     storage: rf.Id;
     reach;
+    unkept:    rf.Id;
+    unreached: Slot;
     undecided: instruction.Undecided;
     ungrouped: Constrained;
     naked;
@@ -326,8 +348,11 @@ fun by_align(a: *Ordered, b: *Ordered) i64 {
 # whether a frame is one the frame keeps a pointer for, which the
 # allocator's allowed set must then leave the pointer out of: the row keeps
 # it always, or the function allocates dynamically, moves its stack pointer,
-# has a local slot aligned past the stack's alignment, or under a row whose
-# call stack is unwound may have a slot that scales
+# has a local slot aligned past the stack's alignment, under a row whose
+# call stack is unwound may have a slot that scales, or could hold an
+# emergency slot of the stack pointer's kind the frame code reaches off the
+# stack pointer only through a scratch, which `lay` then reaches off the
+# frame pointer where the frame reserves one
 # ---
 # a:   the allocator the scan takes
 # f:   the function
@@ -348,7 +373,109 @@ pub fun keeps_pointer(a: *allocator.Allocator, f: *Function, r: Request) res[boo
     if (sel got.err) { ret res[bool, Error].err{scan_err(got.err)}; }
     var x: Facts = got.ok;
     fin { scan.release(?x); }
-    ret res[bool, Error].ok{needs_pointer(?x, f, frame, held(row).context.view)};
+    if (needs_pointer(?x, f, frame, held(row).context.view)) { ret res[bool, Error].ok{true}; }
+    ret unreached(f, r, frame, ?x, sp.some);
+}
+
+# whether a frame that keeps no pointer could hold an emergency slot of the
+# stack pointer's kind the frame code reaches with no scratch from no base it
+# keeps: of the slots `layout` places at the bottom of the locals off the
+# stack pointer, the one past as many others as one move takes scratches at
+# most, beside the register a copy borrows
+fun unreached(f: *Function, r: Request, frame: Frame, x: *Facts, stack: rf.Id) res[bool, Error] {
+    val regs: *Registers           = held(r.convention);
+    val s:    res[SlotData, Error] = save_slot(regs.context.view, stack);
+    if (sel s.err) { ret res[bool, Error].err{s.err}; }
+    val o:    Outgoing        = outgoing_of(f, x.calls, frame.shadow);
+    val last: res[i64, Error] = to_i(up(o.fixed, s.ok.align) + r.code.code.most::u64 * s.ok.size);
+    if (sel last.err) { ret res[bool, Error].ok{true}; }
+    val at: Offset = Offset{fixed: last.ok, per: up(o.per, frame.align)::i64, scale: o.scale};
+    ret res[bool, Error].ok{!reaches(r.code, f, regs, stack, stack, stack, at, record.size_of(s.ok))};
+}
+
+# a register of a kind the convention names, neither the stack pointer nor
+# the frame pointer, the kind's own register where it names none
+fun stand_in(regs: *Registers, stack: rf.Id, like: rf.Id) rf.Id {
+    val file:  *rf.File        = regs.context.view.file;
+    val k:     u16             = rf.class_of(like);
+    var lists: [2]Slice[rf.Id] = [2]Slice[rf.Id]{regs.clobbered, regs.preserved};
+    var l:     usize           = 0;
+    for (l < 2) {
+        val list: Slice[rf.Id] = lists[l];
+        var i:    usize        = 0;
+        for (i < list.size) {
+            val c: rf.Id = list.data[i];
+            if (c != stack && !named_opt(regs.pointer, c) && class.alike(file, c, k)) { ret c; }
+            i = i + 1;
+        }
+        l = l + 1;
+    }
+    ret like;
+}
+
+# whether the frame code saves a register of a kind to an emergency slot at
+# a base register plus an offset and restores it, with no scratch
+# ---
+# c:     the bound frame code
+# f:     a function whose allocator and set the trial takes
+# regs:  the convention's registers
+# stack: the stack pointer
+# like:  a register of the slot's kind
+# base:  the base register
+# at:    the offset
+# size:  the slot's bytes
+fun reaches(c: *Admitted, f: *Function, regs: *Registers, stack: rf.Id, like: rf.Id, base: rf.Id, at: Offset, size: Offset) bool {
+    val step: Access = Access{register: stand_in(regs, stack, like), base: base, at: at, size: size};
+    ret code.bare(c, f, stack, Step.store{step}) && code.bare(c, f, stack, Step.load{step});
+}
+
+# the first emergency slot of the stack pointer's kind a laid out frame holds
+# that the frame code reaches with no scratch from the base it is at, none
+# where it reaches every one
+fun far(p: *Plan, f: *Function, c: *Admitted, regs: *Registers) opt[Slot] {
+    val stack: rf.Id    = p.layout.stack;
+    val file:  *rf.File = regs.context.view.file;
+    var i:     usize    = 0;
+    for (i < p.layout.reserved.len) {
+        val e: Emergency = p.layout.reserved.data[i];
+        if (class.alike(file, stack, rf.class_of(e.like))) {
+            val pl: Place = p.layout.slots.data[e.slot.index];
+            if (!(sel pl.at))                                                                                { ret opt[Slot].some{e.slot}; }
+            if (!reaches(c, f, regs, stack, e.like, record.base_of(?p.layout, pl.at), pl.at.offset, e.size)) { ret opt[Slot].some{e.slot}; }
+        }
+        i = i + 1;
+    }
+    ret opt[Slot].none{};
+}
+
+# the outgoing area before rounding
+# ---
+# fixed: the most any call's stack piece reaches in fixed bytes, and at
+#        least the row's shadow space where there is a call
+# per:   the most any scaled piece reaches in bytes per unit
+# scale: the scale of a scaled piece, read only when per is nonzero
+rec Outgoing {
+    fixed: u64;
+    per:   u64;
+    scale: u8;
+}
+
+fun outgoing_of(f: *Function, calls: bool, shadow: u64) Outgoing {
+    var o: Outgoing = Outgoing{fixed: 0, per: 0, scale: 0};
+    var i: usize    = 0;
+    for (i < f.slots.len) {
+        val s: SlotData = f.slots.data[i];
+        if (sel s.area.outgoing) {
+            if (s.per != 0 || s.area.outgoing.per != 0) {
+                o.scale = s.scale;
+                if (s.area.outgoing.per + s.per > o.per) { o.per = s.area.outgoing.per + s.per; }
+            }
+            if (s.area.outgoing.fixed + s.size > o.fixed) { o.fixed = s.area.outgoing.fixed + s.size; }
+        }
+        i = i + 1;
+    }
+    if (calls && shadow > o.fixed) { o.fixed = shadow; }
+    ret o;
 }
 
 # whether the stack pointer alone cannot address the frame, or a frame whose
@@ -539,19 +666,57 @@ pub fun lay(a: *allocator.Allocator, f: *Function, used: Slice[u32], r: Request,
         release(?p);
         ret res[Plan, Error].err{listed_scratch.err};
     }
-    # a frame whose prologue calls the probe routine for its locals and did
-    # not save the link register is laid out again saving it, as any call
-    # writes it
-    var laid: res[bool, Error] = layout(a, f, conv, regs, st.memory, r.at, r.helper, false, reserve, ?p);
-    if (sel laid.ok && laid.ok) {
-        relay(?p);
-        laid = layout(a, f, conv, regs, st.memory, r.at, r.helper, true, reserve, ?p);
-    }
-    if (sel laid.err) {
+    # a frame whose emergency slots of the stack pointer's kind the frame
+    # code reaches only through a scratch is laid out again with them off a
+    # base that reaches them: off the stack pointer in a frame that keeps
+    # its pointer and does not move the stack pointer, and in one that keeps
+    # none, off the frame pointer it then keeps, which an allocation that
+    # took it is asked to withhold
+    val failed: err[Error] = placed(a, f, conv, regs, st.memory, r, reserve, ?p);
+    if (sel failed.err) {
         release(?p);
-        ret res[Plan, Error].err{laid.err};
+        ret res[Plan, Error].err{failed.err};
     }
     ret res[Plan, Error].ok{p};
+}
+
+# lay out a frame until the frame code reaches its emergency slots of the
+# stack pointer's kind with no scratch, or no base is left to try
+fun placed(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Registers, frame: Frame, r: Request, reserve: Slice[Bank], p: *Plan) err[Error] {
+    var keep: bool = false;
+    var low:  bool = false;
+    for {
+        val laid: err[Error] = laid_as(a, f, conv, regs, frame, r, keep, low, reserve, p);
+        if (sel laid.err) { ret laid; }
+        val out: opt[Slot] = far(p, f, r.code, regs);
+        if (sel out.none) { ret err[Error].ok{}; }
+        val kept: bool = p.layout.pointer != rf.NONE;
+        if (kept && !low && !p.facts.dynamic && !p.facts.moves) { low = true; }
+        or (kept || keep || !(sel frame.pointer.register))      { ret err[Error].err{Error.unreached{out.some}}; }
+        or {
+            if (sel regs.pointer.none) { ret err[Error].err{Error.unreached{out.some}}; }
+            val fp:    rf.Id            = regs.pointer.some;
+            val wrote: res[bool, Error] = written(?p.facts, r.at, fp);
+            if (sel wrote.err) { ret err[Error].err{wrote.err}; }
+            if (wrote.ok)      { ret err[Error].err{Error.unkept{fp}}; }
+            keep = true;
+        }
+        relay(p);
+    }
+    ret err[Error].ok{};
+}
+
+# lay out a frame, laid out again saving the link register where its
+# prologue calls the probe routine for its locals and did not save it, as
+# any call writes it
+fun laid_as(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Registers, frame: Frame, r: Request, keep: bool, low: bool, reserve: Slice[Bank], p: *Plan) err[Error] {
+    var laid: res[bool, Error] = layout(a, f, conv, regs, frame, r.at, r.helper, false, keep, low, reserve, p);
+    if (sel laid.ok && laid.ok) {
+        relay(p);
+        laid = layout(a, f, conv, regs, frame, r.at, r.helper, true, keep, low, reserve, p);
+    }
+    if (sel laid.err) { ret err[Error].err{laid.err}; }
+    ret err[Error].ok{};
 }
 
 # whether a frame's record is its first pair saved, the shape compact unwind
@@ -650,13 +815,14 @@ fun calls_for_locals(prologue: Prologue, locals: u64) bool {
 
 # lay out a frame, or say it must be laid out again saving the link register,
 # true, where the prologue calls the probe routine for the locals' move and
-# `relink` did not ask the link saved. its `reserve` emergency slots of a
-# fixed size go where the frame code reaches them at a fixed offset: below
-# the saves off the frame pointer in a frame that keeps one, and at the
-# bottom of the locals, just above the outgoing area, off the stack pointer
-# otherwise. those of a kind that scales go in the scaled area below its
-# saves
-fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Registers, frame: Frame, at: *Locations, helper: opt[id.Symbol], relink: bool, reserve: Slice[Bank], p: *Plan) res[bool, Error] {
+# `relink` did not ask the link saved. it keeps the frame pointer where the
+# row states one and `keep` asks it. its `reserve` emergency slots of a
+# fixed size go below the saves off the frame pointer in a frame that keeps
+# one and `low` does not ask otherwise, and at the bottom of the locals, just
+# above the outgoing area, off the stack pointer otherwise, those of the
+# stack pointer's kind nearest it. those of a kind that scales go in the
+# scaled area below its saves
+fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Registers, frame: Frame, at: *Locations, helper: opt[id.Symbol], relink: bool, keep: bool, low: bool, reserve: Slice[Bank], p: *Plan) res[bool, Error] {
     val x:    *Facts = ?p.facts;
     var word: u64    = 0;
     if (sel conv.row.word.bits) { word = conv.row.word.bits::u64 / 8; }
@@ -673,7 +839,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
     var keeper:  Keeper;
     if (sel frame.pointer.register) {
         keeper = frame.pointer.register;
-        kept   = keeper.always || needs;
+        kept   = keeper.always || needs || keep;
     }
     or (needs)                { ret res[bool, Error].err{Error.pointer{}}; }
     if (realign && x.dynamic) { ret res[bool, Error].err{Error.base{}}; }
@@ -686,6 +852,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
         if (taken.ok)      { ret res[bool, Error].err{Error.taken{fp}}; }
         p.layout.pointer = fp;
     }
+    val high:   bool   = kept && !low;
     var linked: bool   = false;
     var chain:  Linked;
     val shape:  Record = keeper.record;
@@ -776,7 +943,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
         k = k + 1;
     }
     if (linked && sel frame.link.stack && cursor < word) { cursor = word; }
-    if (kept) {
+    if (high) {
         var j: usize = 0;
         for (j < spares.len) {
             val s: SlotData = p.added.data[spare_at::usize + j];
@@ -819,8 +986,6 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
     }
     var order: vector.Vector[Ordered] = vector.init[Ordered](a);
     fin { vector.dnit[Ordered](?order); }
-    var outgoing: u64 = 0;
-    var out_per:  u64 = 0;
     i = 0;
     for (i < f.slots.len) {
         val s: SlotData = f.slots.data[i];
@@ -831,9 +996,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
                 if (have_scale && s.scale != scale) { ret res[bool, Error].err{Error.scales{}}; }
                 have_scale = true;
                 scale      = s.scale;
-                if (s.area.outgoing.per + s.per > out_per) { out_per = s.area.outgoing.per + s.per; }
             }
-            if (s.area.outgoing.fixed + s.size > outgoing) { outgoing = s.area.outgoing.fixed + s.size; }
         }
         if (sel s.area.local && x.named.data[i]) {
             val pushed: res[usize, allocator.Error] = vector.push[Ordered](?order, Ordered{align: s.align, index: i::u32});
@@ -841,23 +1004,31 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
         }
         i = i + 1;
     }
-    if (x.calls && frame.shadow > outgoing) { outgoing = frame.shadow; }
-    if (order.len > 1)                      { sort.sort_by[Ordered](order.data, order.len, by_align); }
+    val area:     Outgoing = outgoing_of(f, x.calls, frame.shadow);
+    val outgoing: u64      = area.fixed;
+    val out_per:  u64      = area.per;
+    if (order.len > 1) { sort.sort_by[Ordered](order.data, order.len, by_align); }
     var depths: vector.Vector[u64] = vector.init[u64](a);
     fin { vector.dnit[u64](?depths); }
     val filled: err[allocator.Error] = slice.fill[u64](?depths, f.slots.len, 0);
     if (sel filled.err) { ret res[bool, Error].err{alloc_err(filled.err)}; }
     var local_cursor: u64 = outgoing;
     var widest:       u64 = 1;
-    if (!kept) {
-        var j: usize = 0;
-        for (j < spares.len) {
-            val s: SlotData = p.added.data[spare_at::usize + j];
-            if (s.per == 0) {
-                spares.data[j] = up(local_cursor, s.align);
-                local_cursor   = spares.data[j] + s.size;
+    if (!high) {
+        # those of the stack pointer's kind nearest the stack pointer, then the others
+        var pass: u32 = 0;
+        for (pass < 2) {
+            var j: usize = 0;
+            for (j < spares.len) {
+                val s:    SlotData = p.added.data[spare_at::usize + j];
+                val near: bool     = class.alike(regs.context.view.file, p.layout.stack, rf.class_of(likes.data[j]));
+                if (s.per == 0 && near == (pass == 0)) {
+                    spares.data[j] = up(local_cursor, s.align);
+                    local_cursor   = spares.data[j] + s.size;
+                }
+                j = j + 1;
             }
-            j = j + 1;
+            pass = pass + 1;
         }
     }
     k = 0;
@@ -985,7 +1156,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
             if (kept) { at_ = place(Base.frame{}, 0 - top_i - pointer_at, 0 - d, scale); }
             or        { at_ = place(Base.stack{}, locals::i64, whole - d, scale); }
         }
-        or (kept) { at_ = place(Base.frame{}, 0 - d - pointer_at, 0, 0); }
+        or (high) { at_ = place(Base.frame{}, 0 - d - pointer_at, 0, 0); }
         or        { at_ = place(Base.stack{}, d - shift, out_i, scale); }
         vector.push[Place](?p.layout.slots, at_);
         val pushed: res[usize, allocator.Error] = vector.push[Emergency](?p.layout.reserved, Emergency{slot: Slot{index: (f.slots.len + spare_at::usize + k)::u32}, size: record.size_of(s), like: likes.data[k]});
