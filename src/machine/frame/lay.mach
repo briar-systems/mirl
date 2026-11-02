@@ -6,7 +6,9 @@
 #   the frame keeps its pointer, then every other callee-saved register the
 #   function writes, each at its own slot of the width the row keeps it at,
 #   then the fixed emergency slots of a frame that keeps its pointer and
-#   reaches them there
+#   reaches them there. under an unwind encoding that reads an epilogue by
+#   its shape the saves the prologue pushes come first, just below the return
+#   address in the order they are pushed
 # - the scaled area: the slots whose size scales, each at an offset per unit
 #   of the scale's multiplier, the area's size per unit a multiple of the
 #   stack's alignment so every multiplier keeps it: the saves, then the
@@ -166,8 +168,9 @@ pub rec Request {
 #            more than 240 bytes above the stack pointer, under windows'
 #            arm64 unwind codes a frame with a scaled area or a frame pointer
 #            set more than 2040 bytes above the stack pointer or at no
-#            multiple of 8, and under compact unwind a frame whose record is
-#            not its first pair saved
+#            multiple of 8, under compact unwind a frame whose record is
+#            not its first pair saved, and a frame that pushes its saves with
+#            a scaled area or a push not just below the one before
 # exit:      a function whose row's returns leave through a routine whose
 #            global the module declares none of
 pub tag Error: u8 {
@@ -213,12 +216,15 @@ pub rec Bank {
 # scaled:   whether it is in the scaled area
 # width:    the bytes of it an unwinder restores from a fixed slot, as mink's
 #           frame records state a save's width
+# pushed:   whether the prologue pushes it and the epilogues pop it, rather
+#           than store and load it
 pub rec Spot {
     register: rf.Id;
     slot:     u32;
     depth:    u64;
     scaled:   bool;
     width:    u16;
+    pushed:   bool;
 }
 
 # a laid out frame and what writing it needs
@@ -226,11 +232,14 @@ pub rec Spot {
 # layout:    the layout, over the function's slots and then the added ones
 # added:     the slots the frame adds, one per saved register, then its
 #            emergency slots
-# spots:     where each saved register goes, in the order the prologue saves
+# spots:     where each saved register goes, in the order the prologue saves,
+#            those it pushes first
 # facts:     what the function's instructions show
 # empty:     the frame moves nothing and saves nothing
 # top:       the bytes from the canonical frame address to the bottom of the
 #            saved registers, a multiple of the stack's alignment
+# pushed:    the bytes of the saves the prologue pushes, just below the
+#            return address
 # per:       the scaled area's bytes per unit, a multiple of the alignment
 # out:       the scaled outgoing area's bytes per unit, a multiple of the
 #            alignment, at the bottom of the frame
@@ -241,6 +250,9 @@ pub rec Spot {
 # align:     the stack's alignment at a call
 # unwound:   whether the frame states call frame rules, which a row whose
 #            code no unwinder walks leaves out
+# bounded:   whether those rules state the prologue alone, its end marked,
+#            and no epilogue, as windows' unwind codes, which state no rule
+#            past the prologue
 # paired:    whether the prologue and epilogues move two adjacent saves of
 #            one size in one instruction where the frame code has one
 # probe:     the helper routine the prologue calls to probe the pages its
@@ -257,6 +269,7 @@ pub rec Plan {
     facts:     Facts;
     empty:     bool;
     top:       u64;
+    pushed:    u64;
     per:       u64;
     out:       u64;
     scale:     u8;
@@ -264,6 +277,7 @@ pub rec Plan {
     scratches: vector.Vector[rf.Id];
     align:     u64;
     unwound:   bool;
+    bounded:   bool;
     paired:    bool;
     probe:     opt[id.Symbol];
     apart:     bool;
@@ -539,7 +553,7 @@ fun push_spot(p: *Plan, regs: *rf.Available, row: *Convention, reg: rf.Id) err[E
     val slot: u32                         = p.added.len::u32;
     val a:    res[usize, allocator.Error] = vector.push[SlotData](?p.added, s);
     if (sel a.err) { ret err[Error].err{alloc_err(a.err)}; }
-    val spot: Spot                        = Spot{register: reg, slot: slot, depth: 0, scaled: s.per != 0, width: unwound(row, reg, s)};
+    val spot: Spot                        = Spot{register: reg, slot: slot, depth: 0, scaled: s.per != 0, width: unwound(row, reg, s), pushed: false};
     val b:    res[usize, allocator.Error] = vector.push[Spot](?p.spots, spot);
     if (sel b.err) { ret err[Error].err{alloc_err(b.err)}; }
     ret err[Error].ok{};
@@ -600,6 +614,7 @@ fun empty_plan(a: *allocator.Allocator, stack: rf.Id) Plan {
         facts:     Facts{calls: false, dynamic: false, moves: false, written: vector.init[bool](a), named: vector.init[bool](a), exits: vector.init[bool](a)},
         empty:     true,
         top:       0,
+        pushed:    0,
         per:       0,
         out:       0,
         scale:     0,
@@ -607,6 +622,7 @@ fun empty_plan(a: *allocator.Allocator, stack: rf.Id) Plan {
         scratches: vector.init[rf.Id](a),
         align:     1,
         unwound:   false,
+        bounded:   false,
         paired:    false,
         probe:     opt[id.Symbol].none{},
         apart:     false,
@@ -625,12 +641,14 @@ fun relay(p: *Plan) {
     p.layout  = Layout{entry: 0, size: record.bytes(0), outgoing: 0, red: 0, stack: p.layout.stack, pointer: rf.NONE, at: 0, realign: 0, slots: p.layout.slots, saves: p.layout.saves, reserved: p.layout.reserved};
     p.empty   = true;
     p.top     = 0;
+    p.pushed  = 0;
     p.per     = 0;
     p.out     = 0;
     p.scale   = 0;
     p.locals  = 0;
     p.align   = 1;
     p.unwound = false;
+    p.bounded = false;
     p.paired  = false;
     p.probe   = opt[id.Symbol].none{};
     p.apart   = false;
@@ -761,6 +779,93 @@ fun record_first(p: *Plan) bool {
     ret true;
 }
 
+# whether an encoding states a pair saved together only with its lower
+# numbered register at the lower address, as windows' arm64 codes do
+# (`stp x19, x20`, `stp d8, d9`)
+fun rising(u: Unwind) bool {
+    ret sel u.seh_arm64;
+}
+
+# each pair of fixed saves the prologue stores together, as the frame writes
+# them two by two in save order, laid with its lower numbered register at the
+# lower address, the record's two left where the row puts them
+fun rise(p: *Plan, file: *rf.File, linked: bool, fp: rf.Id, link: rf.Id) {
+    var k: usize = 0;
+    for (k + 1 < p.spots.len) {
+        val a: *Spot = ?p.spots.data[k];
+        val b: *Spot = ?p.spots.data[k + 1];
+        if (!together(p, file, linked, fp, link, a, b)) {
+            k = k + 1;
+            cnt;
+        }
+        val ra:   opt[*rf.Register] = rf.row_of(file, a.register);
+        val rb:   opt[*rf.Register] = rf.row_of(file, b.register);
+        var low:  *Spot             = a;
+        var high: *Spot             = b;
+        if (sel ra.some) {
+            if (sel rb.some) {
+                if (rb.some.number < ra.some.number) {
+                    low  = b;
+                    high = a;
+                }
+            }
+        }
+        if (low.depth < high.depth) {
+            val d: u64 = low.depth;
+            low.depth  = high.depth;
+            high.depth = d;
+        }
+        k = k + 2;
+    }
+}
+
+# whether two adjacent saves are a pair the frame may store together: both
+# fixed, of one class and one size at adjacent slots, neither of the record
+fun together(p: *Plan, file: *rf.File, linked: bool, fp: rf.Id, link: rf.Id, a: *Spot, b: *Spot) bool {
+    if (a.scaled || b.scaled)                                                                         { ret false; }
+    if (linked && (a.register == fp || a.register == link || b.register == fp || b.register == link)) { ret false; }
+    if (rf.class_of(a.register) != rf.class_of(b.register))                                           { ret false; }
+    val ra: opt[*rf.Register] = rf.row_of(file, a.register);
+    val rb: opt[*rf.Register] = rf.row_of(file, b.register);
+    if (sel ra.none || sel rb.none) { ret false; }
+    val size: u64 = p.added.data[a.slot].size;
+    if (p.added.data[b.slot].size != size || p.added.data[a.slot].per != 0 || p.added.data[b.slot].per != 0) { ret false; }
+    ret a.depth + size == b.depth || b.depth + size == a.depth;
+}
+
+# whether an encoding reads an epilogue by its shape alone, so a frame saves
+# each register a push can save by a push and restores it by a pop: windows'
+# x64 unwind codes state the prologue alone, and its unwinder takes code for
+# an epilogue only as a release of the stack, pops of the saves in reverse
+# and a return or jump (x64 prolog and epilog, "epilog code")
+fun pushes(u: Unwind) bool {
+    ret sel u.seh;
+}
+
+# mark each save a push can make, a whole word of the stack pointer's class
+# in a fixed slot and not one the record places, and order the marked first,
+# each in its order, so they are pushed just below the return address
+fun mark_pushed(p: *Plan, file: *rf.File, word: u64, linked: bool, fp: rf.Id, link: rf.Id) {
+    var first: usize = 0;
+    var k:     usize = 0;
+    for (k < p.spots.len) {
+        val s:    Spot     = p.spots.data[k];
+        val slot: SlotData = p.added.data[s.slot];
+        val held: bool     = linked && (s.register == fp || s.register == link);
+        if (!s.scaled && !held && slot.size == word && class.addresses(file, p.layout.stack, rf.class_of(s.register))) {
+            var j: usize = k;
+            for (j > first) {
+                p.spots.data[j] = p.spots.data[j - 1];
+                j               = j - 1;
+            }
+            p.spots.data[first]        = s;
+            p.spots.data[first].pushed = true;
+            first                      = first + 1;
+        }
+        k = k + 1;
+    }
+}
+
 # whether the frame keeps the row's prologue shape, and whether it states
 # call frame rules
 # ---
@@ -769,16 +874,19 @@ fun record_first(p: *Plan) bool {
 # x:        what the function's instructions show
 # red:      whether the frame is in the red zone, its stack pointer never moving
 # kept:     whether the frame keeps its pointer
-# moved:    the fixed bytes the prologue moves the stack pointer by otherwise
+# moved:    the fixed bytes the prologue moves the stack pointer by past its
+#           pushes otherwise
 # helper:   the module's symbol for the row's probe routine
 #
 # a frame moving past a page under a row that probes through a routine calls
 # it for that one move, or where the prologue moves apart for the locals'
-# move, the saves' own never past a page. windows' unwind codes state one
-# fixed allocation, the saves at offsets from the stack pointer below it and
-# a frame pointer set at most 240 bytes above it, a multiple of 16, which the
-# one move, the saves and the frame pointer set at the bottom of the saves
-# meet while the locals take no more. windows' arm64 unwind codes state the
+# move, the saves' own never past a page. windows' unwind codes state the
+# pushes, one fixed allocation, the other saves at offsets from the stack
+# pointer below it and a frame pointer set at most 240 bytes above it, a
+# multiple of 16, which the pushes, the one move, the stored saves and the
+# frame pointer set at the bottom of the saves meet while the locals take no
+# more. a frame that pushes has no scaled area, which its epilogue's release
+# would have to state. windows' arm64 unwind codes state the
 # frame pointer set at most 2040 bytes above the stack pointer, a multiple of
 # 8 ("arm64 exception handling", add_fp), which a frame moving apart meets
 # where its saves take no more
@@ -798,6 +906,7 @@ fun keeps_shape(prologue: Prologue, p: *Plan, x: *Facts, red: bool, kept: bool, 
     }
     p.paired = prologue.pair_saves;
     val unwind: Unwind = prologue.unwind;
+    if (p.pushed != 0 && (p.per != 0 || p.out != 0))        { ret err[Error].err{Error.unwind{}}; }
     if (sel unwind.compact && !p.empty && !record_first(p)) { ret err[Error].err{Error.unwind{}}; }
     if (sel unwind.seh && !p.empty) {
         if (p.per != 0 || p.out != 0)                       { ret err[Error].err{Error.unwind{}}; }
@@ -813,6 +922,7 @@ fun keeps_shape(prologue: Prologue, p: *Plan, x: *Facts, red: bool, kept: bool, 
         }
     }
     p.unwound = !(sel unwind.none);
+    p.bounded = sel unwind.seh || sel unwind.seh_arm64;
     ret err[Error].ok{};
 }
 
@@ -909,6 +1019,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
         }
         i = i + 1;
     }
+    if (pushes(frame.prologue.unwind) && word != 0) { mark_pushed(p, regs.context.view.file, word, linked, fp, link); }
     # the emergency slots, each kind's in turn, and the register of each one's kind
     val spare_at: u32                  = p.added.len::u32;
     var likes:    vector.Vector[rf.Id] = vector.init[rf.Id](a);
@@ -954,10 +1065,16 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
             }
             if (!fixed_at)         { sp.depth = up(cursor + slot.size, slot.align); }
             if (sp.depth > cursor) { cursor = sp.depth; }
+            if (sp.pushed) {
+                # a push lands just below the last, so each sits a slot below the one before
+                if (sp.depth != entry + p.pushed + slot.size) { ret res[bool, Error].err{Error.unwind{}}; }
+                p.pushed = p.pushed + slot.size;
+            }
         }
         k = k + 1;
     }
-    if (linked && sel frame.link.stack && cursor < word) { cursor = word; }
+    if (frame.prologue.pair_saves && rising(frame.prologue.unwind)) { rise(p, regs.context.view.file, linked, fp, link); }
+    if (linked && sel frame.link.stack && cursor < word)            { cursor = word; }
     if (high) {
         var j: usize = 0;
         for (j < spares.len) {
@@ -1100,8 +1217,8 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
     val per_i:  i64        = per::i64;
     val out_i:  i64        = out::i64;
     val whole:  i64        = per_i + out_i;
-    val red:    bool       = !empty && !x.calls && !kept && !x.dynamic && per == 0 && out == 0 && total_u - entry <= frame.red;
-    val shaped: err[Error] = keeps_shape(frame.prologue, p, x, red, kept, total_u - entry, helper);
+    val red:    bool       = !empty && !x.calls && !kept && !x.dynamic && per == 0 && out == 0 && p.pushed == 0 && total_u - entry <= frame.red;
+    val shaped: err[Error] = keeps_shape(frame.prologue, p, x, red, kept, total_u - entry - p.pushed, helper);
     if (sel shaped.err) { ret res[bool, Error].err{shaped.err}; }
     var shift: i64 = 0;
     if (red) {
