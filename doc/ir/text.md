@@ -425,8 +425,8 @@ debug table
   the layout it is laid out as, a tagged union its layout, discriminant,
   payload field when it has one and cases, an enumeration its base type and values, an
   array its element and count, a pointer the key of its pointee and a
-  function its parameters and results. `open` is an entry declared and not
-  yet defined. a variable is its source name, debug type, declaring
+  function its parameters and results, and a type may name any type of the
+  table, before or after it. `open` is an entry declared and not yet defined. a variable is its source name, debug type, declaring
   location and its position among the parameters when it is one. every
   file is printed, then every location, site, type and variable, each in
   order.

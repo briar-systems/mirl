@@ -1,8 +1,8 @@
 # the driver: one pass, one row or a whole schedule over a module
 #
-# a pass that refuses leaves the module as it was: the driver snapshots the
-# module before each visit or module run, restores it on a refusal and gives
-# the snapshot back otherwise, so no pass has to take back its own edits.
+# a pass that refuses aborts the run with its diagnostic and the module is
+# given up: the driver takes no snapshot, so a refusing pass may leave its edits
+# in the function it was visiting.
 # after a pass changes a function, every analysis it does not preserve is
 # dropped. every run verifies the module it is given before the first pass, a
 # checked run verifies it after every pass, and from the last legalisation of
@@ -19,16 +19,15 @@ use std.types.size.usize;
 use std.types.string.str;
 
 use std.allocator;
+use std.chrono.time.Instant;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
+use mirl.base.stats;
+use mirl.base.stats.Stats;
 use mirl.build;
 use mirl.ir.id.Function;
-use mirl.ir.module;
 use mirl.ir.module.Module;
-use mirl.ir.snapshot;
-use mirl.ir.snapshot.Reach;
-use mirl.ir.snapshot.Snapshot;
 use mirl.pass.analysis;
 use mirl.pass.cache;
 use mirl.pass.cache.Cache;
@@ -70,10 +69,13 @@ use mirl.verify;
 # level:   the optimisation level
 # checked: verify the module after every pass
 # floats:  the float relaxations the build permits, none for exact semantics
+# stats:   where the time of the passes, the lowerings and the verifier runs
+#          and the count of verifier runs are added, none for none
 pub rec Options {
     level:   Level;
     checked: bool;
     floats:  Relaxations;
+    stats:   opt[*Stats];
 }
 
 # a run in progress
@@ -121,23 +123,23 @@ fun lost(e: allocator.Error) res[bool, Error] {
     ret res[bool, Error].err{Error.alloc{e}};
 }
 
-# the allocator's refusal of a release, the only refusal a body the driver
-# took from the module can give
-fun released(r: err[module.Error]) err[allocator.Error] {
-    if (sel r.err) {
-        if (sel r.err.alloc) { ret err[allocator.Error].err{r.err.alloc}; }
-    }
-    ret err[allocator.Error].ok{};
-}
-
 # verify the module, as legal code once the run is past legalisation, naming
 # the pass that left it so
 fun verified(d: *Driver, name: str) err[Error] {
     var stage: verify.Stage = verify.Stage.open{};
     if (d.legal) { stage = verify.Stage.legal{analysis.trees(?d.cache)}; }
-    val r: err[verify.Error] = verify.against(d.m, d.t, target_basis.context_of(d.basis), stage);
+    val r: err[verify.Error] = against(d.options.stats, d.m, d.t, d.basis, stage);
     if (sel r.err) { ret err[Error].err{Error.unverified{Unverified{pass: name, error: r.err}}}; }
     ret err[Error].ok{};
+}
+
+# the verifier's run over the module, timed and counted in the stats
+fun against(s: opt[*Stats], m: *Module, t: *Target, basis: opt[*Basis], stage: verify.Stage) err[verify.Error] {
+    val from: opt[Instant]      = stats.start(s);
+    val r:    err[verify.Error] = verify.against(m, t, target_basis.context_of(basis), stage);
+    stats.stop(s, stats.Stage.verify{}, from);
+    if (sel s.some) { s.some.verified = s.some.verified + 1; }
+    ret r;
 }
 
 # a lowering's visit and the build it is given
@@ -181,18 +183,12 @@ fun each_function(d: *Driver, c: *Context, name: str, preserves: cache.Set, call
     for (i < count) {
         val f: Function = Function{index: i::u32};
         if (record.touches(c, f)) {
-            val taken: res[Snapshot, module.Error] = snapshot.take(d.m, Reach.function{f});
-            if (sel taken.err) { ret refused(name, opt[Function].some{f}, Why.ir{taken.err}); }
-            var kept: Snapshot       = taken.ok;
-            var u:    Unit           = Unit{context: c, f: f};
-            val r:    res[bool, Why] = visit_of(call, ?u);
+            var u: Unit           = Unit{context: c, f: f};
+            val r: res[bool, Why] = visit_of(call, ?u);
             if (sel r.err) {
-                snapshot.restore(d.m, ?kept);
                 cache.forget(?d.cache, f);
                 ret refused(name, opt[Function].some{f}, r.err);
             }
-            val given: err[allocator.Error] = released(snapshot.discard(d.m, ?kept));
-            if (sel given.err) { ret lost(given.err); }
             if (r.ok) {
                 changed = true;
                 val dropped: err[allocator.Error] = cache.drop(?d.cache, f, preserves);
@@ -205,17 +201,11 @@ fun each_function(d: *Driver, c: *Context, name: str, preserves: cache.Set, call
 }
 
 fun whole_module(d: *Driver, c: *Context, name: str, preserves: cache.Set, call: Running) res[bool, Error] {
-    val taken: res[Snapshot, module.Error] = snapshot.take(d.m, Reach.module{});
-    if (sel taken.err) { ret refused(name, opt[Function].none{}, Why.ir{taken.err}); }
-    var kept: Snapshot       = taken.ok;
-    val r:    res[bool, Why] = run_of(call, c);
+    val r: res[bool, Why] = run_of(call, c);
     if (sel r.err) {
-        snapshot.restore(d.m, ?kept);
         cache.drop_all(?d.cache, cache.NONE);
         ret refused(name, opt[Function].none{}, r.err);
     }
-    val given: err[allocator.Error] = released(snapshot.discard(d.m, ?kept));
-    if (sel given.err) { ret lost(given.err); }
     if (r.ok) {
         val dropped: err[allocator.Error] = cache.drop_all(?d.cache, preserves);
         if (sel dropped.err) { ret lost(dropped.err); }
@@ -246,14 +236,16 @@ fun context(d: *Driver, time: Time, skips: record.Filter) Context {
 # ---
 # d:   the run
 # p:   the pass
-# ret: whether it changed anything, or why the run fails, with every
-#      function as it was before the pass when the pass refused
+# ret: whether it changed anything, or why the run fails, the module given up
+#      when the pass refused
 pub fun apply(d: *Driver, p: *Pass) res[bool, Error] {
-    var c:       Context = context(d, p.time, p.skips);
+    var c:       Context      = context(d, p.time, p.skips);
     var changed: res[bool, Error];
+    val from:    opt[Instant] = stats.start(d.options.stats);
     if (sel p.scope.function) { changed = each_function(d, ?c, p.name, p.preserves, Visiting.pass{p.scope.function}); }
     or (sel p.scope.module)   { changed = whole_module(d, ?c, p.name, p.preserves, Running.pass{p.scope.module}); }
     or                        { ret refused(p.name, opt[Function].none{}, Why.reason{"the pass states no scope"}); }
+    stats.stop(d.options.stats, stats.Stage.passes{}, from);
     ret checked(d, p.name, changed);
 }
 
@@ -263,14 +255,16 @@ pub fun apply(d: *Driver, p: *Pass) res[bool, Error] {
 # d:   the run, whose selection is the build's
 # p:   the lowering
 # b:   the build
-# ret: whether it changed anything, or why the run fails, with every
-#      function as it was before the lowering when it refused
+# ret: whether it changed anything, or why the run fails, the module given up
+#      when it refused
 pub fun lower(d: *Driver, p: *Lowering, b: *Build) res[bool, Error] {
-    var c:       Context = context(d, p.time, p.skips);
+    var c:       Context      = context(d, p.time, p.skips);
     var changed: res[bool, Error];
+    val from:    opt[Instant] = stats.start(d.options.stats);
     if (sel p.scope.function) { changed = each_function(d, ?c, p.name, p.preserves, Visiting.lowering{Lowers{visit: p.scope.function, build: b}}); }
     or (sel p.scope.module)   { changed = whole_module(d, ?c, p.name, p.preserves, Running.lowering{LowersAll{run: p.scope.module, build: b}}); }
     or                        { ret refused(p.name, opt[Function].none{}, Why.reason{"the lowering states no scope"}); }
+    stats.stop(d.options.stats, stats.Stage.lower{}, from);
     ret checked(d, p.name, changed);
 }
 
@@ -325,7 +319,7 @@ pub fun step_family(d: *Driver, s: Step, b: *Build) err[Error] {
 
 # run a plan the schedule was checked for, the module verified before it
 fun run_plan(m: *Module, t: *Target, basis: opt[*Basis], rows: Slice[Row], steps: Slice[Step], b: *Build, options: Options) err[Error] {
-    val given: err[verify.Error] = verify.against(m, t, target_basis.context_of(basis), verify.Stage.open{});
+    val given: err[verify.Error] = against(options.stats, m, t, basis, verify.Stage.open{});
     if (sel given.err) {
         if (sel given.err.alloc) { ret err[Error].err{Error.alloc{given.err.alloc}}; }
         ret err[Error].err{Error.input{given.err.refused}};
