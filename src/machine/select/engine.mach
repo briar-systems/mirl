@@ -70,6 +70,7 @@ use mirl.ir.type.Type;
 use mirl.ir.value.Def;
 use mirl.ir.value.ValueData;
 use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.live.Clobbers;
 use mirl.machine.alloc.location;
 use mirl.machine.alloc.location.Locations;
 use mirl.machine.class;
@@ -319,15 +320,26 @@ pub rec Calls {
 # a selected function and the clobbers its calls state
 # ---
 # function: the machine function
-# clobbers: one per clobbered register of each call it makes
+# words:    the words of one clobber set's mask
+# masks:    each clobber set's mask over the register rows, one set for each
+#           list of clobbered registers its calls state
+# clobbers: one per call it makes that clobbers registers, naming its set
 pub rec Selected {
     function: mf.Function;
+    words:    u32;
+    masks:    vector.Vector[u64];
     clobbers: vector.Vector[Clobber];
+}
+
+# the clobbers a selected function's calls state
+pub fun clobbers_of(x: *Selected) Clobbers {
+    ret Clobbers{words: x.words, masks: Slice[u64]{data: x.masks.data, size: x.masks.len}, calls: Slice[Clobber]{data: x.clobbers.data, size: x.clobbers.len}};
 }
 
 # give back a selected function
 pub fun release(x: *Selected) err[allocator.Error] {
     var failed: err[allocator.Error] = mf.dnit(?x.function);
+    keep(?failed, vector.dnit[u64](?x.masks));
     keep(?failed, vector.dnit[Clobber](?x.clobbers));
     ret failed;
 }
@@ -1000,6 +1012,10 @@ rec Move {
 #            selection with no convention row, where a rule naming one of
 #            its registers is refused when it emits
 # clobbers:  the clobbers stated so far
+# masks:     the mask of each clobber set stated so far
+# words:     the words of one set's mask, 0 before the first set
+# sets:      the list of registers each set was made of, so a list the
+#            function's calls state again is located once
 # labels:    how many labels partner operands name so far
 # layout:    the target's data layout, which sizes slots
 # implied:   the implicit locations of the instruction being made
@@ -1020,6 +1036,9 @@ rec State {
     calls:     *Calls;
     own:       *Registers;
     clobbers:  *vector.Vector[Clobber];
+    masks:     *vector.Vector[u64];
+    words:     u32;
+    sets:      vector.Vector[Slice[rf.Id]];
     labels:    u32;
     layout:    Layout;
     implied:   vector.Vector[Implicit];
@@ -1066,6 +1085,7 @@ fun drop_state(st: *State) {
     vector.dnit[u32](?st.ready);
     vector.dnit[u32](?st.todo);
     vector.dnit[Implicit](?st.implied);
+    vector.dnit[Slice[rf.Id]](?st.sets);
 }
 
 fun alloc_err(e: allocator.Error) err[Error] {
@@ -1784,18 +1804,42 @@ fun made(st: *State, b: u32, op: mi.Opcode, operands: *Operand, count: u32, md: 
     if (sel made.err) { ret res[Instruction, Error].err{Error.machine{made.err}}; }
     val at:   Instruction    = made.ok;
     val kind: res[u8, Error] = transfer_of(st, at);
-    if (sel kind.err)           { ret res[Instruction, Error].err{kind.err}; }
-    if (kind.ok != effect.CALL) { ret res[Instruction, Error].ok{at}; }
+    if (sel kind.err)                                  { ret res[Instruction, Error].err{kind.err}; }
+    if (kind.ok != effect.CALL || clobbered.size == 0) { ret res[Instruction, Error].ok{at}; }
+    val set: res[u32, Error] = set_of(st, clobbered);
+    if (sel set.err) { ret res[Instruction, Error].err{set.err}; }
+    val p: res[usize, allocator.Error] = vector.push[Clobber](st.clobbers, Clobber{instruction: at, set: set.ok});
+    if (sel p.err) { ret res[Instruction, Error].err{Error.alloc{p.err}}; }
+    ret res[Instruction, Error].ok{at};
+}
+
+# the clobber set of a list of clobbered registers, made the first time the
+# function's calls state the list
+fun set_of(st: *State, clobbered: Slice[rf.Id]) res[u32, Error] {
     var k: usize = 0;
-    for (k < clobbered.size) {
-        val id:  rf.Id                        = clobbered.data[k];
-        val loc: res[u32, location.Unlocated] = location.locate(st.calls.at, Physical.register{id});
-        if (sel loc.err) { ret res[Instruction, Error].err{Error.unlocated{loc.err}}; }
-        val p: res[usize, allocator.Error] = vector.push[Clobber](st.clobbers, Clobber{instruction: at, location: loc.ok});
-        if (sel p.err) { ret res[Instruction, Error].err{Error.alloc{p.err}}; }
+    for (k < st.sets.len) {
+        if (st.sets.data[k].data == clobbered.data && st.sets.data[k].size == clobbered.size) { ret res[u32, Error].ok{k::u32}; }
         k = k + 1;
     }
-    ret res[Instruction, Error].ok{at};
+    if (st.calls.at.file == nil) { ret res[u32, Error].err{Error.unlocated{location.Unlocated.unfiled{clobbered.data[0]}}}; }
+    if (st.words == 0)           { st.words = (st.calls.at.file.register_count + 63) / 64; }
+    val base: usize                = st.masks.len;
+    val room: err[allocator.Error] = slice.fill[u64](st.masks, st.words::usize, 0);
+    if (sel room.err) { ret res[u32, Error].err{Error.alloc{room.err}}; }
+    var i: usize = 0;
+    for (i < clobbered.size) {
+        val loc: res[u32, location.Unlocated] = location.locate(st.calls.at, Physical.register{clobbered.data[i]});
+        if (sel loc.err) {
+            vector.truncate[u64](st.masks, base);
+            ret res[u32, Error].err{Error.unlocated{loc.err}};
+        }
+        val w: usize = base + (loc.ok / 64)::usize;
+        st.masks.data[w] = st.masks.data[w] | ((1::u64) << (loc.ok % 64)::u64);
+        i                = i + 1;
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Slice[rf.Id]](?st.sets, clobbered);
+    if (sel pushed.err) { ret res[u32, Error].err{Error.alloc{pushed.err}}; }
+    ret res[u32, Error].ok{st.sets.len::u32 - 1};
 }
 
 fun put(st: *State, b: u32, op: mi.Opcode, operands: *Operand, count: u32, md: Metadata, declassifies: bool) err[Error] {
@@ -3215,6 +3259,7 @@ pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls, context:
     if (sel body.err) { ret res[Selected, Error].err{Error.module{body.err}}; }
     var out:      mf.Function            = mf.init(s.a, s.index.isa.set);
     var clobbers: vector.Vector[Clobber] = vector.init[Clobber](s.a);
+    var masks:    vector.Vector[u64]     = vector.init[u64](s.a);
     var st:       State                  = State{
         s:         s,
         ctx:       context,
@@ -3225,6 +3270,9 @@ pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls, context:
         calls:     calls,
         own:       own,
         clobbers:  ?clobbers,
+        masks:     ?masks,
+        words:     0,
+        sets:      vector.init[Slice[rf.Id]](s.a),
         labels:    0,
         layout:    layout.of(s.index.target, ?m.types, context_of(s)),
         implied:   vector.init[Implicit](s.a),
@@ -3249,12 +3297,14 @@ pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls, context:
         frames:    vector.init[u32](s.a),
         naked:     register_schema.naked(m, f),
     };
-    val ran: err[Error] = run(?st);
+    val ran:   err[Error] = run(?st);
+    val words: u32        = st.words;
     drop_state(?st);
     if (sel ran.err) {
         mf.dnit(?out);
+        vector.dnit[u64](?masks);
         vector.dnit[Clobber](?clobbers);
         ret res[Selected, Error].err{ran.err};
     }
-    ret res[Selected, Error].ok{Selected{function: out, clobbers: clobbers}};
+    ret res[Selected, Error].ok{Selected{function: out, words: words, masks: masks, clobbers: clobbers}};
 }
