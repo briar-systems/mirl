@@ -151,6 +151,9 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `target.op` | any number of value operands | `op` a target op | none | propagates |
 | `target.op.memory` | any number of value operands | `op` a target op | none | propagates |
 | `atomic.cmpxchg.words` | `address`, then any number of value operands | `success` a memory ordering, `failure` a memory ordering | none | declared |
+| `timing.read` | none | `type` a type, `state` a state value | none | propagates |
+| `timing.set` | none | `state` a state value | none | propagates |
+| `timing.restore` | `saved` | `state` a state value | none | propagates |
 
 ### `add`
 
@@ -2244,4 +2247,43 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
   - traps when the address in `address` cannot be accessed
 - secrecy: declared
 - vector: none
+
+### `timing.read`
+
+- operands: none
+- immediates: `type` a type, `state` a state value
+- targets: 0
+- typing:
+  - the type in `type` is an integer
+- results:
+  - one result of the type in `type`
+- effects: reads memory, writes memory
+- secrecy: propagates
+- vector: none
+- made: by a pass of mirl only, so a module given to a schedule that holds it is refused
+
+### `timing.set`
+
+- operands: none
+- immediates: `state` a state value
+- targets: 0
+- typing: none
+- results: none
+- effects: reads memory, writes memory
+- secrecy: propagates
+- vector: none
+- made: by a pass of mirl only, so a module given to a schedule that holds it is refused
+
+### `timing.restore`
+
+- operands: `saved`
+- immediates: `state` a state value
+- targets: 0
+- typing:
+  - `saved` is an integer
+- results: none
+- effects: reads memory, writes memory
+- secrecy: propagates
+- vector: none
+- made: by a pass of mirl only, so a module given to a schedule that holds it is refused
 
