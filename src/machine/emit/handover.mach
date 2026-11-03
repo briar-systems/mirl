@@ -95,12 +95,14 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.char.char;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 use std.types.view.View;
 
 use std.allocator;
@@ -134,7 +136,8 @@ use arches:     mink.catalog.arch;
 use mink.catalog.format.Format;
 use mink.format.registration;
 use mink.format.registry;
-use mink_lower: mink.lower;
+use mink_lower:  mink.lower;
+use mink_bridge: mink.model.bridge;
 use mink.model.directive;
 use mink_line: mink.model.line;
 use mink.model.object;
@@ -146,7 +149,9 @@ use core_fixup: masc.core.fixup;
 use core_state: masc.core.state;
 
 use mirl.debug.dwarf;
-use ia:       mirl.ir.assembly;
+use ia: mirl.ir.assembly;
+use mirl.ir.attribute.Attribute;
+use mirl.ir.attribute.Datum;
 use ir_debug: mirl.ir.debug;
 use mirl.ir.function.FunctionData;
 use mirl.ir.function.in_constant_time;
@@ -156,6 +161,7 @@ use mirl.ir.linkage.Linkage;
 use mirl.ir.module;
 use mirl.ir.module.Contents;
 use mirl.ir.module.Module;
+use types: mirl.ir.type;
 use mirl.ir.type.DEFAULT_SPACE;
 use mirl.machine.class.Physical;
 use mirl.machine.emit.data;
@@ -182,6 +188,7 @@ use mirl.machine.range.Range;
 use mirl.machine.range.Ranges;
 use mirl.target.abi.call;
 use mirl.target.abi.convention;
+use mirl.target.abi.convention.Bridging;
 use mirl.target.abi.convention.Convention;
 use mirl.target.abi.convention.Unadmitted;
 use mirl.target.address;
@@ -194,6 +201,7 @@ use mirl.target.layout;
 use mirl.target.layout.Layout;
 use mirl.target.record;
 use mirl.target.record.Target;
+use mirl.target.register.schema;
 
 use mirl.base.fail.keep;
 use mirl.base.slice;
@@ -443,6 +451,10 @@ rec Emitter {
     fixing:    vector.Vector[Fixing];
     stating:   vector.Vector[Stating];
     shorts:    Shorts;
+    bridging:  opt[*Bridging];
+    default:   str;
+    routine:   opt[str];
+    plain:     vector.Vector[opt[build.Label]];
 }
 
 # what a line fact handed to masc was stated for
@@ -738,23 +750,190 @@ fun misplaced(g: id.Global, why: Fault) Error {
     ret Error.global{Misplaced{global: g, fault: why}};
 }
 
+# the name native code reaches a function by, written to `out`, where the
+# target's default row bridges to another convention's code: a function of
+# the default row, but the routine its frames call, named as the bridge
+# decorates it. false for a function named as it is
+fun decorated(e: *Emitter, data: *FunctionData, out: *vector.Vector[u8]) res[bool, Error] {
+    val b: opt[*Bridging] = e.bridging;
+    if (sel b.none) { ret res[bool, Error].ok{false}; }
+    val s: res[types.Function, types.Error] = types.signature(?e.m.types, data.signature);
+    if (sel s.err)                                                                                                     { ret res[bool, Error].err{Error.symbol{module.Error.types{s.err}}}; }
+    if (s.ok.convention.len != 0 && !slice.same_view(s.ok.convention, View{data: e.default, len: str_len(e.default)})) { ret res[bool, Error].ok{false}; }
+    val routine: opt[str] = e.routine;
+    if (sel routine.some && slice.same_view(data.name, View{data: routine.some, len: str_len(routine.some)})) { ret res[bool, Error].ok{false}; }
+    val written: res[bool, allocator.Error] = b.some.decorate(data.name, out);
+    if (sel written.err) { ret res[bool, Error].err{Error.alloc{written.err}}; }
+    ret res[bool, Error].ok{written.ok};
+}
+
+# the label of the guest exit thunk the module defines for a function of a
+# decorated name, none where it defines none
+fun guest_of(e: *Emitter, name: View) res[opt[build.Label], Error] {
+    val b: opt[*Bridging] = e.bridging;
+    if (sel b.none) { ret res[opt[build.Label], Error].ok{opt[build.Label].none{}}; }
+    var spelled: vector.Vector[u8] = vector.init[u8](e.a);
+    fin { vector.dnit[u8](?spelled); }
+    val written: res[bool, allocator.Error] = b.some.guest(name, ?spelled);
+    if (sel written.err) { ret res[opt[build.Label], Error].err{Error.alloc{written.err}}; }
+    if (!written.ok)     { ret res[opt[build.Label], Error].ok{opt[build.Label].none{}}; }
+    val found: opt[id.Symbol] = module.find(e.m, View{data: spelled.data::*char, len: spelled.len});
+    if (sel found.some) {
+        val s: id.Symbol = found.some;
+        if (sel s.function) {
+            val l: res[build.Label, Error] = function_label(e, s.function);
+            if (sel l.err) { ret res[opt[build.Label], Error].err{l.err}; }
+            ret res[opt[build.Label], Error].ok{opt[build.Label].some{l.ok}};
+        }
+    }
+    ret res[opt[build.Label], Error].ok{opt[build.Label].none{}};
+}
+
+# a weak external of a name that `target` stands in for unless the link
+# defines the name otherwise, as an arm64ec name the other convention's code
+# reaches stands for the native one (`.weak_anti_dep`)
+fun anti_dependency(e: *Emitter, name: View, target: build.Label) res[build.Label, Error] {
+    val l: res[build.Label, Error] = named(e, name);
+    if (sel l.err) { ret l; }
+    val shown: err[Error] = builder(build.expose(e.b, l.ok, build.Exposure{binding: ?symbol.WEAKLY, visibility: ?symbol.DEFAULT, kind: ?symbol.FUNCTION, size: build.Size.none{}}));
+    if (sel shown.err) { ret res[build.Label, Error].err{shown.err}; }
+    val fell: err[Error] = builder(build.fall_back(e.b, l.ok, target, ?symbol.ANTI_DEPENDENCY));
+    if (sel fell.err) { ret res[build.Label, Error].err{fell.err}; }
+    ret l;
+}
+
 # the label of a function of the module, a function symbol of the object made
-# when it is first named, sized from its label to its end when a unit emits it
+# when it is first named, sized from its label to its end when a unit emits it.
+# where the default row bridges, a function native code reaches by a name of
+# its own takes that name ("arm64ec function name decoration"), and the name
+# the other convention's code reaches it by is a label of its own: for a
+# definition other objects see, a weak external the decorated one stands in
+# for, and for a declaration with a guest exit thunk, the same, the
+# decorated name itself a weak external the thunk stands in for, as llvm
+# states them. a declaration with none names both undefined
 fun function_label(e: *Emitter, f: id.Function) res[build.Label, Error] {
     if (f.index::usize >= e.functions.len) { ret res[build.Label, Error].err{Error.symbol{module.Error.function{f}}}; }
     val held: opt[build.Label] = e.functions.data[f.index];
     if (sel held.some) { ret res[build.Label, Error].ok{held.some}; }
-    val data: res[FunctionData, module.Error] = module.function_data(e.m, f);
+    var data: res[FunctionData, module.Error] = module.function_data(e.m, f);
     if (sel data.err) { ret res[build.Label, Error].err{Error.symbol{data.err}}; }
-    val l: res[build.Label, Error] = named(e, data.ok.name);
+    var spelled: vector.Vector[u8] = vector.init[u8](e.a);
+    fin { vector.dnit[u8](?spelled); }
+    val marked: res[bool, Error] = decorated(e, ?data.ok, ?spelled);
+    if (sel marked.err) { ret res[build.Label, Error].err{marked.err}; }
+    var name: View = data.ok.name;
+    if (marked.ok) { name = View{data: spelled.data::*char, len: spelled.len}; }
+    val l: res[build.Label, Error] = named(e, name);
     if (sel l.err) { ret l; }
     var size: build.Size = build.Size.none{};
     val unit: opt[u32]   = e.emitters.data[f.index];
     if (sel unit.some) { size = build.Size.measured{build.Difference{plus: e.ends.data[unit.some], minus: l.ok, addend: 0}}; }
-    val shown: err[build.Refusal] = build.expose(e.b, l.ok, exposure(data.ok.linkage, ?symbol.FUNCTION, size));
+    var shows: build.Exposure   = exposure(data.ok.linkage, ?symbol.FUNCTION, size);
+    var guest: opt[build.Label] = opt[build.Label].none{};
+    if (marked.ok && sel unit.none) {
+        val g: res[opt[build.Label], Error] = guest_of(e, name);
+        if (sel g.err) { ret res[build.Label, Error].err{g.err}; }
+        guest = g.ok;
+        if (sel guest.some) { shows.binding = ?symbol.WEAKLY; }
+    }
+    val shown: err[build.Refusal] = build.expose(e.b, l.ok, shows);
     if (sel shown.err) { ret res[build.Label, Error].err{Error.builder{shown.err}}; }
     e.functions.data[f.index] = opt[build.Label].some{l.ok};
+    if (sel guest.some) {
+        val fell: err[Error] = builder(build.fall_back(e.b, l.ok, guest.some, ?symbol.ANTI_DEPENDENCY));
+        if (sel fell.err) { ret res[build.Label, Error].err{fell.err}; }
+    }
+    if (!marked.ok) { ret res[build.Label, Error].ok{l.ok}; }
+    if ((sel unit.some && symbol.binds(data.ok.linkage.binding, symbol.EXTERNAL)) || sel guest.some) {
+        val p: res[build.Label, Error] = anti_dependency(e, data.ok.name, l.ok);
+        if (sel p.err) { ret p; }
+        e.plain.data[f.index] = opt[build.Label].some{p.ok};
+    }
+    or (sel unit.none) {
+        val p: res[build.Label, Error] = named(e, data.ok.name);
+        if (sel p.err) { ret p; }
+        val plain: err[build.Refusal] = build.expose(e.b, p.ok, exposure(data.ok.linkage, ?symbol.FUNCTION, build.Size.none{}));
+        if (sel plain.err) { ret res[build.Label, Error].err{Error.builder{plain.err}}; }
+        e.plain.data[f.index] = opt[build.Label].some{p.ok};
+    }
     ret res[build.Label, Error].ok{l.ok};
+}
+
+# the label an address of a function is taken through: the name the other
+# convention's code reaches a declared function by where its native name is
+# decorated, so the address is the one that code takes, and the function's
+# own label otherwise
+fun address_label(e: *Emitter, f: id.Function) res[build.Label, Error] {
+    val l: res[build.Label, Error] = function_label(e, f);
+    if (sel l.err) { ret l; }
+    val plain: opt[build.Label] = e.plain.data[f.index];
+    val unit:  opt[u32]         = e.emitters.data[f.index];
+    if (sel plain.some) {
+        if (sel unit.none) { ret res[build.Label, Error].ok{plain.some}; }
+    }
+    ret l;
+}
+
+# the label of a function or global a reference of a relocation kind names: a
+# function's own label for a branch to it, which the link may route through a
+# stub, and the label its address is taken through for any other
+fun reached_label(e: *Emitter, s: id.Symbol, kind: *reloc.Kind) res[build.Label, Error] {
+    if (sel s.function) {
+        if (!reloc.has(kind, reloc.PLT)) { ret address_label(e, s.function); }
+    }
+    ret symbol_label(e, s);
+}
+
+# the label of a function or global an address in data names
+fun datum_label(e: *Emitter, s: id.Symbol) res[build.Label, Error] {
+    if (sel s.function) { ret address_label(e, s.function); }
+    ret symbol_label(e, s);
+}
+
+# the bridge one attribute of a thunk states, of a role. a guest exit
+# thunk's row names the thunk first and the function it stands in for second,
+# as llvm's arm64ec symbol map does, and every other names the function first
+fun bridge_of(e: *Emitter, thunk: id.Function, at: *Attribute, role: *mink_bridge.Role) err[Error] {
+    val datum: Datum = at.datum;
+    if (!(sel datum.text)) { ret err[Error].err{Error.symbol{module.Error.function{thunk}}}; }
+    val found: opt[id.Symbol] = module.find(e.m, datum.text);
+    if (sel found.none) { ret err[Error].err{Error.symbol{module.Error.function{thunk}}}; }
+    val served: id.Symbol = found.some;
+    if (!(sel served.function)) { ret err[Error].err{Error.symbol{module.Error.function{thunk}}}; }
+    val own: res[build.Label, Error] = function_label(e, thunk);
+    if (sel own.err) { ret err[Error].err{own.err}; }
+    var target: res[build.Label, Error] = address_label(e, served.function);
+    if (role == ?mink_bridge.ENTRY)      { target = function_label(e, served.function); }
+    if (sel target.err)                  { ret err[Error].err{target.err}; }
+    if (role == ?mink_bridge.GUEST_EXIT) { ret builder(build.bridge(e.b, own.ok, target.ok, role)); }
+    ret builder(build.bridge(e.b, target.ok, own.ok, role));
+}
+
+# each bridge a thunk of the module states it serves, as its register
+# attributes name the function: an entry thunk to the function it enters, an
+# exit thunk from the name the callee's emulated code is reached by, and a
+# guest exit thunk to that name
+fun bridges(e: *Emitter) err[Error] {
+    if (sel e.bridging.none) { ret err[Error].ok{}; }
+    var i: usize = 0;
+    for (i < e.m.functions.len) {
+        val thunk: id.Function = id.Function{index: i::u32};
+        var k:     usize       = 0;
+        for (k < e.m.functions.data[i].attributes.len) {
+            val at: *Attribute = ?e.m.functions.data[i].attributes.data[k];
+            k = k + 1;
+            var role: opt[*mink_bridge.Role] = opt[*mink_bridge.Role].none{};
+            if (schema.is(at, schema.ENTRY)) { role = opt[*mink_bridge.Role].some{?mink_bridge.ENTRY}; }
+            or (schema.is(at, schema.EXIT))  { role = opt[*mink_bridge.Role].some{?mink_bridge.EXIT}; }
+            or (schema.is(at, schema.GUEST)) { role = opt[*mink_bridge.Role].some{?mink_bridge.GUEST_EXIT}; }
+            if (sel role.some) {
+                val made: err[Error] = bridge_of(e, thunk, at, role.some);
+                if (sel made.err) { ret made; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
 }
 
 # the label of a global of the module, a data symbol of the object made when it
@@ -983,7 +1162,7 @@ fun give_address(b: *Body, at: Instruction, ins: *masc_emit.Instruction, k: u32,
     var span: u32                 = 1;
     val sym:  opt[operand.Symbol] = a.symbol;
     if (sel sym.some) {
-        val l: res[build.Label, Error] = symbol_label(b.e, sym.some.symbol);
+        val l: res[build.Label, Error] = reached_label(b.e, sym.some.symbol, sym.some.kind);
         if (sel l.err) { ret res[u32, Error].err{l.err}; }
         val f: res[mo.FixupKind, Error] = fixup_of(b, at, k, own_fixup(ro), sym.some.kind);
         if (sel f.err) { ret res[u32, Error].err{f.err}; }
@@ -1063,7 +1242,7 @@ fun give(b: *Body, at: Instruction, ins: *masc_emit.Instruction, k: u32, o: Oper
     }
     if (sel o.symbol) {
         if (!(sel ro.shape.immediate || sel ro.shape.relative || sel ro.shape.marker)) { ret res[u32, Error].err{refused(b, at, k, Reason.shape{})}; }
-        val l: res[build.Label, Error] = symbol_label(e, o.symbol.symbol);
+        val l: res[build.Label, Error] = reached_label(e, o.symbol.symbol, o.symbol.kind);
         if (sel l.err) { ret res[u32, Error].err{l.err}; }
         val f: res[mo.FixupKind, Error] = fixup_of(b, at, k, own_fixup(ro), o.symbol.kind);
         if (sel f.err) { ret res[u32, Error].err{f.err}; }
@@ -2032,7 +2211,7 @@ fun write_image(e: *Emitter, g: id.Global, i: *data.Image) err[Error] {
         if (d.width > core_fixup.MAX_WIDTH::u64) { ret err[Error].err{misplaced(g, Fault.width{})}; }
         val before: err[Error] = bytes_of(e, i, at, d.offset);
         if (sel before.err) { ret before; }
-        val l: res[build.Label, Error] = symbol_label(e, d.symbol);
+        val l: res[build.Label, Error] = datum_label(e, d.symbol);
         if (sel l.err) { ret err[Error].err{l.err}; }
         val put: err[Error] = builder(build.datum(e.b, build.Reference{target: l.ok, addend: d.addend, width: d.width::u8, basis: core_fixup.ABSOLUTE}));
         if (sel put.err) { ret put; }
@@ -2411,6 +2590,10 @@ pub fun emit(a: *allocator.Allocator, m: *Module, opened: *Build, t: *Target, un
         fixing:    vector.init[Fixing](a),
         stating:   vector.init[Stating](a),
         shorts:    shorts,
+        bridging:  row.ok.bridging,
+        default:   row.ok.name,
+        routine:   convention.probe_helper(row.ok),
+        plain:     vector.init[opt[build.Label]](a),
     };
     fin {
         vector.dnit[opt[build.Label]](?e.functions);
@@ -2429,11 +2612,14 @@ pub fun emit(a: *allocator.Allocator, m: *Module, opened: *Build, t: *Target, un
         vector.dnit[Calling](?e.calling);
         vector.dnit[Fixing](?e.fixing);
         vector.dnit[Stating](?e.stating);
+        vector.dnit[opt[build.Label]](?e.plain);
     }
     val sourced: err[Error] = files(?e);
     if (sel sourced.err) { ret res[object.Object, Error].err{sourced.err}; }
     val unnamed: err[allocator.Error] = slice.fill[opt[build.Label]](?e.functions, m.functions.len, opt[build.Label].none{});
     if (sel unnamed.err) { ret res[object.Object, Error].err{Error.alloc{unnamed.err}}; }
+    val unspelled: err[allocator.Error] = slice.fill[opt[build.Label]](?e.plain, m.functions.len, opt[build.Label].none{});
+    if (sel unspelled.err) { ret res[object.Object, Error].err{Error.alloc{unspelled.err}}; }
     val unemitted: err[allocator.Error] = slice.fill[opt[u32]](?e.emitters, m.functions.len, opt[u32].none{});
     if (sel unemitted.err) { ret res[object.Object, Error].err{Error.alloc{unemitted.err}}; }
     val ended: err[Error] = end_units(?e, units);
@@ -2460,6 +2646,8 @@ pub fun emit(a: *allocator.Allocator, m: *Module, opened: *Build, t: *Target, un
     if (sel described.err) { ret res[object.Object, Error].err{described.err}; }
     val labelled: err[Error] = label_exported(?e);
     if (sel labelled.err) { ret res[object.Object, Error].err{labelled.err}; }
+    val bridged: err[Error] = bridges(?e);
+    if (sel bridged.err) { ret res[object.Object, Error].err{bridged.err}; }
     val finished: res[object.Object, build.Refusal] = build.finish(?b);
     if (sel finished.err) { ret res[object.Object, Error].err{finish_refused(?e, finished.err)}; }
     var o:        object.Object = finished.ok;

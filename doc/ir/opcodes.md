@@ -135,7 +135,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `mul.ov.u` | `lhs`, `rhs` | none | lanewise | propagates |
 | `clz` | `operand` | none | lanewise | propagates |
 | `ctz` | `operand` | none | lanewise | propagates |
-| `call.placed` | `callee`, then any number of argument operands | `signature` a type, `places` a place list | none | declared |
+| `call.placed` | `callee`, then any number of argument operands | `signature` a type, `places` a place list, `named` a named argument count | none | declared |
 | `ret.placed` | any number of returned value operands | `places` a place list | none | no results |
 | `div.wide.u` | `high`, `low`, `divisor` | none | lanewise | propagates |
 | `mul.high.u` | `lhs`, `rhs` | none | lanewise | propagates |
@@ -2014,7 +2014,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 ### `call.placed`
 
 - operands: `callee`, then any number of argument operands
-- immediates: `signature` a type, `places` a place list
+- immediates: `signature` a type, `places` a place list, `named` a named argument count
 - targets: 0
 - typing:
   - `callee` is a pointer
