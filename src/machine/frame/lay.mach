@@ -48,6 +48,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
 use std.allocator;
 use std.collections.slice.Slice;
@@ -57,6 +58,7 @@ use std.collections.vector;
 use mirl.base.fail.keep;
 use mirl.base.slice;
 use mirl.ir.id;
+use mirl.machine.alloc.live.Clobbers;
 use mirl.machine.alloc.location;
 use mirl.machine.alloc.location.Locations;
 use mirl.machine.alloc.spill;
@@ -110,14 +112,21 @@ use mink.model.frame;
 # at:         the locations of the target
 # helper:     the module's symbol for the routine the row's prologue calls to
 #             probe, none where it calls none or the module declares none
+# exit:       the module's symbol for the global holding the routine the
+#             row's returns leave through, none where they return or the
+#             module declares none
 # naked:      the function states `naked`, so its body is laid as written
+# clobbers:   what the function's calls leave undefined, as the selection
+#             stated it under each callee's row
 # code:       the target's frame code bound to the function's selection,
 #             whose reach places the emergency slots
 pub rec Request {
     convention: *Resolved;
     at:         *Locations;
     helper:     opt[id.Symbol];
+    exit:       opt[id.Symbol];
     naked:      bool;
+    clobbers:   Clobbers;
     code:       *Admitted;
 }
 
@@ -167,6 +176,8 @@ pub rec Request {
 #            not its first pair saved, and a frame that pushes its saves with
 #            a scaled area or a push not just below the one before, and under
 #            either windows encoding a realigned frame with no frame pointer
+# exit:      a function whose row's returns leave through a routine whose
+#            global the module declares none of
 pub tag Error: u8 {
     alloc: allocator.Error;
     foreign;
@@ -189,6 +200,7 @@ pub tag Error: u8 {
     naked;
     probe;
     unwind;
+    exit;
 }
 
 # the emergency slots of one kind a frame reserves
@@ -255,6 +267,8 @@ pub rec Spot {
 #            apart, the locals' move, none where it probes none
 # apart:     whether the prologue moves the stack pointer for the saves and
 #            then for the locals, the row's prologue's
+# exit:      the global holding the routine every return leaves through past
+#            its epilogue, none where the function returns
 pub rec Plan {
     layout:    Layout;
     added:     vector.Vector[SlotData];
@@ -275,6 +289,7 @@ pub rec Plan {
     paired:    bool;
     probe:     opt[id.Symbol];
     apart:     bool;
+    exit:      opt[id.Symbol];
 }
 
 # give back a plan's storage
@@ -620,6 +635,7 @@ fun empty_plan(a: *allocator.Allocator, stack: rf.Id) Plan {
         paired:    false,
         probe:     opt[id.Symbol].none{},
         apart:     false,
+        exit:      opt[id.Symbol].none{},
     };
 }
 
@@ -648,6 +664,53 @@ fun relay(p: *Plan) {
     p.apart   = false;
 }
 
+# the locations a function overwrites: those its allocation assigned, and
+# those a call leaves undefined that a callee under the function's own row
+# would not, as a call from an arm64ec entry thunk under the x64 row to
+# native code leaves the upper halves of v8-v15 undefined, which the thunk
+# then saves
+fun overwritten(regs: *Registers, r: Request, used: Slice[u32], out: *vector.Vector[u32]) err[Error] {
+    var i: usize = 0;
+    for (i < used.size) {
+        val pushed: res[usize, allocator.Error] = vector.push[u32](out, used.data[i]);
+        if (sel pushed.err) { ret err[Error].err{alloc_err(pushed.err)}; }
+        i = i + 1;
+    }
+    val sets: Clobbers = r.clobbers;
+    if (sets.words == 0) { ret err[Error].ok{}; }
+    var k: usize = 0;
+    for (k < sets.masks.size) {
+        val word: u64 = sets.masks.data[k];
+        var bit:  u32 = 0;
+        for (bit < 64) {
+            if (((word >> bit::u64) & 1) != 0) {
+                val at: u32 = (k % sets.words::usize)::u32 * 64 + bit;
+                if (!owned(regs, r.at, at)) {
+                    val pushed: res[usize, allocator.Error] = vector.push[u32](out, at);
+                    if (sel pushed.err) { ret err[Error].err{alloc_err(pushed.err)}; }
+                }
+            }
+            bit = bit + 1;
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether the register row `at` is one a call under the function's own row
+# clobbers
+fun owned(regs: *Registers, at: *Locations, row: u32) bool {
+    var j: usize = 0;
+    for (j < regs.clobbered.size) {
+        val r: res[u32, location.Unlocated] = location.locate(at, Physical.register{regs.clobbered.data[j]});
+        if (sel r.ok) {
+            if (r.ok == row) { ret true; }
+        }
+        j = j + 1;
+    }
+    ret false;
+}
+
 # lay out the frame of an allocated function
 # ---
 # a:       the allocator the plan takes
@@ -671,8 +734,18 @@ pub fun lay(a: *allocator.Allocator, f: *Function, used: Slice[u32], r: Request,
     if (sel sp.none) { ret res[Plan, Error].err{Error.stack{}}; }
     val stack_row: res[u32, location.Unlocated] = location.locate(r.at, Physical.register{sp.some});
     if (sel stack_row.err) { ret res[Plan, Error].err{Error.unlocated{stack_row.err}}; }
-    var p:   Plan                   = empty_plan(a, sp.some);
-    val got: res[Facts, scan.Error] = scan.scan(a, f, regs.context, r.at, stack_row.ok, used);
+    val leaves: opt[str] = convention.exit_routine(conv.row);
+    if (sel leaves.some && sel r.exit.none) { ret res[Plan, Error].err{Error.exit{}}; }
+    var p: Plan = empty_plan(a, sp.some);
+    p.exit = r.exit;
+    var written: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?written); }
+    val over: err[Error] = overwritten(regs, r, used, ?written);
+    if (sel over.err) {
+        release(?p);
+        ret res[Plan, Error].err{over.err};
+    }
+    val got: res[Facts, scan.Error] = scan.scan(a, f, regs.context, r.at, stack_row.ok, Slice[u32]{data: written.data, size: written.len});
     if (sel got.err) {
         release(?p);
         ret res[Plan, Error].err{scan_err(got.err)};

@@ -1,0 +1,769 @@
+# the thunks and checks a convention whose code shares an image with code of
+# another needs, as arm64ec's shares x64's
+#
+# a target whose default row states a bridging ("understanding arm64ec abi
+# and assembly code") makes, before the abi legalisation places any call:
+# - for each function it defines that another object may call, or whose
+#   address it takes, the entry thunk of the function's signature, through
+#   which emulated code enters it: a function under the bridge's foreign row
+#   that takes the callee's address leading and calls it under the default
+#   row, its returns leaving as the foreign row's frame states
+# - for each function it declares and calls directly, the exit thunk of its
+#   signature and its guest exit thunk. the exit thunk is a function under the
+#   bridge's native row that takes the callee's address leading and calls the
+#   emulator's dispatch routine under the foreign row, the address leading
+#   again. the guest exit thunk stands in for the native code of the callee
+#   when the link finds none: it checks the callee, named as emulated code
+#   names it, and calls what the check hands back under the native row
+# - for each indirect call, a call of the check routine first, given the
+#   callee and the exit thunk of the call's signature, and then a call of
+#   what the check hands back under the native row, the address it hands
+#   back for an exit thunk leading
+#
+# a thunk is named by its signature as the bridge spells it, so every object
+# that serves a signature makes the one thunk the link keeps, and every
+# integer and pointer of a word shares a thunk of one word. each thunk is
+# weak and states, as a register attribute, every function it serves, which
+# the emitter hands to the object as its bridges.
+#
+# what it refuses, naming the function: a signature no thunk of the bridge
+# serves where a thunk is needed, and an indirect variadic call, whose exit
+# thunk copies its stack words and is no thunk the pass makes yet. the pass
+# reads no value, so it keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.model.symbol;
+
+use mirl.build;
+use mirl.build.Builder;
+use mirl.build.Failure;
+use mirl.ir.attribute.Attribute;
+use mirl.ir.attribute.Datum;
+use mirl.ir.constant.Address;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.Binding;
+use mirl.ir.function.Body;
+use mirl.ir.function.ConstantTime;
+use mirl.ir.function.FunctionData;
+use mirl.ir.function.NO_EXTENSIONS;
+use mirl.ir.global.GlobalData;
+use mirl.ir.global.Secrecy;
+use mirl.ir.global.Section;
+use mirl.ir.global.Tls;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Global;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.linkage.Linkage;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.place.Named;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl.ir.type.table.DEFAULT_SPACE;
+use mirl.ir.type.table.Extension;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.pass.cache;
+use mirl.pass.failure;
+use mirl.pass.failure.Why;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.target.abi.convention.Bridging;
+use mirl.target.abi.convention.Declared;
+use mirl.target.abi.convention.Thunk;
+use mirl.target.abi.describe;
+use mirl.target.abi.view;
+use mirl.target.basis;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record.Target;
+use mirl.target.register.schema;
+
+pub val BRIDGES: Pass = Pass{name: "bridges", kind: Kind.legalise{}, scope: Scope.module{run}, preserves: cache.NONE, time: Time.keeps{}, applies: bridged};
+
+# the bridging of a target's default row, none for a target whose default row
+# shares its image with no other convention's code
+fun bridging_of(t: *Target) opt[*Bridging] {
+    val d: Declared = t.convention;
+    if (!(sel d.rows)) { ret opt[*Bridging].none{}; }
+    ret d.rows.default.bridging;
+}
+
+fun bridged(g: *Ground) bool {
+    val b: opt[*Bridging] = bridging_of(g.t);
+    ret sel b.some;
+}
+
+# the pass over one module
+# ---
+# m:        the module
+# l:        its layout under the target
+# bridging: the default row's bridging
+# default:  the default row's name
+# ptr:      the pointer type
+# word:     the integer type of a word
+# checker:  the global holding the check routine's address
+# dispatch: the global holding the emulator's dispatch routine's address
+# room:     the bytes of the name being made
+rec Work {
+    m:        *Module;
+    l:        Layout;
+    bridging: *Bridging;
+    default:  str;
+    ptr:      Type;
+    word:     Type;
+    checker:  Global;
+    dispatch: Global;
+    room:     Vector[u8];
+}
+
+fun ir(r: err[module.Error]) err[Why] {
+    ret failure.edit(r);
+}
+
+fun built(bld: *Builder) err[Why] {
+    val done: err[Failure] = build.done(bld);
+    if (sel done.err) { ret err[Why].err{Why.build{done.err}}; }
+    ret err[Why].ok{};
+}
+
+fun text(s: str) View {
+    ret View{data: s, len: str_len(s)};
+}
+
+fun same(a: View, b: View) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun no_targets() Slice[Branch] {
+    ret Slice[Branch]{data: nil, size: 0};
+}
+
+fun intern(w: *Work, s: types.Shape) res[Type, Why] {
+    val t: res[Type, types.Error] = types.intern(?w.m.types, s);
+    if (sel t.err) { ret res[Type, Why].err{Why.ir{module.Error.types{t.err}}}; }
+    ret res[Type, Why].ok{t.ok};
+}
+
+# whether a signature is made under the default row, naming none or it
+fun defaulted(w: *Work, s: types.Function) bool {
+    ret s.convention.len == 0 || same(s.convention, text(w.default));
+}
+
+fun signature_of(w: *Work, ty: Type) res[types.Function, Why] {
+    val s: res[types.Function, types.Error] = types.signature(?w.m.types, ty);
+    if (sel s.err) { ret res[types.Function, Why].err{Why.ir{module.Error.types{s.err}}}; }
+    ret res[types.Function, Why].ok{s.ok};
+}
+
+# the global of a routine's address the module declares, declared external
+# when it declares none
+fun routine(w: *Work, name: str) res[Global, Why] {
+    val as:    View        = text(name);
+    val found: opt[Symbol] = module.find(w.m, as);
+    if (sel found.some) {
+        if (sel found.some.global) { ret res[Global, Why].ok{found.some.global}; }
+        ret res[Global, Why].err{Why.reason{"a function named as the global an arm64ec bridge reads a routine's address from"}};
+    }
+    val made: res[Global, module.Error] = module.add_global(w.m, GlobalData{name: as, type: w.ptr, initial: opt[Constant].none{}, alignment: opt[u64].none{}, section: opt[Section].none{}, tls: opt[Tls].none{}, linkage: Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT}, constant: false, secret: Secrecy.public{}, debug: opt[Binding].none{}});
+    if (sel made.err) { ret res[Global, Why].err{Why.ir{made.err}}; }
+    ret res[Global, Why].ok{made.ok};
+}
+
+# the types a thunk carries a signature's values as: each a whole word where
+# the bridge widens its spelling to one, else its own type
+fun carried(w: *Work, v: *view.View, list: Slice[Type], nodes: *Vector[u32], out: *Vector[Type]) err[Why] {
+    var i: usize = 0;
+    for (i < list.size) {
+        val d: res[u32, describe.Error] = describe.describe(?w.l, DEFAULT_SPACE, v, list.data[i]);
+        if (sel d.err) { ret err[Why].err{Why.reason{"a signature value an arm64ec thunk carries that has no layout"}}; }
+        val noted: res[usize, allocator.Error] = vector.push[u32](nodes, d.ok);
+        if (sel noted.err) { ret failure.lost(noted.err); }
+        var ty: Type = list.data[i];
+        if (w.bridging.worded(v, d.ok)) { ty = w.word; }
+        val pushed: res[usize, allocator.Error] = vector.push[Type](out, ty);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# a signature's types with a pointer before them
+fun led(w: *Work, list: Slice[Type], out: *Vector[Type]) err[Why] {
+    val first: res[usize, allocator.Error] = vector.push[Type](out, w.ptr);
+    if (sel first.err) { ret failure.lost(first.err); }
+    var i: usize = 0;
+    for (i < list.size) {
+        val pushed: res[usize, allocator.Error] = vector.push[Type](out, list.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# extensions with none before them, empty for none
+fun led_extensions(w: *Work, list: Slice[Extension], out: *Vector[Extension]) err[Why] {
+    if (list.size == 0) { ret err[Why].ok{}; }
+    val first: res[usize, allocator.Error] = vector.push[Extension](out, Extension.none{});
+    if (sel first.err) { ret failure.lost(first.err); }
+    var i: usize = 0;
+    for (i < list.size) {
+        val pushed: res[usize, allocator.Error] = vector.push[Extension](out, list.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun under(w: *Work, params: Slice[Type], results: Slice[Type], row: str) res[Type, Why] {
+    var f: types.Function = types.plain(params, results);
+    f.convention = text(row);
+    ret intern(w, types.Shape.function{f});
+}
+
+# a signature with the callee's address leading, under a row
+fun leading(w: *Work, s: types.Function, row: str) res[Type, Why] {
+    var params: Vector[Type]      = vector.init[Type](w.m.a);
+    var exts:   Vector[Extension] = vector.init[Extension](w.m.a);
+    fin {
+        vector.dnit[Type](?params);
+        vector.dnit[Extension](?exts);
+    }
+    val p: err[Why] = led(w, s.params, ?params);
+    if (sel p.err) { ret res[Type, Why].err{p.err}; }
+    val e: err[Why] = led_extensions(w, s.param_ext, ?exts);
+    if (sel e.err) { ret res[Type, Why].err{e.err}; }
+    var f: types.Function = types.Function{params: Slice[Type]{data: params.data, size: params.len}, results: s.results, param_ext: Slice[Extension]{data: exts.data, size: exts.len}, result_ext: s.result_ext, convention: text(row), variadic: s.variadic};
+    ret intern(w, types.Shape.function{f});
+}
+
+# a register attribute stating the function a thunk serves, none for a
+# thunk an indirect call takes, which serves no one function
+fun serve(w: *Work, thunk: Function, role: str, served: View) err[Why] {
+    if (served.len == 0) { ret err[Why].ok{}; }
+    ret ir(module.attach(w.m, Symbol.function{thunk}, Attribute{family: text(schema.FAMILY), name: text(role), datum: Datum.text{served}}));
+}
+
+fun weak() Linkage {
+    ret Linkage{binding: ?symbol.WEAKLY, visibility: ?symbol.DEFAULT};
+}
+
+fun address_of(bld: *Builder, ptr: Type, s: Symbol) Value {
+    ret build.use_constant(bld, build.constant(bld, ConstantData.address{Address{type: ptr, symbol: s, offset: 0}}));
+}
+
+# the address of a function, which code takes only through `func.addr`
+fun function_address(bld: *Builder, ptr: Type, f: Function) Value {
+    var imm: [2]Immediate = [2]Immediate{Immediate.function{f}, Immediate.ty{ptr}};
+    ret build.value(bld, Request{opcode: opcode.FUNC_ADDR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: no_targets()});
+}
+
+# the address a routine's global holds, loaded
+fun loaded(w: *Work, bld: *Builder, g: Global) Value {
+    val at:  Value        = address_of(bld, w.ptr, Symbol.global{g});
+    var ops: [1]Value     = [1]Value{at};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{w.ptr}, Immediate.alignment{8}};
+    ret build.value(bld, Request{opcode: opcode.LOAD, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: no_targets()});
+}
+
+fun call(bld: *Builder, sig: Type, operands: Slice[Value]) Instruction {
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{sig}, Immediate.named{Named.all{}}};
+    ret build.emit(bld, Request{opcode: opcode.CALL, operands: operands, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: no_targets()});
+}
+
+# return a call's results
+fun returned(w: *Work, bld: *Builder, c: Instruction, count: usize) err[Why] {
+    var out: Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?out); }
+    var i: usize = 0;
+    for (i < count) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?out, build.result(bld, c, i::u32));
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    build.emit(bld, Request{opcode: opcode.RET, operands: Slice[Value]{data: out.data, size: out.len}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: no_targets()});
+    ret err[Why].ok{};
+}
+
+# a function defined in the module with an entry block of a signature's
+# parameters, the builder at the block's end
+fun opened(w: *Work, bld: *Builder, name: View, sig: Type, params: Slice[Type], linkage: Linkage) res[Function, Why] {
+    val f: Function = build.function(bld, FunctionData{name: name, signature: sig, linkage: linkage, constant_time: ConstantTime.none{}, extensions: NO_EXTENSIONS, alignment: opt[u64].none{}, section: opt[Section].none{}});
+    build.enter(bld, f);
+    var decls: Vector[Declaration] = vector.init[Declaration](w.m.a);
+    fin { vector.dnit[Declaration](?decls); }
+    var i: usize = 0;
+    for (i < params.size) {
+        val pushed: res[usize, allocator.Error] = vector.push[Declaration](?decls, Declaration{type: params.data[i], secret: false, name: opt[View].none{}});
+        if (sel pushed.err) { ret res[Function, Why].err{Why.alloc{pushed.err}}; }
+        i = i + 1;
+    }
+    val k: Block = build.block(bld, Slice[Declaration]{data: decls.data, size: decls.len});
+    build.at_end(bld, k);
+    ret res[Function, Why].ok{f};
+}
+
+# the parameters of a function's entry block from `from` on
+fun parameters(w: *Work, bld: *Builder, f: Function, from: usize, count: usize, out: *Vector[Value]) err[Why] {
+    var i: usize = from;
+    for (i < count) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](out, build.parameter(bld, Block{index: 0}, i::u32));
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    ret err[Why].ok{};
+}
+
+# the thunk of a kind for a signature, made when the module has none, stated
+# to serve the function named `served`: none where no thunk of the bridge
+# serves the signature
+fun thunk(w: *Work, kind: Thunk, s: types.Function, served: View) res[opt[Function], Why] {
+    var v:       view.View    = view.View{nodes: vector.init[view.Node](w.m.a)};
+    var rnodes:  Vector[u32]  = vector.init[u32](w.m.a);
+    var pnodes:  Vector[u32]  = vector.init[u32](w.m.a);
+    var results: Vector[Type] = vector.init[Type](w.m.a);
+    var params:  Vector[Type] = vector.init[Type](w.m.a);
+    var lead:    Vector[Type] = vector.init[Type](w.m.a);
+    fin {
+        vector.dnit[view.Node](?v.nodes);
+        vector.dnit[u32](?rnodes);
+        vector.dnit[u32](?pnodes);
+        vector.dnit[Type](?results);
+        vector.dnit[Type](?params);
+        vector.dnit[Type](?lead);
+    }
+    val r: err[Why] = carried(w, ?v, s.results, ?rnodes, ?results);
+    if (sel r.err) { ret res[opt[Function], Why].err{r.err}; }
+    val p: err[Why] = carried(w, ?v, s.params, ?pnodes, ?params);
+    if (sel p.err) { ret res[opt[Function], Why].err{p.err}; }
+    vector.clear[u8](?w.room);
+    val named: res[bool, allocator.Error] = w.bridging.name(kind, ?v, Slice[u32]{data: rnodes.data, size: rnodes.len}, Slice[u32]{data: pnodes.data, size: pnodes.len}, ?w.room);
+    if (sel named.err) { ret res[opt[Function], Why].err{Why.alloc{named.err}}; }
+    if (!named.ok)     { ret res[opt[Function], Why].ok{opt[Function].none{}}; }
+    val name:  View        = View{data: w.room.data::*char, len: w.room.len};
+    val found: opt[Symbol] = module.find(w.m, name);
+    if (sel found.some) {
+        if (!(sel found.some.function)) { ret res[opt[Function], Why].err{Why.reason{"a global named as an arm64ec thunk"}}; }
+        val stated: err[Why] = serve(w, found.some.function, role_of(kind), served);
+        if (sel stated.err) { ret res[opt[Function], Why].err{stated.err}; }
+        ret res[opt[Function], Why].ok{opt[Function].some{found.some.function}};
+    }
+    val held: err[Why] = led(w, Slice[Type]{data: params.data, size: params.len}, ?lead);
+    if (sel held.err) { ret res[opt[Function], Why].err{held.err}; }
+    val rs:  Slice[Type] = Slice[Type]{data: results.data, size: results.len};
+    val ls:  Slice[Type] = Slice[Type]{data: lead.data, size: lead.len};
+    var row: str         = w.bridging.native.name;
+    if (sel kind.entry) { row = w.bridging.foreign.name; }
+    val sig: res[Type, Why] = under(w, ls, rs, row);
+    if (sel sig.err) { ret res[opt[Function], Why].err{sig.err}; }
+    # the callee: under the default row for an entry thunk, which calls the
+    # native function, and the foreign row for an exit thunk, which calls the
+    # emulator with the callee's address leading again
+    var callee_sig: res[Type, Why] = under(w, ls, rs, w.bridging.foreign.name);
+    if (sel kind.entry)     { callee_sig = under(w, Slice[Type]{data: params.data, size: params.len}, rs, w.default); }
+    if (sel callee_sig.err) { ret res[opt[Function], Why].err{callee_sig.err}; }
+
+    var bld: Builder            = build.init(w.m);
+    val f:   res[Function, Why] = opened(w, ?bld, name, sig.ok, ls, weak());
+    if (sel f.err) { ret res[opt[Function], Why].err{f.err}; }
+    var operands: Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?operands); }
+    if (sel kind.exit) {
+        val first: res[usize, allocator.Error] = vector.push[Value](?operands, loaded(w, ?bld, w.dispatch));
+        if (sel first.err) { ret res[opt[Function], Why].err{Why.alloc{first.err}}; }
+    }
+    val taken: err[Why] = parameters(w, ?bld, f.ok, 0, ls.size, ?operands);
+    if (sel taken.err) { ret res[opt[Function], Why].err{taken.err}; }
+    val c:    Instruction = call(?bld, callee_sig.ok, Slice[Value]{data: operands.data, size: operands.len});
+    val back: err[Why]    = returned(w, ?bld, c, rs.size);
+    if (sel back.err) { ret res[opt[Function], Why].err{back.err}; }
+    val made: err[Why] = built(?bld);
+    if (sel made.err) { ret res[opt[Function], Why].err{made.err}; }
+    val stated: err[Why] = serve(w, f.ok, role_of(kind), served);
+    if (sel stated.err) { ret res[opt[Function], Why].err{stated.err}; }
+    ret res[opt[Function], Why].ok{opt[Function].some{f.ok}};
+}
+
+fun role_of(kind: Thunk) str {
+    if (sel kind.entry) { ret schema.ENTRY; }
+    ret schema.EXIT;
+}
+
+# a thunk the function named `served` needs, refused where none serves it
+fun needed(w: *Work, kind: Thunk, s: types.Function, served: View) res[Function, Why] {
+    val got: res[opt[Function], Why] = thunk(w, kind, s, served);
+    if (sel got.err)     { ret res[Function, Why].err{got.err}; }
+    if (sel got.ok.none) { ret res[Function, Why].err{Why.reason{"a signature no arm64ec thunk serves, of more than one result or of a float but of 32 or 64 bits, where code of the other convention reaches it"}}; }
+    ret res[Function, Why].ok{got.ok.some};
+}
+
+# the name of a function's guest exit thunk, in the work's room
+fun guest_name(w: *Work, name: View) res[bool, Why] {
+    var decorated: Vector[u8] = vector.init[u8](w.m.a);
+    fin { vector.dnit[u8](?decorated); }
+    val marked: res[bool, allocator.Error] = w.bridging.decorate(name, ?decorated);
+    if (sel marked.err) { ret res[bool, Why].err{Why.alloc{marked.err}}; }
+    if (!marked.ok)     { ret res[bool, Why].ok{false}; }
+    vector.clear[u8](?w.room);
+    val named: res[bool, allocator.Error] = w.bridging.guest(View{data: decorated.data::*char, len: decorated.len}, ?w.room);
+    if (sel named.err) { ret res[bool, Why].err{Why.alloc{named.err}}; }
+    ret res[bool, Why].ok{named.ok};
+}
+
+# a declared function's guest exit thunk, under its own signature: the check
+# of the callee, named as emulated code names it, given its exit thunk, and a
+# call of what the check hands back under the native row
+fun guest(w: *Work, d: Function) err[Why] {
+    val data: FunctionData             = w.m.functions.data[d.index].data;
+    val s:    res[types.Function, Why] = signature_of(w, data.signature);
+    if (sel s.err) { ret err[Why].err{s.err}; }
+    val exit: res[Function, Why] = needed(w, Thunk.exit{}, s.ok, data.name);
+    if (sel exit.err) { ret err[Why].err{exit.err}; }
+    val named: res[bool, Why] = guest_name(w, data.name);
+    if (sel named.err) { ret err[Why].err{named.err}; }
+    if (!named.ok)     { ret err[Why].ok{}; }
+    val name:  View        = View{data: w.room.data::*char, len: w.room.len};
+    val found: opt[Symbol] = module.find(w.m, name);
+    if (sel found.some) { ret err[Why].ok{}; }
+    val check: res[Type, Why] = checking(w);
+    if (sel check.err) { ret err[Why].err{check.err}; }
+    val native: res[Type, Why] = leading(w, s.ok, w.bridging.native.name);
+    if (sel native.err) { ret err[Why].err{native.err}; }
+
+    var bld: Builder            = build.init(w.m);
+    val f:   res[Function, Why] = opened(w, ?bld, name, data.signature, s.ok.params, weak());
+    if (sel f.err) { ret err[Why].err{f.err}; }
+    val checked:  Instruction   = checked_call(w, ?bld, function_address(?bld, w.ptr, d), exit.ok, check.ok);
+    var operands: Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?operands); }
+    val first: res[usize, allocator.Error] = vector.push[Value](?operands, build.result(?bld, checked, 0));
+    if (sel first.err) { ret failure.lost(first.err); }
+    val second: res[usize, allocator.Error] = vector.push[Value](?operands, build.result(?bld, checked, 1));
+    if (sel second.err) { ret failure.lost(second.err); }
+    val taken: err[Why] = parameters(w, ?bld, f.ok, 0, s.ok.params.size, ?operands);
+    if (sel taken.err) { ret taken; }
+    val c:    Instruction = call(?bld, native.ok, Slice[Value]{data: operands.data, size: operands.len});
+    val back: err[Why]    = returned(w, ?bld, c, s.ok.results.size);
+    if (sel back.err) { ret back; }
+    val made: err[Why] = built(?bld);
+    if (sel made.err) { ret made; }
+    ret serve(w, f.ok, schema.GUEST, data.name);
+}
+
+# the signature of the check: the callee and its exit thunk in, what to call
+# and the address an exit thunk leaves for out
+fun checking(w: *Work) res[Type, Why] {
+    var two: [2]Type = [2]Type{w.ptr, w.ptr};
+    ret under(w, Slice[Type]{data: ?two[0], size: 2}, Slice[Type]{data: ?two[0], size: 2}, w.bridging.check.name);
+}
+
+# the check of a callee given the exit thunk of its call's signature, at the
+# builder's cursor
+fun checked_call(w: *Work, bld: *Builder, callee: Value, exit: Function, check: Type) Instruction {
+    val routine: Value    = loaded(w, bld, w.checker);
+    var ops:     [3]Value = [3]Value{routine, callee, function_address(bld, w.ptr, exit)};
+    ret call(bld, check, Slice[Value]{data: ?ops[0], size: 3});
+}
+
+# the function a call's callee names directly, none for an indirect call
+fun direct(w: *Work, f: Function, callee: Value) opt[Function] {
+    val b:   *Body = ?w.m.functions.data[f.index].body;
+    val def: Def   = b.values.data[callee.index].def;
+    if (!(sel def.constant)) { ret opt[Function].none{}; }
+    val c: ConstantData = w.m.constants.data[def.constant.index];
+    if (!(sel c.address)) { ret opt[Function].none{}; }
+    val s: Symbol = c.address.symbol;
+    if (c.address.offset != 0) { ret opt[Function].none{}; }
+    if (!(sel s.function))     { ret opt[Function].none{}; }
+    ret opt[Function].some{s.function};
+}
+
+# one indirect call checked first, then made through what the check hands
+# back under the native row
+fun check_call(w: *Work, f: Function, c: Instruction) err[Why] {
+    val d:      *InstructionData = ?w.m.functions.data[f.index].body.instructions.data[c.index];
+    val stated: Immediate        = d.immediates.data[0];
+    if (!(sel stated.ty)) { ret err[Why].err{Why.reason{"a call with no signature"}}; }
+    val s: res[types.Function, Why] = signature_of(w, stated.ty);
+    if (sel s.err) { ret err[Why].err{s.err}; }
+    val named: Immediate = d.immediates.data[1];
+    if (sel named.named) {
+        val n: Named = named.named;
+        if (sel n.first) { ret err[Why].err{Why.reason{"an indirect variadic call, whose arm64ec exit thunk copies its stack words and is no thunk mirl makes yet"}}; }
+    }
+    val exit: res[Function, Why] = needed(w, Thunk.exit{}, s.ok, View{data: nil, len: 0});
+    if (sel exit.err) { ret err[Why].err{exit.err}; }
+    val check: res[Type, Why] = checking(w);
+    if (sel check.err) { ret err[Why].err{check.err}; }
+    val native: res[Type, Why] = leading(w, s.ok, w.bridging.native.name);
+    if (sel native.err) { ret err[Why].err{native.err}; }
+    var args: Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?args); }
+    val again: *InstructionData = ?w.m.functions.data[f.index].body.instructions.data[c.index];
+    var i:     usize            = 0;
+    for (i < again.operands.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?args, again.operands.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    var bld: Builder = build.init(w.m);
+    build.enter(?bld, f);
+    build.derive(?bld, c);
+    build.before(?bld, c);
+    val checked:  Instruction   = checked_call(w, ?bld, args.data[0], exit.ok, check.ok);
+    var operands: Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?operands); }
+    val first: res[usize, allocator.Error] = vector.push[Value](?operands, build.result(?bld, checked, 0));
+    if (sel first.err) { ret failure.lost(first.err); }
+    val second: res[usize, allocator.Error] = vector.push[Value](?operands, build.result(?bld, checked, 1));
+    if (sel second.err) { ret failure.lost(second.err); }
+    i = 1;
+    for (i < args.len) {
+        val pushed: res[usize, allocator.Error] = vector.push[Value](?operands, args.data[i]);
+        if (sel pushed.err) { ret failure.lost(pushed.err); }
+        i = i + 1;
+    }
+    build.replacing(?bld, c);
+    call(?bld, native.ok, Slice[Value]{data: operands.data, size: operands.len});
+    ret built(?bld);
+}
+
+# whether a constant holds the address of a function, anywhere in it
+fun mark_constant(w: *Work, k: Constant, addressed: *Vector[bool]) {
+    val c: ConstantData = w.m.constants.data[k.index];
+    if (sel c.address) {
+        val s: Symbol = c.address.symbol;
+        if (sel s.function) {
+            if (s.function.index::usize < addressed.len) { addressed.data[s.function.index] = true; }
+        }
+        ret;
+    }
+    if (sel c.aggregate) {
+        var i: usize = 0;
+        for (i < c.aggregate.elements.size) {
+            mark_constant(w, c.aggregate.elements.data[i], addressed);
+            i = i + 1;
+        }
+    }
+}
+
+# which of the first `n` functions are called directly and not variadically,
+# and which have their address taken, by a use of it as anything but the
+# callee of a call or by a global's initial value
+fun survey(w: *Work, n: usize, called: *Vector[bool], addressed: *Vector[bool]) {
+    var g: usize = 0;
+    for (g < w.m.globals.len) {
+        val initial: opt[Constant] = w.m.globals.data[g].data.initial;
+        if (sel initial.some) { mark_constant(w, initial.some, addressed); }
+        g = g + 1;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        val b: *Body = ?w.m.functions.data[i].body;
+        var v: usize = 0;
+        for (v < b.values.len) {
+            val def: Def = b.values.data[v].def;
+            if (sel def.constant) {
+                val c:      ConstantData  = w.m.constants.data[def.constant.index];
+                var target: opt[Function] = opt[Function].none{};
+                if (sel c.address) {
+                    val s: Symbol = c.address.symbol;
+                    if (sel s.function) {
+                        if (s.function.index::usize < n) { target = opt[Function].some{s.function}; }
+                    }
+                }
+                or { mark_constant(w, def.constant, addressed); }
+                if (sel target.some) {
+                    val uses: *Vector[Instruction] = ?b.values.data[v].uses;
+                    var u:    usize                = 0;
+                    for (u < uses.len) {
+                        val d:      *InstructionData = ?b.instructions.data[uses.data[u].index];
+                        var callee: bool             = d.opcode.index == opcode.CALL.index && d.operands.len > 0 && d.operands.data[0].index::usize == v;
+                        var k:      usize            = 1;
+                        for (k < d.operands.len) {
+                            if (d.operands.data[k].index::usize == v) { callee = false; }
+                            k = k + 1;
+                        }
+                        if (!callee) { addressed.data[target.some.index] = true; }
+                        or {
+                            var plain: bool = true;
+                            if (d.immediates.len > 1) {
+                                val named: Immediate = d.immediates.data[1];
+                                if (sel named.named) {
+                                    val count: Named = named.named;
+                                    plain = !(sel count.first);
+                                }
+                            }
+                            if (plain) { called.data[target.some.index] = true; }
+                        }
+                        u = u + 1;
+                    }
+                }
+            }
+            v = v + 1;
+        }
+        var j: usize = 0;
+        for (j < b.instructions.len) {
+            val d: *InstructionData = ?b.instructions.data[j];
+            if (d.opcode.index == opcode.FUNC_ADDR.index && d.immediates.len > 0) {
+                val taken: Immediate = d.immediates.data[0];
+                if (sel taken.function) {
+                    if (taken.function.index::usize < n) { addressed.data[taken.function.index] = true; }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun local(l: Linkage) bool {
+    ret !symbol.binds(l.binding, symbol.EXTERNAL);
+}
+
+fun defined(w: *Work, f: usize) bool {
+    ret w.m.functions.data[f].body.blocks.len != 0;
+}
+
+# the indirect calls of a function, under the default row
+fun indirect_calls(w: *Work, f: Function, out: *Vector[Instruction]) err[Why] {
+    val b: *Body = ?w.m.functions.data[f.index].body;
+    var j: usize = 0;
+    for (j < b.instructions.len) {
+        val d: *InstructionData = ?b.instructions.data[j];
+        if (d.opcode.index == opcode.CALL.index && sel d.place.placed && d.operands.len > 0 && d.immediates.len > 0) {
+            val stated: Immediate     = d.immediates.data[0];
+            val target: opt[Function] = direct(w, f, d.operands.data[0]);
+            if (sel stated.ty) {
+                if (sel target.none) {
+                    val s: res[types.Function, Why] = signature_of(w, stated.ty);
+                    if (sel s.err) { ret err[Why].err{s.err}; }
+                    if (defaulted(w, s.ok)) {
+                        val pushed: res[usize, allocator.Error] = vector.push[Instruction](out, Instruction{index: j::u32});
+                        if (sel pushed.err) { ret failure.lost(pushed.err); }
+                    }
+                }
+            }
+        }
+        j = j + 1;
+    }
+    ret err[Why].ok{};
+}
+
+fun flags(a: *allocator.Allocator, n: usize) res[Vector[bool], Why] {
+    var v: Vector[bool] = vector.init[bool](a);
+    var i: usize        = 0;
+    for (i < n) {
+        val pushed: res[usize, allocator.Error] = vector.push[bool](?v, false);
+        if (sel pushed.err) {
+            vector.dnit[bool](?v);
+            ret res[Vector[bool], Why].err{Why.alloc{pushed.err}};
+        }
+        i = i + 1;
+    }
+    ret res[Vector[bool], Why].ok{v};
+}
+
+fun run(c: *Context) res[bool, Why] {
+    val bridging: opt[*Bridging] = bridging_of(c.t);
+    if (sel bridging.none) { ret res[bool, Why].ok{false}; }
+    val d: Declared = c.t.convention;
+    if (!(sel d.rows)) { ret res[bool, Why].ok{false}; }
+    val ptr: res[Type, types.Error] = types.intern(?c.m.types, types.Shape.pointer{types.Pointer{space: 0}});
+    if (sel ptr.err) { ret res[bool, Why].err{Why.ir{module.Error.types{ptr.err}}}; }
+    val word: res[Type, types.Error] = types.intern(?c.m.types, types.Shape.integer{types.Integer{width: 64}});
+    if (sel word.err) { ret res[bool, Why].err{Why.ir{module.Error.types{word.err}}}; }
+    var w: Work = Work{m: c.m, l: layout.of(c.t, ?c.m.types, basis.context_of(c.basis)), bridging: bridging.some, default: d.rows.default.name, ptr: ptr.ok, word: word.ok, checker: Global{index: 0}, dispatch: Global{index: 0}, room: vector.init[u8](c.m.a)};
+    fin { vector.dnit[u8](?w.room); }
+    val checker: res[Global, Why] = routine(?w, bridging.some.checker);
+    if (sel checker.err) { ret res[bool, Why].err{checker.err}; }
+    w.checker = checker.ok;
+    val dispatch: res[Global, Why] = routine(?w, bridging.some.dispatch);
+    if (sel dispatch.err) { ret res[bool, Why].err{dispatch.err}; }
+    w.dispatch = dispatch.ok;
+
+    val n:      usize                  = c.m.functions.len;
+    val called: res[Vector[bool], Why] = flags(c.m.a, n);
+    if (sel called.err) { ret res[bool, Why].err{called.err}; }
+    var calls: Vector[bool] = called.ok;
+    fin { vector.dnit[bool](?calls); }
+    val taken: res[Vector[bool], Why] = flags(c.m.a, n);
+    if (sel taken.err) { ret res[bool, Why].err{taken.err}; }
+    var addressed: Vector[bool] = taken.ok;
+    fin { vector.dnit[bool](?addressed); }
+    survey(?w, n, ?calls, ?addressed);
+
+    var i: usize = 0;
+    for (i < n) {
+        val data: FunctionData             = c.m.functions.data[i].data;
+        val s:    res[types.Function, Why] = signature_of(?w, data.signature);
+        if (sel s.err) { ret res[bool, Why].err{s.err}; }
+        if (defaulted(?w, s.ok)) {
+            if (defined(?w, i)) {
+                if (!local(data.linkage) || addressed.data[i]) {
+                    val entry: res[Function, Why] = needed(?w, Thunk.entry{}, s.ok, data.name);
+                    if (sel entry.err) { ret res[bool, Why].err{entry.err}; }
+                }
+            }
+            or (calls.data[i]) {
+                val made: err[Why] = guest(?w, Function{index: i::u32});
+                if (sel made.err) { ret res[bool, Why].err{made.err}; }
+            }
+        }
+        i = i + 1;
+    }
+    var sites: Vector[Instruction] = vector.init[Instruction](c.m.a);
+    fin { vector.dnit[Instruction](?sites); }
+    i = 0;
+    for (i < n) {
+        if (defined(?w, i)) {
+            val f: Function = Function{index: i::u32};
+            vector.clear[Instruction](?sites);
+            val found: err[Why] = indirect_calls(?w, f, ?sites);
+            if (sel found.err) { ret res[bool, Why].err{found.err}; }
+            var k: usize = 0;
+            for (k < sites.len) {
+                val done: err[Why] = check_call(?w, f, sites.data[k]);
+                if (sel done.err) { ret res[bool, Why].err{done.err}; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret res[bool, Why].ok{true};
+}
