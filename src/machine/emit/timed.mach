@@ -57,12 +57,15 @@
 # only where it is a function of the module this build walks for constant
 # time, as the constant-time helpers the legalisation delivers are, each of
 # whose parameters arrive in registers and which reads no memory but the secret
-# globals its walk seeds and the slots of its own frame its walk follows the
+# globals its walk seeds, the slots of its own frame its walk follows the
 # stores to, whose address never escapes, is moved only by public offsets
-# and is stored whole before every read (`mirl.ct.frame`), so it reads none
-# of the caller's frame, which its walk seeds nothing of, and its model is
-# confined, so the walk takes nothing at the call from memory it does not
-# keep. it accepts a secret in its secret parameters' registers alone, so a
+# and is stored whole before every read (`mirl.ct.frame`), and the copies its
+# signature passes by reference. its walk seeds each copy as memory off the
+# register its address arrives in, the address public, and the caller's model
+# reads every addressed local of its frame, a copy among them, and accepts a
+# secret in each, so a callee taking a copy is checked only where the walk
+# places every one. the model is confined, so the walk takes nothing at the
+# call from memory it does not keep. it accepts a secret in its secret parameters' registers alone, so a
 # secret in a public parameter is refused. every model reads the secret
 # globals' ranges, which a checked callee accepts, so a secret in one reaches
 # no callee that is not checked. a secret reaching any other callee is
@@ -108,6 +111,7 @@ use mirl.ir.module;
 use mirl.ir.module.Module;
 use mirl.ir.opcode;
 use mirl.ir.opcode.Row;
+use mirl.ir.place.Named;
 use mirl.ir.place.Placed;
 use types: mirl.ir.type;
 use mirl.ir.value.Def;
@@ -117,9 +121,12 @@ use mf:    mirl.machine.function;
 use mirl.machine.instruction;
 use mirl.machine.instruction.InstructionData;
 use mirl.machine.operand.Instruction;
+use mirl.target.abi.call;
 use mirl.target.abi.convention;
 use mirl.target.abi.convention.Registers;
 use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.piece;
+use mirl.target.abi.piece.Assignment;
 use mirl.target.build;
 use mirl.target.build.Build;
 use mirl.target.layout;
@@ -260,8 +267,10 @@ pub fun requires(m: *Module, f: id.Function) bool {
     ret in_constant_time(m.functions.data[f.index].data.constant_time) && m.functions.data[f.index].body.blocks.len > 0;
 }
 
-# the seeds of function `f`'s entry: each secret parameter's place
-fun seeds(m: *Module, l: *Layout, f: *Framed, out: *vector.Vector[walk.Seed]) res[bool, allocator.Error] {
+# the seeds of function `f`'s entry: each secret parameter's place, and the copy each argument its signature passes by
+# reference points to, as memory off the register its address arrives in, which takes the secret of the value it holds.
+# the address itself is public
+fun seeds(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, f: *Framed, out: *vector.Vector[walk.Seed]) res[bool, allocator.Error] {
     val b: *Body = ?m.functions.data[f.function.index].body;
     if (b.blocks.len == 0) { ret res[bool, allocator.Error].ok{true}; }
     val params: *vector.Vector[id.Value] = ?b.blocks.data[0].parameters;
@@ -290,6 +299,19 @@ fun seeds(m: *Module, l: *Layout, f: *Framed, out: *vector.Vector[walk.Seed]) re
             or { ret res[bool, allocator.Error].ok{false}; }
         }
         j = j + 1;
+    }
+    var refs: vector.Vector[Referenced] = vector.init[Referenced](a);
+    fin { vector.dnit[Referenced](?refs); }
+    val found: err[allocator.Error] = referenced(a, m, bd, l, f.function, ?refs);
+    if (sel found.err) { ret res[bool, allocator.Error].err{found.err}; }
+    var r: usize = 0;
+    for (r < refs.len) {
+        val p: Placed = places.data[refs.data[r].param];
+        if (!(sel p.place.register)) { ret res[bool, allocator.Error].ok{false}; }
+        val at:     walk.Extent                 = walk.Extent{base: p.place.register, offset: 0, length: refs.data[r].length};
+        val pushed: res[usize, allocator.Error] = vector.push[walk.Seed](out, walk.Seed.memory{at});
+        if (sel pushed.err) { ret res[bool, allocator.Error].err{pushed.err}; }
+        r = r + 1;
     }
     val marked: res[bool, allocator.Error] = slots(f, out);
     if (sel marked.err) { ret marked; }
@@ -635,10 +657,12 @@ fun extent(x: *Models, e: walk.Extent) err[allocator.Error] {
 
 # the caller's frame a callee keeps and the addressed frame locals it may read and write, a pointer argument reaching
 # them: `kept` from its lowest slot through the return address, and every addressed local into `touched`. all three
-# empty for a frame the walk cannot place from a fixed offset, so every byte may be read and written
-fun frame_of(x: *Models, f: *Framed, kept: *Run, touched: *Run) err[allocator.Error] {
+# empty for a frame the walk cannot place from a fixed offset, so every byte may be read and written. `whole` is
+# whether every addressed local is in `touched`, as a copy the caller passes by reference is
+fun frame_of(x: *Models, f: *Framed, kept: *Run, touched: *Run, whole: *bool) err[allocator.Error] {
     @kept    = Run{first: x.extents.len::u32, len: 0};
     @touched = @kept;
+    @whole   = false;
     val code: *mf.Function  = f.code;
     val l:    *frame.Layout = f.layout;
     val got:  opt[Based]    = based(l);
@@ -664,7 +688,8 @@ fun frame_of(x: *Models, f: *Framed, kept: *Run, touched: *Run) err[allocator.Er
     }
     @kept    = Run{first: kept.first, len: x.extents.len::u32 - kept.first};
     @touched = Run{first: x.extents.len::u32, len: 0};
-    i        = 0;
+    var all: bool = true;
+    i = 0;
     for (i < code.slots.len) {
         val s: mf.SlotData = code.slots.data[i];
         if (s.addressed && sel s.area.local) {
@@ -673,10 +698,12 @@ fun frame_of(x: *Models, f: *Framed, kept: *Run, touched: *Run) err[allocator.Er
                 val made: err[allocator.Error] = extent(x, walk.Extent{base: b.base, offset: cfa.some - b.at, length: s.size});
                 if (sel made.err) { ret made; }
             }
+            or { all = false; }
         }
         i = i + 1;
     }
     @touched = Run{first: touched.first, len: x.extents.len::u32 - touched.first};
+    @whole   = all;
     ret err[allocator.Error].ok{};
 }
 
@@ -706,15 +733,72 @@ fun called(m: *Module, b: *Body, d: *ir_instruction.InstructionData) opt[id.Func
     ret opt[id.Function].some{s.function};
 }
 
-# whether every address operand of instruction `d` of body `b` is formed from a global that states a secret byte
-fun secret_reads(m: *Module, l: *Layout, b: *Body, slots: *slots_of.Slots, d: *ir_instruction.InstructionData, row: *Row) bool {
+# an argument of a function's entry its signature passes by reference: the entry parameter its address arrives in and
+# the bytes of the copy the caller made, which the address points to
+rec Referenced {
+    param:  usize;
+    length: u64;
+}
+
+# the arguments of function `f`'s entry its signature passes by reference, into `out`, none where the signature does
+# not classify under the build's rows. the entry's parameters are the address of a result passed by reference, first,
+# then each argument's pieces in order, as the abi legalisation placed them
+fun referenced(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, f: id.Function, out: *vector.Vector[Referenced]) err[allocator.Error] {
+    val ty:  types.Type                       = m.functions.data[f.index].data.signature;
+    val sig: res[types.Function, types.Error] = types.signature(?m.types, ty);
+    if (sel sig.err) { ret err[allocator.Error].ok{}; }
+    val row: opt[*Resolved] = build.under(bd, sig.ok.convention);
+    if (sel row.none) { ret err[allocator.Error].ok{}; }
+    val got: res[Assignment, call.Error] = call.classify(a, l, row.some, ty, call.Statement{aggregates: call.Aggregates.platform{}, named: Named.all{}});
+    if (sel got.err) {
+        if (sel got.err.alloc) { ret err[allocator.Error].err{got.err.alloc}; }
+        ret err[allocator.Error].ok{};
+    }
+    var asg: Assignment = got.ok;
+    fin { piece.dnit(?asg); }
+    var at: usize = 0;
+    if (sel asg.address.some) { at = 1; }
+    var i: usize = 0;
+    for (i < asg.arguments.len) {
+        val passed: piece.Passed = asg.arguments.data[i];
+        if (sel passed.passing.reference) {
+            if (passed.count == 1) {
+                val pushed: res[usize, allocator.Error] = vector.push[Referenced](out, Referenced{param: at, length: passed.passing.reference.size});
+                if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+            }
+        }
+        at = at + passed.count::usize;
+        i  = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether address `v` of body `b` is one of `refs`, an entry parameter carrying the address of a copy passed by
+# reference, or a constant offset past one
+fun into_copy(b: *Body, refs: *vector.Vector[id.Value], v: id.Value) bool {
+    var i: usize = 0;
+    for (i < refs.len) {
+        if (refs.data[i].index == v.index) { ret true; }
+        i = i + 1;
+    }
+    val def: Def = b.values.data[v.index].def;
+    if (!(sel def.result)) { ret false; }
+    val d: *ir_instruction.InstructionData = ?b.instructions.data[def.result.instruction.index];
+    if (d.opcode.index != opcode.PTR_ADD.index || d.operands.len != 2) { ret false; }
+    val k: Def = b.values.data[d.operands.data[1].index].def;
+    ret sel k.constant && into_copy(b, refs, d.operands.data[0]);
+}
+
+# whether every address operand of instruction `d` of body `b` is formed from a global that states a secret byte, a
+# readable slot of its frame, or a copy of `refs` passed by reference
+fun secret_reads(m: *Module, l: *Layout, b: *Body, slots: *slots_of.Slots, refs: *vector.Vector[id.Value], d: *ir_instruction.InstructionData, row: *Row) bool {
     var any: bool  = false;
     var k:   usize = 0;
     for (k < d.operands.len && k < $length_of(opcode.Operands)) {
         val role: opcode.Role = row.operands[k].role;
         if (sel role.address) {
             val v: id.Value = d.operands.data[k];
-            if (!secret_globals.of_secret(m, l, b, v) && !slots_of.readable(slots, b, v)) { ret false; }
+            if (!secret_globals.of_secret(m, l, b, v) && !slots_of.readable(slots, b, v) && !into_copy(b, refs, v)) { ret false; }
             any = true;
         }
         k = k + 1;
@@ -722,12 +806,37 @@ fun secret_reads(m: *Module, l: *Layout, b: *Body, slots: *slots_of.Slots, d: *i
     ret any;
 }
 
-# whether the body of function `f` reads no memory but its readable frame slots and the secret globals every walk
-# seeds, at addresses the ir forms from them, and through a direct call of a function that reads none either, as the division helpers read none. a
-# walk seeds no memory outside a frame but those globals, so a callee whose walk took any other memory as public may
-# read none. `depth` bounds the calls followed, a cycle reading as memory read
-fun reads_none(m: *Module, l: *Layout, f: id.Function, depth: usize) res[bool, allocator.Error] {
+# the entry parameters of function `f` that carry the address of a copy its signature passes by reference, into `out`.
+# false where the entry is not placed as its signature classifies
+fun copy_addresses(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, f: id.Function, out: *vector.Vector[id.Value]) res[bool, allocator.Error] {
+    var refs: vector.Vector[Referenced] = vector.init[Referenced](a);
+    fin { vector.dnit[Referenced](?refs); }
+    val found: err[allocator.Error] = referenced(a, m, bd, l, f, ?refs);
+    if (sel found.err) { ret res[bool, allocator.Error].err{found.err}; }
+    val b:      *Body                    = ?m.functions.data[f.index].body;
+    val params: *vector.Vector[id.Value] = ?b.blocks.data[0].parameters;
+    var i:      usize                    = 0;
+    for (i < refs.len) {
+        if (refs.data[i].param >= params.len) { ret res[bool, allocator.Error].ok{false}; }
+        val pushed: res[usize, allocator.Error] = vector.push[id.Value](out, params.data[refs.data[i].param]);
+        if (sel pushed.err) { ret res[bool, allocator.Error].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# whether the body of function `f` reads no memory but its readable frame slots, the secret globals every walk seeds
+# and the copies its signature passes by reference, which its walk seeds off the registers their addresses arrive in,
+# at addresses the ir forms from them, and through a direct call of a function that reads none either, as the division
+# helpers read none. a walk seeds no other memory outside a frame, so a callee whose walk took any other memory as
+# public may read none. `depth` bounds the calls followed, a cycle reading as memory read
+fun reads_none(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, f: id.Function, depth: usize) res[bool, allocator.Error] {
     if (depth == 0) { ret res[bool, allocator.Error].ok{false}; }
+    var refs: vector.Vector[id.Value] = vector.init[id.Value](a);
+    fin { vector.dnit[id.Value](?refs); }
+    val copies: res[bool, allocator.Error] = copy_addresses(a, m, bd, l, f, ?refs);
+    if (sel copies.err) { ret copies; }
+    if (!copies.ok)     { ret copies; }
     val found: res[slots_of.Slots, module.Error] = slots_of.of(m.a, m, l, f);
     if (sel found.err) {
         if (sel found.err.alloc) { ret res[bool, allocator.Error].err{found.err.alloc}; }
@@ -751,11 +860,11 @@ fun reads_none(m: *Module, l: *Layout, f: id.Function, depth: usize) res[bool, a
                         val callee: opt[id.Function] = called(m, b, d);
                         if (sel callee.none)           { ret res[bool, allocator.Error].ok{false}; }
                         if (!requires(m, callee.some)) { ret res[bool, allocator.Error].ok{false}; }
-                        val inner: res[bool, allocator.Error] = reads_none(m, l, callee.some, depth - 1);
+                        val inner: res[bool, allocator.Error] = reads_none(a, m, bd, l, callee.some, depth - 1);
                         if (sel inner.err) { ret inner; }
                         if (!inner.ok)     { ret inner; }
                     }
-                    or (!secret_reads(m, l, b, ?slots, d, row.some)) { ret res[bool, allocator.Error].ok{false}; }
+                    or (!secret_reads(m, l, b, ?slots, ?refs, d, row.some)) { ret res[bool, allocator.Error].ok{false}; }
                 }
                 i = i + 1;
             }
@@ -766,16 +875,24 @@ fun reads_none(m: *Module, l: *Layout, f: id.Function, depth: usize) res[bool, a
 }
 
 # whether `callee` is checked: a callee this build walks, its walk taking a secret only in a parameter marked so, in
-# the secret globals every walk seeds and in the slots of its own frame it stores, every parameter arriving in a
-# register. it reads no memory but those globals and slots, so it reads none of the caller's frame whatever a pointer
-# argument reaches, and its model is confined and accepts a secret in every read and in the registers of its secret
+# the secret globals every walk seeds, in the slots of its own frame it stores and in the copies its signature passes by
+# reference, every parameter arriving in a register. it reads no memory but those globals, slots and copies, and a copy
+# is an addressed local of the caller's frame, which the model reads, so a callee taking one is checked only where
+# `whole`, every addressed local of the caller's frame placed. its model is confined and accepts a secret in every read and in the registers of its secret
 # parameters (`accepted_of`), so a secret in a public parameter's register is refused. a parameter on the stack is read
 # from the caller's outgoing area, which no model's reads name, so a callee with one is not checked. this is the one
 # place a call's acceptance is decided
-fun accepts(m: *Module, l: *Layout, framed: Slice[Framed], callee: opt[id.Function]) res[bool, allocator.Error] {
+fun accepts(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, framed: Slice[Framed], whole: bool, callee: opt[id.Function]) res[bool, allocator.Error] {
     if (sel callee.none)                   { ret res[bool, allocator.Error].ok{false}; }
     if (!walked_callee(m, framed, callee)) { ret res[bool, allocator.Error].ok{false}; }
-    val none: res[bool, allocator.Error] = reads_none(m, l, callee.some, m.functions.len + 1);
+    if (!whole) {
+        var refs: vector.Vector[Referenced] = vector.init[Referenced](a);
+        fin { vector.dnit[Referenced](?refs); }
+        val found: err[allocator.Error] = referenced(a, m, bd, l, callee.some, ?refs);
+        if (sel found.err) { ret res[bool, allocator.Error].err{found.err}; }
+        if (refs.len > 0)  { ret res[bool, allocator.Error].ok{false}; }
+    }
+    val none: res[bool, allocator.Error] = reads_none(a, m, bd, l, callee.some, m.functions.len + 1);
     if (sel none.err) { ret none; }
     if (!none.ok)     { ret none; }
     val b:     *Body = ?m.functions.data[callee.some.index].body;
@@ -1018,12 +1135,13 @@ fun model(x: *Models, m: *Module, b: *Build, l: *Layout, framed: Slice[Framed], 
     if (sel wrote.err) { ret err[allocator.Error].err{wrote.err}; }
     var frame_kept: Run                  = NO_RUN;
     var touched:    Run                  = NO_RUN;
-    val framed_at:  err[allocator.Error] = frame_of(x, f, ?frame_kept, ?touched);
+    var whole:      bool                 = false;
+    val framed_at:  err[allocator.Error] = frame_of(x, f, ?frame_kept, ?touched, ?whole);
     if (sel framed_at.err) { ret framed_at; }
     val globals: err[allocator.Error] = secret_globals.extents(m, l, ?x.extents);
     if (sel globals.err) { ret globals; }
     val reads:   Run                        = Run{first: touched.first, len: x.extents.len::u32 - touched.first};
-    val checked: res[bool, allocator.Error] = accepts(m, l, framed, s.callee);
+    val checked: res[bool, allocator.Error] = accepts(x.models.a, m, b, l, framed, whole, s.callee);
     if (sel checked.err) { ret err[allocator.Error].err{checked.err}; }
     var taken: Run = NO_RUN;
     if (checked.ok) {
@@ -1143,7 +1261,7 @@ fun walked(a: *allocator.Allocator, m: *Module, b: *Build, l: *Layout, o: *objec
     val placed: res[bool, allocator.Error] = public(f, r, points, ?lifted);
     if (sel placed.err) { ret res[opt[mct.Unmet], allocator.Error].err{placed.err}; }
     if (!placed.ok)     { ret unfollowed(f.function, walk.MISPLACED, 0, none); }
-    val seeded: res[bool, allocator.Error] = seeds(m, l, f, ?list);
+    val seeded: res[bool, allocator.Error] = seeds(a, m, b, l, f, ?list);
     if (sel seeded.err) { ret res[opt[mct.Unmet], allocator.Error].err{seeded.err}; }
     if (!seeded.ok)     { ret unfollowed(f.function, walk.UNSEEDABLE, 0, none); }
     val globals: err[allocator.Error] = secret_globals.seeds(m, l, ?list);
