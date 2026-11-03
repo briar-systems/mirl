@@ -194,7 +194,10 @@ types
   bracketed name is its calling convention, none when left out, and it has
   no results when it states none. a parameter or result may state how an
   integer is extended, `sext` or `zext`, and it is part of the type:
-  `fun(i8 sext)` and `fun(i8)` are different types.
+  `fun(i8 sext)` and `fun(i8)` are different types. a last `...` among the
+  parameters makes the signature variadic, `fun(ptr, ...) i32`, as a
+  function's own list does, `ext fun printf(ptr, ...) i32;`, and it is part
+  of the type too.
 
 literals
 
