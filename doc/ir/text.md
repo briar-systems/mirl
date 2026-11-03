@@ -73,7 +73,7 @@ done:
     ret(acc);
 }
 
-#[oblivious]
+#[constant_time(soft)]
 pub fun pick(a: ^i64, b: ^i64, c: ^i1) i64 {
     val r: ^i64 = select(c, a, b);
     ret(r);
@@ -257,8 +257,8 @@ decorators
   #[secret([o, n], ...)]    the byte ranges of a global that are secret, each
                             its offset and length, at least one, ascending and
                             none overlapping or touching the one before it
-  #[oblivious]              the function must run in time independent of its
-                            secret values
+  #[constant_time(mode)]    the function must run in time independent of its
+                            secret values, `soft` or `hard` (see ir.md 7.1)
   #[convention(name)]       the calling convention of a function's signature,
                             the default when left out
   #[placed(type, places)]   the abi legalisation has put the body in pieces:

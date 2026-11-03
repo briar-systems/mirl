@@ -13,6 +13,11 @@
 # conditional branch selection marked as declassifying, a division's trap
 # guard, reads what it tests as public, as the walk's declassify point there
 # says.
+#
+# the timing of the integer multiply at a width (`multiply`) is read the same
+# way, off the rows of every rule of the build's selection table that covers
+# the multiply at that width, so a front end asks mirl, as mach's
+# `$mach.build.ct_mul` does, and never states it.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -37,8 +42,19 @@ use mirl.machine.operand.Instruction;
 use mirl.machine.operand.Operand;
 use mirl.machine.operand.Register;
 
+use mirl.ir.opcode.Opcode;
+use mirl.ir.opcode.rule.Class;
+use mirl.machine.isa;
+use mirl.machine.isa.Isa;
+use mirl.machine.isa.Isas;
+use mirl.machine.select.rule;
+use mirl.machine.select.rule.Rule;
+use mirl.target.build.Build;
+use mirl.target.capability.Bits;
+
 use masc.core.ct;
-use mo: masc.core.operand;
+use mo:   masc.core.operand;
+use rows: masc.core.row;
 use masc.core.state;
 
 # a secret where constant-time code may hold none
@@ -226,4 +242,149 @@ pub fun mark_slots(a: *allocator.Allocator, selected: *Function, allocated: *Fun
     fin { vector.dnit[bool](?none); }
     mark_written(allocated, ?none, allocated);
     ret err[allocator.Error].ok{};
+}
+
+# whether an integer multiply of a width runs in time independent of its operands on a build
+# ---
+# constant:     it does under the timing modes the system sets for every process
+# under:        it does only under these timing modes too (`mirl.ct.Needs`), each named by the feature that
+#               guarantees it (`mirl.ct.feature`), as dit on aarch64 and zkt on riscv
+# variable:     it does under no timing mode the set has
+# helper:       no rule of the build's selection table covers it at that width, so a helper computes it
+# unclassified: the build's instruction set classifies no instruction's timing, or guarantees none, or mirl carries no
+#               selection table for it
+pub tag Multiply: u8 {
+    constant;
+    under: mct.Needs;
+    variable;
+    helper;
+    unclassified;
+}
+
+# whether type test `t` of a rule admits an integer of `width` bits, against the target's register of `register`
+fun admits_width(t: *rule.Test, width: u32, register: u32) bool {
+    if (t.lanes) { ret false; }
+    val c: Class = t.class;
+    if (sel c.width) {
+        if (c.width != width) { ret false; }
+    }
+    or (!(sel c.integer) && !(sel c.any) && !(sel c.scalar)) { ret false; }
+    val w: rule.Width = t.width;
+    if (sel w.any)      { ret true; }
+    if (sel w.register) { ret width == register; }
+    if (sel w.part)     { ret w.part != 0 && width * w.part::u32 == register; }
+    if (sel w.whole)    { ret width == register * w.whole::u32; }
+    ret false;
+}
+
+# whether rule `r` covers an instruction of opcode `op` and its every type test admits an integer of `width` bits
+fun covers(r: *Rule, op: Opcode, width: u32, register: u32) bool {
+    var found: bool = false;
+    var n:     u32  = 0;
+    for (n < r.nodes.len) {
+        if (r.nodes.at[n].opcode.index == op.index) { found = true; }
+        n = n + 1;
+    }
+    if (!found) { ret false; }
+    var t: u32 = 0;
+    for (t < r.tests.len) {
+        if (!admits_width(?r.tests.at[t], width, register)) { ret false; }
+        t = t + 1;
+    }
+    ret true;
+}
+
+# whether every row of the expansion of rule `r` is admitted under `ctx`
+fun available(r: *Rule, ctx: *state.Context) bool {
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *rule.Emit = ?r.expansion.at[e];
+        var n:    u32        = 0;
+        for (n < instruction.rows_in(emit.opcode)) {
+            if (!state.admits(ctx, instruction.row_in(emit.opcode, n).requires)) { ret false; }
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+    ret true;
+}
+
+# whether some row of the expansion of rule `r` takes a time that depends on one of its operands under `timed`
+fun dependent(r: *Rule, timed: *state.Context) bool {
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *rule.Emit = ?r.expansion.at[e];
+        var n:    u32        = 0;
+        for (n < instruction.rows_in(emit.opcode)) {
+            val row: *rows.Row = instruction.row_in(emit.opcode, n);
+            var k:   u32       = 0;
+            for (k < row.operands.len) {
+                val late: opt[ct.Refusal] = mct.latency(row, timed, ct.Input.operand{k::u8});
+                if (sel late.some) { ret true; }
+                k = k + 1;
+            }
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+    ret false;
+}
+
+# whether some rule of `table` the build admits that covers `op` at `width` is dependent under `timed`, and whether
+# any is admitted at all
+fun any_dependent(table: *rule.Table, ctx: *state.Context, timed: *state.Context, op: Opcode, width: u32, register: u32, seen: *bool) bool {
+    @seen = false;
+    var i: u32 = 0;
+    for (i < table.rules.len) {
+        val r: *Rule = ?table.rules.at[i];
+        if (covers(r, op, width, register) && available(r, ctx)) {
+            @seen = true;
+            if (dependent(r, timed)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the integer multiply `op` of `width` bits runs in time independent of its operands on build `b`
+# ---
+# a:     the allocator a context with a timing mode's extension takes
+# isas:  the instruction sets mirl carries for the build's family
+# b:     the build, opened for its target
+# op:    the multiply, `mul` for the low half or one of `mul.high.u`, `mul.high.s` and `mul.high.su`
+# width: the width of its operands, in bits
+# ret:   how its time depends on its operands, or why there was no storage
+pub fun multiply(a: *allocator.Allocator, isas: *Isas, b: *Build, op: Opcode, width: u32) res[Multiply, allocator.Error] {
+    val asked: ct.Required = ct.required(b.basis.set.ct);
+    if (!(sel asked.held)) { ret res[Multiply, allocator.Error].ok{Multiply.unclassified{}}; }
+    val found: opt[*Isa] = isa.of(isas, b.basis.set);
+    if (sel found.none) { ret res[Multiply, allocator.Error].ok{Multiply.unclassified{}}; }
+    val reg: Bits = b.basis.target.caps.widths.register;
+    if (!(sel reg.bits)) { ret res[Multiply, allocator.Error].ok{Multiply.helper{}}; }
+    val ctx:   *state.Context = ?b.basis.context;
+    var seen:  bool           = false;
+    var timed: state.Context  = mct.stated(ctx);
+    if (!any_dependent(found.some.table, ctx, ?timed, op, width, reg.bits, ?seen)) {
+        if (!seen) { ret res[Multiply, allocator.Error].ok{Multiply.helper{}}; }
+        ret res[Multiply, allocator.Error].ok{Multiply.constant{}};
+    }
+    val lifted: mct.Needs = mct.liftable_modes(ctx);
+    if (lifted == mct.NO_NEEDS) { ret res[Multiply, allocator.Error].ok{Multiply.variable{}}; }
+    var t: mct.Timed = mct.plain(ctx);
+    fin { mct.release(?t); }
+    val opened: err[allocator.Error] = mct.under(a, ctx, lifted, ?t);
+    if (sel opened.err)                                                               { ret res[Multiply, allocator.Error].err{opened.err}; }
+    if (any_dependent(found.some.table, ctx, ?t.context, op, width, reg.bits, ?seen)) { ret res[Multiply, allocator.Error].ok{Multiply.variable{}}; }
+    ret res[Multiply, allocator.Error].ok{Multiply.under{lifted}};
+}
+
+# whether the integer multiply `op` of `width` bits on build `b` runs in time independent of its operands under the
+# timing modes the build guarantees (`mirl.ct.guaranteed`), as a hard constant-time function holds it
+pub fun multiply_guaranteed(a: *allocator.Allocator, isas: *Isas, b: *Build, op: Opcode, width: u32) res[bool, allocator.Error] {
+    val got: res[Multiply, allocator.Error] = multiply(a, isas, b, op, width);
+    if (sel got.err) { ret res[bool, allocator.Error].err{got.err}; }
+    val m: Multiply = got.ok;
+    if (sel m.constant) { ret res[bool, allocator.Error].ok{true}; }
+    if (sel m.under)    { ret res[bool, allocator.Error].ok{(m.under & ~mct.guaranteed(?b.basis.context)) == 0}; }
+    ret res[bool, allocator.Error].ok{false};
 }
