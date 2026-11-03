@@ -60,6 +60,10 @@ The other half of the allocator's request is the allowed set. `allowed.of_build(
 
 A value of an aggregate type has no register and is refused as `aggregate`. The abi legalisation leaves one only where a value is loaded whole from memory, which a later legalisation has to split.
 
+## The timing switch
+
+No rule covers `timing.read`, `timing.set` or `timing.restore`, which only the timing legalisation makes. The engine places each from the steps masc's switch of the state value it names states (`masc.core.switch`), as a read's, a set's or a restore's sequence of rows in order. Each operand of a step is the value the step fixes, a register at its own location or an immediate, a condition or an enumerant without parameters as an immediate, the virtual register of the saved word, the read's result or the restore's operand, held in the class the switch saves its state in, or a fresh virtual register of the class of each scratch register the switch names. A set that states no switch of the value, as x86-64, RISC-V, WebAssembly and SPIR-V, refuses the opcode as `switched`, naming the instruction and what it could not place, and so does a saved word of another class.
+
 ## Divisions that do not trap
 
 A division whose opcode row states a trap (a zero divisor, a signed overflow, a quotient that does not fit) is selected without the `checked` flag only where the target's division traps for each of them as the ir does. Where `arithmetic.division` declares the division, or the division of a two-word dividend, `quiet` for a trap the row states, a chosen rule that covers a division without the flag is refused as `unchecked`, naming the instruction, since no test of the trap stands before it. The engine reads the opcode row's traps and the target's declared faults, and names no target.
