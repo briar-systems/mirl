@@ -126,11 +126,13 @@ use mirl.target.record.Target;
 use register_schema: mirl.target.register.schema;
 
 use masc.core.effect;
-use mo:         masc.core.operand;
-use rf:         masc.core.register;
+use mo: masc.core.operand;
+use rf: masc.core.register;
+use masc.core.requirement;
 use rows:       masc.core.row;
 use mset:       masc.core.set;
 use core_state: masc.core.state;
+use mswitch:    masc.core.switch;
 use masc.inline.inline;
 
 use mink.catalog.format.Format;
@@ -285,6 +287,16 @@ pub tag Error: u8 {
     unchecked: id.Instruction;
     assembly:  Assembled;
     naked:     id.Instruction;
+    switched:  Switched;
+}
+
+# a timing switch opcode selection refused to place
+# ---
+# instruction: the ir instruction
+# why:         what of the set's switch it could not place
+pub rec Switched {
+    instruction: id.Instruction;
+    why:         str;
 }
 
 # a machine instruction selection made whose transfer is undecided
@@ -2870,7 +2882,7 @@ fun choose_block(st: *State, k: id.Block) err[Error] {
         val at: id.Instruction = list.data[i];
         if (st.shared.data[at.index] != 0 && read_by_matches(st, at)) { st.consumed.data[at.index] = true; }
         if (only_bound(st, at))                                       { st.consumed.data[at.index] = true; }
-        if (instruction(st, at).opcode.index == ir.ASM.index) {
+        if (unruled(instruction(st, at).opcode)) {
             var held: Choice = Choice{rule: NONE, found: unmatched_match(st), consumes: 0};
             held.found.nodes[0] = at;
             held.found.count    = 1;
@@ -3004,6 +3016,122 @@ fun allocated(st: *State, v: id.Value) opt[id.Instruction] {
     ret opt[id.Instruction].some{x};
 }
 
+# whether an opcode is the timing switch's, which selection places from the set's switch
+fun timing(op: ir.Opcode) bool {
+    ret op.index == ir.TIMING_READ.index || op.index == ir.TIMING_SET.index || op.index == ir.TIMING_RESTORE.index;
+}
+
+# whether an instruction of opcode `op` is emitted by no rule of the table: an inline assembly item, which masc reads,
+# and a timing switch opcode, which the set's switch states
+fun unruled(op: ir.Opcode) bool {
+    ret op.index == ir.ASM.index || timing(op);
+}
+
+fun unswitched(at: id.Instruction, why: str) err[Error] {
+    ret err[Error].err{Error.switched{Switched{instruction: at, why: why}}};
+}
+
+# the steps of switch `sw` a timing switch opcode places: a read's, a set's or a restore's
+fun steps_of(op: ir.Opcode, sw: *mswitch.Switch) mswitch.Steps {
+    if (op.index == ir.TIMING_READ.index) { ret sw.read; }
+    if (op.index == ir.TIMING_SET.index)  { ret sw.set; }
+    ret sw.restore;
+}
+
+# a timing switch opcode emitted into block `b` as the steps the set's switch of the state value it names states for
+# it, in order. each operand of a step is the fixed value the step states, the virtual register of the saved word, the
+# read's result or the restore's operand, which must be of the class the switch saves its state in, or a fresh virtual
+# register of the class of the scratch register the step names, one for each scratch register of the switch. a set
+# that states no switch of the value refuses the opcode
+fun switched(st: *State, b: u32, at: id.Instruction, md: Metadata) err[Error] {
+    val d:     *InstructionData = instruction(st, at);
+    var named: opt[View]        = opt[View].none{};
+    var i:     usize            = 0;
+    for (i < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[i];
+        if (sel imm.state) { named = opt[View].some{imm.state}; }
+        i = i + 1;
+    }
+    if (sel named.none) { ret err[Error].err{defect(NONE, false, UNKNOWN_NODE)}; }
+    if (st.ctx == nil)  { ret unswitched(at, "no context is open to read the state value under"); }
+    val set:   *mset.Set           = st.s.index.isa.set;
+    val state: opt[requirement.Id] = core_state.lookup(st.ctx.selection.catalog, st.ctx.axes, named.some.data, 0, named.some.len);
+    if (sel state.none) { ret unswitched(at, "the instruction set has no state value the opcode names"); }
+    val found: opt[*mswitch.Switch] = mswitch.switching(set.switches, state.some);
+    if (sel found.none)   { ret unswitched(at, "the instruction set states no switch of the state value the opcode names"); }
+    if (set.codec == nil) { ret unswitched(at, "the instruction set has no rows"); }
+    val sw:    *mswitch.Switch = found.some;
+    var saved: u32             = NONE;
+    if (d.opcode.index == ir.TIMING_READ.index && d.results.len == 1) {
+        val r: res[u32, Error] = register(st, d.results.data[0]);
+        if (sel r.err) { ret err[Error].err{r.err}; }
+        saved = r.ok;
+    }
+    if (d.opcode.index == ir.TIMING_RESTORE.index && d.operands.len == 1) {
+        val r: res[u32, Error] = value_register(st, b, d.operands.data[0], at, md);
+        if (sel r.err) { ret err[Error].err{r.err}; }
+        saved = r.ok;
+    }
+    if (saved != NONE && !of_class(st, saved, sw.saved)) { ret unswitched(at, "the saved word is held in another class than the switch saves its state in"); }
+    var scratch: [MOST_SCRATCH]u32;
+    if (sw.scratch.len > MOST_SCRATCH) { ret unswitched(at, "the switch names more scratch registers than selection places"); }
+    var k: u32 = 0;
+    for (k < sw.scratch.len) {
+        val made: res[u32, Error] = virtual_in(st, Class.hardware{class.Hardware{file: mf.file(st.out), index: sw.scratch.at[k]}}, false);
+        if (sel made.err) { ret err[Error].err{made.err}; }
+        scratch[k] = made.ok;
+        k          = k + 1;
+    }
+    val steps: mswitch.Steps = steps_of(d.opcode, sw);
+    var n:     u32           = 0;
+    for (n < steps.len) {
+        val step: *mswitch.Step = ?steps.at[n];
+        val row:  *rows.Row     = rows.at(set.codec.rows, step.row);
+        if (row == nil)                           { ret unswitched(at, "a step of the switch names no row of the instruction set"); }
+        if (step.values.len != row.operands.len)  { ret unswitched(at, "a step of the switch gives other than one value per operand of its row"); }
+        if (row.operands.len > rows.MAX_OPERANDS) { ret unswitched(at, "a step of the switch has more operands than a row may"); }
+        var ops: [rows.MAX_OPERANDS]Operand;
+        var o:   u32 = 0;
+        for (o < step.values.len) {
+            val src: mswitch.Source = step.values.at[o];
+            if (sel src.saved) {
+                if (saved == NONE) { ret unswitched(at, "a step of the switch names the saved register where the opcode holds no saved word"); }
+                ops[o] = Operand.virtual{Virtual{index: saved}};
+            }
+            or (sel src.scratch) {
+                if (src.scratch::u32 >= sw.scratch.len) { ret unswitched(at, "a step of the switch names a scratch register the switch does not"); }
+                ops[o] = Operand.virtual{Virtual{index: scratch[src.scratch]}};
+            }
+            or {
+                val placed: opt[Operand] = stated_value(src.value);
+                if (sel placed.none) { ret unswitched(at, "a step of the switch states a value of a kind selection does not place"); }
+                ops[o] = placed.some;
+            }
+            o = o + 1;
+        }
+        val made: res[Instruction, Error] = made(st, b, mi.Opcode.row{row}, ?ops[0], step.values.len, md, false, vstate.NONE, Slice[rf.Id]{data: nil, size: 0});
+        if (sel made.err) { ret err[Error].err{made.err}; }
+        n = n + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the most scratch registers one switch names that selection places
+val MOST_SCRATCH: u32 = 4;
+
+# the operand a fixed value of a switch's step is placed as: a register at its own location, and an immediate,
+# condition or enumerant without parameters as the immediate the handover reads as the row's operand states it
+fun stated_value(v: mo.Value) opt[Operand] {
+    if (sel v.register)  { ret opt[Operand].some{Operand.physical{Physical.register{v.register}}}; }
+    if (sel v.immediate) { ret opt[Operand].some{Operand.immediate{v.immediate}}; }
+    if (sel v.condition) { ret opt[Operand].some{Operand.immediate{v.condition::i64}}; }
+    if (sel v.enumerant) {
+        if (v.enumerant.params.len != 0) { ret opt[Operand].none{}; }
+        ret opt[Operand].some{Operand.immediate{v.enumerant.value::i64}};
+    }
+    ret opt[Operand].none{};
+}
+
 # an inline assembly item emitted into block `b` as one instruction of the
 # block masc parsed: each operand of the block at a virtual register of its
 # class, tied where it reads and writes one, the frame slot of an alloca it
@@ -3125,7 +3253,9 @@ fun emit_block(st: *State, k: id.Block) err[Error] {
         val before: u32 = st.out.instructions.len::u32;
         val root:   u32 = c.found.nodes[0].index;
         if (c.rule == NONE) {
-            val done: err[Error] = assemble(st, b, c.found.nodes[0], md);
+            var done: err[Error] = err[Error].ok{};
+            if (timing(d.opcode))                                                      { done = switched(st, b, c.found.nodes[0], md); }
+            or                                                                         { done = assemble(st, b, c.found.nodes[0], md); }
             if (sel done.err)                                                          { ret done; }
             if (st.out.instructions.len::u32 > before && st.firsts.data[root] == NONE) { st.firsts.data[root] = before; }
             cnt;
