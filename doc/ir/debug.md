@@ -27,7 +27,7 @@ The kinds are
 | union | members laid out as fields of an IR union |
 | tagged | a tagged union, laid out as an IR structure of a discriminant and a union of the cases. It holds the discriminant member, the field that is the union of the cases and the cases in source order, each with the discriminant value that selects it and an optional payload member. A tagged union whose cases carry no payload may be laid out as its discriminant alone, with no payload field, and then no case has a payload |
 | enumeration | a base debug type and named values in source order |
-| array | an element debug type and a count |
+| array | an element debug type and a count, laid out as an IR array of that count or a vector of that many lanes |
 | pointer | the key of its pointee, which is linked to the one entry described under that key |
 | function | parameter and result debug types |
 
@@ -37,7 +37,7 @@ This is how a front end gives a debugger the source type of a lowered tagged uni
 
 An aggregate refers to itself and to others, so an entry is declared under its key before its members are walked. `declare(table, types, entry)` gives either a **fresh** open entry, whose members the caller walks and then gives with `define`, or the **known** entry already described under that key. A base or pointer entry is complete once declared. An entry declared a second time under its key must say the same thing, or the table refuses it as a conflict.
 
-`define(table, types, entry, shape)` gives an open entry its members. A member that is laid out as a field of the owner's IR type must name a field that exists and agree with it, and a table refuses a member that does not. A tagged union with no payload field that gives a case a payload is refused too.
+`define(table, types, entry, shape)` gives an open entry its members. A member that is laid out as a field of the owner's IR type must name a field that exists and agree with it, and a table refuses a member that does not, naming the entry being defined and the field (`Error.agree`, a `Disagree`). A tagged union with no payload field that gives a case a payload is refused too.
 
 A pointer names its pointee by key. `pending(table)` gives the key of the first pointee that no entry is described under yet, and the caller describes it and asks again until none is left. `finish(table)` links every pointee and confirms that every entry is defined. A producer reads the table only after `finish` succeeds.
 
