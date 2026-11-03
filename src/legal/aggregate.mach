@@ -20,6 +20,10 @@
 #   alignment allows up to the target's bound of moves, and past it is one
 #   `mem.copy` or `mem.fill` (mirl.legal.moves). volatile and kept accesses
 #   keep their leaves.
+# - a `mem.copy` or `mem.fill` the front end made, of a constant length and,
+#   for a fill, a constant byte, is made of the same word moves where the
+#   bound admits them, and stays whole past it. a volatile or kept one stays
+#   whole. so a small aggregate copied through memory is never a block move.
 #
 # the pass runs twice in a register family's schedule. first ahead of the
 # helpers, so the bulk operations it makes are classified as any other: native,
@@ -56,6 +60,7 @@ use std.collections.vector;
 use std.collections.vector.Vector;
 
 use mirl.fold.word;
+use mirl.fold.word.Wide;
 use mirl.ir.body;
 use mirl.ir.body.Records;
 use mirl.ir.constant.ConstantData;
@@ -946,9 +951,11 @@ fun copied(w: *Work, store: Instruction, x: Value) opt[Instruction] {
     ret opt[Instruction].some{l};
 }
 
-# a run of bytes moved or zeroed in the widest words each alignment allows,
-# the last store in the store's place
-fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, f: Flags) {
+# a run of bytes moved, or filled with one byte, in the widest words each
+# alignment allows, the last store in the store's place. every word is loaded
+# before the first store, so a move between overlapping runs reads the bytes
+# as they were
+fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, byte: u8, f: Flags) {
     var loads: Vector[Value] = vector.init[Value](w.keep);
     var done:  u64           = 0;
     if (sel from.some) {
@@ -977,7 +984,7 @@ fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u
         var x: Value = Value{index: 0};
         if (sel from.some) { x = loads.data[k]; }
         or {
-            val z: res[Value, Why] = emit.constant(?w.site, ty.ok, word.zero());
+            val z: res[Value, Why] = emit.constant(?w.site, ty.ok, filled(byte, n));
             if (sel z.err) {
                 fail(w, z.err);
                 ret;
@@ -990,6 +997,17 @@ fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u
         done = done + n;
         k    = k + 1;
     }
+}
+
+# a word of n bytes each one byte
+fun filled(byte: u8, n: u64) Wide {
+    var x: Wide = word.zero();
+    var k: u64  = 0;
+    for (k < n && byte != 0) {
+        x[k / 8] = x[k / 8] | (byte::u64 << ((k % 8) * 8));
+        k        = k + 1;
+    }
+    ret x;
 }
 
 # a run of bytes moved or zeroed as one bulk operation in the store's place
@@ -1061,7 +1079,7 @@ fun store(w: *Work, i: Instruction) err[Why] {
                 if (other < both) { both = other; }
             }
             emit.open(?w.site, i, k, position(b, k, i));
-            if (moves.in_words(w.caps, size.ok, both, w.word, zero, !w.late)) { in_words(w, i, to, source, size.ok, both, f); }
+            if (moves.in_words(w.caps, size.ok, both, w.word, zero, !w.late)) { in_words(w, i, to, source, size.ok, both, 0, f); }
             or                                                                { in_bulk(w, i, to, source, size.ok, both, f); }
             val ok: err[Why] = emit.done(?w.site);
             if (sel ok.err)    { ret ok; }
@@ -1124,13 +1142,76 @@ fun handed(w: *Work, i: Instruction, x: Value) err[Why] {
     ret failure.edit(body.substitute(w.site.m, w.site.f, i, x, whole));
 }
 
-# take apart what one instruction reads or gives as an aggregate
+# the value of a constant integer that fits a word, none for any other value
+fun known(w: *Work, x: Value) opt[u64] {
+    val def: Def = body_of(w).values.data[x.index].def;
+    if (!(sel def.constant)) { ret opt[u64].none{}; }
+    val got: res[ConstantData, module.Error] = module.constant_data(w.site.m, def.constant);
+    if (sel got.err) { ret opt[u64].none{}; }
+    val data: ConstantData = got.ok;
+    if (sel data.zero)                { ret opt[u64].some{0}; }
+    if (!(sel data.integer))          { ret opt[u64].none{}; }
+    if (data.integer.words.size == 0) { ret opt[u64].some{0}; }
+    var k: usize = 1;
+    for (k < data.integer.words.size) {
+        if (data.integer.words.data[k] != 0) { ret opt[u64].none{}; }
+        k = k + 1;
+    }
+    ret opt[u64].some{data.integer.words.data[0]};
+}
+
+# the bytes a `mem.copy` or `mem.fill` moves, when the length is a constant,
+# the fill's byte is one and the access is neither volatile nor kept, none
+# for any other
+fun small_bulk(w: *Work, d: *InstructionData) opt[u64] {
+    val code: Opcode = d.opcode;
+    if (code.index != opcode.MEM_COPY.index && code.index != opcode.MEM_FILL.index) { ret opt[u64].none{}; }
+    if (d.metadata.flags.volatile || d.metadata.flags.kept || d.operands.len != 3)  { ret opt[u64].none{}; }
+    if (code.index == opcode.MEM_FILL.index) {
+        val byte: opt[u64] = known(w, d.operands.data[1]);
+        if (sel byte.none) { ret opt[u64].none{}; }
+    }
+    ret known(w, d.operands.data[2]);
+}
+
+# a `mem.copy` or `mem.fill` of a length the compiler knows, made of word moves
+# where the bound of moves admits it (mirl.legal.moves), and left whole past
+# it, as it already stands legal
+fun bulk(w: *Work, i: Instruction) err[Why] {
+    val b:    *Body            = body_of(w);
+    val d:    *InstructionData = ?b.instructions.data[i.index];
+    val size: opt[u64]         = small_bulk(w, d);
+    if (sel size.none) { ret err[Why].ok{}; }
+    val fill:  bool       = d.opcode.index == opcode.MEM_FILL.index;
+    val align: u64        = alignment_of(d);
+    val to:    Value      = d.operands.data[0];
+    var from:  opt[Value] = opt[Value].none{};
+    var byte:  u8         = 0;
+    if (!fill) { from = opt[Value].some{d.operands.data[1]}; }
+    val second: opt[u64] = known(w, d.operands.data[1]);
+    if (sel second.some) {
+        if (fill) { byte = (second.some & 0xff)::u8; }
+    }
+    if (size.some == 0)                                                { ret gone(w, i); }
+    if (!moves.in_words(w.caps, size.some, align, w.word, fill, true)) { ret err[Why].ok{}; }
+    val f: Flags = d.metadata.flags;
+    val k: Block = block_of(b, i);
+    emit.open(?w.site, i, k, position(b, k, i));
+    in_words(w, i, to, from, size.some, align, byte, f);
+    val ok: err[Why] = emit.done(?w.site);
+    if (sel ok.err) { ret ok; }
+    ret failure_of(w);
+}
+
+# take apart what one instruction reads or gives as an aggregate, or makes a
+# known small bulk operation of word moves
 fun visit_one(w: *Work, i: Instruction) err[Why] {
-    val b:     *Body            = body_of(w);
-    val d:     *InstructionData = ?b.instructions.data[i.index];
-    val code:  Opcode           = d.opcode;
-    var reads: bool             = false;
-    var k:     usize            = 0;
+    val b:    *Body            = body_of(w);
+    val d:    *InstructionData = ?b.instructions.data[i.index];
+    val code: Opcode           = d.opcode;
+    if (code.index == opcode.MEM_COPY.index || code.index == opcode.MEM_FILL.index) { ret bulk(w, i); }
+    var reads: bool  = false;
+    var k:     usize = 0;
     for (k < d.operands.len) {
         if (aggregate(w, type_of(w, d.operands.data[k]))) { reads = true; }
         k = k + 1;
@@ -1344,8 +1425,10 @@ fun visit(u: *Unit, late: bool) res[bool, Why] {
             }
             var n: usize = 0;
             for (n < b.blocks.data[k].instructions.len) {
-                val d: *InstructionData = ?b.instructions.data[b.blocks.data[k].instructions.data[n].index];
-                var r: usize            = 0;
+                val d:     *InstructionData = ?b.instructions.data[b.blocks.data[k].instructions.data[n].index];
+                val small: opt[u64]         = small_bulk(?w, d);
+                if (sel small.some) { any = true; }
+                var r: usize = 0;
                 for (r < d.results.len) {
                     if (aggregate(?w, type_of(?w, d.results.data[r]))) { any = true; }
                     r = r + 1;
