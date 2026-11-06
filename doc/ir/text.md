@@ -195,9 +195,10 @@ types
   no results when it states none. a parameter or result may state how an
   integer is extended, `sext` or `zext`, and it is part of the type:
   `fun(i8 sext)` and `fun(i8)` are different types. a last `...` among the
-  parameters makes the signature variadic, `fun(ptr, ...) i32`, as a
-  function's own list does, `ext fun printf(ptr, ...) i32;`, and it is part
-  of the type too.
+  parameters makes the signature variadic, `fun(ptr, ...) i32`, as an
+  external function's own list does, `ext fun printf(ptr, ...) i32;`, and it
+  is part of the type too. the verifier refuses a variadic function with a
+  body.
 
 literals
 
