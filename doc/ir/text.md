@@ -244,6 +244,10 @@ decorators
   #[export]                 a shared image exports the symbol by its name
   #[weak] #[unique]         its binding, which `pub` states global and no
                             word states local
+  #[replaceable]            a definition elsewhere may stand for this one at
+                            link time, as distinct from an instance, whose
+                            definitions are all equivalent (see ir.md 1). the
+                            verifier takes it on a `weak` symbol alone
   #[visibility(name)]       its visibility, by the name of mink's row:
                             protected, hidden, internal. default when left out
   #[extensions(string, ...)] the extensions a function's code may use past
