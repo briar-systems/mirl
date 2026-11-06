@@ -74,6 +74,8 @@ A rule's guard is its type tests, its `orderings` and its hook. A type test name
 
 Of the rules for an instruction whose guard holds, the least cost wins. Of equal cost the earlier row in the target's table wins. This is the whole tie-break. A target that cares about a choice gives its rules different costs, and never relies on a row's place to express a preference it has not costed.
 
+In a constant-time function, a rule that puts a secret in a row whose timing depends on one of its operands gives way to the next rule that does not, by the same class the timing check reads off masc's rows. So rv32 under Zbb takes `slli` and `srai` for a secret `trunc` to `i8`, since Zkt lists no `sext.b`. Where every rule depends, the first stands and the timing check refuses it at the instruction.
+
 ## One class per type
 
 Every type the target reaches has exactly one class, its default, and exactly one row of `holds` admits it. A `Hold` row admits a class of the IR typing vocabulary (`ir.within` is the one whole-type test), so two rows overlap when some type is in both classes. Order is never identity: no code in selection or in a register class picks a class by the position of a `holds` row.

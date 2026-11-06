@@ -39,7 +39,8 @@ use std.collections.vector;
 use mirl.base.fail.keep;
 
 use mirl.base.slice;
-use ia: mirl.ir.assembly;
+use mct: mirl.ct;
+use ia:  mirl.ir.assembly;
 use mirl.ir.constant.Address;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.debug.Binding;
@@ -47,6 +48,7 @@ use mirl.ir.debug.Location;
 use mirl.ir.debug.Site;
 use mirl.ir.function.Body;
 use mirl.ir.function.Entry;
+use mirl.ir.function.in_constant_time;
 use mirl.ir.id;
 use mirl.ir.instruction.Edge;
 use mirl.ir.instruction.InstructionData;
@@ -111,6 +113,7 @@ use mirl.machine.select.rule.Rule;
 use mirl.machine.select.rule.Slot;
 use mirl.machine.select.rule.Source;
 use mirl.machine.select.rule.Table;
+use machine_timing: mirl.machine.timing;
 use mirl.machine.vstate;
 use mirl.target.abi.convention;
 use mirl.target.abi.convention.Registers;
@@ -976,6 +979,7 @@ rec State {
     stored:    vector.Vector[Stored];
     frames:    vector.Vector[u32];
     naked:     bool;
+    timed:     opt[*core_state.Context];
 }
 
 fun drop_state(st: *State) {
@@ -1608,8 +1612,38 @@ fun shape(st: *State, d: *InstructionData, k: usize) u32 {
     ret candidates.ANY;
 }
 
+# whether a match reads or makes a secret
+fun touches_secret(st: *State, mt: *Match) bool {
+    var n: u32 = 0;
+    for (n < mt.count) {
+        val d: *InstructionData = instruction(st, mt.nodes[n]);
+        if (d.metadata.secret) { ret true; }
+        var k: usize = 0;
+        for (k < d.operands.len) {
+            if (value(st, d.operands.data[k]).secret) { ret true; }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < d.results.len) {
+            if (value(st, d.results.data[k]).secret) { ret true; }
+            k = k + 1;
+        }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# whether a rule that holds of a match would put a secret in a row whose timing
+# depends on it, which the timing check would refuse (`mirl.machine.timing`)
+fun leaks(st: *State, r: *Rule, mt: *Match) bool {
+    if (sel st.timed.none) { ret false; }
+    ret touches_secret(st, mt) && machine_timing.dependent(r, st.timed.some);
+}
+
 # the least cost rule for an instruction whose pattern matches and guard
-# holds, the first in table order among rules of one cost
+# holds, the first in table order among rules of one cost. a rule that leaks
+# gives way to the next that does not, and is taken where every rule leaks, so
+# the timing check refuses it at the instruction
 fun choose(st: *State, i: id.Instruction) res[Choice, Error] {
     val d:  *InstructionData       = instruction(st, i);
     val op: ir.Opcode              = d.opcode;
@@ -1620,7 +1654,9 @@ fun choose(st: *State, i: id.Instruction) res[Choice, Error] {
     mt.body     = st.body;
     mt.function = st.f;
     mt.target   = st.s.index.target;
-    var k: u32 = cs.starts.data[at];
+    var leaking: Choice;
+    var leaked:  bool = false;
+    var k:       u32  = cs.starts.data[at];
     for (k < cs.starts.data[at + 1]) {
         val index: u32   = cs.rules.data[k];
         val r:     *Rule = ?st.s.index.isa.table.rules.at[index];
@@ -1634,7 +1670,14 @@ fun choose(st: *State, i: id.Instruction) res[Choice, Error] {
                 if (sel eaten.some) {
                     val held: res[bool, Error] = guard(st, r, ?mt);
                     if (sel held.err) { ret res[Choice, Error].err{held.err}; }
-                    if (held.ok)      { ret res[Choice, Error].ok{Choice{rule: index, found: mt, consumes: eaten.some}}; }
+                    if (held.ok) {
+                        val picked: Choice = Choice{rule: index, found: mt, consumes: eaten.some};
+                        if (!leaks(st, r, ?mt)) { ret res[Choice, Error].ok{picked}; }
+                        if (!leaked) {
+                            leaking = picked;
+                            leaked  = true;
+                        }
+                    }
                 }
             }
             if (mask == swaps) { brk; }
@@ -1642,6 +1685,7 @@ fun choose(st: *State, i: id.Instruction) res[Choice, Error] {
         }
         k = k + 1;
     }
+    if (leaked) { ret res[Choice, Error].ok{leaking}; }
     ret res[Choice, Error].err{Error.unmatched{unmatched_of(st, i, Operation.opcode{op})}};
 }
 
@@ -3401,6 +3445,14 @@ fun run(st: *State) err[Error] {
 pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls, context: *core_state.Context, own: *Registers, checked: bool) res[Selected, Error] {
     val body: res[*Body, module.Error] = module.body(m, f);
     if (sel body.err) { ret res[Selected, Error].err{Error.module{body.err}}; }
+    var timed: mct.Timed                = mct.plain(context);
+    var asked: opt[*core_state.Context] = opt[*core_state.Context].none{};
+    fin { mct.release(?timed); }
+    if (in_constant_time(m.functions.data[f.index].data.constant_time)) {
+        val assumed: err[allocator.Error] = mct.assume(s.a, context, ?timed);
+        if (sel assumed.err) { ret res[Selected, Error].err{Error.alloc{assumed.err}}; }
+        asked = opt[*core_state.Context].some{?timed.context};
+    }
     var out:      mf.Function            = mf.init(s.a, s.index.isa.set, checked);
     var clobbers: vector.Vector[Clobber] = vector.init[Clobber](s.a);
     var masks:    vector.Vector[u64]     = vector.init[u64](s.a);
@@ -3439,6 +3491,7 @@ pub fun select(s: *Selector, m: *Module, f: id.Function, calls: *Calls, context:
         stored:    vector.init[Stored](s.a),
         frames:    vector.init[u32](s.a),
         naked:     register_schema.naked(m, f),
+        timed:     asked,
     };
     val ran:   err[Error] = run(?st);
     val words: u32        = st.words;
