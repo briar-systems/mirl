@@ -391,9 +391,11 @@ functions
   block's text in the set's source dialect, its operands in order, each its
   name, role, constraint and the type of the value it binds, and `reads`
   and `writes` where it declares it touches memory beyond its memory
-  operands. a class is masc's handle of a class of the set's register file.
-  the item's operands are the values the block binds:
-  `val d: i64 = asm["addi {d}, {a}, {k}" {d: out reg(0) i64, a: in reg(0) i64, k: in imm(12, signed) i64}](x, 7);`.
+  operands, and `under` with the selection it states, in the set's own
+  spelling, where it states one. a class is masc's handle of a class of the
+  set's register file. the item's operands are the values the block binds:
+  `val d: i64 = asm["addi {d}, {a}, {k}" {d: out reg(0) i64, a: in reg(0) i64, k: in imm(12, signed) i64}](x, 7);`
+  and `val d: i64 = asm["andn {d}, {a}, {b}" {d: out reg(0) i64, a: in reg(0) i64, b: in reg(0) i64} under "rv64i_zbb"](x, y);`.
 
   a target op is the `target.op` operation, or `target.op.memory` where it
   touches memory, whose op is the instruction set as its target's catalog
