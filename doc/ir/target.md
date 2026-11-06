@@ -256,7 +256,7 @@ A target declares the conventions its calls are made under in `convention`: its 
 | `reserved` | the registers no call clobbers and nothing allocates |
 | `stack` | none, or a stack in memory with its alignment at a call, its red zone, its shadow space, where a call leaves the return address (`link`), its frame pointer with the frame record it heads (`pointer`) and where the stack pointer lives (`pointer_home`: a register, or a global symbol as wasm's `__stack_pointer`) |
 | `indirect` | what carries the address of a result passed by reference, and where a callee hands it back |
-| `variadic` | where unnamed arguments travel, the count a caller sets, and how a callee reaches them |
+| `variadic` | where a caller places unnamed arguments, the count it sets, and the convention's va_list, whose size and alignment a front end hands one on by |
 | `half` | whether a 16-bit float travels as a float or as an integer |
 | `pairs` | whether a two-word value the classifier pairs starts at an even register or at any |
 | `packing` | whether stack arguments take word slots or pack at their own size and alignment |
