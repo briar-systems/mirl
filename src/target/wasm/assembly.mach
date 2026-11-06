@@ -1,0 +1,331 @@
+# an inline assembly block's wasm form
+#
+# masc's inline reader takes a set of registers, so a typed stream's block is
+# read here: its text is wasm's plain instructions, read and encoded by masc's
+# body reader (`masc.isa.wasm.body`) under the build's context and observed by
+# its stream, after each `{name}` the block declares is spelled as what it
+# stands for. a name of a register or of memory stands for the index of a
+# local that holds the value it binds, for memory the address, as a block
+# reaches memory through a load or a store of its own, and a name of an
+# immediate stands for its value. any other braced text is left for the reader
+# to refuse, as wasm's text has no braces.
+#
+# masc states no footprint of such a block, so what the block may do is read
+# here, off the encoded rows: it names no local but its names', nothing of the
+# module's index spaces, whose numbers only a link settles, branches to no
+# block it did not open and does not return, as that would skip the frame's
+# unwind. it reads and writes memory only as it declares. a block of plain
+# instructions is held to the stack it found, taking nothing off it and leaving
+# nothing on it. one that opens blocks or jumps has heights only a validator
+# reads across its labels, so its code is written inside a block of its own
+# (`Read.fenced`), which holds it to the same stack where the module loads.
+# neither reads the value types of what it moves, which the module's validation
+# holds.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use masc.codec.walk;
+use masc.core.diagnostic;
+use masc.core.dispatch;
+use masc.core.effect;
+use masc.core.field;
+use masc.core.inst;
+use mo: masc.core.operand;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.state;
+use wasm_body:   masc.isa.wasm.body;
+use wasm_kind:   masc.isa.wasm.kind;
+use wasm_stream: masc.isa.wasm.stream;
+use wasm_text:   masc.isa.wasm.text;
+
+pub val CLASS:     str = "a register class, which wasm has none of but class 0, a local of the value's own type";
+pub val IMMEDIATE: str = "an immediate that is not an integer constant, as no number stands for a symbol in wasm's text";
+pub val LOCAL:     str = "a local no `{name}` of the block binds";
+pub val MODULE:    str = "an index of the module's, which only a link settles";
+pub val LABEL:     str = "a branch to a block the block did not open";
+pub val RETURN:    str = "a return, which would skip the function's unwind";
+pub val OPEN:      str = "a block the block does not close";
+pub val READS:     str = "a read of memory the block does not declare";
+pub val WRITES:    str = "a write of memory the block does not declare";
+pub val SHORT:     str = "an instruction that takes more off the stack than the block put on it";
+pub val LEFT:      str = "a stack that is not as the block found it where the block ends";
+pub val UNREAD:    str = "code the block's own encoding does not decode to";
+
+# what one `{name}` of a block stands for
+# ---
+# name:   how the text names it
+# number: the value it is spelled as
+# local:  it stands for a local, which the block may name
+pub rec Bind {
+    name:   View;
+    number: i64;
+    local:  bool;
+}
+
+# a block read
+# ---
+# code:   its encoded instructions, given back with `release`
+# fenced: its code must stand inside a block of its own
+pub rec Read {
+    code:   vector.Vector[u8];
+    fenced: bool;
+}
+
+pub fun release(r: *Read) {
+    vector.dnit[u8](?r.code);
+}
+
+fun put(out: *vector.Vector[u8], c: u8) err[allocator.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[u8](out, c);
+    if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+# the decimal spelling of `n` added to `out`
+fun number(out: *vector.Vector[u8], n: i64) err[allocator.Error] {
+    var digits: [24]u8;
+    var count:  usize = 0;
+    var rest:   u64   = n:~u64;
+    if (n < 0) {
+        val sign: err[allocator.Error] = put(out, '-');
+        if (sel sign.err) { ret sign; }
+        rest = ~rest + 1;
+    }
+    for (rest != 0 || count == 0) {
+        digits[count] = '0' + (rest % 10)::u8;
+        rest          = rest / 10;
+        count         = count + 1;
+    }
+    for (count > 0) {
+        count = count - 1;
+        val digit: err[allocator.Error] = put(out, digits[count]);
+        if (sel digit.err) { ret digit; }
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the bind of the `{name}` at `at` of `text`, with its closing brace's offset into `end`, none where none is declared there
+fun bound_at(text: View, at: usize, binds: Slice[Bind], end: *usize) opt[*Bind] {
+    var k: usize = 0;
+    for (k < binds.size) {
+        val b:     *Bind = ?binds.data[k];
+        val close: usize = at + 1 + b.name.len;
+        if (close < text.len && text.data[close] == '}') {
+            var i: usize = 0;
+            for (i < b.name.len && text.data[at + 1 + i] == b.name.data[i]) { i = i + 1; }
+            if (i == b.name.len) {
+                @end = close;
+                ret opt[*Bind].some{b};
+            }
+        }
+        k = k + 1;
+    }
+    ret opt[*Bind].none{};
+}
+
+# the block's text with each name spelled as what it stands for
+fun spelled(text: View, binds: Slice[Bind], out: *vector.Vector[u8]) err[allocator.Error] {
+    var at: usize = 0;
+    for (at < text.len) {
+        var end: usize = 0;
+        if (text.data[at] == '{') {
+            val found: opt[*Bind] = bound_at(text, at, binds, ?end);
+            if (sel found.some) {
+                val spell: err[allocator.Error] = number(out, found.some.number);
+                if (sel spell.err) { ret spell; }
+                at = end + 1;
+                cnt;
+            }
+        }
+        val copied: err[allocator.Error] = put(out, text.data[at]);
+        if (sel copied.err) { ret copied; }
+        at = at + 1;
+    }
+    ret put(out, 0);
+}
+
+fun binds_local(binds: Slice[Bind], n: u32) bool {
+    var k: usize = 0;
+    for (k < binds.size) {
+        if (binds.data[k].local && binds.data[k].number == n::i64) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun label_held(v: mo.Value, open: u32) bool {
+    if (sel v.id) { ret v.id < open; }
+    if (sel v.list) {
+        var i: u32 = 0;
+        for (i < v.list.len) {
+            val each: mo.Value = v.list.at[i];
+            if (!label_held(each, open)) { ret false; }
+            i = i + 1;
+        }
+    }
+    ret true;
+}
+
+# why operand `k` of instruction `ins` may not stand in a block, `open` blocks open around it, none for none
+fun index_refused(ins: *inst.Inst, k: u32, binds: Slice[Bind], open: u32) opt[str] {
+    val shape: *mo.Shape = ?ins.row.operands.at[k].shape;
+    val v:     mo.Value  = ins.values[k];
+    if (sel shape.group) {
+        if (sel v.group) {
+            var i: u32 = 0;
+            for (i < v.group.len) {
+                val each: mo.Value = v.group.at[i];
+                if (sel each.id) { ret opt[str].some{MODULE}; }
+                i = i + 1;
+            }
+        }
+        ret opt[str].none{};
+    }
+    if (!sel shape.id) { ret opt[str].none{}; }
+    val space: u16 = shape.id.space;
+    if (space == wasm_kind.LOCALS) {
+        if (sel v.id && !binds_local(binds, v.id)) { ret opt[str].some{LOCAL}; }
+        ret opt[str].none{};
+    }
+    if (space == wasm_kind.LABELS) {
+        if (!label_held(v, open)) { ret opt[str].some{LABEL}; }
+        ret opt[str].none{};
+    }
+    if (space == wasm_kind.MEMORIES) {
+        if (sel v.id && v.id != 0) { ret opt[str].some{MODULE}; }
+        ret opt[str].none{};
+    }
+    ret opt[str].some{MODULE};
+}
+
+# the values `refs` of instruction `ins` stand for under the stream, none for what no count states
+fun counted(ctx: *state.Context, ins: *inst.Inst, refs: effect.Types, pushed: bool) opt[u32] {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < refs.len) {
+        val got: opt[u32] = wasm_stream.HOOKS.arity(ctx.stream, ins, refs.at[i], pushed);
+        if (sel got.none) { ret got; }
+        n = n + got.some;
+        i = i + 1;
+    }
+    ret opt[u32].some{n};
+}
+
+# why the block encoded at `code` may not stand, none for none, and into `fenced` whether its code needs a block of
+# its own
+fun checked(a: *allocator.Allocator, codec: *dispatch.Codec, ctx: *state.Context, code: *vector.Vector[u8], binds: Slice[Bind], reads: bool, writes: bool, fenced: *bool) res[opt[str], allocator.Error] {
+    var store: vector.Vector[mo.Value] = vector.init[mo.Value](a);
+    fin { vector.dnit[mo.Value](?store); }
+    var alts: vector.Vector[requirement.Alternative] = vector.init[requirement.Alternative](a);
+    fin { vector.dnit[requirement.Alternative](?alts); }
+    var open:   u32   = 0;
+    var height: u32   = 0;
+    var at:     usize = 0;
+    for (at < code.len) {
+        val got: res[walk.Decoded, field.Refusal] = walk.decode_grown(codec, ctx, code.data, code.len, at, ?store, ?alts);
+        if (sel got.err) {
+            if (sel got.err.cause.memory) { ret res[opt[str], allocator.Error].err{got.err.cause.memory}; }
+            ret res[opt[str], allocator.Error].ok{opt[str].some{UNREAD}};
+        }
+        var ins: inst.Inst      = got.ok.inst;
+        val e:   *effect.Effect = ins.row.effect;
+        at = at + got.ok.len;
+        if (e.control.transfer == effect.RETURN) { ret res[opt[str], allocator.Error].ok{opt[str].some{RETURN}}; }
+        if (effect.opens(e.structure))           { open = open + 1; }
+        if (e.structure == effect.CLOSES) {
+            if (open == 0) { ret res[opt[str], allocator.Error].ok{opt[str].some{LABEL}}; }
+            open = open - 1;
+        }
+        var k: u32 = 0;
+        for (k < ins.count && k < ins.row.operands.len) {
+            val refused: opt[str] = index_refused(?ins, k, binds, open);
+            if (sel refused.some) { ret res[opt[str], allocator.Error].ok{refused}; }
+            k = k + 1;
+        }
+        var m: u32 = 0;
+        for (m < e.memory.len) {
+            val role: mo.Role = e.memory.at[m].role;
+            if ((role & mo.READ) != 0 && !reads)   { ret res[opt[str], allocator.Error].ok{opt[str].some{READS}}; }
+            if ((role & mo.WRITE) != 0 && !writes) { ret res[opt[str], allocator.Error].ok{opt[str].some{WRITES}}; }
+            m = m + 1;
+        }
+        if (e.structure != effect.FLAT || e.control.transfer != effect.NONE) { @fenced = true; }
+        val pops:   opt[u32] = counted(ctx, ?ins, e.signature.pops, false);
+        val pushes: opt[u32] = counted(ctx, ?ins, e.signature.pushes, true);
+        if (sel pops.some) {
+            if (sel pushes.some) {
+                if (!@fenced) {
+                    if (pops.some > height) { ret res[opt[str], allocator.Error].ok{opt[str].some{SHORT}}; }
+                    height = height - pops.some + pushes.some;
+                }
+            }
+            or { @fenced = true; }
+        }
+        or { @fenced = true; }
+    }
+    if (open != 0)               { ret res[opt[str], allocator.Error].ok{opt[str].some{OPEN}}; }
+    if (!@fenced && height != 0) { ret res[opt[str], allocator.Error].ok{opt[str].some{LEFT}}; }
+    ret res[opt[str], allocator.Error].ok{opt[str].none{}};
+}
+
+# why a block was not read
+# ---
+# alloc:  the allocator refused storage
+# reason: masc's words for the text, or what the block may not do
+pub tag Refusal: u8 {
+    alloc:  allocator.Error;
+    reason: str;
+}
+
+# block `text` read in wasm's text under `ctx`, whose stream observes it
+# ---
+# a:      the allocator
+# codec:  the set's codec
+# ctx:    the build's context
+# text:   the block's text
+# binds:  what each of its names stands for
+# reads:  it may read memory
+# writes: it may write memory
+# ret:    its code, or why it may not stand
+pub fun read(a: *allocator.Allocator, codec: *dispatch.Codec, ctx: *state.Context, text: View, binds: Slice[Bind], reads: bool, writes: bool) res[Read, Refusal] {
+    var spelling: vector.Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?spelling); }
+    val spell: err[allocator.Error] = spelled(text, binds, ?spelling);
+    if (sel spell.err) { ret res[Read, Refusal].err{Refusal.alloc{spell.err}}; }
+    var out: Read             = Read{code: vector.init[u8](a), fenced: false};
+    var r:   wasm_body.Reader = wasm_body.make(a, spelling.data, diagnostic.START, codec, ctx);
+    fin { wasm_body.release(?r); }
+    var l:    wasm_text.Lexer            = wasm_text.make(spelling.data, 0, spelling.len - 1);
+    val done: err[diagnostic.Diagnostic] = wasm_body.sequence(?r, ?l, ?out.code);
+    if (sel done.err) {
+        release(?out);
+        ret res[Read, Refusal].err{Refusal.reason{done.err.message}};
+    }
+    if (wasm_text.ahead(?l).kind != wasm_text.END) {
+        release(?out);
+        ret res[Read, Refusal].err{Refusal.reason{wasm_body.BROKEN_TEXT}};
+    }
+    val held: res[opt[str], allocator.Error] = checked(a, codec, ctx, ?out.code, binds, reads, writes, ?out.fenced);
+    if (sel held.err) {
+        release(?out);
+        ret res[Read, Refusal].err{Refusal.alloc{held.err}};
+    }
+    if (sel held.ok.some) {
+        release(?out);
+        ret res[Read, Refusal].err{Refusal.reason{held.ok.some}};
+    }
+    ret res[Read, Refusal].ok{out};
+}
