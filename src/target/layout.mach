@@ -4,14 +4,25 @@
 # producer alike, so no other module computes a size, an alignment, an offset
 # or a stride. it reads the type table, the target's widths and alignments,
 # and the rules of the address space a type is laid out in.
+#
+# each type is laid out once, in id order, onto the sheet its rules write in
+# the module's type table, and a question reads that row. a module names one
+# target, so a sheet needs no key but its rules. what turns on the build, a
+# vector the target aligns by its registers or a pointer under an addressing
+# model, is left open on the sheet and worked out per build, since one table
+# is read under a build's context and under none.
 
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
+use std.allocator;
 use std.collections.slice.Slice;
+use vectors: std.collections.vector;
 
 use core_state: masc.core.state;
 
@@ -19,7 +30,10 @@ use mink.catalog.trait.Choice;
 
 use mirl.ir.type.format.Format;
 use mirl.ir.type.table;
+use mirl.ir.type.table.Laid;
 use mirl.ir.type.table.Shape;
+use mirl.ir.type.table.Sheet;
+use mirl.ir.type.table.Standing;
 use mirl.ir.type.table.Structure;
 use mirl.ir.type.table.Type;
 use mirl.target.capability;
@@ -101,11 +115,14 @@ pub fun align(l: *Layout, ty: Type, space: u32) res[u64, Error] {
 pub fun offset(l: *Layout, ty: Type, space: u32, member: u32) res[u64, Error] {
     val r: res[Rules, Error] = rules(l, space);
     if (sel r.err) { ret res[u64, Error].err{r.err}; }
-    val s: res[Shape, table.Error] = table.shape(l.types, ty);
+    val s: res[*Shape, table.Error] = table.shape_at(l.types, ty);
     if (sel s.err) { ret res[u64, Error].err{Error.types{s.err}}; }
     var at: u64 = 0;
     if (sel s.ok.structure) {
         if (member::usize >= s.ok.structure.members.size) { ret res[u64, Error].err{Error.member{member}}; }
+        val row: res[*Laid, Error] = laid(l, r.ok, ty);
+        if (sel row.err)                { ret res[u64, Error].err{row.err}; }
+        if (sel row.ok.standing.placed) { ret res[u64, Error].ok{sheet_of(l, r.ok).offsets.data[row.ok.first + member]}; }
         val e: res[Extent, Error] = structure(l, r.ok, ty, s.ok.structure, member, ?at, nil);
         if (sel e.err) { ret res[u64, Error].err{e.err}; }
         ret res[u64, Error].ok{at};
@@ -129,9 +146,20 @@ pub fun offset(l: *Layout, ty: Type, space: u32, member: u32) res[u64, Error] {
 pub fun offsets(l: *Layout, ty: Type, space: u32, out: *u64) err[Error] {
     val r: res[Rules, Error] = rules(l, space);
     if (sel r.err) { ret err[Error].err{r.err}; }
-    val s: res[Shape, table.Error] = table.shape(l.types, ty);
+    val s: res[*Shape, table.Error] = table.shape_at(l.types, ty);
     if (sel s.err)             { ret err[Error].err{Error.types{s.err}}; }
     if (!(sel s.ok.structure)) { ret err[Error].err{wrong(l, ty)}; }
+    val row: res[*Laid, Error] = laid(l, r.ok, ty);
+    if (sel row.err) { ret err[Error].err{row.err}; }
+    if (sel row.ok.standing.placed) {
+        val from: *u64  = ?sheet_of(l, r.ok).offsets.data[row.ok.first];
+        var i:    usize = 0;
+        for (i < s.ok.structure.members.size) {
+            out[i] = from[i];
+            i      = i + 1;
+        }
+        ret err[Error].ok{};
+    }
     var at: u64                = 0;
     val e:  res[Extent, Error] = structure(l, r.ok, ty, s.ok.structure, 0, ?at, out);
     if (sel e.err) { ret err[Error].err{e.err}; }
@@ -148,7 +176,7 @@ pub fun offsets(l: *Layout, ty: Type, space: u32, out: *u64) err[Error] {
 pub fun stride(l: *Layout, ty: Type, space: u32) res[u64, Error] {
     val r: res[Rules, Error] = rules(l, space);
     if (sel r.err) { ret res[u64, Error].err{r.err}; }
-    val s: res[Shape, table.Error] = table.shape(l.types, ty);
+    val s: res[*Shape, table.Error] = table.shape_at(l.types, ty);
     if (sel s.err)         { ret res[u64, Error].err{Error.types{s.err}}; }
     if (!(sel s.ok.array)) { ret res[u64, Error].err{wrong(l, ty)}; }
     var step: u64                = 0;
@@ -411,8 +439,106 @@ fun union_of(l: *Layout, r: Rules, ty: Type, members: Slice[Type]) res[Extent, E
     ret res[Extent, Error].ok{Extent{size: total.some, align: align}};
 }
 
-# members are interned before their owner, so a walk never meets its own type
+# the sheet a set of rules writes
+fun sheet_of(l: *Layout, r: Rules) *Sheet {
+    if (sel r.std140) { ret table.sheet(l.types, 1); }
+    if (sel r.std430) { ret table.sheet(l.types, 2); }
+    if (sel r.scalar) { ret table.sheet(l.types, 3); }
+    ret table.sheet(l.types, 0);
+}
+
+# whether a sheet left a type open
+fun left_open(sheet: *Sheet, ty: Type) bool {
+    val row: *Laid = ?sheet.laid.data[ty.index];
+    ret sel row.standing.open;
+}
+
+# whether a type's layout turns on the build: a vector the target aligns by
+# its registers, a pointer not physical, or anything holding one
+fun turns_on_build(l: *Layout, r: Rules, sheet: *Sheet, ty: Type) bool {
+    val got: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+    if (sel got.err) { ret false; }
+    val s: *Shape = got.ok;
+    if (sel s.pointer) {
+        val rows: Slice[Space] = l.target.caps.widths.pointers;
+        var i:    usize        = 0;
+        for (i < rows.size) {
+            if (rows.data[i].space == s.pointer.space) {
+                val p: Pointer = record.pointer_of(l.target, ?rows.data[i]);
+                ret !(sel p.physical);
+            }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (sel s.vector) {
+        if (sel r.c && sel l.target.data.vectors.register) { ret true; }
+        ret left_open(sheet, s.vector.element);
+    }
+    if (sel s.array) { ret left_open(sheet, s.array.element); }
+    var members: Slice[Type] = Slice[Type]{data: nil, size: 0};
+    if (sel s.structure) { members = s.structure.members; }
+    if (sel s.union)     { members = s.union.members; }
+    var i: usize = 0;
+    for (i < members.size) {
+        if (left_open(sheet, members.data[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# lay out every type the table has interned since the sheet was last written,
+# each from the rows of its members, which are interned before their owner
+fun lay_up(l: *Layout, r: Rules, sheet: *Sheet) err[Error] {
+    val count: usize = table.mark(l.types)::usize;
+    for (sheet.laid.len < count) {
+        val ty:  Type = Type{index: sheet.laid.len::u32};
+        var row: Laid = Laid{size: 0, align: 0, first: sheet.offsets.len::u32, standing: Standing.open{}};
+        if (!turns_on_build(l, r, sheet, ty)) {
+            val got: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+            if (sel got.err) { ret err[Error].err{Error.types{got.err}}; }
+            var held: usize = 0;
+            if (sel got.ok.structure) { held = got.ok.structure.members.size; }
+            val room: res[usize, allocator.Error] = vectors.reserve[u64](?sheet.offsets, held);
+            if (sel room.err) { ret err[Error].err{Error.types{table.Error.alloc{room.err}}}; }
+            val e: res[Extent, Error] = lay(l, r, ty, vectors.spare[u64](?sheet.offsets).data);
+            row.standing = Standing.refused{};
+            if (sel e.ok) {
+                row.size     = e.ok.size;
+                row.align    = e.ok.align;
+                row.standing = Standing.placed{};
+                vectors.commit[u64](?sheet.offsets, held);
+            }
+        }
+        val pushed: res[usize, allocator.Error] = vectors.push[Laid](?sheet.laid, row);
+        if (sel pushed.err) { ret err[Error].err{Error.types{table.Error.alloc{pushed.err}}}; }
+    }
+    ret err[Error].ok{};
+}
+
+# a type's row on the sheet of a set of rules
+fun laid(l: *Layout, r: Rules, ty: Type) res[*Laid, Error] {
+    val sheet: *Sheet = sheet_of(l, r);
+    if (ty.index::usize >= sheet.laid.len) {
+        val up: err[Error] = lay_up(l, r, sheet);
+        if (sel up.err)                        { ret res[*Laid, Error].err{up.err}; }
+        if (ty.index::usize >= sheet.laid.len) { ret res[*Laid, Error].err{Error.types{table.Error.unknown{ty}}}; }
+    }
+    ret res[*Laid, Error].ok{?sheet.laid.data[ty.index]};
+}
+
+# the extent of a type: its row when placed, and worked out when its row is
+# open or why it is refused is what is asked
 fun walk(l: *Layout, r: Rules, ty: Type) res[Extent, Error] {
+    val row: res[*Laid, Error] = laid(l, r, ty);
+    if (sel row.err)                { ret res[Extent, Error].err{row.err}; }
+    if (sel row.ok.standing.placed) { ret res[Extent, Error].ok{Extent{size: row.ok.size, align: row.ok.align}}; }
+    ret lay(l, r, ty, nil);
+}
+
+# work a type out from its members' extents, giving a structure's member
+# offsets through `every` when it is not nil
+fun lay(l: *Layout, r: Rules, ty: Type, every: *u64) res[Extent, Error] {
     val got: res[*Shape, table.Error] = table.shape_at(l.types, ty);
     if (sel got.err) { ret res[Extent, Error].err{Error.types{got.err}}; }
     val s: *Shape = got.ok;
@@ -426,7 +552,7 @@ fun walk(l: *Layout, r: Rules, ty: Type) res[Extent, Error] {
     }
     if (sel s.structure) {
         var at: u64 = 0;
-        ret structure(l, r, ty, s.structure, 0, ?at, nil);
+        ret structure(l, r, ty, s.structure, 0, ?at, every);
     }
     if (sel s.union) { ret union_of(l, r, ty, s.union.members); }
     ret res[Extent, Error].err{Error.unsized{ty}};
