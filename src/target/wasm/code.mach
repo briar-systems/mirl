@@ -49,6 +49,13 @@
 # one access, the first of its footprint. an atomic read-modify-write is a
 # load and a store of the one address, each seeded alike, so the store follows
 # what the access states. any other store states nothing.
+#
+# each call in such a function is walked through a model of its callee
+# (`mirl.machine.emit.timed`, `stream_model`), its extents off the local that
+# holds the base of the frame, the decisions those of every other target. each
+# result of a call the ir declares secret seeds the walk at the call
+# (`walk.Seed.after`), as a load's does through its access, since nothing the
+# walk reads there need hold the secret.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -78,6 +85,7 @@ use wasm_stream: masc.isa.wasm.stream;
 use masc.walk.walk;
 
 use mirl.ct;
+use slots_of:       mirl.ct.frame;
 use secret_globals: mirl.ct.global;
 use ia:             mirl.ir.assembly;
 use mirl.ir.cfg.graph.NONE;
@@ -105,6 +113,7 @@ use mirl.ir.place.Placed;
 use types: mirl.ir.type;
 use mirl.ir.type.Type;
 use mirl.ir.value.Def;
+use timing: mirl.machine.emit.timed;
 use mirl.pass.analysis;
 use mirl.pass.analysis.live.Liveness;
 use mirl.pass.failure.Why;
@@ -146,6 +155,15 @@ pub rec Frame {
     branched: bool;
 }
 
+# a call in a constant-time function's code
+# ---
+# at:     where the call instruction starts
+# callee: the function it names, none for one it reaches through the table
+pub rec Site {
+    at:     u64;
+    callee: opt[Function];
+}
+
 # what the code of one function is emitted with
 pub rec Emitter {
     u:      *Unit;
@@ -159,6 +177,7 @@ pub rec Emitter {
     frame:  u64;
     base:   u32;
     stated: vector.Vector[walk.Seed];
+    sites:  vector.Vector[Site];
     rows:   vector.Vector[line.Row];
     tail:   u32;
     failed: opt[Error];
@@ -480,7 +499,7 @@ fun same_results(e: *Emitter, call: *InstructionData) bool {
 # callee may be handed the address of and which a return gives back before
 # it leaves. the callee's results must be the function's own, as the
 # proposal types a tail call, and a function held to constant time makes
-# none, as the walk of its code follows no call
+# none, as a model is stated of its calls alone
 fun tail_of(e: *Emitter, k: u32) u32 {
     if (!core_state.holds(e.u.ctx, wasm_extension.TAIL_CALL))                 { ret NONE; }
     if (e.base != local.NONE)                                                 { ret NONE; }
@@ -885,6 +904,37 @@ fun state(e: *Emitter, d: *InstructionData) {
     val seed:   walk.Seed                   = walk.Seed.access{walk.Access{at: e.w.out.len::u64, access: walk.Accessor.index{0}, secret: d.metadata.secret}};
     val pushed: res[usize, allocator.Error] = vector.push[walk.Seed](?e.stated, seed);
     if (sel pushed.err) { lost(e, pushed.err); }
+}
+
+# the site of the call written next for instruction `d`, for a constant-time function, and the written seed of each
+# result of it the ir declares secret
+fun site(e: *Emitter, d: *InstructionData, callee: opt[Function]) {
+    if (!in_constant_time(e.u.m.functions.data[e.f.index].data.constant_time)) { ret; }
+    val at:     u64                         = e.w.out.len::u64;
+    val listed: res[usize, allocator.Error] = vector.push[Site](?e.sites, Site{at: at, callee: callee});
+    if (sel listed.err) {
+        lost(e, listed.err);
+        ret;
+    }
+    var order: vector.Vector[usize] = vector.init[usize](e.u.a);
+    fin { vector.dnit[usize](?order); }
+    val got: res[bool, allocator.Error] = operand.result_order(d, ?order);
+    if (sel got.err) {
+        lost(e, got.err);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < order.len) {
+        if (e.b.values.data[d.results.data[order.data[k]].index].secret) {
+            val seed:   walk.Seed                   = walk.Seed.after{walk.Written{at: at, place: walk.Place.value{(order.len - 1 - k)::u32}}};
+            val pushed: res[usize, allocator.Error] = vector.push[walk.Seed](?e.stated, seed);
+            if (sel pushed.err) {
+                lost(e, pushed.err);
+                ret;
+            }
+        }
+        k = k + 1;
+    }
 }
 
 # the load of a value type of a width from memory
@@ -1717,6 +1767,7 @@ fun call(e: *Emitter, i: Instruction, d: *InstructionData) {
     if (sel callee.some) {
         var row: u32 = gen_row_index.CALL;
         if (tail) { row = gen_row_index.RETURNCALL; }
+        site(e, d, callee);
         writer.one(e.w, row, relocation.function(e.u, callee.some));
         ret;
     }
@@ -1759,6 +1810,7 @@ fun call(e: *Emitter, i: Instruction, d: *InstructionData) {
     }
     var row: u32 = gen_row_index.CALLINDIRECT;
     if (tail) { row = gen_row_index.RETURNCALLINDIRECT; }
+    site(e, d, callee);
     writer.indirect(e.w, row, relocation.type(e.u, typed(e, params.data, params.len::u32, results.data, results.len::u32)));
 }
 
@@ -1867,11 +1919,12 @@ pub fun function(u: *Unit, f: Function, out: *vector.Vector[u8], fixups: *vector
     }
     var w: Writer = writer.make(u.a, u.codec, u.ctx);
     fin { writer.release(?w); }
-    var e: Emitter = Emitter{u: u, f: f, b: b, s: s.ok, l: ?l, w: ?w, frames: vector.init[Frame](u.a), slots: vector.init[u64](u.a), frame: 0, base: local.NONE, stated: vector.init[walk.Seed](u.a), rows: vector.init[line.Row](u.a), tail: NONE, failed: opt[Error].none{}};
+    var e: Emitter = Emitter{u: u, f: f, b: b, s: s.ok, l: ?l, w: ?w, frames: vector.init[Frame](u.a), slots: vector.init[u64](u.a), frame: 0, base: local.NONE, stated: vector.init[walk.Seed](u.a), sites: vector.init[Site](u.a), rows: vector.init[line.Row](u.a), tail: NONE, failed: opt[Error].none{}};
     fin {
         vector.dnit[Frame](?e.frames);
         vector.dnit[u64](?e.slots);
         vector.dnit[walk.Seed](?e.stated);
+        vector.dnit[Site](?e.sites);
         vector.dnit[line.Row](?e.rows);
     }
     n = 0;
@@ -1911,19 +1964,68 @@ pub fun function(u: *Unit, f: Function, out: *vector.Vector[u8], fixups: *vector
         if (sel pushed.err) { ret err[Error].err{Error.alloc{pushed.err}}; }
         n = n + 1;
     }
-    if (in_constant_time(u.m.functions.data[f.index].data.constant_time)) { ret timed(u, f, b, ?l, ?w.out, ?e.stated); }
+    if (in_constant_time(u.m.functions.data[f.index].data.constant_time)) { ret timed(u, f, b, ?l, ?e); }
     ret err[Error].ok{};
 }
 
-# a constant-time function's code walked from its secret params, the secret
-# ranges of every global of the module and the access seeds of `stated`:
-# refused where the walk finds a secret where none may be, and warned of where
-# wasm cannot guarantee its timing. no site places a global's address in wasm
-# code, so an access the walk cannot place and no seed states may read any of
-# them. a function whose own frame reads a slot no store reaches first is
-# refused before it is walked
-fun timed(u: *Unit, f: Function, b: *Body, l: *Locals, code: *vector.Vector[u8], stated: *vector.Vector[walk.Seed]) err[Error] {
-    val own: res[opt[ct.Unmet], allocator.Error] = ct.fresh(u.a, u.m, u.l, f);
+# the extents of the frame of `e`'s function, off the local holding its base: all of it into `kept`, and each slot whose
+# address its code lets out into `touched`, which a pointer argument may reach. none for a function of no frame
+fun frame_extents(e: *Emitter, kept: *vector.Vector[walk.Extent], touched: *vector.Vector[walk.Extent]) err[Error] {
+    if (e.base == local.NONE) { ret err[Error].ok{}; }
+    val base:  opt[walk.Entry]             = opt[walk.Entry].some{walk.Entry{space: wasm_kind.LOCALS, index: e.base}};
+    val whole: res[usize, allocator.Error] = vector.push[walk.Extent](kept, walk.Extent{offset: 0, length: e.frame, entry: base});
+    if (sel whole.err) { ret err[Error].err{Error.alloc{whole.err}}; }
+    val found: res[slots_of.Slots, module.Error] = slots_of.of(e.u.a, e.u.m, e.u.l, e.f);
+    if (sel found.err) { ret err[Error].err{Error.ir{found.err}}; }
+    var slots: slots_of.Slots = found.ok;
+    fin { slots_of.release(?slots); }
+    var k: usize = 0;
+    for (k < e.b.instructions.len) {
+        val d:      *InstructionData = ?e.b.instructions.data[k];
+        val placed: Spot             = d.place;
+        if (d.opcode.index == opcode.ALLOCA.index && sel placed.placed && slots_of.escaped(?slots, Instruction{index: k::u32})) {
+            val ty: opt[Type] = type_of(d, 0);
+            if (sel ty.some) {
+                val size: res[u64, record.Error] = layout.size(e.u.l, ty.some, types.DEFAULT_SPACE);
+                if (sel size.err) { ret err[Error].err{Error.layout{size.err}}; }
+                val pushed: res[usize, allocator.Error] = vector.push[walk.Extent](touched, walk.Extent{offset: e.slots.data[k]::i64, length: size.ok, entry: base});
+                if (sel pushed.err) { ret err[Error].err{Error.alloc{pushed.err}}; }
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the model of each call of `e`'s function, into `x`
+fun models(u: *Unit, e: *Emitter, x: *timing.Models) err[Error] {
+    var kept: vector.Vector[walk.Extent] = vector.init[walk.Extent](u.a);
+    fin { vector.dnit[walk.Extent](?kept); }
+    var touched: vector.Vector[walk.Extent] = vector.init[walk.Extent](u.a);
+    fin { vector.dnit[walk.Extent](?touched); }
+    val framed: err[Error] = frame_extents(e, ?kept, ?touched);
+    if (sel framed.err) { ret framed; }
+    var i: usize = 0;
+    for (i < e.sites.len) {
+        val s:    *Site                = ?e.sites.data[i];
+        val made: err[allocator.Error] = timing.stream_model(x, u.m, u.b, u.l, s.at, s.callee, Slice[walk.Extent]{data: kept.data, size: kept.len}, Slice[walk.Extent]{data: touched.data, size: touched.len});
+        if (sel made.err) { ret err[Error].err{Error.alloc{made.err}}; }
+        i = i + 1;
+    }
+    val done: err[allocator.Error] = timing.complete(x);
+    if (sel done.err) { ret err[Error].err{Error.alloc{done.err}}; }
+    ret err[Error].ok{};
+}
+
+# a constant-time function's code walked from its secret params, the secret ranges of every global of the module and the
+# access seeds of the emitter, each call through its model: refused where the walk finds a secret where none may be, and
+# warned of where wasm cannot guarantee its timing. no site places a global's address in wasm code, so an access the walk
+# cannot place and no seed states may read any of them. a function whose own frame reads a slot no store reaches first
+# is refused before it is walked
+fun timed(u: *Unit, f: Function, b: *Body, l: *Locals, e: *Emitter) err[Error] {
+    val code:   *vector.Vector[u8]                  = ?e.w.out;
+    val stated: *vector.Vector[walk.Seed]           = ?e.stated;
+    val own:    res[opt[ct.Unmet], allocator.Error] = ct.fresh(u.a, u.m, u.l, f);
     if (sel own.err) { ret err[Error].err{Error.alloc{own.err}}; }
     if (sel own.ok.some) {
         val unmet: ct.Unmet = own.ok.some;
@@ -1967,15 +2069,24 @@ fun timed(u: *Unit, f: Function, b: *Body, l: *Locals, code: *vector.Vector[u8],
         if (sel why.alloc) { ret err[Error].err{Error.alloc{why.alloc}}; }
         ret err[Error].err{Error.unfollowed{ct.Unfollowed{function: f, unread: walk.Unread{message: head.fact(why), offset: 0}, location: opt[Location].none{}}}};
     }
+    var x: timing.Models = timing.models_of(u.a);
+    fin { timing.release_models(?x); }
+    val modelled: err[Error] = models(u, e, ?x);
+    if (sel modelled.err) { ret modelled; }
     var walked:  walk.Code                       = walk.Code{set: u.b.basis.set, data: code.data, len: code.len, sites: walk.NO_SITES};
     var secrets: walk.Secrets                    = walk.Secrets{at: seeds.data, len: seeds.len::u32};
-    val answer:  res[ct.Answer, allocator.Error] = ct.check(u.a, ?walked, u.ctx, reading.context, reading.gated, u.ctx, ?secrets, ?walk.NO_DECLASSIFIED, ?walk.NO_CALLS, u.m.functions.data[f.index].data.constant_time);
+    var calls:   walk.Calls                      = walk.Calls{at: x.calls.data, len: x.calls.len::u32};
+    val answer:  res[ct.Answer, allocator.Error] = ct.check(u.a, ?walked, u.ctx, reading.context, reading.gated, u.ctx, ?secrets, ?walk.NO_DECLASSIFIED, ?calls, u.m.functions.data[f.index].data.constant_time);
     if (sel answer.err) { ret err[Error].err{Error.alloc{answer.err}}; }
     val got: ct.Answer = answer.ok;
-    if (sel got.refused)      { ret err[Error].err{Error.timing{ct.refused(f, ct.Where.offset{got.refused.offset}, got.refused.refusal, opt[Location].none{})}}; }
+    if (sel got.refused) {
+        var refused: ct.Refused = ct.refused(f, ct.Where.offset{got.refused.offset}, got.refused.refusal, opt[Location].none{});
+        if (got.refused.refusal.reason == masc_ct.UNCHECKED) { refused.callee = timing.callee_at(?x, got.refused.offset); }
+        ret err[Error].err{Error.timing{refused}};
+    }
     if (sel got.unread)       { ret err[Error].err{Error.unfollowed{ct.Unfollowed{function: f, unread: got.unread, location: opt[Location].none{}}}}; }
     if (sel got.unguaranteed) { ret err[Error].err{Error.unguaranteed{ct.Unguaranteed{function: f, needs: got.unguaranteed, set: u.b.basis.set}}}; }
-    if (sel got.warned)       { warn(u, f); }
+    if (sel got.warned)       { warn(u, f, got.warned); }
     ret err[Error].ok{};
 }
 
@@ -1983,8 +2094,8 @@ fun write(w: *io.Writer, data: *u8, len: usize) {
     val wrote: err[io.WriteError] = io.write_all(w, data, len);
 }
 
-# the warning that wasm cannot hold a function to constant time
-fun warn(u: *Unit, f: Function) {
+# the warning that wasm cannot hold a function to constant time, and what the walk could not follow, where it could not
+fun warn(u: *Unit, f: Function, unread: opt[walk.Unread]) {
     if (sel u.warnings.none) { ret; }
     val w:    *io.Writer   = u.warnings.some;
     val name: FunctionData = u.m.functions.data[f.index].data;
@@ -1992,5 +2103,11 @@ fun warn(u: *Unit, f: Function) {
     write(w, name.name.data, name.name.len);
     write(w, ": ", 2);
     write(w, masc_ct.UNGUARANTEED, str_len(masc_ct.UNGUARANTEED));
+    write(w, "\n", 1);
+    if (sel unread.none) { ret; }
+    write(w, "warning: ", 9);
+    write(w, name.name.data, name.name.len);
+    write(w, ": not verified: ", 16);
+    write(w, unread.some.message, str_len(unread.some.message));
     write(w, "\n", 1);
 }
