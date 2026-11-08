@@ -15,7 +15,7 @@
 # program exits with, and the __mirl_exit every start stub calls, which masc
 # assembles for each lane target: test/example/exit-<arch>.s where one is
 # written for its architecture, test/example/exit.s, RISC-V's, otherwise. the lane targets are the
-# lines `mirl lanes` writes, the one list of tuples mirl.target.lane holds. an
+# lines of test/lanes.sh, the one list of them. an
 # example is built for each by a copy whose target statement spells that target's
 # tuple and is its only change, so an example states nothing a lane target lays out
 # otherwise. for each example and each lane target the lane checks:
@@ -50,8 +50,8 @@ mkdir -p "$out" || exit 2
 # environment in mink's catalog, its baseline as masc's selection, its
 # convention and its object format, which masc reads together, mink links
 # for the architecture, system, environment and format and qemu-<arch> runs
-lanes=$("$mirl" lanes) || { echo "example.sh: mirl lanes refused" >&2; exit 2; }
-[ -n "$lanes" ] || { echo "example.sh: mirl lanes names no target" >&2; exit 2; }
+. "$here/lanes.sh"
+[ -n "$lanes" ] || { echo "example.sh: test/lanes.sh names no target" >&2; exit 2; }
 while read -r _ arch _ _ _ _ _; do
     command -v "qemu-$arch" >/dev/null || { echo "example.sh: qemu-$arch is not on the path" >&2; exit 2; }
 done <<<"$lanes"
@@ -102,11 +102,11 @@ example() {
     fi
     { printf '%s\n' "$line"; tail -n +2 "$src"; } >"$at.mirl"
     src=$at.mirl
-    if ! "$mirl" emit "$src" --body --checked -e object >"$at.o" 2>"$at.emit"; then
+    if ! "$mirl" emit "$src" --body --checked --emit object >"$at.o" 2>"$at.emit"; then
         fail "$target $name" "mirl emit refuses it: $(cat "$at.emit")"
         return
     fi
-    if ! "$mirl" emit "$src" --body --checked -e listing >"$at.s" 2>"$at.emit"; then
+    if ! "$mirl" emit "$src" --body --checked --emit listing >"$at.s" 2>"$at.emit"; then
         fail "$target $name" "mirl emit refuses its listing: $(cat "$at.emit")"
         return
     fi
