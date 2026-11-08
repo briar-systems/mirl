@@ -46,13 +46,13 @@ out=$repo/out/example/$1
 [ -e "$out" ] && { echo "example.sh: $out exists, name a fresh run" >&2; exit 2; }
 mkdir -p "$out" || exit 2
 
-# each lane target: its derived name, its architecture, system and
-# environment in mink's catalog, its baseline as masc's selection, its
-# convention and its object format, which masc reads together, mink links
-# for the architecture, system, environment and format and qemu-<arch> runs
+# each lane target: its spelling as -t takes it, its architecture, system and
+# environment in mink's catalog, its baseline as masc's selection and its
+# convention, which masc reads together, mink links for the target under the
+# environment and convention, and qemu-<arch> runs
 . "$here/lanes.sh"
 [ -n "$lanes" ] || { echo "example.sh: test/lanes.sh names no target" >&2; exit 2; }
-while read -r _ arch _ _ _ _ _; do
+while read -r _ arch _ _ _ _; do
     command -v "qemu-$arch" >/dev/null || { echo "example.sh: qemu-$arch is not on the path" >&2; exit 2; }
 done <<<"$lanes"
 
@@ -134,10 +134,10 @@ example() {
     echo "ok   $target $name"
 }
 
-while read -r -u 3 target arch system env isa abi format; do
+while read -r -u 3 target arch system env isa abi; do
     line="target { arch: \"$arch\", sys: \"$system\", env: \"$env\", abi: \"$abi\", isa: \"$isa\" };"
-    masc_as="--arch $arch --isa $isa --abi $abi --format $format"
-    link="--kind static --format $format --arch $arch --sys $system --env $env"
+    masc_as="-t $target --env $env --isa $isa --abi $abi"
+    link="--kind static -t $target --env $env --abi $abi"
     qemu=qemu-$arch
     dir=$out/$target
     mkdir -p "$dir" || exit 2
