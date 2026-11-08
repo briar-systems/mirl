@@ -20,7 +20,14 @@ mach build .
 The library artifact is `mirl`, whose entry is `src/lib/mirl.mach`, and the
 program is `cli`, whose entry is `src/bin/mirl.mach`. `mach build .` builds the
 library, and `mach build . -a cli` writes the program to
-`out/linux-x86_64/debug/bin/mirl` on a Linux x86_64 host.
+`out/linux-x86_64/debug/bin/mirl` on a Linux x86_64 host. `mirl help` lists the
+commands and `mirl help <command>` shows one's options. A target is named as
+`-t <sys>-<arch>`, as `mach info targets` lists it, with `--env`, `--abi`,
+`--isa`, `--ext` and `--code-model` narrowing it.
+
+`doc/ir/opcodes.md` is generated. After a change to the opcode table, rebuild
+it with `mach build . -a opcodes` and run the `mirl-opcodes` program it writes
+beside `mirl`, redirecting its output to `doc/ir/opcodes.md`.
 
 Dependencies are `[dep.<name>]` tables in `mach.toml`, and the exact commit of
 each is the committed gitlink under `dep/`. There is no lock file.

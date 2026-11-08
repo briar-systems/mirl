@@ -114,7 +114,7 @@ analyze() {
 
 for arch in x86_64 aarch64; do
     lane=$(lane_of "$arch")
-    [ -n "$lane" ] || { fail "$arch" "mirl lanes names no linux $arch target"; continue; }
+    [ -n "$lane" ] || { fail "$arch" "test/lanes.sh names no linux $arch target"; continue; }
     dir=$out/$arch
     mkdir -p "$dir" || exit 2
     start_s=$here/oracle-$arch.s

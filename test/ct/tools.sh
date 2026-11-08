@@ -48,13 +48,14 @@ masc=${MASC:-$(tool masc cli masc)} || exit 2
 mink=${MINK:-$(tool mink cli mink)} || exit 2
 
 # the linux target of architecture `$1` the suites build for, in the columns
-# `mirl lanes` writes: its name, architecture, system, environment, baseline,
-# convention and format. x86-64's is its lane target, and aarch64, which no
-# lane runs, takes its baseline armv8-a
+# of test/lanes.sh: its target, architecture, system, environment, baseline
+# and convention. x86-64's is its lane target, and aarch64's takes the
+# baseline armv8-a, not its lane's
+. "$repo/test/lanes.sh"
 lane_of() {
     case "$1" in
-        aarch64) echo "aarch64-linux-gnu-aapcs64-armv8-a aarch64 linux gnu armv8-a aapcs64 elf" ;;
-        *) "$mirl" lanes | awk -v arch="$1" '$2 == arch && $3 == "linux" { print; exit }' ;;
+        aarch64) echo "linux-aarch64 aarch64 linux gnu armv8-a aapcs64" ;;
+        *) awk -v arch="$1" '$2 == arch && $3 == "linux" { print; exit }' <<<"$lanes" ;;
     esac
 }
 
@@ -77,13 +78,13 @@ said() {
 program() {
     local src=$1 lane=$2 at=${1%.mirl}
     shift 2
-    local _ arch system env isa abi format
-    read -r _ arch system env isa abi format <<<"$lane"
-    if ! "$mirl" emit "$src" --body --checked -e object >"$at.o" 2>"$at.emit"; then
+    local target arch system env isa abi
+    read -r target arch system env isa abi <<<"$lane"
+    if ! "$mirl" emit "$src" --body --checked --emit object >"$at.o" 2>"$at.emit"; then
         echo "mirl emit refuses it: $(cat "$at.emit")"
         return 1
     fi
-    if ! "$mink" link "$at.o" "$@" -o "$at" --kind static --format "$format" --arch "$arch" --sys "$system" --env "$env" 2>"$at.link"; then
+    if ! "$mink" link "$at.o" "$@" -o "$at" --kind static -t "$target" --env "$env" --abi "$abi" 2>"$at.link"; then
         echo "the link is refused: $(cat "$at.link")"
         return 1
     fi
@@ -92,14 +93,14 @@ program() {
 
 # assemble the host source `$1` for the lane `$2` into `$3`
 assemble() {
-    local _ arch system env isa abi format
-    read -r _ arch system env isa abi format <<<"$2"
-    "$masc" assemble "$1" --arch "$arch" --isa "$isa" --abi "$abi" --format "$format" -o "$3"
+    local target arch system env isa abi
+    read -r target arch system env isa abi <<<"$2"
+    "$masc" assemble "$1" -t "$target" --env "$env" --isa "$isa" --abi "$abi" -o "$3"
 }
 
 # the target statement of the lane `$1`
 target_line() {
-    local _ arch system env isa abi format
-    read -r _ arch system env isa abi format <<<"$1"
+    local _ arch system env isa abi
+    read -r _ arch system env isa abi <<<"$1"
     printf 'target { arch: "%s", sys: "%s", env: "%s", abi: "%s", isa: "%s" };\n' "$arch" "$system" "$env" "$abi" "$isa"
 }

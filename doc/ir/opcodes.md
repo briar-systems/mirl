@@ -1,6 +1,6 @@
 # Opcode reference
 
-This file is generated from the rows of the opcode table and is not edited by hand. Each opcode's semantics are stated in [the specification](../ir.md).
+This file is generated from the rows of the opcode table and is not edited by hand. `mach build . -a opcodes` builds its generator, `src/bin/opcodes.mach`, which writes it to stdout. Each opcode's semantics are stated in [the specification](../ir.md).
 
 Operand names are the names the text form gives them. A subject such as `lhs` is the type of that operand, and a subject written as the type in an immediate is the type that immediate holds. In a lanewise opcode a class applies to the lanes of a vector operand. In an across opcode the operand must be a vector and a class applies to its lanes.
 
@@ -2247,6 +2247,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
   - traps when the address in `address` cannot be accessed
 - secrecy: declared
 - vector: none
+- made: by a pass of mirl only, so a module given to a schedule that holds it is refused
 
 ### `timing.read`
 

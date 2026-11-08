@@ -48,7 +48,7 @@ leak=${LEAK:-10}
 noise=${NOISE:-4.5}
 
 lane=$(lane_of "$host_arch")
-[ -n "$lane" ] || { echo "harness.sh: mirl lanes names no linux $host_arch target" >&2; exit 2; }
+[ -n "$lane" ] || { echo "harness.sh: test/lanes.sh names no linux $host_arch target" >&2; exit 2; }
 line=$(target_line "$lane")
 clock_s=$here/clock-$host_arch.s
 if ! assemble "$clock_s" "$lane" "$out/clock.o" 2>"$out/clock.as"; then
