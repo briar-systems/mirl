@@ -2,7 +2,7 @@
 
 A module and its text are interchangeable. The text form is the printed form of a module, written for people and for tests, and a front end may write it instead of calling the builder. It is spelled as mach is wherever the two mean the same thing: declarations, signatures, types, decorators, literals and comments are mach's, and only what mach has no word for is mirl's own.
 
-`mirl.ir.text.print(w, m)` writes a module to any `std.io.writer.Writer`, and `mirl.ir.text.same(a, b)` compares two modules for structural equality. `mirl.ir.text.parse.parse(a, text)` reads a text that begins with its version statement into a module, and `mirl.ir.text.parse.parse_body(a, text)` reads a text that has none, as the IR text files under `test/ir` do. `mirl.ir.text.parse.parse_into(m, a, text)` reads a text that has neither a version nor a target statement into a module that already holds other items, as legalisation delivers a helper written in the text form: its names resolve among the module's symbols and its own, and a name the module already holds is refused. A refusal names the line, the column and the reason, and `mirl.ir.text.describe` spells it.
+`mirl.ir.text.item.print(w, m)` writes a module to any `std.io.writer.Writer`, and `mirl.ir.text.equal.same(a, b)` compares two modules for structural equality. `mirl.ir.text.parse.parse(a, text)` reads a text that begins with its version statement into a module, and `mirl.ir.text.parse.parse_body(a, text)` reads a text that has none, as the IR text files under `test/ir` do. `mirl.ir.text.parse.parse_into(m, a, text)` reads a text that has neither a version nor a target statement into a module that already holds other items, as legalisation delivers a helper written in the text form: its names resolve among the module's symbols and its own, and a name the module already holds is refused. A refusal names the line, the column and the reason, and `mirl.ir.text.parse.refusal.describe` spells it.
 
 ## Version and stability
 
@@ -12,7 +12,7 @@ The text form has no stability or backward compatibility promise. A text written
 
 ## Comments
 
-A comment is no part of the module, so `parse` drops it and two texts that differ only in comments read as the same module. `mirl.ir.text.parse.parse_noted` keeps them in a `mirl.ir.text.Notes` beside the module, and `mirl.ir.text.print_noted` writes them back, which is how `mirl fmt` keeps a file's comments. Each comment is given to the statement it was written beside: a comment on a line of its own to the first statement after it, and one after code to the statement its line belongs to. A statement is an item, a typedef's member, a debug entry, a block's label, an instruction, a binding record, a closing brace or the version, target and language statements, and a comment after the last of them stays at the end of the text. The printer writes each comment on its own line before its statement, at the statement's indent, or after the statement on its line, so a comment moves with what it was written beside when the printer reorders items. A typedef printed on one line is spread over one line per member when a comment stands beside a member or its closing brace.
+A comment is no part of the module, so `parse` drops it and two texts that differ only in comments read as the same module. `mirl.ir.text.parse.parse_noted` keeps them in a `mirl.ir.text.notes.Notes` beside the module, and `mirl.ir.text.item.print_noted` writes them back, which is how `mirl fmt` keeps a file's comments. Each comment is given to the statement it was written beside: a comment on a line of its own to the first statement after it, and one after code to the statement its line belongs to. A statement is an item, a typedef's member, a debug entry, a block's label, an instruction, a binding record, a closing brace or the version, target and language statements, and a comment after the last of them stays at the end of the text. The printer writes each comment on its own line before its statement, at the statement's indent, or after the statement on its line, so a comment moves with what it was written beside when the printer reorders items. A typedef printed on one line is spread over one line per member when a comment stands beside a member or its closing brace.
 
 ## Names
 
@@ -89,7 +89,7 @@ pub fun main() i64 {
 
 ## The grammar
 
-The grammar below is the single statement of the text form. `mirl.ir.text.parse` reads every construct of it, and `mirl.ir.text.print` writes nothing outside it.
+The grammar below is the single statement of the text form. `mirl.ir.text.parse` reads every construct of it, and `mirl.ir.text.item.print` writes nothing outside it.
 
 ```text
 grammar

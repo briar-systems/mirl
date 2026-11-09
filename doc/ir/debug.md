@@ -66,7 +66,7 @@ A pass that builds a value at the head of a block moves the records standing the
 
 When what a record reads goes, through an erased instruction, a removed parameter or an erased block, the record becomes `unavailable` at its point. It is never deleted, since that would leave the variable's earlier value standing as a stale answer. A pass that removes a value it can still describe salvages the record first with `mirl.ir.body.rebind`, giving it another operand and an expression that recovers the variable from it. `mirl.ir.body.salvage` finds that expression from the step table: when an operand is the result of an instruction a step row names, with a constant operand where the row takes one, it reads the instruction's other operand through that step, and otherwise it answers `unavailable`. Dead code removal salvages every record that reads a value it removes this way, through as many removed instructions as the chain holds.
 
-Records are made through the builder, by `mirl.build.bind_at`, at the builder's cursor and with no sticky attribute. `copy_binding` copies one through a map.
+Records are made through the builder, by `mirl.build.builder.bind_at`, at the builder's cursor and with no sticky attribute. `copy_binding` copies one through a map.
 
 ### Composite bindings
 
@@ -106,7 +106,7 @@ Every step is one a DWARF location expression can state, so a producer encodes e
 
 ## Location kinds
 
-Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.Where`, named apart from the IR's source location `mirl.ir.debug.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
+Where a variable's value is, at a record's point or over a range of code below the IR, is one tag, `mirl.debug.location.Where`, named apart from the IR's source location `mirl.ir.debug.record.Location`, and every producer reads it. The tag lives above the IR, since its payloads are machine form and masc facts, and a record keeps its IR shape. `mirl.debug.location.of_record` gives the location a record reads: `ssa` for the value it reads, a constant's value included, since a family that keeps SSA ids names a constant by its own id, or `unavailable`. The salvage expression is read from the record beside it.
 
 | kind | where the value is |
 |---|---|
@@ -120,7 +120,7 @@ Where a variable's value is, at a record's point or over a range of code below t
 | `constant` | a constant of the module |
 | `pieces` | in parts, each a number of bits at its own location, in order from the variable's lowest bit. A piece is never pieces |
 
-Each producer is a row of `mirl.debug.rows` that states the kinds it writes as a set, and `mirl.debug.admit` refuses a location, or a piece of one, of a kind its producer does not state, naming that kind. `unavailable` is not a place but the absence of one, so every producer writes it, as optimised out, and no set states it.
+Each producer is a row of `mirl.debug.rows` that states the kinds it writes as a set, and `mirl.debug.producer.admit` refuses a location, or a piece of one, of a kind its producer does not state, naming that kind. `unavailable` is not a place but the absence of one, so every producer writes it, as optimised out, and no set states it.
 
 | producer | kinds |
 |---|---|

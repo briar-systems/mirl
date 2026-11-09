@@ -1,6 +1,6 @@
 # Instruction selection
 
-Selection turns an IR function into the machine form. A target supplies one table, `mirl.machine.select.Table`, and nothing else. The engine reads the table, the IR opcode rows and masc's rows, and names no target.
+Selection turns an IR function into the machine form. A target supplies one table, `mirl.machine.select.rule.Table`, and nothing else. The engine reads the table, the IR opcode rows and masc's rows, and names no target.
 
 ## The table
 
@@ -13,7 +13,7 @@ A table holds
 - `offsets`, the rules that add an address constant's offset past its symbol after a constant rule built the symbol's address.
 - `landing`, the instructions each block a jump table names begins with, such as AArch64's `bti j`. It is empty for a set whose indirect jumps can land anywhere.
 
-`mirl.machine.select.init` takes the record of the target's instruction set, a `mirl.machine.isa.Isa` the caller hands in with its table, masc's set and its loops, and the registers of the target's default convention row. It checks the table once against the schema and against the target it is made ready for. A table that breaks either is refused with a typed error and nothing is built.
+`mirl.machine.select.engine.init` takes the record of the target's instruction set, a `mirl.machine.isa.Isa` the caller hands in with its table, masc's set and its loops, and the registers of the target's default convention row. It checks the table once against the schema and against the target it is made ready for. A table that breaks either is refused with a typed error and nothing is built.
 
 ## Sources
 
@@ -24,7 +24,7 @@ An emitted operand comes from the pattern (a register an operand is in, a consta
 - `scratch` is a temporary of a class of the register file. `fresh` takes its class from a value's type, which a temporary inside a float constant's expansion cannot, since only an integer register can hold the bits.
 
 - `width` is the bits of a value's integer type and `register` the bits of the target's general register, each as an immediate. A rule passes them to a loop's parameters, so one loop serves every width the rule's guard admits.
-- `ordered` is the immediate a target's `Forms` give the ordering a node states, one immediate per ir ordering, as RISC-V's aq and rl bits. The ordering is the join of every ordering immediate the node's ir row holds, so a compare and exchange's success and failure are read as one, the weakest ordering at least as strong as both (`mirl.ir.opcode.joined`). A node whose row holds no ordering immediate is refused by the table check as `unordered`.
+- `ordered` is the immediate a target's `Forms` give the ordering a node states, one immediate per ir ordering, as RISC-V's aq and rl bits. The ordering is the join of every ordering immediate the node's ir row holds, so a compare and exchange's success and failure are read as one, the weakest ordering at least as strong as both (`mirl.ir.opcode.rule.joined`). A node whose row holds no ordering immediate is refused by the table check as `unordered`.
 - `tied` is one register an instruction both reads and writes, the value of an operand in and a result of the root out, at a row position masc states read and written, as `amocas` reads the value expected and gives the value held. The allocator gives both halves one location and copies the value in first when it is read again later.
 
 An emitted instruction is a row, a pseudo or a target's loop (see [loops](loop.md)). A rule whose expansion holds a loop is admitted only when the selection admits every row of the loop's steps, and the table check refuses a loop that breaks the loop schema, one the set's loops do not hold, and, as `breached`, one whose body breaks its constraint.
