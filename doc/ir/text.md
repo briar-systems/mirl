@@ -181,17 +181,23 @@ types
   results     = param | "(" param { "," param } ")" ;
   handle      = "handle" "[" name { "," ( uint | type ) } "]" ;  ; the target's kind, then its operands
 
-  typedef     = ( "rec" | "uni" ) ident "{" { member } "}" ;
+  typedef     = ( "rec" | "uni" ) ident [ "packed" ] [ "align" uint ] "{" { member } "}" ;
   member      = ident ":" type [ "at" uint ] ";" ;
 
   f16, f32 and f64 are the binary16, binary32 and binary64 number formats,
   and any other format is spelled by its row's name. a structure and a
   union are declared once by a typedef and named by it everywhere else. a
   structure states every member's byte offset with `at`, or none and leaves
-  them to the data layout, and a union states none. two typedefs of one
+  them to the data layout, and a union states none. `packed` places a
+  structure's members with no padding and aligns either aggregate at one,
+  and `align` states a power of two its alignment is raised to, so an opaque
+  type of a size and an alignment is a `rec` of one byte array at that
+  alignment. a text that states neither reads and prints as before. two typedefs of one
   structure are refused, since a type is its structure. an array with
   `stride` states the bytes from one element to the next. a signature's
-  bracketed name is its calling convention, none when left out, and it has
+  bracketed name is its calling convention, mink's psabi row of the
+  target's architecture by its name, or that, a dot and a bridge role's word
+  (`arm64ec.x64`), refused when it names no such row, none when left out, and it has
   no results when it states none. a parameter or result may state how an
   integer is extended, `sext` or `zext`, and it is part of the type:
   `fun(i8 sext)` and `fun(i8)` are different types. a last `...` among the

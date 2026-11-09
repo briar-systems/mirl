@@ -20,8 +20,12 @@ use std.collections.map;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
+use arches: mink.catalog.arch;
+
 use mirl.base.slice;
 use mirl.base.slice.mix;
+use mirl.ir.type.calling;
+use mirl.ir.type.calling.Calling;
 use mirl.ir.type.format.Format;
 use mirl.ir.type.format.Row;
 use mirl.ir.type.format.row;
@@ -97,16 +101,26 @@ pub rec Array {
 # members: the member types in order
 # offsets: the byte offset of each member, one to one with members, or none
 #          when the target's data layout places them
+# align:   the alignment it states, a power of two its own alignment is
+#          raised to when that is less, none for none
+# packed:  its members are placed with no padding, each at an alignment of
+#          one, and it is aligned at one unless it states an alignment
 pub rec Structure {
     members: Slice[Type];
     offsets: opt[Slice[u64]];
+    align:   opt[u64];
+    packed:  bool;
 }
 
 # storage whose members overlap
 # ---
 # members: the member types in order
+# align:   the alignment it states, as a structure's
+# packed:  it is aligned at one unless it states an alignment
 pub rec Union {
     members: Slice[Type];
+    align:   opt[u64];
+    packed:  bool;
 }
 
 # how a narrow integer parameter or result is extended to the width a
@@ -128,15 +142,14 @@ pub tag Extension: u8 {
 # extension anywhere, or one to one with its types, and one read back is
 # always one to one. the convention a signature names is part of it too:
 # a call through it and a function of it are made under that row of the
-# target's conventions, and an empty name is the target's default row.
+# target's conventions, and none names the target's default row.
 # ---
 # params:     the parameter types in order
 # results:    the result types in order
 # param_ext:  the extension of each parameter, one to one with params, or empty
 # result_ext: the extension of each result, one to one with results, or empty
-# convention: the name of the convention row it is called under, empty for
-#             the target's default, compared by its bytes and never read by
-#             the table
+# convention: the row it is called under, mink's psabi row in a role, none
+#             for the target's default, never read by the table
 # variadic:   it takes unnamed arguments after its parameters, as a C function
 #             declared with `...` does
 pub rec Function {
@@ -144,7 +157,7 @@ pub rec Function {
     results:    Slice[Type];
     param_ext:  Slice[Extension];
     result_ext: Slice[Extension];
-    convention: View;
+    convention: opt[Calling];
     variadic:   bool;
 }
 
@@ -207,6 +220,7 @@ pub tag Error: u8 {
     format: Format;
     lanes;
     offsets;
+    align:   u64;
     unknown: Type;
     kind:    Kind;
     name;
@@ -349,7 +363,7 @@ pub fun same(a: Type, b: Type) bool {
 
 # a signature that states no extension
 pub fun plain(params: Slice[Type], results: Slice[Type]) Function {
-    ret Function{params: params, results: results, param_ext: Slice[Extension]{data: nil, size: 0}, result_ext: Slice[Extension]{data: nil, size: 0}, convention: View{data: nil, len: 0}, variadic: false};
+    ret Function{params: params, results: results, param_ext: Slice[Extension]{data: nil, size: 0}, result_ext: Slice[Extension]{data: nil, size: 0}, convention: calling.DEFAULT, variadic: false};
 }
 
 # the extension at a position of a list, none past a list that states none
@@ -722,9 +736,13 @@ fun check(t: *Table, s: *Shape) err[Error] {
         if (sel s.structure.offsets.some && s.structure.offsets.some.size != s.structure.members.size) {
             ret err[Error].err{Error.offsets{}};
         }
+        val a: err[Error] = stated_align(s.structure.align);
+        if (sel a.err) { ret a; }
         ret known(t, s.structure.members);
     }
     or (sel s.union) {
+        val a: err[Error] = stated_align(s.union.align);
+        if (sel a.err) { ret a; }
         ret known(t, s.union.members);
     }
     or (sel s.function) {
@@ -748,6 +766,21 @@ fun check(t: *Table, s: *Shape) err[Error] {
         }
     }
     ret err[Error].ok{};
+}
+
+# a stated alignment is a power of two
+fun stated_align(align: opt[u64]) err[Error] {
+    if (sel align.none) { ret err[Error].ok{}; }
+    val n: u64 = align.some;
+    if (n == 0 || (n & (n - 1)) != 0) { ret err[Error].err{Error.align{n}}; }
+    ret err[Error].ok{};
+}
+
+fun mix_traits(h: u64, align: opt[u64], packed: bool) u64 {
+    var acc: u64 = h;
+    if (sel align.some) { acc = mix(mix(acc, 2), align.some); }
+    if (packed)         { acc = mix(acc, 3); }
+    ret acc;
 }
 
 fun mix_types(h: u64, list: Slice[Type]) u64 {
@@ -792,13 +825,14 @@ fun hash(s: *Shape) u64 {
                 i = i + 1;
             }
         }
+        h = mix_traits(h, s.structure.align, s.structure.packed);
     }
-    or (sel s.union) { h = mix_types(mix(h, 7), s.union.members); }
+    or (sel s.union) { h = mix_traits(mix_types(mix(h, 7), s.union.members), s.union.align, s.union.packed); }
     or (sel s.function) {
         h = mix_types(mix_types(mix(h, 8), s.function.params), s.function.results);
         h = mix_extensions(mix(h, 1), s.function.params, s.function.param_ext);
         h = mix_extensions(mix(h, 2), s.function.results, s.function.result_ext);
-        h = slice.hash_view(mix(mix(h, 3), s.function.convention.len::u64), s.function.convention);
+        h = calling.hash(mix(h, 3), s.function.convention);
         if (s.function.variadic) { h = mix(h, 4); }
     }
     or (sel s.handle) {
@@ -813,6 +847,41 @@ fun hash(s: *Shape) u64 {
         }
     }
     ret h;
+}
+
+# restate the convention of every signature on another architecture, by its
+# row's name and role, as a module given another target does. every row is
+# restated or none is
+# ---
+# t:    the table
+# arch: the architecture, none for one mink's catalog has no row of
+# ret:  none when every row is restated, else the first row the
+#       architecture has none of, leaving the table as it was
+pub fun restate(t: *Table, arch: opt[*arches.Arch]) opt[Calling] {
+    var i: usize = 0;
+    for (i < t.nodes.len) {
+        val s: *Shape = ?t.nodes.data[i].shape;
+        if (sel s.function) {
+            val k: opt[Calling] = s.function.convention;
+            if (sel k.some) {
+                if (sel arch.none) { ret k; }
+                val moved: opt[Calling] = calling.restate(k.some, arch.some);
+                if (sel moved.none) { ret k; }
+            }
+        }
+        i = i + 1;
+    }
+    if (sel arch.none) { ret opt[Calling].none{}; }
+    i = 0;
+    for (i < t.nodes.len) {
+        val s: *Shape = ?t.nodes.data[i].shape;
+        if (sel s.function) {
+            val k: opt[Calling] = s.function.convention;
+            if (sel k.some) { s.function.convention = calling.restate(k.some, arch.some); }
+        }
+        i = i + 1;
+    }
+    ret opt[Calling].none{};
 }
 
 # whether two lists hold the same types in the same order
@@ -831,6 +900,11 @@ pub fun same_stride(a: opt[u64], b: opt[u64]) bool {
     if (sel a.none) { ret sel b.none; }
     if (sel b.none) { ret false; }
     ret a.some == b.some;
+}
+
+# whether two aggregates state the same alignment, or both state none
+pub fun same_align(a: opt[u64], b: opt[u64]) bool {
+    ret same_stride(a, b);
 }
 
 fun same_offsets(a: opt[Slice[u64]], b: opt[Slice[u64]]) bool {
@@ -878,18 +952,19 @@ fun equal(a: *Shape, b: *Shape) bool {
     }
     if (sel a.structure) {
         if (!(sel b.structure)) { ret false; }
-        ret same_list(a.structure.members, b.structure.members) && same_offsets(a.structure.offsets, b.structure.offsets);
+        ret same_list(a.structure.members, b.structure.members) && same_offsets(a.structure.offsets, b.structure.offsets)
+            && same_align(a.structure.align, b.structure.align) && a.structure.packed == b.structure.packed;
     }
     if (sel a.union) {
         if (!(sel b.union)) { ret false; }
-        ret same_list(a.union.members, b.union.members);
+        ret same_list(a.union.members, b.union.members) && same_align(a.union.align, b.union.align) && a.union.packed == b.union.packed;
     }
     if (sel a.function) {
         if (!(sel b.function))                                                                                      { ret false; }
         if (!same_list(a.function.params, b.function.params) || !same_list(a.function.results, b.function.results)) { ret false; }
         ret same_extensions(a.function.params, a.function.param_ext, b.function.param_ext)
             && same_extensions(a.function.results, a.function.result_ext, b.function.result_ext)
-            && slice.same_view(a.function.convention, b.function.convention)
+            && calling.same(a.function.convention, b.function.convention)
             && a.function.variadic == b.function.variadic;
     }
     if (sel a.handle) {
@@ -952,12 +1027,12 @@ fun own(a: *allocator.Allocator, s: Shape) res[Shape, allocator.Error] {
             }
             offs = opt[Slice[u64]].some{o.ok};
         }
-        ret res[Shape, allocator.Error].ok{Shape.structure{Structure{members: m.ok, offsets: offs}}};
+        ret res[Shape, allocator.Error].ok{Shape.structure{Structure{members: m.ok, offsets: offs, align: s.structure.align, packed: s.structure.packed}}};
     }
     if (sel s.union) {
         val m: res[Slice[Type], allocator.Error] = slice.copy[Type](a, s.union.members);
         if (sel m.err) { ret res[Shape, allocator.Error].err{m.err}; }
-        ret res[Shape, allocator.Error].ok{Shape.union{Union{members: m.ok}}};
+        ret res[Shape, allocator.Error].ok{Shape.union{Union{members: m.ok, align: s.union.align, packed: s.union.packed}}};
     }
     if (sel s.function) {
         val p: res[Slice[Type], allocator.Error] = slice.copy[Type](a, s.function.params);
@@ -980,15 +1055,7 @@ fun own(a: *allocator.Allocator, s: Shape) res[Shape, allocator.Error] {
             slice.release[Extension](a, pe.ok);
             ret res[Shape, allocator.Error].err{re.err};
         }
-        val c: res[View, allocator.Error] = slice.copy_view(a, s.function.convention);
-        if (sel c.err) {
-            slice.release[Type](a, p.ok);
-            slice.release[Type](a, r.ok);
-            slice.release[Extension](a, pe.ok);
-            slice.release[Extension](a, re.ok);
-            ret res[Shape, allocator.Error].err{c.err};
-        }
-        ret res[Shape, allocator.Error].ok{Shape.function{Function{params: p.ok, results: r.ok, param_ext: pe.ok, result_ext: re.ok, convention: c.ok, variadic: s.function.variadic}}};
+        ret res[Shape, allocator.Error].ok{Shape.function{Function{params: p.ok, results: r.ok, param_ext: pe.ok, result_ext: re.ok, convention: s.function.convention, variadic: s.function.variadic}}};
     }
     if (sel s.handle) {
         val n: res[View, allocator.Error] = slice.copy_view(a, s.handle.kind);
@@ -1021,9 +1088,7 @@ fun release_shape(a: *allocator.Allocator, s: *Shape) err[allocator.Error] {
         if (sel r.err) { ret r; }
         val pe: err[allocator.Error] = slice.release[Extension](a, s.function.param_ext);
         if (sel pe.err) { ret pe; }
-        val re: err[allocator.Error] = slice.release[Extension](a, s.function.result_ext);
-        if (sel re.err) { ret re; }
-        ret slice.release_view(a, s.function.convention);
+        ret slice.release[Extension](a, s.function.result_ext);
     }
     if (sel s.handle) {
         val k: err[allocator.Error] = slice.release_view(a, s.handle.kind);
