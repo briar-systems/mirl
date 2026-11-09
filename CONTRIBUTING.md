@@ -54,8 +54,8 @@ timing-leak harness, run locally and never in CI. CI builds every target.
 
 IR text inputs live in `test/ir/` as `*.mirl` files. Each one is valid IR,
 verifier-clean. A file starts with its `target` statement and has no version statement,
-which the commands read with `--body`, since the reader puts the library's own
-before it and no release touches the files.
+so no release touches the files. The commands read only whole texts, so a harness
+puts the library's version statement, `mirl "<mirl --version>";`, before a file it reads.
 
 
 ## Branching

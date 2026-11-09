@@ -17,10 +17,10 @@
 # written for its architecture, test/example/exit.s, RISC-V's, otherwise. the lane targets are the
 # lines of test/lanes.sh, the one list of them. an
 # example is built for each by a copy whose target statement spells that target's
-# tuple and is its only change, so an example states nothing a lane target lays out
+# tuple, under the library's version statement, so an example states nothing a lane target lays out
 # otherwise. for each example and each lane target the lane checks:
-#   - mirl emit writes its object
-#   - mirl emit writes its listing, which masc assembles again. a byte
+#   - mirl compile writes its object
+#   - mirl compile writes its listing, which masc assembles again. a byte
 #     difference from mirl's object shows masc disassemble of both, diffed,
 #     for reading only
 #   - mink link links the object and the exit object into a static linux gnu
@@ -41,6 +41,8 @@ case "$(uname -s)/$(uname -m)" in
 esac
 mirl=$repo/out/$host_dir/debug/bin/mirl
 [ -x "$mirl" ] || { echo "example.sh: $mirl is not built, run: mach build . -a cli" >&2; exit 2; }
+# the examples are bodies, and each copy states the library's own version
+version=$("$mirl" --version)
 
 out=$repo/out/example/$1
 [ -e "$out" ] && { echo "example.sh: $out exists, name a fresh run" >&2; exit 2; }
@@ -100,14 +102,14 @@ example() {
         fail "$target $name" "states no exit status"
         return
     fi
-    { printf '%s\n' "$line"; tail -n +2 "$src"; } >"$at.mirl"
+    { printf 'mirl "%s";\n%s\n' "$version" "$line"; tail -n +2 "$src"; } >"$at.mirl"
     src=$at.mirl
-    if ! "$mirl" emit "$src" --body --checked --emit object >"$at.o" 2>"$at.emit"; then
-        fail "$target $name" "mirl emit refuses it: $(cat "$at.emit")"
+    if ! "$mirl" compile "$src" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
+        fail "$target $name" "mirl compile refuses it: $(cat "$at.emit")"
         return
     fi
-    if ! "$mirl" emit "$src" --body --checked --emit listing >"$at.s" 2>"$at.emit"; then
-        fail "$target $name" "mirl emit refuses its listing: $(cat "$at.emit")"
+    if ! "$mirl" compile "$src" --verify --emit asm -o "$at.s" 2>"$at.emit"; then
+        fail "$target $name" "mirl compile refuses its listing: $(cat "$at.emit")"
         return
     fi
     if ! "$masc" assemble "$at.s" $masc_as -o "$at.rt.o" 2>"$at.as"; then

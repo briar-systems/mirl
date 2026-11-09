@@ -80,8 +80,10 @@ program() {
     shift 2
     local target arch system env isa abi
     read -r target arch system env isa abi <<<"$lane"
-    if ! "$mirl" emit "$src" --body --checked --emit object >"$at.o" 2>"$at.emit"; then
-        echo "mirl emit refuses it: $(cat "$at.emit")"
+    # the case is a body, so it is read under the library's own version statement
+    { printf 'mirl "%s";\n' "$("$mirl" --version)"; cat "$src"; } >"$at.text.mirl"
+    if ! "$mirl" compile "$at.text.mirl" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
+        echo "mirl compile refuses it: $(cat "$at.emit")"
         return 1
     fi
     if ! "$mink" link "$at.o" "$@" -o "$at" --kind static -t "$target" --env "$env" --abi "$abi" 2>"$at.link"; then
