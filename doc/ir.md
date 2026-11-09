@@ -64,6 +64,8 @@ A structure is an ordered list of member types. It has no layout of its own. The
 
 A union is a list of member types that overlap in storage. Every member is at offset 0.
 
+A structure or union may state two facts of its own layout, for a front end whose language has them. **Packed** places a structure's members with no padding, each at an alignment of one, and aligns a structure or union at one, so a stated offset need not keep a member's alignment. Only the `c` rules lay a packed structure out. A stated **alignment**, a power of two, raises the aggregate's alignment to it where its own is less, and its size is rounded up to the result. An opaque type of a size and an alignment is a structure of one byte array of that size at that alignment. So the target's data layout answers every size, alignment and offset a front end asks of its own types, which it interns in a type table of its own before any module exists (see [ir/target.md](ir/target.md)).
+
 ### 2.6 Function types
 
 A function type has a list of parameter types and a list of result types. A function may have any number of results. A pointer to a function is an ordinary pointer, and a call states the signature it calls through.
@@ -344,7 +346,7 @@ The rules are a table. Each is a row with an id, a short name and a check over t
 |---|---|---|
 | 0 | `target` | the module's tuple is its target's, and the target declares every fact the pipeline reads |
 | 1 | `width` | every integer type in the type table has a legal width, which is 1 or a power of two from 8 to 512 |
-| 2 | `layout` | every structure that states its offsets and every array that states its stride states ones the rules of some address space of the target keep: offsets none overlapping and each a multiple of its member's alignment, and a stride no shorter than the element and a multiple of the array's alignment. A type names no space, so it is not held to the space of each use |
+| 2 | `layout` | every type that states its own layout, a structure's offsets, an array's stride or an aggregate's packing or alignment, states one the rules of some address space of the target keep: offsets none overlapping and each a multiple of its member's alignment unless the structure is packed, and a stride no shorter than the element and a multiple of the array's alignment. A type names no space, so it is not held to the space of each use |
 | 3 | `constant` | every constant is of its type, an aggregate has one element per member, an address names a function or global of the module and a specialization constant's default is an integer or float of its type |
 | 4 | `initial` | every global's initial value is a constant of the global's type |
 | 5 | `attribute` | every attribute on a function or global is one the schema of the target's family defines: of that family, of a name the schema has an entry for, attached to the kind of symbol the entry attaches to, with a datum of the entry's kind, and keeping the entry's rule, which reads the datum beside the symbol's other attributes and the target's declarations. A target that accepts no attribute refuses every one |
