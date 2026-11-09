@@ -8,7 +8,7 @@ expand(a, ?framed)                                # err[expand.Error]
 
 ## A loop's row
 
-A target states each loop as data, a `mirl.machine.loop.Loop`:
+A target states each loop as data, a `mirl.machine.loop.row.Loop`:
 
 - `name`, its spelling in the text form, unique among the set's loops,
 - `constraint`, the shape its body keeps, one its set states (see below),

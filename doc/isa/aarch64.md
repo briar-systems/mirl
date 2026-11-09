@@ -1,6 +1,6 @@
 # AArch64 selection rules
 
-`mirl.target.register.aarch64.isa.TABLE` is the selection table for AArch64 under AAPCS64, darwinpcs, aapcs64win and arm64ec (see [selection](../machine/select.md)). It is static data, and names rows of masc's AArch64 catalog by the handles masc publishes for them (`gen_row.ADD_64_ADDSUB_SHIFT`), so mirl never encodes and never invents an instruction. Its record in `mirl.target.register.isa` joins it, the frame code, the moves and the loops to masc's set.
+`mirl.target.register.aarch64.rules.TABLE` is the selection table for AArch64 under AAPCS64, darwinpcs, aapcs64win and arm64ec (see [selection](../machine/select.md)). It is static data, and names rows of masc's AArch64 catalog by the handles masc publishes for them (`gen_row.ADD_64_ADDSUB_SHIFT`), so mirl never encodes and never invents an instruction. Its record in `mirl.target.register.isa` joins it, the frame code, the moves and the loops to masc's set.
 
 ## What it reads
 

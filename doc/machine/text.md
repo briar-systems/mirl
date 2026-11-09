@@ -8,7 +8,7 @@ mirl.machine.text.print(w, m, isas, items)    # err[Error]
 
 What the machine form names itself takes `%`, which no row's name starts with: a virtual register is `%` and its number, a frame slot `%s` and its number and a block `%b` and its number. A tuple, one register of a pair class as RISC-V's amocas.q and rv32 Zdinx operands take, is spelled by its row's name, quoted as `"x12:x13"`, or as `"vg2.v4"` for a RISC-V vector group, since the assembly syntax spells it by its first member alone. A virtual register of a group is declared of its class, `var %0: vg2;`, and `%0[1]` names its second member, which is the high half of a RISC-V pair, so a pair is made from its words and taken apart into them.
 
-The grammar is stated once, in `src/machine/text.mach`.
+The grammar is stated once, in `src/machine/text/print.mach`.
 
 ## Placement
 
