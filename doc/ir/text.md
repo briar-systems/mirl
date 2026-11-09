@@ -195,7 +195,9 @@ types
   alignment. a text that states neither reads and prints as before. two typedefs of one
   structure are refused, since a type is its structure. an array with
   `stride` states the bytes from one element to the next. a signature's
-  bracketed name is its calling convention, none when left out, and it has
+  bracketed name is its calling convention, mink's psabi row of the
+  target's architecture by its name, or that, a dot and a bridge role's word
+  (`arm64ec.x64`), refused when it names no such row, none when left out, and it has
   no results when it states none. a parameter or result may state how an
   integer is extended, `sext` or `zext`, and it is part of the type:
   `fun(i8 sext)` and `fun(i8)` are different types. a last `...` among the
