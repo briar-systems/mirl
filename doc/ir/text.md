@@ -208,9 +208,10 @@ types
 
 literals
 
-  literal     = number | "-" number | "zero" | aggregate | address | spec ;
+  literal     = number | "-" number | "zero" | aggregate | bytes | address | spec ;
   number      = uint ;
   aggregate   = [ type ] "{" [ literal { "," literal } ] "}" ;
+  bytes       = [ type ] string ;
   address     = "?" name [ ( "+" | "-" ) uint ] ;
   spec        = "spec" "(" uint "," [ "-" ] uint ")" ;
   typed       = literal [ "::" type ] ;

@@ -99,6 +99,7 @@ A **constant** is typed and owned by its module. It is one of
 - a float, given as the bits of its encoding in the same way,
 - `zero`, every bit of a type zero,
 - an aggregate of constants, one per member, element or lane, in order,
+- a run of bytes, an array of 8-bit integers stated whole, which is what a string or a table's image is without a constant per byte,
 - an address, which is a function or global plus a signed byte offset, of a pointer type,
 - a specialization constant, an id and a default of an integer or float type, whose value the consumer of the module sets before the code runs.
 
