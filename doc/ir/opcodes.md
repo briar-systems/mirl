@@ -154,6 +154,8 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `timing.read` | none | `type` a type, `state` a state value | none | propagates |
 | `timing.set` | none | `state` a state value | none | propagates |
 | `timing.restore` | `saved` | `state` a state value | none | propagates |
+| `arg.incoming` | none | `type` a type, `pointer` a type, `places` a place list | none | propagates |
+| `arg.outgoing` | none | `type` a type, `pointer` a type, `places` a place list | none | propagates |
 
 ### `add`
 
@@ -2284,6 +2286,34 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
   - `saved` is an integer
 - results: none
 - effects: reads memory, writes memory
+- secrecy: propagates
+- vector: none
+- made: by a pass of mirl only, so a module given to a schedule that holds it is refused
+
+### `arg.incoming`
+
+- operands: none
+- immediates: `type` a type, `pointer` a type, `places` a place list
+- targets: 0
+- typing:
+  - the type in `pointer` is a pointer
+- results:
+  - one result of the type in `pointer`
+- effects: none
+- secrecy: propagates
+- vector: none
+- made: by a pass of mirl only, so a module given to a schedule that holds it is refused
+
+### `arg.outgoing`
+
+- operands: none
+- immediates: `type` a type, `pointer` a type, `places` a place list
+- targets: 0
+- typing:
+  - the type in `pointer` is a pointer
+- results:
+  - one result of the type in `pointer`
+- effects: none
 - secrecy: propagates
 - vector: none
 - made: by a pass of mirl only, so a module given to a schedule that holds it is refused

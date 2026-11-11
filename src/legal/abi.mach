@@ -12,7 +12,12 @@
 #
 # memory carries what is not a scalar. a by-value aggregate is read piece by
 # piece from the memory it was loaded from, at the point it was loaded, or
-# from a stack slot it is stored to before the call. a value passed by
+# from a stack slot it is stored to before the call. one that lies whole in
+# the argument area, every piece a stack place one after the other, travels as
+# one block instead where the target's bulk copy is native: the caller copies
+# it to the area once, at the address `arg.outgoing` gives, and the callee
+# reads it where it lies, at the address `arg.incoming` gives, so it has no
+# piece in the signature and no register carries its words. a value passed by
 # reference is copied to a stack slot the caller owns, and the piece is its
 # address. a result returned by reference lands in a slot whose address the
 # caller passes, and the callee rebuilds an incoming aggregate in a slot of
@@ -136,6 +141,7 @@ use mirl.ir.place.Named;
 use mirl.ir.place.Place;
 use mirl.ir.place.Placed;
 use mirl.ir.place.Scale;
+use mirl.ir.place.stacked;
 use mirl.ir.type.calling.Calling;
 use type_format: mirl.ir.type.format;
 use mirl.ir.type.table;
@@ -690,6 +696,86 @@ fun note_unused(w: *Work, i: Instruction) err[refusal.Error] {
     ret err[refusal.Error].ok{};
 }
 
+# where a value by value lies whole in the argument area: an aggregate every
+# piece of which is a fixed stack place, one after the other from its first
+# byte to its last, so its bytes there are its memory image. such a value
+# travels as one block, copied to the area once by the caller and read in
+# place by the callee, with no piece in the signature. it does so only where
+# the target's bulk copy is native, since a helper's call between the copy and
+# the call it serves could write the area
+# ---
+# ret: the offset of its first byte in the area, or none when it travels in
+#      pieces
+fun laid(w: *Work, ty: Type, passed: Passed, asg: *Assignment) res[opt[u64], refusal.Error] {
+    val none: res[opt[u64], refusal.Error] = res[opt[u64], refusal.Error].ok{opt[u64].none{}};
+    if (!(sel passed.passing.value) || passed.count < 2) { ret none; }
+    if (!(sel w.t.caps.bulk.copy.native))                { ret none; }
+    val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel s.err)        { ret res[opt[u64], refusal.Error].err{s.err}; }
+    if (!aggregate(s.ok)) { ret none; }
+    val size: res[u64, refusal.Error] = size_of(w, ty);
+    if (sel size.err) { ret res[opt[u64], refusal.Error].err{size.err}; }
+    val head: Place = piece.piece(asg, passed.first).place;
+    if (!(sel head.stack)) { ret none; }
+    val base: u64 = head.stack.offset;
+    var done: u64 = 0;
+    var n:    u32 = 0;
+    for (n < passed.count) {
+        val p:     Piece = piece.piece(asg, passed.first + n);
+        val place: Place = p.place;
+        if (!(sel place.stack))                                      { ret none; }
+        if (!(sel p.scale.fixed) || !(sel place.stack.scale.fixed))  { ret none; }
+        if (p.offset != done || place.stack.offset != base + done)   { ret none; }
+        done = done + p.size;
+        n    = n + 1;
+    }
+    if (done != size.ok) { ret none; }
+    ret res[opt[u64], refusal.Error].ok{opt[u64].some{base}};
+}
+
+# the address of a value laid whole in the argument area at an offset, the
+# function's own incoming one or the outgoing one of the call the builder
+# stands ahead of
+fun area(w: *Work, bld: *Builder, ty: Type, offset: u64, incoming: bool) Value {
+    var places: [1]Placed    = [1]Placed{Placed{place: stacked(offset), scale: Scale.fixed{}, fill: Fill.exact{}}};
+    var imm:    [3]Immediate = [3]Immediate{Immediate.ty{ty}, Immediate.ty{w.slot}, Immediate.places{Slice[Placed]{data: ?places[0], size: 1}}};
+    var code:   Opcode       = opcode_table.ARG_OUTGOING;
+    if (incoming) { code = opcode_table.ARG_INCOMING; }
+    ret make(bld, code, Slice[Value]{data: nil, size: 0}, Slice[Immediate]{data: ?imm[0], size: 3});
+}
+
+# whether an instruction writes the outgoing argument area alone: a copy or a
+# store whose address is the area's
+fun fills_area(w: *Work, i: Instruction) bool {
+    val b: *Body            = body_of(w);
+    val d: *InstructionData = ?b.instructions.data[i.index];
+    if (d.opcode.index != opcode_table.MEM_COPY.index && d.opcode.index != opcode_table.STORE.index) { ret false; }
+    if (d.operands.len == 0)                                                                         { ret false; }
+    val made: opt[Instruction] = made_by(w, root_of(w, d.operands.data[0]), opcode_table.ARG_OUTGOING);
+    ret sel made.some;
+}
+
+# whether the memory a load read still holds what it read at a later
+# instruction of its block: nothing between the two writes memory but into
+# the outgoing argument area, which no load the pass reads in place addresses
+fun stands_until(w: *Work, l: Instruction, at: Instruction) bool {
+    val b: *Body = body_of(w);
+    val k: Block = block_of(b, l);
+    if (block_of(b, at).index != k.index) { ret false; }
+    val from: u32 = position(b, k, l);
+    val to:   u32 = position(b, k, at);
+    if (to <= from) { ret false; }
+    var p: u32 = from + 1;
+    for (p < to) {
+        val i:   Instruction          = b.blocks.data[k.index].instructions.data[p];
+        val row: opt[*opcode_row.Row] = opcode_table.at(b.instructions.data[i.index].opcode);
+        if (sel row.none)                                      { ret false; }
+        if (row.some.effects.writes && !fills_area(w, i))      { ret false; }
+        p = p + 1;
+    }
+    ret true;
+}
+
 # a value about to travel and what it travels from
 # ---
 # value:  the value
@@ -753,6 +839,50 @@ fun send(w: *Work, bld: *Builder, at: Instruction, side: Side, x: Sent, passed: 
         ret push(w, bld, out, places, made.ok, piece.piece(asg, passed.first));
     }
     if (passed.count == 0) { ret err[refusal.Error].ok{}; }
+    if (sel side.argument) {
+        val block: res[opt[u64], refusal.Error] = laid(w, x.ty, passed, asg);
+        if (sel block.err) { ret err[refusal.Error].err{block.err}; }
+        if (sel block.ok.some) {
+            val size: res[u64, refusal.Error] = size_of(w, x.ty);
+            if (sel size.err) { ret err[refusal.Error].err{size.err}; }
+            val al: res[u64, refusal.Error] = align_of(w, x.ty);
+            if (sel al.err) { ret err[refusal.Error].err{al.err}; }
+            var source: Value            = x.value;
+            var placed: bool             = false;
+            val from:   opt[Instruction] = loaded(w, x.value);
+            if (sel from.some) {
+                if (stands_until(w, from.some, at)) {
+                    source = body_of(w).instructions.data[from.some.index].operands.data[0];
+                    placed = true;
+                    val noted: err[refusal.Error] = note_unused(w, from.some);
+                    if (sel noted.err) { ret noted; }
+                }
+            }
+            if (!placed) {
+                val home: res[Value, refusal.Error] = slot(w, x.ty, al.ok);
+                if (sel home.err) { ret err[refusal.Error].err{home.err}; }
+                val read: opt[Instruction] = copied_from(w, x, at);
+                if (sel read.some) {
+                    val b:    *Body   = body_of(w);
+                    val k:    Block   = block_of(b, read.some);
+                    var near: Builder = builder.init(w.m);
+                    builder.enter(?near, w.f);
+                    builder.derive(?near, read.some);
+                    builder.secret(?near, x.secret);
+                    builder.at(?near, k, position(b, k, read.some) + 1);
+                    val copied: err[refusal.Error] = copy(w, ?near, b.instructions.data[read.some.index].operands.data[0], home.ok, size.ok, al.ok);
+                    if (sel copied.err) { ret copied; }
+                    val done: err[refusal.Error] = built(?near);
+                    if (sel done.err) { ret done; }
+                    val noted: err[refusal.Error] = note_unused(w, read.some);
+                    if (sel noted.err) { ret noted; }
+                }
+                or { store(bld, home.ok, x.value, al.ok); }
+                source = home.ok;
+            }
+            ret copy(w, bld, source, area(w, bld, x.ty, block.ok.some, false), size.ok, al.ok);
+        }
+    }
     val memory: res[bool, refusal.Error] = through_memory(w, ?x.shape, passed.count);
     if (sel memory.err) { ret err[refusal.Error].err{memory.err}; }
     if (!memory.ok) {
@@ -1166,7 +1296,11 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
     var tys:    Vector[Type]       = vector.init[Type](w.m.a);
     var places: Vector[Placed]     = vector.init[Placed](w.m.a);
     var params: Vector[Value]      = vector.init[Value](w.m.a);
+    var lays:   Vector[opt[u64]]   = vector.init[opt[u64]](w.m.a);
+    var counts: Vector[u32]        = vector.init[u32](w.m.a);
     fin {
+        vector.dnit[opt[u64]](?lays);
+        vector.dnit[u32](?counts);
         vector.dnit[Value](?olds);
         vector.dnit[opt[Value]](?homes);
         vector.dnit[Type](?tys);
@@ -1179,8 +1313,17 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
         val v:      Value                       = b.blocks.data[w.entry.index].parameters.data[i];
         val pushed: res[usize, allocator.Error] = vector.push[Value](?olds, v);
         if (sel pushed.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{pushed.err}}; }
-        val h: res[opt[Value], refusal.Error] = home_for(w, body_of(w).values.data[v.index].type, asg.arguments.data[i]);
-        if (sel h.err) { ret res[opt[Value], refusal.Error].err{h.err}; }
+        val lay: res[opt[u64], refusal.Error] = laid(w, body_of(w).values.data[v.index].type, asg.arguments.data[i], asg);
+        if (sel lay.err) { ret res[opt[Value], refusal.Error].err{lay.err}; }
+        val lain: res[usize, allocator.Error] = vector.push[opt[u64]](?lays, lay.ok);
+        if (sel lain.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{lain.err}}; }
+        var count: u32 = asg.arguments.data[i].count;
+        if (sel lay.ok.some) { count = 0; }
+        val counted: res[usize, allocator.Error] = vector.push[u32](?counts, count);
+        if (sel counted.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{counted.err}}; }
+        var h: res[opt[Value], refusal.Error] = res[opt[Value], refusal.Error].ok{opt[Value].none{}};
+        if (sel lay.ok.none) { h = home_for(w, body_of(w).values.data[v.index].type, asg.arguments.data[i]); }
+        if (sel h.err)       { ret res[opt[Value], refusal.Error].err{h.err}; }
         val kept: res[usize, allocator.Error] = vector.push[opt[Value]](?homes, h.ok);
         if (sel kept.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{kept.err}}; }
         i = i + 1;
@@ -1195,8 +1338,9 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
     i = 0;
     for (i < old) {
         val ty: Type               = body_of(w).values.data[olds.data[i].index].type;
-        val ok: err[refusal.Error] = receive_types(w, Side.argument{i::u32}, ty, asg.arguments.data[i], asg, ?tys, ?places);
-        if (sel ok.err) { ret res[opt[Value], refusal.Error].err{ok.err}; }
+        var ok: err[refusal.Error] = err[refusal.Error].ok{};
+        if (sel lays.data[i].none) { ok = receive_types(w, Side.argument{i::u32}, ty, asg.arguments.data[i], asg, ?tys, ?places); }
+        if (sel ok.err)            { ret res[opt[Value], refusal.Error].err{ok.err}; }
         i = i + 1;
     }
     var first: u32 = 0;
@@ -1205,7 +1349,7 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
         var secret: bool      = false;
         var name:   opt[View] = opt[View].none{};
         if (!(sel asg.address.some) || i != 0) {
-            val owner: opt[usize] = owner_of(asg, sel asg.address.some, i);
+            val owner: opt[usize] = owner_of(?counts, sel asg.address.some, i);
             if (sel owner.some) {
                 val old_value: Value  = olds.data[owner.some];
                 val passed:    Passed = asg.arguments.data[owner.some];
@@ -1232,7 +1376,14 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
         val v:      Value  = olds.data[i];
         val passed: Passed = asg.arguments.data[i];
         builder.secret(?bld, body_of(w).values.data[v.index].secret);
-        val got: res[Value, refusal.Error] = rebuild(w, ?bld, body_of(w).values.data[v.index].type, passed, asg, homes.data[i], Slice[Value]{data: ?params.data[at], size: passed.count::usize});
+        var got: res[Value, refusal.Error] = res[Value, refusal.Error].ok{v};
+        if (sel lays.data[i].some) {
+            val ty: Type                    = body_of(w).values.data[v.index].type;
+            val al: res[u64, refusal.Error] = align_of(w, ty);
+            if (sel al.err) { ret res[opt[Value], refusal.Error].err{al.err}; }
+            got = res[Value, refusal.Error].ok{load(?bld, area(w, ?bld, ty, lays.data[i].some, true), ty, al.ok)};
+        }
+        or { got = rebuild(w, ?bld, body_of(w).values.data[v.index].type, passed, asg, homes.data[i], Slice[Value]{data: ?params.data[at], size: passed.count::usize}); }
         if (sel got.err) { ret res[opt[Value], refusal.Error].err{got.err}; }
         val done: err[refusal.Error] = built(?bld);
         if (sel done.err) { ret res[opt[Value], refusal.Error].err{done.err}; }
@@ -1240,7 +1391,7 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
         if (sel moved.err) { ret res[opt[Value], refusal.Error].err{moved.err}; }
         val spread: err[refusal.Error] = at_uses(w, got.ok);
         if (sel spread.err) { ret res[opt[Value], refusal.Error].err{spread.err}; }
-        at = at + passed.count;
+        at = at + counts.data[i];
         i  = i + 1;
     }
     val after: err[refusal.Error] = handed(w, ?bld);
@@ -1303,14 +1454,15 @@ fun handed(w: *Work, bld: *Builder) err[refusal.Error] {
     ret ir(body.hand(w.m, w.f, list.data[0], list.data[c.at.index]));
 }
 
-# the argument a piece type of the entry's list belongs to
-fun owner_of(asg: *Assignment, addressed: bool, at: usize) opt[usize] {
+# the argument a piece type of the entry's list belongs to, by how many pieces
+# of each argument the list carries, none for one laid whole in the argument area
+fun owner_of(carried: *Vector[u32], addressed: bool, at: usize) opt[usize] {
     var k: usize = at;
     if (addressed) { k = k - 1; }
     var i: usize = 0;
     var n: usize = 0;
-    for (i < asg.arguments.len) {
-        n = n + asg.arguments.data[i].count::usize;
+    for (i < carried.len) {
+        n = n + carried.data[i]::usize;
         if (k < n) { ret opt[usize].some{i}; }
         i = i + 1;
     }
@@ -1326,8 +1478,9 @@ fun touches(w: *Work, i: Instruction) bool {
 }
 
 # whether every use of an address reads or writes the memory it addresses, as
-# a load's or a store's address or the base of an address past it that does
-# the same, so the address goes nowhere memory or a call could keep it
+# a load's or a store's address, a copy's or a fill's, or the base of an address
+# past it that does the same, so the address goes nowhere memory or a call
+# could keep it
 fun contained(w: *Work, v: Value) bool {
     val b: *Body = body_of(w);
     var k: usize = 0;
@@ -1343,6 +1496,14 @@ fun contained(w: *Work, v: Value) bool {
         }
         or (d.opcode.index == opcode_table.PTR_ADD.index) {
             if (!at || d.operands.data[1].index == v.index || !contained(w, d.results.data[0])) { ret false; }
+        }
+        or (d.opcode.index == opcode_table.MEM_COPY.index) {
+            # a copy reads or writes the bytes at an address and keeps neither address
+            if (d.operands.len != 3 || d.operands.data[2].index == v.index)             { ret false; }
+            if (d.operands.data[0].index == v.index && d.operands.data[1].index == v.index) { ret false; }
+        }
+        or (d.opcode.index == opcode_table.MEM_FILL.index) {
+            if (d.operands.len != 3 || !at || d.operands.data[1].index == v.index || d.operands.data[2].index == v.index) { ret false; }
         }
         or { ret false; }
         k = k + 1;
