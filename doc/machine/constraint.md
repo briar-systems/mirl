@@ -28,7 +28,7 @@ stands(f, d)                  # opt[Breach]
 - The allocator's scan, at every location it considers for a bundle: the copy hint, each free candidate, and each candidate whose bundles it would evict. The bundle is at the candidate, every other operand at its bundle's location, at its pin while it has none, or not chosen yet. A bundle no location of its class stands at is refused with `scan.Error.constrained`, naming the instruction and the breach at the first location tried.
 - The allocation checker, which asks again of every rewritten instruction (`check.Error.breach`).
 - Copy lowering's free locations: a register a move between two memory locations goes through, and a location a cycle's value is saved into. Each free one is tried by making the moves through it into a function of their own, and the first under which every instruction stands is taken. When every free one breaches, the copy is refused with `Reason.constrained`.
-- The frame code's scratch: `code.make` makes a move under each scratch it is offered in turn, the frame's being every register calls clobber of the stack pointer's class that carries nothing, and copy lowering's every free register of that class. When none stands, the code refuses with `Refusal.constrained`.
+- The frame code's scratch: `code.make` makes a move under each scratch it is offered in turn, the frame's being every register calls clobber of the stack pointer's class that carries nothing, and copy lowering's every free register of that class. When none stands, the code refuses with `Refusal.constrained`. A move the code makes naming no scratch (`Code.scratchless`) is not tried, and is asked only under a checked compilation.
 
 ## Grouping
 
