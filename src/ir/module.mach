@@ -46,6 +46,7 @@ use mirl.ir.id.Instruction;
 use mirl.ir.id.Symbol;
 use mirl.ir.id.Value;
 use mirl.ir.instruction;
+use mirl.ir.instruction.Edge;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.language.Language;
 use mirl.ir.linkage;
@@ -53,11 +54,13 @@ use mirl.ir.linkage.Linkage;
 use mirl.ir.metadata.Bindings;
 use mirl.ir.metadata.UNBOUND;
 use mirl.ir.opcode.check;
+use mirl.ir.opcode.row.Immediate;
 use mirl.ir.place.Placed;
 use mirl.ir.point;
 use mirl.ir.point.Expression;
 use mirl.ir.point.Point;
 use mirl.ir.point.Step;
+use mirl.ir.pool;
 use mirl.ir.type.calling;
 use mirl.ir.type.format;
 use type_table: mirl.ir.type.table;
@@ -260,6 +263,7 @@ fun release_tuple(a: *allocator.Allocator, t: Tuple) err[allocator.Error] {
 #              object it makes (see `lend`)
 # lent:        where its names are while a compilation holds them, none while the module holds them
 # symbols:     per name, by its handle's index, the function or global it names
+# scratch:     the lists typing an instruction fills, kept across instructions so making one allocates none
 pub rec Module {
     a:           *allocator.Allocator;
     target:      Tuple;
@@ -275,6 +279,21 @@ pub rec Module {
     names:       Interner;
     lent:        opt[*Interner];
     symbols:     vector.Vector[opt[Symbol]];
+    scratch:     Scratch;
+}
+
+# the lists typing one instruction fills, emptied by each use and only valid
+# within it
+# ---
+# types:   operand types, then each edge's argument and parameter types
+# secret:  whether each operand is secret
+# edges:   each edge's argument and parameter types, as views of types
+# results: the result types the check gives
+pub rec Scratch {
+    types:   vector.Vector[Type];
+    secret:  vector.Vector[bool];
+    edges:   vector.Vector[check.Edge];
+    results: vector.Vector[Type];
 }
 
 # create an empty module
@@ -301,6 +320,7 @@ pub fun init(a: *allocator.Allocator, target: Tuple) res[Module, Error] {
     m.names       = intern.make(a);
     m.lent        = opt[*Interner].none{};
     m.symbols     = vector.init[opt[Symbol]](a);
+    m.scratch     = Scratch{types: vector.init[Type](a), secret: vector.init[bool](a), edges: vector.init[check.Edge](a), results: vector.init[Type](a)};
     val empty: res[usize, allocator.Error] = vector.push[Slice[Binding]](?m.bindings, Slice[Binding]{data: nil, size: 0});
     if (sel empty.err) {
         release_tuple(a, m.target);
@@ -370,7 +390,6 @@ pub fun release_body(a: *allocator.Allocator, b: *function.Body) err[allocator.E
     }
     i = 0;
     for (i < b.values.len) {
-        keep(?failed, vector.dnit[Instruction](?b.values.data[i].uses));
         keep(?failed, vector.dnit[u32](?b.values.data[i].bound));
         val name: opt[View] = b.values.data[i].name;
         if (sel name.some) { keep(?failed, slice.release_view(a, name.some)); }
@@ -378,7 +397,7 @@ pub fun release_body(a: *allocator.Allocator, b: *function.Body) err[allocator.E
     }
     i = 0;
     for (i < b.instructions.len) {
-        keep(?failed, instruction.release(?b.instructions.data[i]));
+        keep(?failed, instruction.release(a, ?b.instructions.data[i]));
         i = i + 1;
     }
     keep(?failed, vector.dnit[BlockData](?b.blocks));
@@ -386,6 +405,9 @@ pub fun release_body(a: *allocator.Allocator, b: *function.Body) err[allocator.E
     keep(?failed, vector.dnit[InstructionData](?b.instructions));
     keep(?failed, map.dnit[u32, Value](?b.constants));
     keep(?failed, vector.dnit[Point](?b.points));
+    keep(?failed, pool.dnit[Value](?b.lists));
+    keep(?failed, pool.dnit[Immediate](?b.immediates));
+    keep(?failed, pool.dnit[Edge](?b.edges));
     if (sel b.entry.placed) { keep(?failed, vector.dnit[Placed](?b.entry.placed)); }
     b.entry = function.Entry.unplaced{};
     ret failed;
@@ -446,6 +468,10 @@ pub fun dnit(m: *Module) err[allocator.Error] {
     keep(?failed, vector.dnit[Slice[Binding]](?m.bindings));
     keep(?failed, vector.dnit[Slice[Step]](?m.expressions));
     keep(?failed, vector.dnit[opt[Symbol]](?m.symbols));
+    keep(?failed, vector.dnit[Type](?m.scratch.types));
+    keep(?failed, vector.dnit[bool](?m.scratch.secret));
+    keep(?failed, vector.dnit[check.Edge](?m.scratch.edges));
+    keep(?failed, vector.dnit[Type](?m.scratch.results));
     val names: err[Fail] = intern.release(?m.names);
     if (sel names.err) { keep(?failed, err[allocator.Error].err{refusal(names.err)}); }
     keep(?failed, debug_table.dnit(?m.debug));
@@ -684,6 +710,9 @@ pub fun add_function(m: *Module, data: FunctionData) res[Function, Error] {
     n.body.instructions = vector.init[InstructionData](m.a);
     n.body.constants    = map.init[u32, Value](m.a);
     n.body.points       = vector.init[Point](m.a);
+    n.body.lists        = pool.init[Value](m.a);
+    n.body.immediates   = pool.init[Immediate](m.a);
+    n.body.edges        = pool.init[Edge](m.a);
     val id:     Function                    = (m.functions.len::u32);
     val pushed: res[usize, allocator.Error] = vector.push[function.Node](?m.functions, n);
     if (sel pushed.err) {
@@ -869,7 +898,7 @@ fun element_type(s: type_table.Shape, i: usize) Type {
 # m:   the module
 # d:   the constant
 # ret: ok, or why it is refused
-pub fun check_constant(m: *Module, d: *ConstantData) err[Error] {
+fun check_constant(m: *Module, d: *ConstantData) err[Error] {
     if (sel d.integer) {
         val s: res[type_table.Shape, Error] = shape(m, d.integer.type);
         if (sel s.err)           { ret err[Error].err{s.err}; }
