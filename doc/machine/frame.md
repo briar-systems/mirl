@@ -4,20 +4,20 @@
 
 ```
 frame(a, ?allocation, Request{convention: ?resolved, at: ?locations}, ?code, Need{allowed, configured})   # res[Framed, Error]
-lay(a, f, used, request, reserve)                                            # res[Plan, lay.Error]
+lay(a, f, ?effects, used, request, reserve)                                  # res[Plan, lay.Error]
 needed(a, f, ?plan, ?code, request, need)                                    # res[u32, scavenge.Error]
 finish(a, f, ?plan, ?code)                                                   # res[Framed, finish.Error]
-keeps_pointer(a, f, request)                                                 # res[bool, lay.Error]
+keeps_pointer(a, f, ?effects, request)                                       # res[bool, lay.Error]
 ```
 
-`frame` is `lay` then `finish`, laid out again with the emergency slots `scavenge.needed` counts until it holds as many as it needs (below). `keeps_pointer` answers before allocation whether the frame will keep its frame pointer, so the allowed set leaves it out. It also answers yes for a frame that keeps none otherwise but whose emergency slots at the bottom of the locals the frame code would reach only through a scratch (below), so the frame pointer is free for `lay` to keep where the frame reserves them.
+`frame` is `lay` then `finish`, laid out again with the emergency slots `scavenge.needed` counts until it holds as many as it needs (below). `frame` reads the allocated function's effects (`mirl.machine.effects`) once and every `lay` reads them. `keeps_pointer` answers before allocation whether the frame will keep its frame pointer, so the allowed set leaves it out. It reads the effects of the selected function that the allocator's liveness reads too, so the question asks masc nothing of its own. It also answers yes for a frame that keeps none otherwise but whose emergency slots at the bottom of the locals the frame code would reach only through a scratch (below), so the frame pointer is free for `lay` to keep where the frame reserves them.
 
 ## What it reads
 
 - From the convention row's `Stack.memory`: the alignment at a call, the red zone, the shadow space, where a call leaves the return address (`link`: pushed one word below the canonical frame address, in a register, or nowhere code reaches), the frame pointer (`pointer`: its register, whether every function keeps it, and the record it heads, either linked at stated offsets from the canonical frame address or free), where the stack pointer lives (`pointer_home`), and the prologue's shape (`prologue`, below).
 - From the resolved row: the preserved registers, each saved when the function writes it, or a call leaves it undefined that a callee under the function's own row would not, as a call from an arm64ec entry thunk under the x64 row to native code leaves v6 to v15, at the width the row keeps it (`Kept.bits`), its low part in a slot that size where the row keeps only that, as aapcs64's d8 to d15 of v8 to v15, and all of it otherwise, as win64's xmm6 to xmm15, the link and frame pointer registers, and the registers a call clobbers, from which the prologue's and epilogues' scratch registers are those of the stack pointer's class that carry no argument, result, indirect address, count or return address, in the order the row lists its clobbers.
 - From the resolved row: the stack pointer, the register its `pointer_home` names, which masc must flag `STACK`.
-- From masc: each saved register's storage through the selection's view, each instruction's transfer under its row's rules, the implicit writes some operand value of its row makes (masc's `may`), and its stack effect.
+- From masc: each saved register's storage through the selection's view and each instruction's transfer under its row's rules. From the function's effects, which ask masc's footprint once per row an instruction stands for: what it writes and whether it changes the stack pointer.
 - From the function: every slot with its area, size and alignment, and which slots an operand names.
 
 ## The layout

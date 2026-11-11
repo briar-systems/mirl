@@ -1,0 +1,271 @@
+# what each instruction of a machine function reads and writes beyond its
+# virtual operands, asked of masc once per function
+#
+# every register and flag a row's instruction touches comes from masc's
+# footprint of its operand values under the context and the configuration it
+# states, and this module is the one place the machine form asks it. each
+# row an instruction stands for, one for a row and one per step for a loop,
+# gets an entry: the registers and flags it reads, those it writes, the flags
+# it leaves unspecified, each register it writes with what the write leaves,
+# which the storage model's kills read, and whether it changes the stack
+# pointer other than by its writes. a tie with
+# one half a register and the other virtual is read at its source half and
+# written at its dest half, so a virtual half's value stays its own, and every
+# other row is read and written at its dest half. a pseudo and an inline block
+# stand for no row and get no entry. liveness, the frame and the ranges read
+# the entries, and an instruction whose footprint masc leaves undecided
+# refuses them all.
+#
+# with r rows and w words a set over the register file spans, reading the
+# effects asks masc 2r footprints at most and holds 3 r w words and every
+# write of each row.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.instruction.Undecided;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.vstate;
+
+use core_config: masc.core.config;
+use masc.core.effect;
+use masc.core.footprint;
+use mo: masc.core.operand;
+use masc.core.query;
+use rf:         masc.core.register;
+use rows:       masc.core.row;
+use core_state: masc.core.state;
+
+# why the effects were not read
+# ---
+# alloc:     the allocator refused storage
+# undecided: an instruction whose footprint masc leaves undecided, and why
+pub tag Error: u8 {
+    alloc:     allocator.Error;
+    undecided: Undecided;
+}
+
+# the sets of an entry, in its order
+val READS:    u32 = 0;
+val WRITTEN:  u32 = 1;
+val CLOBBERS: u32 = 2;
+val SETS:     u32 = 3;
+
+# the effects of a function's instructions
+# ---
+# words:   the words a set over the register file's rows spans, 0 with no file
+# first:   by instruction, its first entry, one more past the last
+# sets:    by entry, its SETS sets of `words` words each
+# stacked: by entry, whether its footprint states a change to the stack pointer
+# writing: by entry, its first write, one more past the last
+# writes:  every entry's writes, in entry order
+pub rec Effects {
+    words:   u32;
+    first:   vector.Vector[u32];
+    sets:    vector.Vector[u64];
+    stacked: vector.Vector[bool];
+    writing: vector.Vector[u32];
+    writes:  vector.Vector[effect.Written];
+}
+
+# effects holding nothing, which `release` gives back
+pub fun none(a: *allocator.Allocator) Effects {
+    ret Effects{words: 0, first: vector.init[u32](a), sets: vector.init[u64](a), stacked: vector.init[bool](a), writing: vector.init[u32](a), writes: vector.init[effect.Written](a)};
+}
+
+# give back the effects' storage
+pub fun release(x: *Effects) err[allocator.Error] {
+    var failed: err[allocator.Error] = vector.dnit[u32](?x.first);
+    keep(?failed, vector.dnit[u64](?x.sets));
+    keep(?failed, vector.dnit[bool](?x.stacked));
+    keep(?failed, vector.dnit[u32](?x.writing));
+    keep(?failed, vector.dnit[effect.Written](?x.writes));
+    ret failed;
+}
+
+# the entry of the k-th row instruction `i` stands for, below `instruction.rows_in`
+pub fun entry(x: *Effects, i: Instruction, k: u32) u32 {
+    ret x.first.data[i] + k;
+}
+
+fun set_at(x: *Effects, e: u32, n: u32) effect.Set {
+    ret effect.Set{words: ?x.sets.data[((e * SETS + n) * x.words)::usize], len: x.words};
+}
+
+# the registers and flags an entry reads
+pub fun reads(x: *Effects, e: u32) effect.Set {
+    ret set_at(x, e, READS);
+}
+
+# the registers and flags an entry writes
+pub fun written(x: *Effects, e: u32) effect.Set {
+    ret set_at(x, e, WRITTEN);
+}
+
+# the flags an entry leaves unspecified
+pub fun clobbers(x: *Effects, e: u32) effect.Set {
+    ret set_at(x, e, CLOBBERS);
+}
+
+# each register an entry writes, with what the write leaves
+pub fun writes(x: *Effects, e: u32) Slice[effect.Written] {
+    val at: u32 = x.writing.data[e];
+    ret Slice[effect.Written]{data: ?x.writes.data[at], size: (x.writing.data[e + 1] - at)::usize};
+}
+
+# whether an entry's footprint states a change to the stack pointer
+pub fun stacked(x: *Effects, e: u32) bool {
+    ret x.stacked.data[e];
+}
+
+# what reading one footprint fills, kept for the whole read rather than set
+# out per row
+# ---
+# stated: a loop's step's operands
+# values: the values masc reads of a row's operands
+rec Room {
+    stated: [mo.MAX_OPERANDS]Operand;
+    values: [instruction.VALUES]mo.Value;
+}
+
+rec Reader {
+    f:    *Function;
+    ctx:  *core_state.Context;
+    file: *rf.File;
+    fp:   *footprint.Footprint;
+    x:    *Effects;
+    room: *Room;
+}
+
+# whether a tie of `given` has one half a register and the other virtual, so
+# that masc reads its halves apart
+fun split(given: Slice[Operand]) bool {
+    var k: usize = 0;
+    for (k < given.size) {
+        val o: Operand = given.data[k];
+        if (sel o.tied) {
+            val dest:   Register = o.tied.dest;
+            val source: Register = o.tied.source;
+            if ((sel dest.physical) != (sel source.physical)) { ret true; }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# masc's footprint of row `r` of instruction `id` holding `given` under `cfg`, each tie its half `half`
+fun asked(w: *Reader, id: Instruction, r: *rows.Row, given: Slice[Operand], cfg: core_config.Configured, half: instruction.Half) res[*footprint.Footprint, Error] {
+    val got: res[query.Answer[*footprint.Footprint], allocator.Error] = footprint.of(w.fp, r, instruction.halves_of(w.file, r, given, half, ?w.room.values[0]), w.ctx, cfg);
+    if (sel got.err) { ret res[*footprint.Footprint, Error].err{Error.alloc{got.err}}; }
+    val answer: query.Answer[*footprint.Footprint] = got.ok;
+    if (sel answer.undecided) { ret res[*footprint.Footprint, Error].err{Error.undecided{Undecided{instruction: id, why: answer.undecided}}}; }
+    ret res[*footprint.Footprint, Error].ok{answer.decided};
+}
+
+fun copy(into: effect.Set, from: *u64) {
+    var w: u32 = 0;
+    for (w < into.len) {
+        into.words[w] = from[w];
+        w             = w + 1;
+    }
+}
+
+# the entry `e` of row `r` of instruction `id`, holding `given` under `cfg`
+fun row_entry(w: *Reader, id: Instruction, r: *rows.Row, given: Slice[Operand], cfg: core_config.Configured, e: u32) err[Error] {
+    if (split(given)) {
+        val source: res[*footprint.Footprint, Error] = asked(w, id, r, given, cfg, instruction.SOURCE);
+        if (sel source.err) { ret err[Error].err{source.err}; }
+        copy(reads(w.x, e), source.ok.reads.data);
+    }
+    val dest: res[*footprint.Footprint, Error] = asked(w, id, r, given, cfg, instruction.DEST);
+    if (sel dest.err) { ret err[Error].err{dest.err}; }
+    val fp: *footprint.Footprint = dest.ok;
+    if (!split(given)) { copy(reads(w.x, e), fp.reads.data); }
+    copy(written(w.x, e), fp.written.data);
+    copy(clobbers(w.x, e), fp.clobbers.data);
+    w.x.stacked.data[e] = !(sel fp.stack.none);
+    val kept: res[usize, allocator.Error] = vector.extend[effect.Written](?w.x.writes, Slice[effect.Written]{data: fp.writes.data, size: fp.writes.len});
+    if (sel kept.err) { ret err[Error].err{Error.alloc{kept.err}}; }
+    val marked: res[usize, allocator.Error] = vector.push[u32](?w.x.writing, w.x.writes.len::u32);
+    if (sel marked.err) { ret err[Error].err{Error.alloc{marked.err}}; }
+    ret err[Error].ok{};
+}
+
+# read the effects of a function's instructions
+# ---
+# a:   the allocator the effects take
+# f:   the function
+# ctx: the context masc's footprints are asked under
+# ret: the effects, or why they were not read
+pub fun read(a: *allocator.Allocator, f: *Function, ctx: *core_state.Context) res[Effects, Error] {
+    var x:      Effects                     = none(a);
+    val n:      usize                       = f.instructions.len;
+    val file:   *rf.File                    = function.file(f);
+    var failed: err[allocator.Error]        = err[allocator.Error].ok{};
+    val fr:     res[usize, allocator.Error] = vector.reserve[u32](?x.first, n + 1);
+    if (sel fr.err) { keep(?failed, err[allocator.Error].err{fr.err}); }
+    var entries: u32   = 0;
+    var i:       usize = 0;
+    for (i < n && sel failed.ok) {
+        vector.push[u32](?x.first, entries);
+        entries = entries + instruction.rows_in(f.instructions.data[i].opcode);
+        i       = i + 1;
+    }
+    if (sel failed.ok) { vector.push[u32](?x.first, entries); }
+    if (file != nil) { x.words = effect.words(file); }
+    keep(?failed, slice.fill[u64](?x.sets, (entries * SETS * x.words)::usize, 0));
+    keep(?failed, slice.fill[bool](?x.stacked, entries::usize, false));
+    val wr: res[usize, allocator.Error] = vector.reserve[u32](?x.writing, entries::usize + 1);
+    if (sel wr.err) { keep(?failed, err[allocator.Error].err{wr.err}); }
+    if (sel failed.ok) { vector.push[u32](?x.writing, 0); }
+    if (sel failed.err) {
+        release(?x);
+        ret res[Effects, Error].err{Error.alloc{failed.err}};
+    }
+    if (file == nil || entries == 0) { ret res[Effects, Error].ok{x}; }
+    val made: res[footprint.Footprint, allocator.Error] = footprint.make(a, file);
+    if (sel made.err) {
+        release(?x);
+        ret res[Effects, Error].err{Error.alloc{made.err}};
+    }
+    var fp:   footprint.Footprint = made.ok;
+    var room: Room;
+    var w:    Reader              = Reader{f: f, ctx: ctx, file: file, fp: ?fp, x: ?x, room: ?room};
+    fin { footprint.release(?fp); }
+    var k: usize = 0;
+    for (k < n) {
+        val d:   *InstructionData       = ?f.instructions.data[k];
+        val op:  Opcode                 = d.opcode;
+        val cfg: core_config.Configured = vstate.configured(f.set, d.state);
+        var r:   u32                    = 0;
+        for (r < instruction.rows_in(op)) {
+            val row:   *rows.Row      = instruction.row_in(op, r);
+            val given: Slice[Operand] = instruction.operands_in(file, op, r, d.operands, ?room.stated[0]);
+            val done:  err[Error]     = row_entry(?w, k::u32, row, given, cfg, x.first.data[k] + r);
+            if (sel done.err) {
+                release(?x);
+                ret res[Effects, Error].err{done.err};
+            }
+            r = r + 1;
+        }
+        k = k + 1;
+    }
+    ret res[Effects, Error].ok{x};
+}

@@ -7,7 +7,7 @@ of_register(regs, row)                # opt[Storage]
 of_class(regs, class)                 # opt[Storage]
 of_group(regs, class, span)           # opt[Storage]
 sharing(overlaps, row)                # res[rf.Span, allocator.Error]
-kills(footprint, other)               # bool
+kills(file, clobbers, flags, writes, other)  # bool
 view(file, part, whole)               # opt[View]
 viewed(file, whole_id, part, view)    # opt[rf.Id]
 view_kills(file, view, extend)        # bool
@@ -17,7 +17,7 @@ counterpart(file, part_id, from, to)  # opt[rf.Id]
 
 A `Storage` is bits fixed plus bits per unit of one scale's multiplier, the shape of masc's scaled widths, folded through the selection so a scale the selection fixes is a fixed size. The locations' sharing, liveness and its kills, the allocation checker, copy lowering, the spiller and the frame read a location's storage, its views and its groups here, and no other module restates one.
 
-- Liveness ends a value where a write kills it: an instruction writing a location also writes every location sharing its storage that masc's footprint says it leaves no bit of (`kills`). A write that keeps some bits, as an undisturbed tail, is a read as well.
+- Liveness ends a value where a write kills it: an instruction writing a location also writes every location sharing its storage that masc's footprint says it leaves no bit of (`kills`). A write that keeps some bits, as an undisturbed tail, is a read as well. `mirl.machine.effects` asks the footprint once per row an instruction stands for and holds the reads, the writes with their kills, the written registers and the stack change, which liveness, the frame and the ranges read.
 - A memory-backed class states only the bits of each cell, which share storage with nothing but themselves.
 - A tuple, a register of a pair class as RISC-V's x12:x13 or of a vector group class as `vg2.v4`, holds no storage of its own: its storage is its members', laid end to end, and its class's width is theirs together (`of_register`). It shares storage with every row a member does, by masc's overlap index (`sharing`), so a value in x13 is live against the pair, and a call keeps it only when it keeps every member.
 
