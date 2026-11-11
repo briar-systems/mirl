@@ -283,6 +283,8 @@ val p: Passage = mirl.legal.abi.placement(a, ?build, ?layout, signature, named) 
 mirl.legal.abi.release(?p)                                                         # err[allocator.Error]
 ```
 
+A passage is a function of the signature, the named count, the build's rows and the layout alone, and an interned type never changes, so the abi legalisation places each signature and named count of a module once. It asks through a store of passages over the module's layout and the build (`mirl.legal.abi.passages`, `passage`, `forget`), which places a signature the first time a call, an entry or a return under it is lowered and hands every later one the same passage, owned by the store until the pass ends. The store describes each type into the type view once as well (`mirl.target.abi.call.Described`, read through `classify_in`), since a type's view is a function of the type and the layout alone, so a signature placed later reads the nodes of every type an earlier one described. `classify` describes its types for the one call it is asked.
+
 It takes the build a family opened for the target, whose resolved rows classify, the layout of the module the signature is in, the function type and how many of its arguments a call names (`all` for an entry). The **passage** holds
 
 - `row`, the resolved row the signature names,
