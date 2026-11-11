@@ -118,6 +118,8 @@ use mink.model.frame;
 # naked:      the function states `naked`, so its body is laid as written
 # clobbers:   what the function's calls leave undefined, as the selection
 #             stated it under each callee's row
+# owned:      the mask, of the clobbers' words, of the register rows a call
+#             under the function's own row clobbers
 # code:       the target's frame code bound to the function's selection,
 #             whose reach places the emergency slots
 pub rec Request {
@@ -127,6 +129,7 @@ pub rec Request {
     exit:       opt[id.Symbol];
     naked:      bool;
     clobbers:   Clobbers;
+    owned:      Slice[u64];
     code:       *Admitted;
 }
 
@@ -352,7 +355,7 @@ fun scratches_of(r: *Registers, stack: rf.Id, out: *vector.Vector[rf.Id]) err[Er
 fun written(x: *Facts, at: *Locations, reg: rf.Id) res[bool, Error] {
     val row: res[u32, location.Unlocated] = location.locate(at, Physical.register{reg});
     if (sel row.err) { ret res[bool, Error].err{Error.unlocated{row.err}}; }
-    ret res[bool, Error].ok{x.written.data[row.ok]};
+    ret res[bool, Error].ok{scan.written(x, at, row.ok)};
 }
 
 fun scan_err(e: scan.Error) Error {
@@ -384,12 +387,11 @@ fun by_align(a: *Ordered, b: *Ordered) i64 {
 # stack pointer only through a scratch, which `lay` then reaches off the
 # frame pointer where the frame reserves one
 # ---
-# a:   the allocator the scan takes
 # f:   the function
-# fx:  the effects of its instructions
+# x:   its facts, as `facts` reads them
 # r:   the convention and locations
-# ret: whether it keeps one, or why the scan was refused
-pub fun keeps_pointer(a: *allocator.Allocator, f: *Function, fx: *Effects, r: Request) res[bool, Error] {
+# ret: whether it keeps one, or why not
+pub fun keeps_pointer(f: *Function, x: *Facts, r: Request) res[bool, Error] {
     val row: *Resolved = r.convention;
     if (!(sel row.row.stack.memory)) { ret res[bool, Error].ok{false}; }
     val frame: Frame = row.row.stack.memory;
@@ -398,14 +400,32 @@ pub fun keeps_pointer(a: *allocator.Allocator, f: *Function, fx: *Effects, r: Re
     if (frame.pointer.register.always) { ret res[bool, Error].ok{true}; }
     val sp: opt[rf.Id] = stack_pointer(row);
     if (sel sp.none) { ret res[bool, Error].err{Error.stack{}}; }
-    val stack: res[u32, location.Unlocated] = location.locate(r.at, Physical.register{sp.some});
-    if (sel stack.err) { ret res[bool, Error].err{Error.unlocated{stack.err}}; }
-    val got: res[Facts, scan.Error] = scan.scan(a, f, fx, r.at, stack.ok, Slice[u32]{data: nil, size: 0});
-    if (sel got.err) { ret res[bool, Error].err{scan_err(got.err)}; }
-    var x: Facts = got.ok;
-    fin { scan.release(?x); }
-    if (needs_pointer(?x, f, frame, held(row).context.view)) { ret res[bool, Error].ok{true}; }
-    ret unreached(f, r, frame, ?x, sp.some);
+    if (needs_pointer(x, f, frame, held(row).context.view)) { ret res[bool, Error].ok{true}; }
+    ret unreached(f, r, frame, x, sp.some);
+}
+
+# the facts of a function before allocation, which `keeps_pointer` reads and
+# `lay` reads of its allocation, its stack pointer's moves read where its row
+# keeps a stack in memory off a stack pointer
+# ---
+# a:   the allocator the facts take
+# f:   the function
+# fx:  the effects of its instructions
+# r:   the convention and locations
+# ret: the facts, or why the scan was refused
+pub fun facts(a: *allocator.Allocator, f: *Function, fx: *Effects, r: Request) res[Facts, Error] {
+    var stack: u32 = location.NONE;
+    if (sel r.convention.row.stack.memory) {
+        val sp: opt[rf.Id] = stack_pointer(r.convention);
+        if (sel sp.some) {
+            val at: res[u32, location.Unlocated] = location.locate(r.at, Physical.register{sp.some});
+            if (sel at.err) { ret res[Facts, Error].err{Error.unlocated{at.err}}; }
+            stack = at.ok;
+        }
+    }
+    val got: res[Facts, scan.Error] = scan.scan(a, f, fx, r.at, stack);
+    if (sel got.err) { ret res[Facts, Error].err{scan_err(got.err)}; }
+    ret res[Facts, Error].ok{got.ok};
 }
 
 # whether a frame that keeps no pointer could hold an emergency slot of the
@@ -629,7 +649,7 @@ fun empty_plan(a: *allocator.Allocator, stack: rf.Id) Plan {
         layout:    Layout{entry: 0, size: record.bytes(0), outgoing: 0, red: 0, stack: stack, pointer: rf.NONE, at: 0, realign: 0, slots: vector.init[Place](a), saves: vector.init[Save](a), reserved: vector.init[Emergency](a)},
         added:     vector.init[SlotData](a),
         spots:     vector.init[Spot](a),
-        facts:     Facts{calls: false, dynamic: false, moves: false, written: vector.init[bool](a), named: vector.init[bool](a), exits: vector.init[bool](a)},
+        facts:     scan.none(a),
         empty:     true,
         top:       0,
         pushed:    0,
@@ -679,7 +699,7 @@ fun relay(p: *Plan) {
 # would not, as a call from an arm64ec entry thunk under the x64 row to
 # native code leaves the upper halves of v8-v15 undefined, which the thunk
 # then saves
-fun overwritten(a: *allocator.Allocator, regs: *Registers, r: Request, used: Slice[u32], out: *vector.Vector[u32]) err[Error] {
+fun overwritten(r: Request, used: Slice[u32], out: *vector.Vector[u32]) err[Error] {
     var i: usize = 0;
     for (i < used.size) {
         val pushed: res[usize, allocator.Error] = vector.push[u32](out, used.data[i]);
@@ -688,13 +708,9 @@ fun overwritten(a: *allocator.Allocator, regs: *Registers, r: Request, used: Sli
     }
     val sets: Clobbers = r.clobbers;
     if (sets.words == 0) { ret err[Error].ok{}; }
-    var own: vector.Vector[u64] = vector.init[u64](a);
-    fin { vector.dnit[u64](?own); }
-    val made: err[Error] = owned(regs, r.at, sets.words::usize, ?own);
-    if (sel made.err) { ret made; }
     var k: usize = 0;
     for (k < sets.masks.size) {
-        val word: u64 = sets.masks.data[k] & ~own.data[k % sets.words::usize];
+        val word: u64 = sets.masks.data[k] & ~r.owned.data[k % sets.words::usize];
         var bit:  u32 = 0;
         for (word != 0 && bit < 64) {
             if (((word >> bit::u64) & 1) != 0) {
@@ -708,36 +724,21 @@ fun overwritten(a: *allocator.Allocator, regs: *Registers, r: Request, used: Sli
     ret err[Error].ok{};
 }
 
-# the register rows of `words` words a call under the function's own row clobbers
-fun owned(regs: *Registers, at: *Locations, words: usize, into: *vector.Vector[u64]) err[Error] {
-    var w: usize = 0;
-    for (w < words) {
-        val pushed: res[usize, allocator.Error] = vector.push[u64](into, 0);
-        if (sel pushed.err) { ret err[Error].err{alloc_err(pushed.err)}; }
-        w = w + 1;
-    }
-    var j: usize = 0;
-    for (j < regs.clobbered.size) {
-        val r: res[u32, location.Unlocated] = location.locate(at, Physical.register{regs.clobbered.data[j]});
-        if (sel r.ok) {
-            if ((r.ok / 64)::usize < words) { into.data[r.ok / 64] = into.data[r.ok / 64] | (1::u64 << (r.ok % 64)::u64); }
-        }
-        j = j + 1;
-    }
-    ret err[Error].ok{};
-}
-
 # lay out the frame of an allocated function
 # ---
 # a:       the allocator the plan takes
 # f:       the function, every operand a location
-# fx:      the effects of its instructions
-# used:    the locations its allocation assigned
+# from:    the facts of the function it was allocated from, as `facts`
+#          reads them
+# origins: each instruction's instruction of that function
+# spills:  the slots its allocation made for values in pieces
+# used:    the locations its allocation assigned, every register a list's
+#          value covers among them
 # r:       the convention and locations
 # reserve: the emergency slots the frame reserves, by kind, each holding one
 #          register of its kind
 # ret:     the plan, or why the frame was refused
-pub fun lay(a: *allocator.Allocator, f: *Function, fx: *Effects, used: Slice[u32], r: Request, reserve: Slice[Bank]) res[Plan, Error] {
+pub fun lay(a: *allocator.Allocator, f: *Function, from: *Facts, origins: Slice[u32], spills: Slice[Slot], used: Slice[u32], r: Request, reserve: Slice[Bank]) res[Plan, Error] {
     val conv: *Resolved  = r.convention;
     val regs: *Registers = held(conv);
     if (regs == nil || regs.context.view.file != function.file(f) || r.at.file != function.file(f)) { ret res[Plan, Error].err{Error.foreign{}}; }
@@ -749,20 +750,18 @@ pub fun lay(a: *allocator.Allocator, f: *Function, fx: *Effects, used: Slice[u32
     }
     val sp: opt[rf.Id] = stack_pointer(conv);
     if (sel sp.none) { ret res[Plan, Error].err{Error.stack{}}; }
-    val stack_row: res[u32, location.Unlocated] = location.locate(r.at, Physical.register{sp.some});
-    if (sel stack_row.err) { ret res[Plan, Error].err{Error.unlocated{stack_row.err}}; }
     val leaves: opt[str] = convention.exit_routine(conv.row);
     if (sel leaves.some && sel r.exit.none) { ret res[Plan, Error].err{Error.exit{}}; }
     var p: Plan = empty_plan(a, sp.some);
     p.exit = r.exit;
     var written: vector.Vector[u32] = vector.init[u32](a);
     fin { vector.dnit[u32](?written); }
-    val over: err[Error] = overwritten(a, regs, r, used, ?written);
+    val over: err[Error] = overwritten(r, used, ?written);
     if (sel over.err) {
         release(?p);
         ret res[Plan, Error].err{over.err};
     }
-    val got: res[Facts, scan.Error] = scan.scan(a, f, fx, r.at, stack_row.ok, Slice[u32]{data: written.data, size: written.len});
+    val got: res[Facts, scan.Error] = scan.allocated(a, from, f, origins, spills, Slice[u32]{data: written.data, size: written.len});
     if (sel got.err) {
         release(?p);
         ret res[Plan, Error].err{scan_err(got.err)};

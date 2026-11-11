@@ -8,10 +8,22 @@
 # sharing its storage, and the stack pointer moves when an instruction writes
 # it or its effects state a change other than a call's or a return's. the
 # effects read each tie at its dest half for its writes, so both registers of
-# a pair and every register of a group are written. an inline block
+# a pair and every register of a group are written. a row written is marked
+# by one bit of a set over the register file, and a row is written when it or
+# a row sharing its storage is marked, as masc's overlap makes sharing
+# symmetric. an inline block
 # writes what its implicit locations write, as masc's footprint of the block
 # states them, and moves the stack pointer where that footprint states a
 # change to it.
+#
+# the facts of an allocated function are those of the function it was
+# allocated from (`allocated`): its rows write what they wrote but the
+# registers its virtual operands were given, which are among the locations
+# the allocation assigned, each with every register a list's value covers,
+# and the instructions the allocator inserts are copies, spills and reloads,
+# which name only those locations and its spill slots and neither call, leave
+# nor move the stack pointer. so no instruction is walked and no footprint is
+# asked again.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -38,6 +50,7 @@ use mirl.machine.instruction.InstructionData;
 use mirl.machine.operand.Instruction;
 use mirl.machine.operand.Operand;
 use mirl.machine.operand.Register;
+use mirl.machine.operand.Slot;
 use mirl.machine.pseudo;
 
 use masc.core.effect;
@@ -62,7 +75,8 @@ pub tag Error: u8 {
 # dynamic: it allocates dynamically
 # moves:   an instruction moves the stack pointer that is not a call or a
 #          return, whose moves balance
-# written: by register row, whether anything writes storage it shares
+# direct:  a bit per register row, set for each row something writes, the
+#          rows sharing its storage left unmarked (`written`)
 # named:   by slot, whether an operand names it
 # exits:   by instruction, whether it leaves the function, as a return or a
 #          jump to a symbol does
@@ -70,29 +84,54 @@ pub rec Facts {
     calls:   bool;
     dynamic: bool;
     moves:   bool;
-    written: vector.Vector[bool];
+    direct:  vector.Vector[u64];
     named:   vector.Vector[bool];
     exits:   vector.Vector[bool];
 }
 
+# facts of no instruction, which `release` gives back
+pub fun none(a: *allocator.Allocator) Facts {
+    ret Facts{calls: false, dynamic: false, moves: false, direct: vector.init[u64](a), named: vector.init[bool](a), exits: vector.init[bool](a)};
+}
+
+# whether anything writes storage register row `row` of `at` shares
+pub fun written(x: *Facts, at: *Locations, row: u32) bool {
+    val shared: Slice[u32] = location.shares(at, row);
+    var s:      usize      = 0;
+    for (s < shared.size) {
+        if (has_row(Slice[u64]{data: x.direct.data, size: x.direct.len}, shared.data[s])) { ret true; }
+        s = s + 1;
+    }
+    ret false;
+}
+
+fun has_row(set: Slice[u64], row: u32) bool {
+    if ((row / 64)::usize >= set.size) { ret false; }
+    ret (set.data[row / 64] & ((1::u64) << (row % 64)::u64)) != 0;
+}
+
+fun mark_row(direct: *vector.Vector[u64], row: u32) {
+    if ((row / 64)::usize < direct.len) { direct.data[row / 64] = direct.data[row / 64] | ((1::u64) << (row % 64)::u64); }
+}
+
 # give back the facts' storage
 pub fun release(x: *Facts) err[allocator.Error] {
-    var failed: err[allocator.Error] = vector.dnit[bool](?x.written);
+    var failed: err[allocator.Error] = vector.dnit[u64](?x.direct);
     keep(?failed, vector.dnit[bool](?x.named));
     keep(?failed, vector.dnit[bool](?x.exits));
     ret failed;
 }
 
 # a register's location is its row, registers numbering first
-fun mark(direct: *vector.Vector[bool], at: *Locations, p: Physical) err[Error] {
+fun mark(direct: *vector.Vector[u64], at: *Locations, p: Physical) err[Error] {
     if (!(sel p.register)) { ret err[Error].ok{}; }
     val row: res[u32, location.Unlocated] = location.locate(at, p);
     if (sel row.err) { ret err[Error].err{Error.unlocated{row.err}}; }
-    direct.data[row.ok] = true;
+    mark_row(direct, row.ok);
     ret err[Error].ok{};
 }
 
-fun mark_register(direct: *vector.Vector[bool], at: *Locations, r: Register) err[Error] {
+fun mark_register(direct: *vector.Vector[u64], at: *Locations, r: Register) err[Error] {
     if (sel r.physical) { ret mark(direct, at, r.physical); }
     ret err[Error].ok{};
 }
@@ -107,36 +146,26 @@ fun names(at: *Locations, o: Operand, row: u32) res[bool, Error] {
     ret res[bool, Error].ok{got.ok == row};
 }
 
-# mark every register of `set` written, and whether it writes the stack pointer
-fun mark_set(direct: *vector.Vector[bool], file: *rf.File, stack: u32, set: effect.Set) bool {
-    var moves: bool = false;
-    var w:     u32  = 0;
-    for (w < set.len) {
-        var bits: u64 = set.words[w];
-        var b:    u32 = 0;
-        for (bits != 0) {
-            if ((bits & 1) != 0) {
-                val row: u32 = w * 64 + b;
-                if (row < file.register_count) { direct.data[row] = true; }
-                if (row == stack)              { moves = true; }
-            }
-            bits = bits >> 1;
-            b    = b + 1;
-        }
-        w = w + 1;
+# mark every register of `set`, over the same rows, written, and whether it
+# writes the stack pointer
+fun mark_set(direct: *vector.Vector[u64], stack: u32, set: effect.Set) bool {
+    var w: u32 = 0;
+    for (w < set.len && w::usize < direct.len) {
+        direct.data[w] = direct.data[w] | set.words[w];
+        w              = w + 1;
     }
-    ret moves;
+    ret has_row(Slice[u64]{data: set.words, size: set.len::usize}, stack);
 }
 
 # the registers each row instruction `id` stands for writes, as its effects
 # state them, and whether one moves the stack pointer
-fun row_facts(fx: *Effects, direct: *vector.Vector[bool], file: *rf.File, stack: u32, d: *InstructionData, id: u32) bool {
+fun row_facts(fx: *Effects, direct: *vector.Vector[u64], stack: u32, d: *InstructionData, id: u32) bool {
     var moves: bool = false;
     var r:     u32  = 0;
     for (r < instruction.rows_in(d.opcode)) {
         val e: u32 = effects.entry(fx, id, r);
-        if (mark_set(direct, file, stack, effects.written(fx, e))) { moves = true; }
-        if (effects.stacked(fx, e))                                { moves = true; }
+        if (mark_set(direct, stack, effects.written(fx, e))) { moves = true; }
+        if (effects.stacked(fx, e))                          { moves = true; }
         r = r + 1;
     }
     ret moves;
@@ -144,7 +173,7 @@ fun row_facts(fx: *Effects, direct: *vector.Vector[bool], file: *rf.File, stack:
 
 # the registers an inline block's implicit locations write, marked, and
 # whether the block moves the stack pointer
-fun inline_facts(direct: *vector.Vector[bool], at: *Locations, stack: u32, d: *InstructionData) res[bool, Error] {
+fun inline_facts(direct: *vector.Vector[u64], at: *Locations, stack: u32, d: *InstructionData) res[bool, Error] {
     val op: instruction.Opcode = d.opcode;
     if (!(sel op.inline)) { ret res[bool, Error].ok{false}; }
     var moves: bool  = !(sel op.inline.stack.none);
@@ -162,7 +191,8 @@ fun inline_facts(direct: *vector.Vector[bool], at: *Locations, stack: u32, d: *I
     ret res[bool, Error].ok{moves};
 }
 
-fun instruction_facts(x: *Facts, fx: *Effects, direct: *vector.Vector[bool], at: *Locations, file: *rf.File, stack: u32, d: *InstructionData, id: u32) err[Error] {
+fun instruction_facts(x: *Facts, fx: *Effects, at: *Locations, file: *rf.File, stack: u32, d: *InstructionData, id: u32) err[Error] {
+    val direct: *vector.Vector[u64] = ?x.direct;
     val count:  u32                          = d.operands.size::u32;
     val answer: query.Answer[effect.Control] = instruction.transfer(file, d);
     if (sel answer.undecided) { ret err[Error].err{Error.undecided{instruction.Undecided{instruction: id, why: answer.undecided}}}; }
@@ -192,7 +222,7 @@ fun instruction_facts(x: *Facts, fx: *Effects, direct: *vector.Vector[bool], at:
         }
         i = i + 1;
     }
-    if (row_facts(fx, direct, file, stack, d, id)) { moves = true; }
+    if (row_facts(fx, direct, stack, d, id)) { moves = true; }
     val blocked: res[bool, Error] = inline_facts(direct, at, stack, d);
     if (sel blocked.err)                                                   { ret err[Error].err{blocked.err}; }
     if (blocked.ok)                                                        { moves = true; }
@@ -202,16 +232,16 @@ fun instruction_facts(x: *Facts, fx: *Effects, direct: *vector.Vector[bool], at:
 
 # the register rows one instruction writes, as the scan reads them: what
 # its effects state a row it stands for writes and what an operand of a
-# pseudo writes by its role, each marked in `direct`, a flag per row, and not
+# pseudo writes by its role, each marked in `direct`, a bit per row, and not
 # spread to the rows sharing storage with them
 # ---
 # f:      the function, every operand a location
 # fx:     the effects of its instructions
 # at:     the locations of its target
 # id:     the instruction
-# direct: the flags, one per register row, which only gain marks
+# direct: the bits, effect.words of the file's words, which only gain marks
 # ret:    ok, or why the writes were not read
-pub fun writes(f: *Function, fx: *Effects, at: *Locations, id: Instruction, direct: *vector.Vector[bool]) err[Error] {
+pub fun writes(f: *Function, fx: *Effects, at: *Locations, id: Instruction, direct: *vector.Vector[u64]) err[Error] {
     val file: *rf.File = function.file(f);
     if (file == nil) { ret err[Error].ok{}; }
     val d:     *InstructionData   = ?f.instructions.data[id];
@@ -230,7 +260,7 @@ pub fun writes(f: *Function, fx: *Effects, at: *Locations, id: Instruction, dire
             i = i + 1;
         }
     }
-    row_facts(fx, direct, file, file.register_count, d, id);
+    row_facts(fx, direct, file.register_count, d, id);
     val blocked: res[bool, Error] = inline_facts(direct, at, file.register_count, d);
     if (sel blocked.err) { ret err[Error].err{blocked.err}; }
     ret err[Error].ok{};
@@ -243,32 +273,27 @@ pub fun writes(f: *Function, fx: *Effects, at: *Locations, id: Instruction, dire
 # fx:    the effects of its instructions
 # at:    the locations of its target, whose sharing spreads a write
 # stack: the stack pointer's row
-# used:  the locations its allocation assigned
 # ret:   the facts, or why they were not read
-pub fun scan(a: *allocator.Allocator, f: *Function, fx: *Effects, at: *Locations, stack: u32, used: Slice[u32]) res[Facts, Error] {
-    var x:    Facts    = Facts{calls: false, dynamic: false, moves: false, written: vector.init[bool](a), named: vector.init[bool](a), exits: vector.init[bool](a)};
+pub fun scan(a: *allocator.Allocator, f: *Function, fx: *Effects, at: *Locations, stack: u32) res[Facts, Error] {
+    var x:    Facts    = none(a);
     val file: *rf.File = function.file(f);
     var rows: usize    = 0;
-    if (file != nil) { rows = file.register_count::usize; }
-    var direct: vector.Vector[bool] = vector.init[bool](a);
-    fin { vector.dnit[bool](?direct); }
-    var failed: err[allocator.Error] = slice.fill[bool](?x.written, rows, false);
-    keep(?failed, slice.fill[bool](?direct, rows, false));
+    var words: usize   = 0;
+    if (file != nil) {
+        rows  = file.register_count::usize;
+        words = effect.words(file)::usize;
+    }
+    var failed: err[allocator.Error] = slice.fill[u64](?x.direct, words, 0);
     keep(?failed, slice.fill[bool](?x.named, f.slots.len, false));
     keep(?failed, slice.fill[bool](?x.exits, f.instructions.len, false));
     if (sel failed.err) {
         release(?x);
         ret res[Facts, Error].err{Error.alloc{failed.err}};
     }
-    var i: usize = 0;
-    for (i < used.size) {
-        if (used.data[i]::usize < rows) { direct.data[used.data[i]] = true; }
-        i = i + 1;
-    }
     var k: usize = 0;
     for (k < f.instructions.len) {
         if (file != nil) {
-            val read: err[Error] = instruction_facts(?x, fx, ?direct, at, file, stack, ?f.instructions.data[k], k::u32);
+            val read: err[Error] = instruction_facts(?x, fx, at, file, stack, ?f.instructions.data[k], k::u32);
             if (sel read.err) {
                 release(?x);
                 ret res[Facts, Error].err{read.err};
@@ -276,8 +301,13 @@ pub fun scan(a: *allocator.Allocator, f: *Function, fx: *Effects, at: *Locations
         }
         k = k + 1;
     }
-    # bytes within a slot are named, so the slot is, since they are where it is. a slot is
-    # made before any bytes within it, so one pass from the last carries a name down
+    carry_names(?x, f);
+    ret res[Facts, Error].ok{x};
+}
+
+# bytes within a slot are named, so the slot is, since they are where it is. a slot is
+# made before any bytes within it, so one pass from the last carries a name down
+fun carry_names(x: *Facts, f: *Function) {
     var n: usize = f.slots.len;
     for (n > 0) {
         n = n - 1;
@@ -286,18 +316,60 @@ pub fun scan(a: *allocator.Allocator, f: *Function, fx: *Effects, at: *Locations
             if (x.named.data[n] && area.within.slot::usize < f.slots.len) { x.named.data[area.within.slot] = true; }
         }
     }
-    # a write reaches every row sharing storage with the row written
-    var r: usize = 0;
-    for (r < rows) {
-        if (direct.data[r]) {
-            val shared: Slice[u32] = location.shares(at, r::u32);
-            var s:      usize      = 0;
-            for (s < shared.size) {
-                if (shared.data[s]::usize < rows) { x.written.data[shared.data[s]] = true; }
-                s = s + 1;
-            }
-        }
-        r = r + 1;
+}
+
+# the facts of a function allocated from the function `from` holds the facts
+# of, the locations in `used` written and each spill slot named
+# ---
+# a:       the allocator the facts take
+# from:    the facts of the function it was allocated from
+# f:       the allocated function, the input's slots first
+# origins: each instruction's instruction of the input, spill.NONE for one
+#          the allocator inserted
+# spills:  the slots made for values in pieces
+# used:    the locations the allocation assigned, every register a list's
+#          value covers among them, and any it overwrites beside
+# ret:     the facts, or the allocator's refusal
+pub fun allocated(a: *allocator.Allocator, from: *Facts, f: *Function, origins: Slice[u32], spills: Slice[Slot], used: Slice[u32]) res[Facts, Error] {
+    var x:      Facts                = none(a);
+    var failed: err[allocator.Error] = slice.fill[u64](?x.direct, from.direct.len, 0);
+    keep(?failed, slice.fill[bool](?x.named, f.slots.len, false));
+    keep(?failed, slice.fill[bool](?x.exits, origins.size, false));
+    if (sel failed.err) {
+        release(?x);
+        ret res[Facts, Error].err{Error.alloc{failed.err}};
+    }
+    x.calls   = from.calls;
+    x.dynamic = from.dynamic;
+    x.moves   = from.moves;
+    var i: usize = 0;
+    for (i < from.direct.len) {
+        x.direct.data[i] = from.direct.data[i];
+        i                = i + 1;
+    }
+    var rows: u32 = 0;
+    if (function.file(f) != nil) { rows = function.file(f).register_count; }
+    i = 0;
+    for (i < used.size) {
+        if (used.data[i] < rows) { mark_row(?x.direct, used.data[i]); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < from.named.len && i < x.named.len) {
+        x.named.data[i] = from.named.data[i];
+        i               = i + 1;
+    }
+    i = 0;
+    for (i < spills.size) {
+        if (spills.data[i]::usize < x.named.len) { x.named.data[spills.data[i]] = true; }
+        i = i + 1;
+    }
+    carry_names(?x, f);
+    i = 0;
+    for (i < origins.size) {
+        val o: u32 = origins.data[i];
+        if (o::usize < from.exits.len) { x.exits.data[i] = from.exits.data[o]; }
+        i = i + 1;
     }
     ret res[Facts, Error].ok{x};
 }

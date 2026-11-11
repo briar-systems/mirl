@@ -81,6 +81,7 @@ use mirl.machine.frame.record;
 use mirl.machine.frame.record.Fact;
 use mirl.machine.frame.record.Framed;
 use mirl.machine.frame.scan;
+use mirl.machine.frame.scan.Facts;
 use mirl.machine.frame.scavenge;
 use mf: mirl.machine.function;
 use mirl.machine.function.Function;
@@ -115,6 +116,7 @@ use target_record: mirl.target.record;
 use mirl.target.record.Target;
 use register_schema: mirl.target.register.schema;
 
+use masc.core.effect;
 use masc.core.extension;
 use masc.core.mode;
 use rf:         masc.core.register;
@@ -272,6 +274,9 @@ val UNROWED: u32 = 0xffffffff;
 # sizes: the slot each class spills to under the build's context
 # given: the locations the allocator may give under the build's context, as
 #        `given_all` orders them
+# words: the words of a mask over the register rows
+# owned: for each of the build's rows in order, the mask of `words` words of
+#        the register rows a call under that row clobbers
 pub rec State {
     a:     *allocator.Allocator;
     build: *Build;
@@ -283,6 +288,8 @@ pub rec State {
     code:  code.Admitted;
     sizes: spill.Sizes;
     given: vector.Vector[Given];
+    words: u32;
+    owned: vector.Vector[u64];
 }
 
 # what a compilation opens of one module, before any function
@@ -324,12 +331,15 @@ pub rec Context {
 # chosen:     the selected function and the clobbers of its calls
 # effects:    the effects of the selected function's instructions, which an
 #             allocation made again reads
+# facts:      what the frame reads of the selected function, which it reads
+#             of the allocation too
 # given:      the locations the allocator was allowed, which the lowering of
 #             copies reads again, the build's or its set's
 # allocation: the allocated function
 pub rec Allocated {
     chosen:     Selected;
     effects:    Effects;
+    facts:      Facts;
     given:      Slice[Physical];
     allocation: Allocation;
 }
@@ -411,6 +421,7 @@ pub fun release(w: *Work) {
     or (sel w.form.allocated) {
         allocate.release(?w.form.allocated.allocation);
         effects.release(?w.form.allocated.effects);
+        scan.release(?w.form.allocated.facts);
         engine.release(?w.form.allocated.chosen);
     }
     or (sel w.form.framed) {
@@ -440,12 +451,17 @@ pub fun scope(x: *Session, f: id.Function) Scope {
     ret Scope{context: ?u.widened.context, moves: ?u.moves, code: ?u.code, sizes: ?u.sizes, given: ?u.given, convention: under};
 }
 
+# the index in the build's rows of the row a function is made under, the
+# default row's for one whose signature names none
+fun row_index(x: *Session, f: id.Function) usize {
+    if (f::usize < x.rows.len && x.rows.data[f] != UNROWED) { ret x.rows.data[f]::usize; }
+    ret 0;
+}
+
 # the locations a function may be given, under the set it is made under and
 # the row it is made under, past the frame pointer where `keeps`
 fun given_of(x: *Session, f: id.Function, keeps: bool) *Given {
-    var row: usize = 0;
-    if (f::usize < x.rows.len && x.rows.data[f] != UNROWED) { row = x.rows.data[f]::usize; }
-    var at: usize = row * 2;
+    var at: usize = row_index(x, f) * 2;
     if (keeps) { at = at + 1; }
     ret ?scope(x, f).given.data[at];
 }
@@ -475,6 +491,31 @@ fun given_all(a: *allocator.Allocator, b: *Build, at: *Locations, ctx: *core_sta
         i = i + 1;
     }
     ret err[allowed.Error].ok{};
+}
+
+# the masks of the register rows a call under each of the build's rows
+# clobbers, `words` words each, in the rows' order, a row with no registers
+# clobbering none
+fun owned_all(b: *Build, at: *Locations, words: u32, out: *vector.Vector[u64]) err[allocator.Error] {
+    val filled: err[allocator.Error] = slice.fill[u64](out, b.conventions.size * words::usize, 0);
+    if (sel filled.err) { ret filled; }
+    var i: usize = 0;
+    for (i < b.conventions.size) {
+        val regs: *Registers = convention.held(?b.conventions.data[i]);
+        if (regs != nil) {
+            var j: usize = 0;
+            for (j < regs.clobbered.size) {
+                val r: res[u32, location.Unlocated] = location.locate(at, Physical.register{regs.clobbered.data[j]});
+                if (sel r.ok) {
+                    val at: usize = i * words::usize + (r.ok / 64)::usize;
+                    if (r.ok / 64 < words) { out.data[at] = out.data[at] | (1::u64 << (r.ok % 64)::u64); }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
 }
 
 # give back what `given_all` made
@@ -528,7 +569,9 @@ fun request(c: *Context, f: id.Function, clobbers: Clobbers) framing.Request {
     var exit:   opt[id.Symbol] = opt[id.Symbol].none{};
     val leaves: opt[str]       = convention.exit_routine(under.row);
     if (sel leaves.some) { exit = module.find(c.m, View{data: leaves.some, len: str_len(leaves.some)}); }
-    ret framing.Request{convention: under, at: ?c.x.p.at, helper: helper, exit: exit, naked: register_schema.naked(c.m, f), clobbers: clobbers, code: scope(c.x, f).code};
+    val words: usize      = c.x.p.words::usize;
+    val owned: Slice[u64] = Slice[u64]{data: ?c.x.p.owned.data[row_index(c.x, f) * words], size: words};
+    ret framing.Request{convention: under, at: ?c.x.p.at, helper: helper, exit: exit, naked: register_schema.naked(c.m, f), clobbers: clobbers, owned: owned, code: scope(c.x, f).code};
 }
 
 # the classes the table's holds give a policy that never spills a value
@@ -555,23 +598,33 @@ fun allocate_step(c: *Context, w: *Work) res[Form, Error] {
     val chosen: Selected                      = w.form.selected;
     val read:   res[Effects, effects.Error] = effects.read(c.a, ?chosen.function, scope(c.x, w.function).context);
     if (sel read.err) { ret res[Form, Error].err{Error.effects{read.err}}; }
-    var fx:    Effects                  = read.ok;
-    val keeps: res[bool, framing.Error] = framing.keeps_pointer(c.a, ?chosen.function, ?fx, request(c, w.function, engine.clobbers_of(?chosen)));
+    var fx:   Effects                   = read.ok;
+    val req:  framing.Request           = request(c, w.function, engine.clobbers_of(?chosen));
+    val seen: res[Facts, framing.Error] = framing.facts(c.a, ?chosen.function, ?fx, req);
+    if (sel seen.err) {
+        effects.release(?fx);
+        ret res[Form, Error].err{Error.pointer{seen.err}};
+    }
+    var facts: Facts                    = seen.ok;
+    val keeps: res[bool, framing.Error] = framing.keeps_pointer(?chosen.function, ?facts, req);
     if (sel keeps.err) {
+        scan.release(?facts);
         effects.release(?fx);
         ret res[Form, Error].err{Error.pointer{keeps.err}};
     }
-    val done: res[Allocated, Error] = allocated(c, w, chosen, fx, keeps.ok);
+    val done: res[Allocated, Error] = allocated(c, w, chosen, fx, facts, keeps.ok);
     if (sel done.err) {
+        scan.release(?facts);
         effects.release(?fx);
         ret res[Form, Error].err{done.err};
     }
     ret res[Form, Error].ok{Form.allocated{done.ok}};
 }
 
-# allocate a selected function of effects `fx`, the frame pointer left out of
-# the allowed set where the frame keeps it, the effects held by the result
-fun allocated(c: *Context, w: *Work, chosen: Selected, fx: Effects, keeps: bool) res[Allocated, Error] {
+# allocate a selected function of effects `fx` and facts `facts`, the frame
+# pointer left out of the allowed set where the frame keeps it, the effects
+# and facts held by the result
+fun allocated(c: *Context, w: *Work, chosen: Selected, fx: Effects, facts: Facts, keeps: bool) res[Allocated, Error] {
     val given: *Given = given_of(c.x, w.function, keeps);
 
     var never: vector.Vector[Class] = vector.init[Class](c.a);
@@ -600,13 +653,13 @@ fun allocated(c: *Context, w: *Work, chosen: Selected, fx: Effects, keeps: bool)
             ret res[Allocated, Error].err{Error.alloc{marked.err}};
         }
     }
-    ret res[Allocated, Error].ok{Allocated{chosen: chosen, effects: fx, given: Slice[Physical]{data: given.listed.data, size: given.listed.len}, allocation: allocation}};
+    ret res[Allocated, Error].ok{Allocated{chosen: chosen, effects: fx, facts: facts, given: Slice[Physical]{data: given.listed.data, size: given.listed.len}, allocation: allocation}};
 }
 
 # the frame of an allocation, none of its storage released
 fun framed_of(c: *Context, w: *Work, held: *Allocated) res[Framed, finish.Error] {
     val need: scavenge.Need = scavenge.Need{allowed: held.given, configured: configure.scratches(c.x.p.isa.state)};
-    ret frame.frame(c.a, ?held.allocation, request(c, w.function, engine.clobbers_of(?held.chosen)), scope(c.x, w.function).code, need);
+    ret frame.frame(c.a, ?held.allocation, ?held.facts, request(c, w.function, engine.clobbers_of(?held.chosen)), scope(c.x, w.function).code, need);
 }
 
 # whether a frame was refused only for the frame pointer its allocation took,
@@ -626,7 +679,7 @@ fun frame_step(c: *Context, w: *Work) res[Form, Error] {
     val first: res[Framed, finish.Error] = framed_of(c, w, ?held);
     if (sel first.ok)         { ret res[Form, Error].ok{framing_of(c, ?held, first.ok)}; }
     if (!withheld(first.err)) { ret res[Form, Error].err{Error.frame{first.err}}; }
-    val again: res[Allocated, Error] = allocated(c, w, held.chosen, held.effects, true);
+    val again: res[Allocated, Error] = allocated(c, w, held.chosen, held.effects, held.facts, true);
     if (sel again.err) { ret res[Form, Error].err{again.err}; }
     allocate.release(?held.allocation);
     var kept: Allocated = again.ok;
@@ -647,6 +700,7 @@ fun framing_of(c: *Context, held: *Allocated, framed: Framed) Form {
     if (sel c.stats.some) { c.stats.some.allocated = c.stats.some.allocated + mf.placed(?held.allocation.function)::u64; }
     allocate.release(?held.allocation);
     effects.release(?held.effects);
+    scan.release(?held.facts);
     engine.release(?held.chosen);
     ret Form.framed{Framing{given: held.given, framed: framed}};
 }
@@ -1098,6 +1152,20 @@ fun state(p: *State, a: *allocator.Allocator, b: *Build, t: *Target, found: *Isa
         location.dnit(?p.at);
         ret err[Error].err{Error.allowed{listed.err}};
     }
+    p.words = 0;
+    if (p.at.file != nil) { p.words = effect.words(p.at.file); }
+    p.owned = vector.init[u64](a);
+    val owns: err[allocator.Error] = owned_all(b, ?p.at, p.words, ?p.owned);
+    if (sel owns.err) {
+        vector.dnit[u64](?p.owned);
+        release_given(?p.given);
+        spill.release_sizes(?p.sizes);
+        code.dnit(?p.code);
+        move.dnit(?p.moves);
+        engine.release_index(?p.index);
+        location.dnit(?p.at);
+        ret err[Error].err{Error.alloc{owns.err}};
+    }
     ret err[Error].ok{};
 }
 
@@ -1105,6 +1173,7 @@ fun state(p: *State, a: *allocator.Allocator, b: *Build, t: *Target, found: *Isa
 pub fun unprepare(b: *Build) {
     val p: *State               = b.state::*State;
     val a: *allocator.Allocator = p.a;
+    vector.dnit[u64](?p.owned);
     release_given(?p.given);
     spill.release_sizes(?p.sizes);
     code.dnit(?p.code);
