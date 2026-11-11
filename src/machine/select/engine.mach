@@ -382,10 +382,12 @@ pub fun release(x: *Selected) err[allocator.Error] {
 # convention: the registers of the target's default convention row, which
 #             the table's link, argument and result sources are checked
 #             against once, nil for a selection with no convention row
-# rules:      the rules each instruction can match, by its opcode and the
-#             shapes of its operands, each list by cost, the least first, and
-#             rules of one cost in table order
-# constants:  the constant rules' indices in the same order
+# rules:      the rules each instruction can match, by its opcode, the
+#             shapes of its operands and the type its rules' tests read, each
+#             list by cost, the least first, and rules of one cost in table
+#             order
+# constants:  the constant rules a constant can match, by its type, in the
+#             same order
 pub rec Index {
     a:          *allocator.Allocator;
     isa:        *Isa;
@@ -393,7 +395,7 @@ pub rec Index {
     context:    *core_state.Context;
     convention: *Registers;
     rules:      candidates.Candidates;
-    constants:  Slice[u32];
+    constants:  candidates.Candidates;
 }
 
 # the selection of one module over a build's index
@@ -838,28 +840,12 @@ pub fun index(a: *allocator.Allocator, isa: *Isa, target: *Target, context: *cor
     if (!landing_ok(table)) { ret res[Index, Error].err{defect(NONE, true, LANDING)}; }
     val indexed: res[candidates.Candidates, allocator.Error] = candidates.build(a, table.rules, opcode_table.rows());
     if (sel indexed.err) { ret res[Index, Error].err{Error.alloc{indexed.err}}; }
-    var rules: candidates.Candidates = indexed.ok;
-    var many:  usize                 = table.constants.len::usize;
-    if (many == 0) { many = 1; }
-    val fixed: res[*u32, allocator.Error] = allocator.zallocate[u32](a, many);
-    if (sel fixed.err) {
+    var rules:  candidates.Candidates                       = indexed.ok;
+    val formed: res[candidates.Candidates, allocator.Error] = candidates.build_constants(a, table.constants);
+    if (sel formed.err) {
         candidates.release(?rules);
-        ret res[Index, Error].err{Error.alloc{fixed.err}};
+        ret res[Index, Error].err{Error.alloc{formed.err}};
     }
-    val constants: *u32                       = fixed.ok;
-    val scratches: res[*u32, allocator.Error] = allocator.zallocate[u32](a, many);
-    if (sel scratches.err) {
-        candidates.release(?rules);
-        allocator.deallocate[u32](a, constants, many);
-        ret res[Index, Error].err{Error.alloc{scratches.err}};
-    }
-    i = 0;
-    for (i < table.constants.len) {
-        constants[i] = i;
-        i            = i + 1;
-    }
-    candidates.by_cost(table.constants, constants, table.constants.len::usize, scratches.ok);
-    allocator.deallocate[u32](a, scratches.ok, many);
     ret res[Index, Error].ok{Index{
         a:          a,
         isa:        isa,
@@ -867,7 +853,7 @@ pub fun index(a: *allocator.Allocator, isa: *Isa, target: *Target, context: *cor
         context:    context,
         convention: convention,
         rules:      rules,
-        constants:  Slice[u32]{data: constants, size: many},
+        constants:  formed.ok,
     }};
 }
 
@@ -875,7 +861,7 @@ pub fun index(a: *allocator.Allocator, isa: *Isa, target: *Target, context: *cor
 pub fun release_index(x: *Index) err[allocator.Error] {
     var failed: err[allocator.Error] = err[allocator.Error].ok{};
     keep(?failed, candidates.release(?x.rules));
-    keep(?failed, slice.release[u32](x.a, x.constants));
+    keep(?failed, candidates.release(?x.constants));
     ret failed;
 }
 
@@ -1255,10 +1241,7 @@ fun matches(st: *State, r: *Rule, root: id.Instruction, home: id.Block, held: u3
         if (xd.opcode != n.opcode)                             { ret false; }
         if (!(sel xd.place.placed && xd.place.placed == home)) { ret false; }
         # a load that reads a stack slot's bytes in place is a reload of its own, never part of another's pattern
-        if (xd.opcode == opcode_table.LOAD) {
-            val direct: opt[Inside] = slot_access(st, x);
-            if (sel direct.some) { ret false; }
-        }
+        if (xd.opcode == opcode_table.LOAD && in_place(st, x)) { ret false; }
         mt.nodes[i] = x;
         i           = i + 1;
     }
@@ -1687,6 +1670,29 @@ fun leaks(st: *State, r: *Rule, mt: *Match) bool {
     ret touches_secret(st, mt) && machine_timing.dependent(r, st.timed.some);
 }
 
+# the atom of the type of a value
+fun atom(st: *State, v: id.Value) u32 {
+    ret candidates.atom_of(?st.s.index.rules, ?st.m.types, value(st, v).type);
+}
+
+# the atom of the key of a split an instruction reads, NONE where the split has
+# none, the instruction lacks it, or a paired key's two operands differ
+fun key_atom(st: *State, d: *InstructionData, s: *candidates.Split) u32 {
+    val k: u32 = s.key;
+    if (k == candidates.NONE || k == candidates.BUILT) { ret candidates.NONE; }
+    if (k >= candidates.RESULTS) {
+        val r: usize = (k - candidates.RESULTS)::usize;
+        if (r >= d.results.len) { ret candidates.NONE; }
+        ret atom(st, d.results.data[r]);
+    }
+    if (k::usize >= d.operands.len) { ret candidates.NONE; }
+    val a: u32 = atom(st, d.operands.data[k]);
+    if (!s.paired) { ret a; }
+    if (d.operands.len < 2) { ret candidates.NONE; }
+    if (atom(st, d.operands.data[1]) != a) { ret candidates.NONE; }
+    ret a;
+}
+
 # the least cost rule for an instruction whose pattern matches and guard
 # holds, the first in table order among rules of one cost. a rule that leaks
 # gives way to the next that does not, and is taken where every rule leaks, so
@@ -1695,7 +1701,7 @@ fun choose(st: *State, i: id.Instruction) res[Choice, Error] {
     val d:  *InstructionData       = instruction(st, i);
     val op: opcode_row.Opcode      = d.opcode;
     val cs: *candidates.Candidates = ?st.s.index.rules;
-    val at: u32                    = candidates.list(cs, op, shape(st, d, 0), shape(st, d, 1));
+    val at: u32                    = candidates.list(cs, op, shape(st, d, 0), shape(st, d, 1), key_atom(st, d, candidates.split_of(cs, op)));
     var mt: Match;
     mt.module   = st.m;
     mt.body     = st.body;
@@ -1925,9 +1931,13 @@ fun materialise(st: *State, b: u32, v: id.Value, dest: u32, user: id.Instruction
     mt.target   = st.s.index.target;
     mt.count    = 0;
     mt.subject  = v;
-    var k: u32 = 0;
-    for (k < st.s.index.isa.table.constants.len) {
-        val r:    *Rule            = ?st.s.index.isa.table.constants.at[st.s.index.constants.data[k]];
+    val cs:   *candidates.Candidates = ?st.s.index.constants;
+    var kind: u32                    = candidates.NONE;
+    if (candidates.split_of(cs, 0).key == candidates.BUILT) { kind = candidates.atom_of(cs, ?st.m.types, value(st, v).type); }
+    val at: u32 = candidates.list(cs, 0, candidates.ANY, candidates.ANY, kind);
+    var k:  u32 = cs.starts.data[at];
+    for (k < cs.starts.data[at + 1]) {
+        val r:    *Rule            = ?st.s.index.isa.table.constants.at[cs.rules.data[k]];
         val held: res[bool, Error] = guard(st, r, ?mt);
         if (sel held.err) { ret err[Error].err{held.err}; }
         if (held.ok) {
@@ -3030,8 +3040,7 @@ fun choose_block(st: *State, k: id.Block) err[Error] {
         if (only_bound(st, at))                                       { st.consumed.data[at] = true; }
         if (unread(st, at))                                           { st.consumed.data[at] = true; }
         if (folds_away(st, at) || remade(st, at))                     { st.consumed.data[at] = true; }
-        val slotted: opt[Inside] = slot_access(st, at);
-        if (unruled(instruction(st, at).opcode) || sel slotted.some) {
+        if (unruled(instruction(st, at).opcode) || in_place(st, at)) {
             var held: Choice = Choice{rule: NONE, found: unmatched_match(st), consumes: 0};
             held.found.nodes[0] = at;
             held.found.count    = 1;
@@ -3130,6 +3139,7 @@ fun inside(st: *State, v: id.Value) opt[Inside] {
     var at:    id.Value = v;
     var off:   u64      = 0;
     var depth: u32      = 0;
+    var mt:    Match    = unmatched_match(st);
     for (depth < INSIDE_DEPTH) {
         val def: Def = value(st, at).def;
         if (!(sel def.result)) { ret opt[Inside].none{}; }
@@ -3140,7 +3150,6 @@ fun inside(st: *State, v: id.Value) opt[Inside] {
             ret opt[Inside].some{Inside{alloca: x, offset: off}};
         }
         if (xd.opcode != opcode_table.PTR_ADD || xd.operands.len != 2 || xd.results.len != 1) { ret opt[Inside].none{}; }
-        var mt:  Match                      = unmatched_match(st);
         val got: res[opt[i64], match.Error] = match.bits(?mt, xd.operands.data[1]);
         if (sel got.err)      { ret opt[Inside].none{}; }
         if (sel got.ok.none)  { ret opt[Inside].none{}; }
@@ -3180,36 +3189,36 @@ fun moved_type(st: *State, d: *InstructionData) Type {
     ret value(st, d.operands.data[1]).type;
 }
 
-# the bytes of a stack slot a load or a store reads or writes in place, none for any other
-# instruction: one neither volatile nor kept, whose address is inside a slot by `inside`
-# and whose value lies whole within the slot. such a load is a reload of those bytes and
-# such a store a spill to them, as a spilled register's are, so no register holds the
-# address for it. asked once for each instruction
-fun slot_access(st: *State, at: id.Instruction) opt[Inside] {
+# whether a load or a store reads or writes bytes of a stack slot in place: one neither
+# volatile nor kept, whose address is inside a slot by `inside` and whose value lies whole
+# within the slot. such a load is a reload of those bytes and such a store a spill to them,
+# as a spilled register's are, so no register holds the address for it. worked out once for
+# each instruction
+fun in_place(st: *State, at: id.Instruction) bool {
     val d: *InstructionData = instruction(st, at);
-    if (d.opcode != opcode_table.LOAD && d.opcode != opcode_table.STORE) { ret opt[Inside].none{}; }
-    if (st.direct.data[at] == 0)                                                           { ret opt[Inside].none{}; }
+    if (d.opcode != opcode_table.LOAD && d.opcode != opcode_table.STORE) { ret false; }
+    if (st.direct.data[at] != NONE)                                      { ret st.direct.data[at] == 1; }
+    st.direct.data[at] = 0;
     var shaped: bool = false;
     if (d.opcode == opcode_table.LOAD)  { shaped = d.operands.len == 1 && d.results.len == 1; }
     if (d.opcode == opcode_table.STORE) { shaped = d.operands.len == 2 && d.operands.data[1] != d.operands.data[0]; }
-    if (!shaped || d.metadata.flags.volatile || d.metadata.flags.kept) {
-        st.direct.data[at] = 0;
-        ret opt[Inside].none{};
-    }
+    if (!shaped || d.metadata.flags.volatile || d.metadata.flags.kept) { ret false; }
     val in: opt[Inside] = inside(st, d.operands.data[0]);
-    if (sel in.none) {
-        st.direct.data[at] = 0;
-        ret in;
-    }
-    if (st.direct.data[at] == 1) { ret in; }
-    st.direct.data[at] = 0;
+    if (sel in.none) { ret false; }
     val held: res[u64, target_record.Error] = layout.size(?st.layout, moved_type(st, d), type_table.DEFAULT_SPACE);
-    if (sel held.err) { ret opt[Inside].none{}; }
+    if (sel held.err) { ret false; }
     val whole: opt[u64] = slot_bytes(st, in.some.alloca);
-    if (sel whole.none)                                             { ret opt[Inside].none{}; }
-    if (held.ok == 0 || in.some.offset + held.ok > whole.some)      { ret opt[Inside].none{}; }
+    if (sel whole.none)                                        { ret false; }
+    if (held.ok == 0 || in.some.offset + held.ok > whole.some) { ret false; }
     st.direct.data[at] = 1;
-    ret in;
+    ret true;
+}
+
+# the bytes of a stack slot a load or a store reads or writes in place, none for any other
+# instruction
+fun slot_access(st: *State, at: id.Instruction) opt[Inside] {
+    if (!in_place(st, at)) { ret opt[Inside].none{}; }
+    ret inside(st, instruction(st, at).operands.data[0]);
 }
 
 # whether no code is made for instruction `x`, an alloca or an address a constant number of
@@ -3218,7 +3227,7 @@ fun slot_access(st: *State, at: id.Instruction) opt[Inside] {
 # ever holds it. asked once for each instruction
 fun folds_away(st: *State, x: id.Instruction) bool {
     val xd: *InstructionData = instruction(st, x);
-    # only these two keep their answer here: a load's or a store's entry is `slot_access`'s
+    # only these two keep their answer here: a load's or a store's entry is `in_place`'s
     if (xd.opcode != opcode_table.ALLOCA && xd.opcode != opcode_table.PTR_ADD) { ret false; }
     if (st.direct.data[x] != NONE)                                                               { ret st.direct.data[x] == 1; }
     st.direct.data[x] = 0;
@@ -3238,8 +3247,7 @@ fun folds_away(st: *State, x: id.Instruction) bool {
         }
         or {
             if (ud.operands.len == 0 || ud.operands.data[0] != v) { ret false; }
-            val through: opt[Inside] = slot_access(st, u);
-            if (sel through.none) { ret false; }
+            if (!in_place(st, u)) { ret false; }
         }
         i = i + 1;
     }
