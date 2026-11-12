@@ -43,6 +43,7 @@ use masc.isa.riscv.gen_row_index;
 use mirl.machine.class.Physical;
 use mirl.machine.frame.code;
 use mirl.machine.frame.code.Access;
+use mirl.machine.frame.code.Add;
 use mirl.machine.frame.code.Admitted;
 use mirl.machine.frame.code.Code;
 use mirl.machine.frame.code.Emit;
@@ -108,12 +109,12 @@ fun either(e: *Emit, a: *Row, b: *Row) *Row {
 # the register that measures an offset's scale under the emitting state and
 # the bytes of the offset per count it reads, none for a scale no register
 # measures there
-fun measured(e: *Emit, o: Offset, share: *i64) opt[rf.Id] {
-    val view: *rf.Available = e.admitted.context.view;
+fun measured(ctx: *core_state.Context, o: Offset, share: *i64) opt[rf.Id] {
+    val view: *rf.Available = ctx.view;
     val q:    opt[u8]       = rf.bound(view, o.scale);
     if (sel q.none) { ret opt[rf.Id].none{}; }
     val qq: *quantity.Quantity   = ?view.file.quantities.at[q.some];
-    val g:  opt[*quantity.Gauge] = core_state.gauge(e.admitted.context, qq);
+    val g:  opt[*quantity.Gauge] = core_state.gauge(ctx, qq);
     if (sel g.none) { ret opt[rf.Id].none{}; }
     val row: u32 = g.some.row;
     if (row >= view.file.register_count) { ret opt[rf.Id].none{}; }
@@ -144,7 +145,7 @@ fun shift_left(e: *Emit, d: rf.Id, s: rf.Id, by: i64) err[code.Error] {
 # other share
 fun scaled_into(e: *Emit, t: rf.Id, o: Offset, u: opt[rf.Id]) err[code.Error] {
     var share: i64        = 0;
-    val m:     opt[rf.Id] = measured(e, o, ?share);
+    val m:     opt[rf.Id] = measured(e.admitted.context, o, ?share);
     if (sel m.none) { ret err[code.Error].err{code.Error.scaled{o}}; }
     var mag: i64 = share;
     if (mag < 0)  { mag = 0 - mag; }
@@ -298,10 +299,15 @@ fun store(e: *Emit, w: *Width, value: rf.Id, base: rf.Id, at: Offset) err[code.E
     ret three(e, w.store, reg(b.ok), reg(value), Operand.immediate{low});
 }
 
+# whether a load's destination can hold the high part of its address where
+# no scratch is offered: a general register it writes anyway, not its base
+fun holds_address(file: *rf.File, dest: rf.Id, base: rf.Id) bool {
+    ret file.classes[rf.class_of(dest)].kind == rf.GENERAL && dest != base;
+}
+
 fun load(e: *Emit, w: *Width, dest: rf.Id, base: rf.Id, at: Offset) err[code.Error] {
-    # a general destination is written anyway, so it can hold the high part
     var temp: opt[rf.Id] = e.scratch;
-    if (sel temp.none && function.file(e.f).classes[rf.class_of(dest)].kind == rf.GENERAL && dest != base) { temp = opt[rf.Id].some{dest}; }
+    if (sel temp.none && holds_address(function.file(e.f), dest, base)) { temp = opt[rf.Id].some{dest}; }
     if (!w.offset) {
         val held: res[rf.Id, code.Error] = whole(e, dest, base, at, temp);
         if (sel held.err) { ret err[code.Error].err{held.err}; }
@@ -363,5 +369,93 @@ fun scratchless(x: *Admitted, stack: rf.Id, s: Step) bool {
     ret true;
 }
 
+# whether the scaled part of an offset is formed, its share a power of two
+# held in `single`: the register measuring its scale is read and the share
+# is not 0
+fun shared(ctx: *core_state.Context, o: Offset, single: *bool) bool {
+    var share: i64        = 0;
+    val m:     opt[rf.Id] = measured(ctx, o, ?share);
+    if (sel m.none) { ret false; }
+    var mag: i64 = share;
+    if (mag < 0)  { mag = 0 - mag; }
+    if (mag == 0) { ret false; }
+    @single = (mag & (mag - 1)) == 0;
+    ret true;
+}
+
+# 0 where the destination holds what a move builds, as `temporary` takes it
+# under no scratch, else 1
+fun unless_free(dest: rf.Id, src: rf.Id, stack: rf.Id) u32 {
+    if (dest != src && dest != stack) { ret 0; }
+    ret 1;
+}
+
+# the scratches an add takes: a large fixed offset is built in the
+# destination or the scratch, and a scaled one is formed in the destination
+# only where its share is a power of two and its fixed part an immediate,
+# else in the scratch, with a second where the share is no power of two
+fun add_fewest(x: *Admitted, stack: rf.Id, a: Add) u32 {
+    if (a.by.per == 0) {
+        if (fits12(a.by.fixed) || !builds(a.by.fixed)) { ret 0; }
+        ret unless_free(a.dest, a.src, stack);
+    }
+    var single: bool = false;
+    if (!shared(x.context, a.by, ?single)) { ret 0; }
+    val big: bool = !fits12(a.by.fixed);
+    if (big && !builds(a.by.fixed)) { ret 0; }
+    if (!single)                    { ret 2; }
+    if (big)                        { ret 1; }
+    ret unless_free(a.dest, a.src, stack);
+}
+
+# the scratches a load or store takes past its row's offset: one for the
+# address, which a load's general destination holds instead, and a second
+# where a scaled share is no power of two or a fixed part past twelve bits
+# is added to the scaled part. a whole register access forms even a small
+# offset in it
+fun access_fewest(x: *Admitted, stack: rf.Id, a: Access, store: bool) u32 {
+    val w: opt[*Width] = code.width_of(x, a.register, a.size, store);
+    if (sel w.none) { ret 0; }
+    val own: bool = !store && holds_address(x.context.view.file, a.register, a.base);
+    if (w.some.offset) {
+        if (a.at.per == 0) {
+            if (fits12(a.at.fixed) || !builds(a.at.fixed)) { ret 0; }
+            if (own)                                       { ret 0; }
+            ret 1;
+        }
+    }
+    or (a.at.fixed == 0 && a.at.per == 0) { ret 0; }
+    or (a.at.per == 0) {
+        if (fits12(a.at.fixed))  { ret unless_owned(own); }
+        if (!builds(a.at.fixed)) { ret 0; }
+        ret unless_owned(own && a.register != stack);
+    }
+    var single: bool = false;
+    if (!shared(x.context, a.at, ?single)) { ret 0; }
+    val big: bool = !fits12(a.at.fixed);
+    if (big && !builds(a.at.fixed)) { ret 0; }
+    if (!single || big)             { ret 2; }
+    if (w.some.offset)              { ret unless_owned(own); }
+    ret unless_owned(own && a.register != stack);
+}
+
+fun unless_owned(own: bool) u32 {
+    if (own) { ret 0; }
+    ret 1;
+}
+
+# the fewest scratches a move takes, each case as the move's own code chooses
+# its registers
+fun fewest(x: *Admitted, stack: rf.Id, s: Step) u32 {
+    if (sel s.add) { ret add_fewest(x, stack, s.add); }
+    if (sel s.mask) {
+        if (s.mask.align > 0x4000_0000 || fits12(0 - s.mask.align::i64)) { ret 0; }
+        ret unless_free(s.mask.dest, s.mask.src, stack);
+    }
+    if (sel s.store) { ret access_fewest(x, stack, s.store, true); }
+    if (sel s.load)  { ret access_fewest(x, stack, s.load, false); }
+    ret 0;
+}
+
 # the RISC-V frame code
-pub val FRAME: Code = Code{add: add, mask: mask, sub: sub, store: store, load: load, widths: Widths{at: ?WIDTHS[0], len: 12}, scaled: scaled, probe: Probes.none{}, adding: 2, scratchless: scratchless};
+pub val FRAME: Code = Code{add: add, mask: mask, sub: sub, store: store, load: load, widths: Widths{at: ?WIDTHS[0], len: 12}, scaled: scaled, probe: Probes.none{}, adding: 2, scratchless: scratchless, fewest: fewest};
