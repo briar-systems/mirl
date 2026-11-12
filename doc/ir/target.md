@@ -387,7 +387,7 @@ The register family (`mirl.target.register.schema`) defines one attribute:
 
 | name | datum | on | what it states |
 |---|---|---|---|
-| `naked` | integer, 1 | function | the function is its body as written: selection moves none of its parameters, which arrive where the convention places them, and the frame lays no prologue, epilogue or save. The body holds only inline assembly items that bind nothing and the `unreachable` that ends each block, refused at selection otherwise, and a body that needs a frame slot is refused when the frame is laid |
+| `naked` | integer, 1 | function | the function is its body as written: selection moves none of its parameters, which arrive where the convention places them, and the frame lays no prologue, epilogue or save. The body holds only inline assembly items that bind nothing and the `unreachable` that ends each block, refused at selection otherwise, and a block may return from it, as it has no epilogue to skip, and a body that needs a frame slot is refused when the frame is laid |
 
 The SPIR-V family (`mirl.target.spirv.schema`) defines its entry points and interface, every value checked against masc's enumerations of the SPIR-V grammar:
 
