@@ -33,6 +33,18 @@ The kinds are
 
 This is how a front end gives a debugger the source type of a lowered tagged union (see section 2.8 of [the specification](../ir.md)). The IR carries the structure of the discriminant and the union, and the debug type says which field is which and what each case means.
 
+### Home
+
+A type is described once in a program, and its entry's **home** says which module does it. The front end decides the home from facts of the program alone, never from the order modules are compiled in.
+
+| home | who describes it |
+|---|---|
+| shared | every module that names it, each alike. A type no module owns, such as a scalar, a pointer or an instance of a generic, is shared |
+| own | this module, which every other module names it from |
+| outside | another module. The entry is complete once declared and gives no members, and only a structure, union or tagged union can be described outside (`Error.outside`) |
+
+An entry declared a second time under its key must give the same home too. A producer writes an own type in full and an outside type as a reference to its key, which a debugger resolves against the module that owns it when that module is in the same program.
+
 ### Declaring and defining
 
 An aggregate refers to itself and to others, so an entry is declared under its key before its members are walked. `declare(table, types, entry)` gives either a **fresh** open entry, whose members the caller walks and then gives with `define`, or the **known** entry already described under that key. A base or pointer entry is complete once declared. An entry declared a second time under its key must say the same thing, or the table refuses it as a conflict.

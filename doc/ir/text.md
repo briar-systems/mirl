@@ -417,7 +417,8 @@ debug table
   entry_of    = "file" ident "=" string ";"
               | "loc" ident "=" ident ":" uint ":" uint ";"
               | "site" ident "=" string "at" ident [ "in" ident ] ";"
-              | "type" ident "=" string string shape ";"
+              | "type" ident "=" string string [ "own" ] shape ";"
+              | "type" ident "=" string string "outside" ( "structure" | "union" | "tagged" ) "(" type ")" ";"
               | "var" ident "=" string ":" ident "at" ident [ "parameter" uint ] ";" ;
   shape       = "base" "(" encoding "," uint ")"
               | ( "structure" | "union" ) "(" type ")" members
@@ -443,7 +444,10 @@ debug table
   payload field when it has one and cases, an enumeration its base type and values, an
   array its element and count, a pointer the key of its pointee and a
   function its parameters and results, and a type may name any type of the
-  table, before or after it. `open` is an entry declared and not yet defined. a variable is its source name, debug type, declaring
+  table, before or after it. `open` is an entry declared and not yet defined.
+  `own` marks a type this module describes for every other, and `outside`
+  one another module describes, which is its kind and layout alone. a
+  variable is its source name, debug type, declaring
   location and its position among the parameters when it is one. every
   file is printed, then every location, site, type and variable, each in
   order.
