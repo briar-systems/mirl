@@ -255,6 +255,10 @@ decorators
                             link time, as distinct from an instance, whose
                             definitions are all equivalent (see ir.md 1). the
                             verifier takes it on a `weak` symbol alone
+  #[merged(number)]         a merged definition of this identity, every
+                            object needing it holding a copy and the link
+                            keeping one (see ir.md 1). the verifier takes it
+                            on a defined global function alone
   #[visibility(name)]       its visibility, by the name of mink's row:
                             protected, hidden, internal. default when left out
   #[extensions(string, ...)] the extensions a function's code may use past
