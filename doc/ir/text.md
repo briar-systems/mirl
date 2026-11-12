@@ -422,7 +422,7 @@ debug table
               | "var" ident "=" string ":" ident "at" ident [ "parameter" uint ] ";" ;
   shape       = "base" "(" encoding "," uint ")"
               | ( "structure" | "union" ) "(" type ")" members
-              | "tagged" "(" type ")" ( "open" | "discriminant" dmember [ "payload" uint ]
+              | "tagged" "(" type ")" ( "open" | "discriminant" dmember
                 "{" [ case { "," case } ] "}" )
               | "enumeration" ( "open" | "(" ident ")" "{" [ enumerator { "," enumerator } ] "}" )
               | "array" ( "open" | "(" ident "," uint ")" )
@@ -431,7 +431,7 @@ debug table
   encoding    = "signed" | "unsigned" | "float" | "boolean" | "character" | "address" ;
   members     = "open" | "{" [ dmember { "," dmember } ] "}" ;
   dmember     = string ":" ident "field" uint ;
-  case        = string ":" uint [ "payload" dmember ] ;
+  case        = string ":" uint [ "payload" uint dmember ] ;
   enumerator  = string ":" uint ;
   idents      = ident { "," ident } ;
 
@@ -440,8 +440,9 @@ debug table
   was itself inlined at. a type is its key, its source name ("" when
   anonymous) and its shape: a structure or union is the ir type it is laid
   out as and its members, each a source name, a debug type and the field of
-  the layout it is laid out as, a tagged union its layout, discriminant,
-  payload field when it has one and cases, an enumeration its base type and values, an
+  the layout it is laid out as, a tagged union its layout, discriminant
+  and cases, each case's payload the field of the layout that is its union
+  and its member of that union, an enumeration its base type and values, an
   array its element and count, a pointer the key of its pointee and a
   function its parameters and results, and a type may name any type of the
   table, before or after it. `open` is an entry declared and not yet defined.

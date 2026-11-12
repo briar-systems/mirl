@@ -84,7 +84,7 @@ The ir knows no kind by name. A target states each kind its family mints as a ro
 
 ### 2.8 Tagged unions
 
-A tagged union is not an IR type. A front end lowers one to a structure of a discriminant integer and a union of the payloads, for example a `rec` of an `i8` and a `uni` of an `i32` and an `i8`, and branches on the discriminant itself. This keeps the IR free of any source language's rules about what a tag means, and it lets the target's data layout place the parts. The debug table can still describe the lowered structure as a tagged union with its cases, so a debugger shows the source type (see [ir/debug.md](ir/debug.md)).
+A tagged union is not an IR type. A front end lowers one to a structure of a discriminant integer and a union of the payloads, for example a `rec` of an `i8` and a `uni` of an `i32` and an `i8`, or of several unions where its payloads must not share bytes, and branches on the discriminant itself. This keeps the IR free of any source language's rules about what a tag means, and it lets the target's data layout place the parts. The debug table can still describe the lowered structure as a tagged union with its cases, so a debugger shows the source type (see [ir/debug.md](ir/debug.md)).
 
 
 ## 3. Values and constants
