@@ -1,0 +1,408 @@
+# a copy or fill of a length the compiler knows, on a target with no
+# instruction for it, as a loop of word moves in its place
+#
+# the passes that move bytes through memory make a run of word moves up to the
+# target's bound and one `mem.copy` or `mem.fill` past it (mirl.legal.moves).
+# where the target has no instruction for that operation, this pass, which runs
+# after the last of them, makes each of a constant length, neither volatile
+# nor kept, a loop:
+#
+# - each step moves one unit, the widest access at most the word that the
+#   alignment the operation states admits, so every access is aligned. the
+#   loop runs the length's count of units, a constant, and the bytes past the
+#   last whole unit, fewer than a unit, are word moves after it.
+# - a copy's ranges may overlap, so it reads the bytes past the last unit
+#   before the loop, runs down from the top where the destination lies above
+#   the source and up from the bottom otherwise, and writes those bytes after
+#   it. each step reads its unit before it writes it, so no byte is written
+#   before it is read.
+# - a fill stores the byte repeated across a unit, a constant where the byte
+#   is one.
+#
+# one of a length not constant, a volatile one and a kept fill are the helpers
+# legalisation's. the loop's count and every address are made of the length
+# and the operands' addresses alone and none of the bytes it moves, so the
+# loop's steps and accesses depend on no value it moves and the pass keeps
+# constant time. a value it moves is as secret as the operation, its address
+# and count as secret as the addresses it is given.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mirl.build.builder;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.body;
+use mirl.ir.contents;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use Spot: mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.legal.moves;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.target.capability;
+use mirl.target.capability.Capabilities;
+
+# the pass: it splits blocks and adds edges, so it keeps no analysis
+pub val BULK: Pass = Pass{name: "bulk", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: cache.NONE, time: Time.keeps{}, applies: wanted};
+
+# a copy or a fill the target has no instruction for, where memory is
+# addressed physically
+fun wanted(g: *Ground) bool {
+    if (!(sel g.t.caps.addressing.physical)) { ret false; }
+    ret !(sel g.t.caps.bulk.copy.native) || !(sel g.t.caps.bulk.fill.native);
+}
+
+# one function being rewritten
+# ---
+# s:      where instructions are made
+# caps:   the target's capabilities
+# word:   the widest access in bytes, the target's widest arithmetic
+# failed: the first failure
+rec Work {
+    s:      emit.Site;
+    caps:   *Capabilities;
+    word:   u64;
+    failed: opt[refusal.Error];
+}
+
+fun note(w: *Work, why: refusal.Error) {
+    val first: bool = sel w.failed.none;
+    if (first) { w.failed = opt[refusal.Error].some{why}; }
+}
+
+fun body_of(w: *Work) *Body {
+    ret w.s.b;
+}
+
+fun type_of(w: *Work, x: Value) Type {
+    ret w.s.b.values.data[x].type;
+}
+
+fun secret(w: *Work, x: Value) bool {
+    ret w.s.b.values.data[x].secret;
+}
+
+fun block_of(b: *Body, i: Instruction) Block {
+    val at: Spot = b.instructions.data[i].place;
+    if (sel at.placed) { ret at.placed; }
+    ret 0;
+}
+
+fun position(b: *Body, k: Block, i: Instruction) u32 {
+    val list: *vector.Vector[Instruction] = ?b.blocks.data[k].instructions;
+    var p:    usize                       = 0;
+    for (p < list.len && list.data[p] != i) { p = p + 1; }
+    ret p::u32;
+}
+
+# the alignment an access states
+fun alignment_of(d: *InstructionData) u64 {
+    var i: usize = 0;
+    for (i < d.immediates.len) {
+        val m: Immediate = d.immediates.data[i];
+        if (sel m.alignment) { ret m.alignment; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# the integer of a number of bytes
+fun integer(w: *Work, bytes: u64) Type {
+    val t: res[Type, table.Error] = table.intern(?w.s.m.types, table.Shape.integer{table.Integer{width: (bytes * 8)::u32}});
+    if (sel t.err) {
+        note(w, refusal.Error.ir{module.Error.types{t.err}});
+        ret 0;
+    }
+    ret t.ok;
+}
+
+# a constant of an integer type
+fun constant(w: *Work, ty: Type, x: Wide) Value {
+    val made: res[Value, refusal.Error] = emit.constant(?w.s, ty, x);
+    if (sel made.err) {
+        note(w, made.err);
+        ret 0;
+    }
+    ret made.ok;
+}
+
+# a constant of a scalar integer type of a width, x taken modulo the width
+fun count_of(w: *Work, ty: Type, bits: u32, x: u64) Value {
+    var v: u64 = x;
+    if (bits < 64) { v = x & ((1u64 << bits::u64) - 1); }
+    val made: res[Value, refusal.Error] = emit.word_constant(?w.s, ty, v);
+    if (sel made.err) {
+        note(w, made.err);
+        ret 0;
+    }
+    ret made.ok;
+}
+
+# a word of n bytes each one byte
+fun filled(byte: u8, n: u64) Wide {
+    var x: Wide = word.zero();
+    var k: u64  = 0;
+    for (k < n && byte != 0) {
+        x[k / 8] = x[k / 8] | (byte::u64 << ((k % 8) * 8));
+        k        = k + 1;
+    }
+    ret x;
+}
+
+fun load(w: *Work, address: Value, ty: Type, align: u64) Value {
+    var ops: [1]Value     = [1]Value{address};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{align}};
+    val i:   Instruction  = emit.make(?w.s, opcode_table.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+    ret emit.result(?w.s, i, 0);
+}
+
+fun store(w: *Work, address: Value, x: Value, align: u64) {
+    var ops: [2]Value     = [2]Value{address, x};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+    emit.make(?w.s, opcode_table.STORE, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+fun no_values() Slice[Value] {
+    ret Slice[Value]{data: nil, size: 0};
+}
+
+fun no_immediates() Slice[Immediate] {
+    ret Slice[Immediate]{data: nil, size: 0};
+}
+
+# end the block the builder is at in a branch to a block, passing arguments
+fun jump(w: *Work, to: Block, arguments: Slice[Value]) {
+    var targets: [1]Branch = [1]Branch{Branch{block: to, arguments: arguments}};
+    builder.emit(?w.s.bld, Request{opcode: opcode_table.BR, operands: no_values(), immediates: no_immediates(), targets: Slice[Branch]{data: ?targets[0], size: 1}});
+}
+
+# end the block the builder is at in a branch on a condition, passing
+# arguments to the block it takes where the condition holds
+fun fork(w: *Work, condition: Value, yes: Block, arguments: Slice[Value], no: Block) {
+    var ops:     [1]Value  = [1]Value{condition};
+    var targets: [2]Branch = [2]Branch{Branch{block: yes, arguments: arguments}, Branch{block: no, arguments: no_values()}};
+    builder.emit(?w.s.bld, Request{opcode: opcode_table.CBR, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: no_immediates(), targets: Slice[Branch]{data: ?targets[0], size: 2}});
+}
+
+# the value a fill stores in an access of n bytes: the byte repeated, a
+# constant where the byte is one
+fun repeated(w: *Work, byte: Value, n: u64) Value {
+    val ty:    Type     = integer(w, n);
+    val known: opt[u64] = emit.known(?w.s, byte);
+    if (sel known.some) { ret constant(w, ty, filled((known.some & 0xff)::u8, n)); }
+    if (n == 1)         { ret byte; }
+    var x:    Value = emit.convert(?w.s, opcode_table.EXT_U, byte, ty);
+    var bits: u64   = 8;
+    for (bits < n * 8) {
+        x    = emit.binary(?w.s, opcode_table.OR, x, emit.binary(?w.s, opcode_table.SHL, x, count_of(w, ty, (n * 8)::u32, bits)));
+        bits = bits * 2;
+    }
+    ret x;
+}
+
+# the bytes a copy or fill the pass rewrites moves: one the target has no
+# instruction for, of a constant length, neither volatile nor kept. none for
+# any other, which the helpers legalisation takes
+pub fun length_of(m: *Module, b: *Body, caps: *Capabilities, d: *InstructionData) opt[u64] {
+    if (d.opcode == opcode_table.MEM_COPY && sel caps.bulk.copy.native)            { ret opt[u64].none{}; }
+    if (d.opcode == opcode_table.MEM_FILL && sel caps.bulk.fill.native)            { ret opt[u64].none{}; }
+    if (d.opcode != opcode_table.MEM_COPY && d.opcode != opcode_table.MEM_FILL)    { ret opt[u64].none{}; }
+    if (d.metadata.flags.volatile || d.metadata.flags.kept || d.operands.len != 3) { ret opt[u64].none{}; }
+    ret emit.known_in(m, b, d.operands.data[2]);
+}
+
+# one copy or fill as a loop of units in its place, the bytes past the last
+# unit moved after it
+fun rewrite(w: *Work, i: Instruction, length: u64) err[refusal.Error] {
+    val b:      *Body            = body_of(w);
+    val d:      *InstructionData = ?b.instructions.data[i];
+    val fill:   bool             = d.opcode == opcode_table.MEM_FILL;
+    val to:     Value            = d.operands.data[0];
+    val from:   Value            = d.operands.data[1];
+    val lt:     Type             = type_of(w, d.operands.data[2]);
+    val align:  u64              = alignment_of(d);
+    val hidden: bool             = d.metadata.secret;
+    if (length == 0) { ret refusal.edit(body.erase(w.s.m, w.s.f, i)); }
+    val lane: res[opt[Lane], refusal.Error] = emit.lane_of(w.s.m, lt);
+    if (sel lane.err)     { ret err[refusal.Error].err{lane.err}; }
+    if (sel lane.ok.none) { ret err[refusal.Error].err{refusal.Error.reason{"a copy or fill whose length is no integer"}}; }
+    val bits:    u32  = lane.ok.some.bits;
+    val unit:    u64  = moves.step(length, align, w.word);
+    val units:   u64  = length / unit;
+    val whole:   u64  = units * unit;
+    var exposed: bool = secret(w, to);
+    if (!fill && secret(w, from)) { exposed = true; }
+
+    builder.derive(?w.s.bld, i);
+    var decls: [2]Declaration     = [2]Declaration{Declaration{type: lt, secret: exposed, name: opt[View].none{}}, Declaration{type: lt, secret: exposed, name: opt[View].none{}}};
+    val k:     Block              = block_of(b, i);
+    val p:     u32                = position(b, k, i);
+    val step:  Block              = builder.block(?w.s.bld, Slice[Declaration]{data: ?decls[0], size: 2});
+    val rest:  Block              = builder.block(?w.s.bld, Slice[Declaration]{data: nil, size: 0});
+    val split: err[refusal.Error] = emit.done(?w.s);
+    if (sel split.err) { ret split; }
+    val moved: err[refusal.Error] = refusal.edit(body.move(w.s.m, w.s.f, k, p, step));
+    if (sel moved.err) { ret moved; }
+    val after: err[refusal.Error] = refusal.edit(body.move(w.s.m, w.s.f, step, 1, rest));
+    if (sel after.err) { ret after; }
+
+    builder.at_end(?w.s.bld, k);
+    var tail:  Vector[Value] = vector.init[Value](w.s.scratch);
+    var done:  u64           = whole;
+    var value: Value         = 0;
+    var first: Value         = count_of(w, lt, bits, 0);
+    var delta: Value         = count_of(w, lt, bits, unit);
+    if (fill) {
+        builder.secret(?w.s.bld, secret(w, from));
+        value = repeated(w, from, unit);
+    }
+    or {
+        for (done < length) {
+            val at: u64 = moves.aligned_at(align, done);
+            val n:  u64 = moves.step(length - done, at, w.word);
+            builder.secret(?w.s.bld, exposed);
+            val address: Value = emit.binary(?w.s, opcode_table.PTR_ADD, from, count_of(w, lt, bits, done));
+            builder.secret(?w.s.bld, hidden);
+            val pushed: res[usize, allocator.Error] = vector.push[Value](?tail, load(w, address, integer(w, n), at));
+            if (sel pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{pushed.err}}; }
+            done = done + n;
+        }
+        builder.secret(?w.s.bld, exposed);
+        # all ones where the destination lies above the source, which starts at the last unit and steps down
+        val down: Value = emit.binary(?w.s, opcode_table.GT_U, emit.convert(?w.s, opcode_table.PTRTOINT, to, lt), emit.convert(?w.s, opcode_table.PTRTOINT, from, lt));
+        val mask: Value = emit.convert(?w.s, opcode_table.EXT_S, down, lt);
+        first = emit.binary(?w.s, opcode_table.AND, count_of(w, lt, bits, whole - unit), mask);
+        delta = emit.binary(?w.s, opcode_table.SUB, emit.binary(?w.s, opcode_table.XOR, delta, mask), mask);
+    }
+    var start: [2]Value = [2]Value{first, count_of(w, lt, bits, units)};
+    jump(w, step, Slice[Value]{data: ?start[0], size: 2});
+
+    builder.at(?w.s.bld, step, 0);
+    builder.secret(?w.s.bld, exposed);
+    val offset: Value = builder.parameter(?w.s.bld, step, 0);
+    val left:   Value = builder.parameter(?w.s.bld, step, 1);
+    val ty:     Type  = integer(w, unit);
+    if (!fill) {
+        val source: Value = emit.binary(?w.s, opcode_table.PTR_ADD, from, offset);
+        builder.secret(?w.s.bld, hidden);
+        value = load(w, source, ty, unit);
+        builder.secret(?w.s.bld, exposed);
+    }
+    val target: Value = emit.binary(?w.s, opcode_table.PTR_ADD, to, offset);
+    builder.replacing(?w.s.bld, i);
+    store(w, target, value, unit);
+    builder.at_end(?w.s.bld, step);
+    var next: [2]Value = [2]Value{emit.binary(?w.s, opcode_table.ADD, offset, delta), emit.binary(?w.s, opcode_table.SUB, left, count_of(w, lt, bits, 1))};
+    fork(w, emit.binary(?w.s, opcode_table.NE, next[1], count_of(w, lt, bits, 0)), step, Slice[Value]{data: ?next[0], size: 2}, rest);
+
+    builder.at(?w.s.bld, rest, 0);
+    done = whole;
+    var t: usize = 0;
+    for (done < length) {
+        val at: u64 = moves.aligned_at(align, done);
+        val n:  u64 = moves.step(length - done, at, w.word);
+        builder.secret(?w.s.bld, exposed);
+        val address: Value = emit.binary(?w.s, opcode_table.PTR_ADD, to, count_of(w, lt, bits, done));
+        var x:       Value = 0;
+        if (fill) {
+            builder.secret(?w.s.bld, secret(w, from));
+            x = repeated(w, from, n);
+        }
+        or { x = tail.data[t]; }
+        store(w, address, x, at);
+        done = done + n;
+        t    = t + 1;
+    }
+    if (sel w.failed.some) { ret err[refusal.Error].err{w.failed.some}; }
+    ret emit.done(?w.s);
+}
+
+# make every copy and fill of a known length the target has no instruction
+# for a loop. each is found before the first is rewritten, as a rewrite moves
+# what follows it to a block of its own
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:   *Context                 = u.context;
+    val got: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel got.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{got.err}}; }
+    val b: *Body = got.ok;
+    if (!contents.has_opcode(?b.contents, opcode_table.MEM_COPY) && !contents.has_opcode(?b.contents, opcode_table.MEM_FILL)) { ret res[bool, refusal.Error].ok{false}; }
+
+    var ar:   arena.Arena;
+    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.make(?scratch, ?ar);
+
+    var w: Work;
+    w.s = emit.init(c.m, u.f, b, ?scratch);
+    fin { emit.release(?w.s); }
+    w.caps   = ?c.t.caps;
+    w.failed = opt[refusal.Error].none{};
+    w.word   = 8;
+    val top: opt[u32] = capability.widest(?c.t.caps);
+    if (sel top.some) { w.word = (top.some / 8)::u64; }
+    if (w.word == 0)  { w.word = 1; }
+
+    var items:   Vector[Instruction] = vector.init[Instruction](?scratch);
+    var lengths: Vector[u64]         = vector.init[u64](?scratch);
+    var k:       usize               = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var n: usize = 0;
+            for (n < b.blocks.data[k].instructions.len) {
+                val i:      Instruction = b.blocks.data[k].instructions.data[n];
+                val length: opt[u64]    = length_of(c.m, b, ?c.t.caps, ?b.instructions.data[i]);
+                if (sel length.some) {
+                    val pushed: res[usize, allocator.Error] = vector.push[Instruction](?items, i);
+                    if (sel pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{pushed.err}}; }
+                    val held: res[usize, allocator.Error] = vector.push[u64](?lengths, length.some);
+                    if (sel held.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{held.err}}; }
+                }
+                n = n + 1;
+            }
+        }
+        k = k + 1;
+    }
+    var n: usize = 0;
+    for (n < items.len) {
+        val ok: err[refusal.Error] = rewrite(?w, items.data[n], lengths.data[n]);
+        if (sel ok.err) { ret res[bool, refusal.Error].err{ok.err}; }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{items.len > 0};
+}
