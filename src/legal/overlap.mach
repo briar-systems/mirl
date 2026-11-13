@@ -1,0 +1,278 @@
+# whether two runs of bytes can overlap, read from how their addresses are
+# formed, and the orders a copy between them may run in
+#
+# an address is a root and the `ptr.add`s past it. a stack slot or a defined
+# global is storage of its own, which no other slot or global overlaps. a slot
+# whose address only ever reaches the memory it addresses, as the address of
+# a load, a store, a copy or a fill or the base of an address past it that
+# does the same, goes nowhere a pointer could be made from, so only an
+# address formed from that slot reaches it. a copy gives its destination the
+# bytes its source held before it: the passes that lower one may copy in
+# either order where the two runs cannot overlap, from the lowest byte up
+# where the destination starts at or below the source, and from the highest
+# down where it starts at or above it.
+#
+# what is read here is the ir alone. a run counts as apart from another only
+# by one of these, so where none of them holds the runs may overlap:
+#
+# - both are one root, or one slot or global, at known offsets, whose
+#   distance orders them.
+# - they are two slots or defined globals, at known offsets, each run inside
+#   its own storage.
+# - one is a slot no address leaves, and the other's root is something else.
+# - one is a slot and the other's root is a parameter of the function, which
+#   its caller made before any slot of this call existed.
+# - one is a slot and the other the place of a parameter in the argument area,
+#   which the convention lays in the caller's frame.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.global;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata.Flags;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use target_record: mirl.target.record;
+
+# an address as its root and the bytes past it
+# ---
+# root:   the value the `ptr.add`s start from
+# known:  whether every add is constant
+# offset: the bytes past the root, where known
+rec Formed {
+    root:   Value;
+    known:  bool;
+    offset: i64;
+}
+
+# the storage a root is, and its bytes
+# ---
+# slot:     a stack slot, by its instruction
+# global:   a defined global, by its id
+# incoming: the place of a parameter in the caller's argument area, by its
+#           instruction
+# other:    anything else, which may be anywhere
+tag Storage: u8 {
+    slot:     Instruction;
+    global:   u32;
+    incoming: Instruction;
+    other;
+}
+
+# the instruction a value is the result of, of this opcode, none for another
+fun made_by(b: *Body, v: Value, code: Opcode) opt[Instruction] {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.result)) { ret opt[Instruction].none{}; }
+    val i: Instruction = def.result.instruction;
+    if (b.instructions.data[i].opcode != code) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{i};
+}
+
+# the value an address is formed from past every `ptr.add`
+pub fun root_of(b: *Body, v: Value) Value {
+    var at: Value = v;
+    for {
+        val opt_added: opt[Instruction] = made_by(b, at, opcode_table.PTR_ADD);
+        if (sel opt_added.none) { brk; }
+        at = b.instructions.data[opt_added.some].operands.data[0];
+    }
+    ret at;
+}
+
+# whether every use of an address reads or writes the memory it addresses, as
+# a load's or a store's address, a copy's or a fill's, or the base of an address
+# past it that does the same, so the address goes nowhere memory or a call
+# could keep it
+pub fun contained(b: *Body, v: Value) bool {
+    var k: usize = 0;
+    for (k < b.values.data[v].uses.len) {
+        val u:  Instruction      = b.values.data[v].uses.data[k];
+        val d:  *InstructionData = ?b.instructions.data[u];
+        val at: bool             = d.operands.len > 0 && d.operands.data[0] == v;
+        if (d.opcode == opcode_table.LOAD) {
+            if (!at) { ret false; }
+        }
+        or (d.opcode == opcode_table.STORE) {
+            if (!at || d.operands.data[1] == v) { ret false; }
+        }
+        or (d.opcode == opcode_table.PTR_ADD) {
+            if (!at || d.operands.data[1] == v || !contained(b, d.results.data[0])) { ret false; }
+        }
+        or (d.opcode == opcode_table.MEM_COPY) {
+            # a copy reads or writes the bytes at an address and keeps neither address
+            if (d.operands.len != 3 || d.operands.data[2] == v)     { ret false; }
+            if (d.operands.data[0] == v && d.operands.data[1] == v) { ret false; }
+        }
+        or (d.opcode == opcode_table.MEM_FILL) {
+            if (d.operands.len != 3 || !at || d.operands.data[1] == v || d.operands.data[2] == v) { ret false; }
+        }
+        or { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# an address as its root and its offset past it
+fun formed(m: *Module, b: *Body, v: Value) Formed {
+    var f: Formed = Formed{root: v, known: true, offset: 0};
+    for {
+        val opt_added: opt[Instruction] = made_by(b, f.root, opcode_table.PTR_ADD);
+        if (sel opt_added.none) { brk; }
+        val d:      *InstructionData = ?b.instructions.data[opt_added.some];
+        val opt_by: opt[u64]         = emit.known_in(m, b, d.operands.data[1]);
+        if (sel opt_by.some) { f.offset = f.offset + opt_by.some::i64; }
+        or                   { f.known = false; }
+        f.root = d.operands.data[0];
+    }
+    ret f;
+}
+
+# the storage a root is: a slot, a defined global it is the address of with
+# its offset folded into the address's, or anything else
+fun storage_of(m: *Module, b: *Body, f: *Formed) Storage {
+    val opt_slot: opt[Instruction] = made_by(b, f.root, opcode_table.ALLOCA);
+    if (sel opt_slot.some) { ret Storage.slot{opt_slot.some}; }
+    # the convention lays the argument area in the caller's frame, where no slot of this call lies
+    val opt_incoming: opt[Instruction] = made_by(b, f.root, opcode_table.ARG_INCOMING);
+    if (sel opt_incoming.some) { ret Storage.incoming{opt_incoming.some}; }
+    val def: Def = b.values.data[f.root].def;
+    if (!(sel def.constant)) { ret Storage.other{}; }
+    val res_data: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+    if (sel res_data.err) { ret Storage.other{}; }
+    val data: ConstantData = res_data.ok;
+    if (!(sel data.address))               { ret Storage.other{}; }
+    if (!(sel data.address.symbol.global)) { ret Storage.other{}; }
+    val g: u32 = data.address.symbol.global::u32;
+    if (g::usize >= m.globals.len) { ret Storage.other{}; }
+    val node: *global.Node = ?m.globals.data[g];
+    if (sel node.data.initial.none || sel node.data.tls.some) { ret Storage.other{}; }
+    f.offset = f.offset + data.address.offset;
+    ret Storage.global{g};
+}
+
+# the bytes a slot or a defined global holds, none where the layout states none
+fun size_of(m: *Module, b: *Body, l: *Layout, s: Storage) opt[u64] {
+    var ty: Type = 0;
+    if (sel s.slot) {
+        val d: *InstructionData = ?b.instructions.data[s.slot];
+        if (d.immediates.len == 0) { ret opt[u64].none{}; }
+        val held: Immediate = d.immediates.data[0];
+        if (!(sel held.ty)) { ret opt[u64].none{}; }
+        ty = held.ty;
+    }
+    or (sel s.global) { ty = m.globals.data[s.global].data.type; }
+    or                { ret opt[u64].none{}; }
+    val res_size: res[u64, target_record.Error] = layout.size(l, ty, table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret opt[u64].none{}; }
+    ret opt[u64].some{res_size.ok};
+}
+
+# whether a run of `length` bytes at a known offset lies inside storage of `size` bytes
+fun inside(f: Formed, length: opt[u64], size: opt[u64]) bool {
+    if (!f.known || f.offset < 0) { ret false; }
+    if (sel length.none)          { ret false; }
+    if (sel size.none)            { ret false; }
+    val n:   u64 = length.some;
+    val has: u64 = size.some;
+    if (n > has) { ret false; }
+    ret f.offset::u64 <= has - n;
+}
+
+# whether a value is a parameter of the function, which the caller made
+# before any slot of this call existed, so it addresses none of them
+fun entry_parameter(b: *Body, v: Value) bool {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.parameter)) { ret false; }
+    ret def.parameter.block == 0;
+}
+
+# whether two storages are one
+fun same(x: Storage, y: Storage) bool {
+    if (sel x.slot) {
+        if (sel y.slot) { ret x.slot == y.slot; }
+        ret false;
+    }
+    if (sel x.global) {
+        if (sel y.global) { ret x.global == y.global; }
+        ret false;
+    }
+    if (sel x.incoming) {
+        if (sel y.incoming) { ret x.incoming == y.incoming; }
+    }
+    ret false;
+}
+
+# whether a storage is a slot or a defined global, whose bytes the layout states
+fun object(x: Storage) bool {
+    ret sel x.slot || sel x.global;
+}
+
+# the orders a copy may run in and still give its destination the bytes its
+# source held before it, as its ascending and descending marks
+# ---
+# m:      the module
+# b:      the body the copy is in
+# l:      the target's layout
+# to:     the destination address
+# from:   the source address
+# length: the bytes it copies, none where not constant
+# ret:    flags holding only the orders found, every other flag clear
+pub fun order(m: *Module, b: *Body, l: *Layout, to: Value, from: Value, length: opt[u64]) Flags {
+    var orders: Flags;
+    var d:      Formed  = formed(m, b, to);
+    var s:      Formed  = formed(m, b, from);
+    val ds:     Storage = storage_of(m, b, ?d);
+    val ss:     Storage = storage_of(m, b, ?s);
+    if (d.root == s.root || same(ds, ss)) { ret by_gap(d, s, length); }
+    var apart: bool = false;
+    if (sel ds.slot && contained(b, d.root))       { apart = true; }
+    or (sel ss.slot && contained(b, s.root))       { apart = true; }
+    or (sel ds.slot && entry_parameter(b, s.root)) { apart = true; }
+    or (sel ss.slot && entry_parameter(b, d.root)) { apart = true; }
+    or (sel ds.slot && sel ss.incoming)            { apart = true; }
+    or (sel ss.slot && sel ds.incoming)            { apart = true; }
+    or (object(ds) && object(ss)) {
+        apart = inside(d, length, size_of(m, b, l, ds)) && inside(s, length, size_of(m, b, l, ss));
+    }
+    orders.ascending  = apart;
+    orders.descending = apart;
+    ret orders;
+}
+
+# the orders of a copy between two runs from one root, by the distance from
+# the destination up to the source: ascending where it is not below, both
+# where the runs are a length or more apart
+fun by_gap(to: Formed, from: Formed, length: opt[u64]) Flags {
+    var orders: Flags;
+    if (!to.known || !from.known) { ret orders; }
+    val gap: i64 = from.offset - to.offset;
+    orders.ascending  = gap >= 0;
+    orders.descending = gap <= 0;
+    var distance: u64 = gap::u64;
+    if (gap < 0) { distance = (0 - gap)::u64; }
+    if (sel length.some) {
+        if (distance >= length.some) {
+            orders.ascending  = true;
+            orders.descending = true;
+        }
+    }
+    ret orders;
+}

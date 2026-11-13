@@ -130,6 +130,8 @@ use Spot: mirl.ir.instruction.Place;
 use mirl.ir.instruction.Request;
 use mirl.ir.linkage.Linkage;
 use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
 use mirl.ir.module;
 use mirl.ir.module.Module;
 use opcode_row: mirl.ir.opcode.row;
@@ -150,6 +152,7 @@ use mirl.ir.value.Declaration;
 use mirl.ir.value.Def;
 use mirl.legal.helper.deliver;
 use mirl.legal.moves;
+use mirl.legal.overlap;
 use mirl.legal.vector.lanes;
 use mirl.pass.analysis;
 use mirl.pass.record;
@@ -619,16 +622,23 @@ fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u
 
 # copy bytes from one storage to another, nothing when they are one storage,
 # as a result built in place is. the copy is in words or one `mem.copy`, as
-# mirl.legal.moves decides
+# mirl.legal.moves decides. the storage copied to is a slot the pass makes, the
+# outgoing area or the result's memory the caller passes, none of which the
+# memory copied from can be, so the copy runs in either order
 fun copy(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64) err[refusal.Error] {
     if (from == to) { ret err[refusal.Error].ok{}; }
     val timed: bool = in_constant_time(w.m.functions.data[w.f].data.constant_time);
     if (!moves.in_words(?w.t.caps, size, align, WORD, false, timed)) {
         val length: res[Value, refusal.Error] = integer(w, w.offset, size);
         if (sel length.err) { ret err[refusal.Error].err{length.err}; }
-        var ops: [3]Value     = [3]Value{to, from, length.ok};
-        var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+        var ops:   [3]Value     = [3]Value{to, from, length.ok};
+        var imm:   [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+        var apart: Flags        = NO_FLAGS;
+        apart.ascending  = true;
+        apart.descending = true;
+        builder.flags(bld, apart);
         builder.emit(bld, Request{opcode: opcode_table.MEM_COPY, operands: Slice[Value]{data: ?ops[0], size: 3}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+        builder.flags(bld, NO_FLAGS);
         ret err[refusal.Error].ok{};
     }
     var done: u64 = 0;
@@ -690,15 +700,15 @@ fun note_unused(w: *Work, i: Instruction) err[refusal.Error] {
 # byte to its last, so its bytes there are its memory image. such a value
 # travels as one block, copied to the area once by the caller and read in
 # place by the callee, with no piece in the signature. it does so only where
-# the target's bulk copy is native, so a copy to the area past the bound is one
-# instruction just ahead of the call it serves
+# the target has a bulk copy instruction, so a copy to the area past the bound
+# is one instruction just ahead of the call it serves
 # ---
 # ret: the offset of its first byte in the area, or none when it travels in
 #      pieces
 fun laid(w: *Work, ty: Type, passed: Passed, asg: *Assignment) res[opt[u64], refusal.Error] {
     val none: res[opt[u64], refusal.Error] = res[opt[u64], refusal.Error].ok{opt[u64].none{}};
     if (!(sel passed.passing.value) || passed.count < 2) { ret none; }
-    if (!(sel w.t.caps.bulk.copy.native))                { ret none; }
+    if (sel w.t.caps.bulk.copy.none)                     { ret none; }
     val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
     if (sel s.err)        { ret res[opt[u64], refusal.Error].err{s.err}; }
     if (!aggregate(s.ok)) { ret none; }
@@ -740,7 +750,7 @@ fun fills_area(w: *Work, i: Instruction) bool {
     val d: *InstructionData = ?b.instructions.data[i];
     if (d.opcode != opcode_table.MEM_COPY && d.opcode != opcode_table.STORE) { ret false; }
     if (d.operands.len == 0)                                                 { ret false; }
-    val made: opt[Instruction] = made_by(w, root_of(w, d.operands.data[0]), opcode_table.ARG_OUTGOING);
+    val made: opt[Instruction] = made_by(w, overlap.root_of(body_of(w), d.operands.data[0]), opcode_table.ARG_OUTGOING);
     ret sel made.some;
 }
 
@@ -1539,40 +1549,6 @@ fun touches(w: *Work, i: Instruction) bool {
     ret row.some.effects.reads || row.some.effects.writes;
 }
 
-# whether every use of an address reads or writes the memory it addresses, as
-# a load's or a store's address, a copy's or a fill's, or the base of an address
-# past it that does the same, so the address goes nowhere memory or a call
-# could keep it
-fun contained(w: *Work, v: Value) bool {
-    val b: *Body = body_of(w);
-    var k: usize = 0;
-    for (k < b.values.data[v].uses.len) {
-        val u:  Instruction      = b.values.data[v].uses.data[k];
-        val d:  *InstructionData = ?b.instructions.data[u];
-        val at: bool             = d.operands.len > 0 && d.operands.data[0] == v;
-        if (d.opcode == opcode_table.LOAD) {
-            if (!at) { ret false; }
-        }
-        or (d.opcode == opcode_table.STORE) {
-            if (!at || d.operands.data[1] == v) { ret false; }
-        }
-        or (d.opcode == opcode_table.PTR_ADD) {
-            if (!at || d.operands.data[1] == v || !contained(w, d.results.data[0])) { ret false; }
-        }
-        or (d.opcode == opcode_table.MEM_COPY) {
-            # a copy reads or writes the bytes at an address and keeps neither address
-            if (d.operands.len != 3 || d.operands.data[2] == v)     { ret false; }
-            if (d.operands.data[0] == v && d.operands.data[1] == v) { ret false; }
-        }
-        or (d.opcode == opcode_table.MEM_FILL) {
-            if (d.operands.len != 3 || !at || d.operands.data[1] == v || d.operands.data[2] == v) { ret false; }
-        }
-        or { ret false; }
-        k = k + 1;
-    }
-    ret true;
-}
-
 # the instruction a value is the result of, of this opcode, none for another
 fun made_by(w: *Work, v: Value, code: Opcode) opt[Instruction] {
     val b:   *Body = body_of(w);
@@ -1649,9 +1625,9 @@ fun in_place(w: *Work, asg: *Assignment, carrier: opt[Value], rets: *Vector[Inst
     val sd: *InstructionData = ?body_of(w).instructions.data[slot.some];
     if (sd.immediates.len == 0 || sd.metadata.flags.kept) { ret err[refusal.Error].ok{}; }
     val held: Immediate = sd.immediates.data[0];
-    if (!(sel held.ty))           { ret err[refusal.Error].ok{}; }
-    if (!table.same(held.ty, ty)) { ret err[refusal.Error].ok{}; }
-    if (!contained(w, home.some)) { ret err[refusal.Error].ok{}; }
+    if (!(sel held.ty))                            { ret err[refusal.Error].ok{}; }
+    if (!table.same(held.ty, ty))                  { ret err[refusal.Error].ok{}; }
+    if (!overlap.contained(body_of(w), home.some)) { ret err[refusal.Error].ok{}; }
     val bindings: Bindings                          = sd.metadata.bindings;
     val bound:    res[Slice[Binding], module.Error] = module.bound(w.m, bindings);
     if (sel bound.err) { ret ir(err[module.Error].err{bound.err}); }
@@ -1763,17 +1739,6 @@ fun lower_return(w: *Work, asg: *Assignment, r: Instruction, carrier: opt[Value]
     ret built(?bld);
 }
 
-# the address an address is past, through every pointer add
-fun root_of(w: *Work, v: Value) Value {
-    var at: Value = v;
-    for {
-        val added: opt[Instruction] = made_by(w, at, opcode_table.PTR_ADD);
-        if (sel added.none) { brk; }
-        at = body_of(w).instructions.data[added.some].operands.data[0];
-    }
-    ret at;
-}
-
 # whether a value stands before an instruction it is used at in that
 # instruction's block: a parameter or constant, a result of another block,
 # which dominates every use there, or one earlier in the block
@@ -1818,10 +1783,10 @@ fun destination(w: *Work, c: Instruction, asg: *Assignment, olds: *Vector[Value]
     if (!untouched_between(w, c, s))     { ret opt[Instruction].none{}; }
     val dest: Value = sd.operands.data[0];
     if (!stands_before(w, dest, c)) { ret opt[Instruction].none{}; }
-    val root:  Value            = root_of(w, dest);
+    val root:  Value            = overlap.root_of(body_of(w), dest);
     val local: opt[Instruction] = made_by(w, root, opcode_table.ALLOCA);
-    if (sel local.none)      { ret opt[Instruction].none{}; }
-    if (!contained(w, root)) { ret opt[Instruction].none{}; }
+    if (sel local.none)                       { ret opt[Instruction].none{}; }
+    if (!overlap.contained(body_of(w), root)) { ret opt[Instruction].none{}; }
     ret opt[Instruction].some{s};
 }
 

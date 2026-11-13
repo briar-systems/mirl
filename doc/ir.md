@@ -175,6 +175,7 @@ A row states what executing an instance may do beyond giving its results.
 - whether it is **speculatable**, so that it may run where its result is not needed. A speculatable row never traps, reads or writes.
 - whether it is **mergeable**, so that two instances with the same operands give the same results and one may stand for both. A mergeable row never writes. A row with a memory ordering is never speculatable or mergeable.
 - whether it is **keepable**, so that an instance may carry the `kept` flag (see section 6.5). A keepable row writes memory, never reads it, is not mergeable and has no memory ordering. The keepable rows are `store` and `mem.fill`.
+- whether it is **orientable**, so that an instance may carry the `ascending` and `descending` flags. An orientable row reads one range of memory and writes another that may overlap it. The orientable row is `mem.copy`.
 
 
 ## 6. Semantics
@@ -246,7 +247,9 @@ The ordered comparisons (`feq.o`, `fne.o`, `flt.o`, `fle.o`, `fgt.o`, `fge.o`) a
 
 The memory of a stack slot holds no defined value until it is stored to, and it is not zero. A `load` that no store reaches gives an unspecified value of the stated type: any bit pattern, the same one on every read until the next store, and never poison, so nothing after it is undefined. The verifier does not refuse it, since whether a store reaches it depends on the path taken. A front end that wants a zero stores one. A pass may choose any value for it, and the promotion of stack slots chooses a zero of the type.
 
-`mem.copy` copies a byte count between two addresses, and the ranges may overlap. `mem.fill` sets a byte count at an address to one byte value.
+`mem.copy` copies a byte count between two addresses, and the ranges may overlap: the destination gets the bytes the source held before the copy, whether or not the two overlap. `mem.fill` sets a byte count at an address to one byte value.
+
+An `ascending` flag on a copy says that copying from the lowest byte up gives that result, as it does where the ranges do not overlap or the destination starts at or below the source, and a `descending` flag says the same of copying from the highest byte down, as where the ranges do not overlap or the destination starts at or above the source. A copy with both may run in either order, and one with neither picks its order by its addresses when it runs. A front end may state either where it knows it, and the bulk legalisation marks every copy it lowers with the orders its addresses show (see [target](ir/target.md)). The one checker refuses either on an instance of a row that is not orientable.
 
 A `volatile` flag on an instruction makes its memory access observable. It is never merged, moved or removed.
 
