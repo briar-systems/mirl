@@ -39,7 +39,8 @@ use std.collections.vector;
 use mirl.base.fail.keep;
 use mirl.base.slice;
 use mct: mirl.ct;
-use ia:  mirl.ir.assembly;
+use mirl.ct.frame;
+use ia: mirl.ir.assembly;
 use mirl.ir.block.BlockData;
 use mirl.ir.constant.Address;
 use mirl.ir.constant.ConstantData;
@@ -52,7 +53,10 @@ use mirl.ir.function.in_constant_time;
 use mirl.ir.id;
 use mirl.ir.instruction.Edge;
 use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata;
+use mirl.ir.metadata.Extent;
 use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.NO_EXTENT;
 use mirl.ir.metadata.NO_FLAGS;
 use mirl.ir.metadata.UNBOUND;
 use mirl.ir.module;
@@ -192,6 +196,9 @@ pub val UNMADE:        str = "address naming a temporary no earlier instruction 
 pub val TABLELESS:     str = "table address in an expansion that emits no table after it, or a table given sources or emitted twice";
 pub val OFFSET_SYMBOL: str = "offset rule taking a symbol";
 pub val LANDING:       str = "landing instruction that is no row, or whose source is neither a literal nor a fixed register";
+pub val HOT:           str = "expansion writing what may be a secret into more fixed registers than MAX_FRESH";
+pub val UNFRAMED:      str = "a frame extent on an access whose address is formed from no alloca, which the ir verifier refuses";
+pub val SPLIT_MARK:    str = "expansion instruction writing memory a secret mark states and a public register, as a store with address writeback, which one mark cannot state";
 
 # a rule whose loop breaks the constraint its body keeps
 # ---
@@ -1056,8 +1063,36 @@ fun declassifies(op: opcode_row.Opcode) bool {
     ret sel r.some && sel r.some.secrecy.declassifies;
 }
 
+# whether match `mt` of rule `r` covers a declassify anywhere but at its root or as the condition a conditional branch
+# at its root reads, so it would fuse a declassified value with one that is not, which no row of any table may: such a
+# rule never matches, so emission's points name only what a declassify leaves
+fun fuses_declassify(st: *State, r: *Rule, mt: *Match) bool {
+    var n: u32 = 1;
+    for (n < mt.count) {
+        if (declassifies(instruction(st, mt.nodes[n]).opcode)) {
+            if (r.nodes.at[n].parent != 0)                               { ret true; }
+            if (instruction(st, mt.nodes[0]).opcode != opcode_table.CBR) { ret true; }
+        }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# whether emit `e` of rule `r`'s expansion for match `mt`, which covers a declassify, is the instruction its point
+# stands on: under a conditional branch at the root, each conditional branch it emits, which reads the condition, and
+# for a declassify at the root, the last it emits, which leaves the declassified value. no other emit of the expansion
+# holds that value, so none other is marked
+fun carries_point(st: *State, r: *Rule, mt: *Match, e: u32) bool {
+    if (instruction(st, mt.nodes[0]).opcode == opcode_table.CBR) {
+        val op: mi.Opcode = r.expansion.at[e].opcode;
+        if (!(sel op.row)) { ret false; }
+        ret op.row.effect.control.conditional;
+    }
+    ret e + 1 == r.expansion.len;
+}
+
 # whether a match's root or a node it covers declassifies, so what it emits does: a copy that secrecy ends at, or a
-# branch on a guard's public condition, which emission makes a declassify point of
+# branch on a public condition, which emission makes a declassify point of
 fun covers_declassify(st: *State, mt: *Match) bool {
     var n: u32 = 0;
     for (n < mt.count) {
@@ -1067,21 +1102,42 @@ fun covers_declassify(st: *State, mt: *Match) bool {
     ret false;
 }
 
-# whether a match states the secrecy of the memory its expansion reads: its root states its access
-# (`opcode_row.states_access`) and no node it covers reads memory, so every access the expansion makes is the root's
-fun states_access(st: *State, mt: *Match) bool {
-    if (mt.count == 0) { ret false; }
-    val root: opt[*opcode_row.Row] = opcode_table.at(instruction(st, mt.nodes[0]).opcode);
-    if (sel root.none)                        { ret false; }
-    if (!opcode_row.states_access(root.some)) { ret false; }
-    var n: u32 = 1;
+# the node of a match that states the secrecy of the memory its expansion reads or writes: the one node it covers that
+# accesses memory, when that node states its access (`opcode_row.states_access`), what it writes
+# (`opcode_row.states_write`) or what it copies (`opcode_row.states_copy`), as the load an extending load's root covers. none when no node accesses memory, or more
+# than one does, or the one that does states nothing
+fun access_node(st: *State, mt: *Match) opt[u32] {
+    var found: u32  = 0;
+    var any:   bool = false;
+    var n:     u32  = 0;
     for (n < mt.count) {
         val r: opt[*opcode_row.Row] = opcode_table.at(instruction(st, mt.nodes[n]).opcode);
-        if (sel r.none)           { ret false; }
-        if (r.some.effects.reads) { ret false; }
+        if (sel r.none) { ret opt[u32].none{}; }
+        if (r.some.effects.reads || r.some.effects.writes) {
+            if (any)                               { ret opt[u32].none{}; }
+            if (!opcode_row.states_memory(r.some)) { ret opt[u32].none{}; }
+            found = n;
+            any   = true;
+        }
         n = n + 1;
     }
-    ret true;
+    if (!any) { ret opt[u32].none{}; }
+    ret opt[u32].some{found};
+}
+
+# the frame extent the ir instruction `x` states, its slot the frame slot made for the alloca its address is formed
+# from, none where it states none
+fun framed_slot(st: *State, x: id.Instruction) res[Extent, Error] {
+    val d: *InstructionData = instruction(st, x);
+    if (!metadata.states_extent(?d.metadata)) { ret res[Extent, Error].ok{NO_EXTENT}; }
+    if (d.operands.len == 0)                  { ret res[Extent, Error].err{defect(NONE, false, UNFRAMED)}; }
+    val alloca: opt[id.Instruction] = frame.slot_of(st.body, d.operands.data[0]);
+    if (sel alloca.none) { ret res[Extent, Error].err{defect(NONE, false, UNFRAMED)}; }
+    val slot: res[u32, Error] = slot_for(st, alloca.some);
+    if (sel slot.err) { ret res[Extent, Error].err{slot.err}; }
+    var e: Extent = d.metadata.extent;
+    e.slot = slot.ok;
+    ret res[Extent, Error].ok{e};
 }
 
 fun result_at(mt: *Match, s: Slot) opt[id.Value] {
@@ -1723,7 +1779,7 @@ fun choose(st: *State, i: id.Instruction) res[Choice, Error] {
         val swaps: u32   = cs.swaps.data[index];
         var mask:  u32   = 0;
         for {
-            if (matches(st, r, i, home, held, mask, ?mt)) {
+            if (matches(st, r, i, home, held, mask, ?mt) && !fuses_declassify(st, r, ?mt)) {
                 val eaten: opt[u32] = consumes(st, r, ?mt);
                 if (sel eaten.some) {
                     val kept: res[bool, Error] = guard(st, r, ?mt);
@@ -2081,15 +2137,16 @@ fun clobbered_by(st: *State, regs: *Registers, callee: Callee) res[Slice[rf.Id],
     ret res[Slice[rf.Id], Error].ok{described.some};
 }
 
-# whether every register a rule's expansion makes of its own may hold a secret: its instruction is secret, or a result
-# of the instruction it is rooted at is. a materialisation into `dest` makes a constant, public whoever uses it. where
-# neither says, each holds what the instructions writing it read (`staged`), as the value a store stages does
+# whether every register a rule's expansion makes of its own may hold a secret: a result of the instruction it is
+# rooted at may be, or its secret mark states its results. a materialisation into `dest` makes a constant, public
+# whoever uses it. the mark of an instruction that gives no results, as a store, a copy or a fill, states the memory it
+# writes and reads, never its addresses or length, so there each holds what the instructions writing it read (`staged`)
 fun fresh_secret(st: *State, mt: *Match, dest: u32, md: Metadata) bool {
     if (dest != NONE)  { ret false; }
-    if (md.secret)     { ret true; }
-    if (mt.count == 0) { ret false; }
+    if (mt.count == 0) { ret md.secret; }
     val d: *InstructionData = instruction(st, mt.nodes[0]);
-    var i: usize            = 0;
+    if (md.secret && d.results.len > 0) { ret true; }
+    var i: usize = 0;
     for (i < d.results.len) {
         if (value(st, d.results.data[i]).secret) { ret true; }
         i = i + 1;
@@ -2097,13 +2154,60 @@ fun fresh_secret(st: *State, mt: *Match, dest: u32, md: Metadata) bool {
     ret false;
 }
 
-# whether operand `o` holds a value in a secret register
-fun holds_secret(st: *State, o: Operand) bool {
+# whether the memory a rule's expansion reads holds what its root's secret mark states: the root gives no results, so
+# the mark states its memory, and its row reads memory, as a copy's source. a word an expansion loads there is then
+# the data it moves, never bookkeeping
+fun moves_secret(st: *State, mt: *Match, md: Metadata) bool {
+    if (!md.secret || mt.count == 0) { ret false; }
+    val d: *InstructionData = instruction(st, mt.nodes[0]);
+    if (d.results.len > 0) { ret false; }
+    val row: opt[*opcode_row.Row] = opcode_table.at(d.opcode);
+    if (sel row.none) { ret false; }
+    ret row.some.effects.reads;
+}
+
+# the fixed registers an instruction of an expansion has written with what may be a secret, which a later one of it
+# then reads
+rec Hot {
+    at:    [rule.MAX_FRESH]rf.Id;
+    count: u32;
+}
+
+# whether fixed register `r` overlaps one `hot` holds
+fun hot_holds(st: *State, hot: *Hot, r: rf.Id) bool {
+    val file: *rf.File = mf.file(st.out);
+    var k:    u32      = 0;
+    for (k < hot.count) {
+        if (hot.at[k] == r) { ret true; }
+        if (file != nil) {
+            val a: opt[*rf.Register] = rf.row_of(file, hot.at[k]);
+            val b: opt[*rf.Register] = rf.row_of(file, r);
+            if (sel a.some) {
+                if (sel b.some) {
+                    if (rf.overlap(file, a.some, b.some)) { ret true; }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# whether operand `o` holds a value in a secret register, or a fixed register `hot` holds
+fun holds_secret(st: *State, hot: *Hot, o: Operand) bool {
     if (sel o.virtual) { ret mf.secret_of(st.out, o.virtual); }
     if (sel o.member)  { ret mf.secret_of(st.out, o.member.virtual); }
+    if (sel o.physical) {
+        val p: Physical = o.physical;
+        if (sel p.register) { ret hot_holds(st, hot, p.register); }
+    }
     if (sel o.tied) {
         val source: Register = o.tied.source;
         if (sel source.virtual) { ret mf.secret_of(st.out, source.virtual); }
+        if (sel source.physical) {
+            val p: Physical = source.physical;
+            if (sel p.register) { ret hot_holds(st, hot, p.register); }
+        }
     }
     ret false;
 }
@@ -2122,24 +2226,68 @@ fun temporary_of(fresh: *u32, o: Operand) opt[Virtual] {
     ret opt[Virtual].none{};
 }
 
-# a temporary an instruction of an expansion writes marked as it holds a secret when the instruction reads a value that
-# may be one. an address is formed from public registers or refused, so it passes on nothing
-fun staged(st: *State, op: mi.Opcode, ops: *Operand, count: u32, fresh: *u32) {
-    var reads: bool = false;
-    var n:     u32  = 0;
+# the fixed register operand `o` writes, none for any other
+fun fixed_of(o: Operand) opt[rf.Id] {
+    var at: opt[Physical] = opt[Physical].none{};
+    if (sel o.physical) { at = opt[Physical].some{o.physical}; }
+    if (sel o.tied) {
+        val dest: Register = o.tied.dest;
+        if (sel dest.physical) { at = opt[Physical].some{dest.physical}; }
+    }
+    if (sel at.none) { ret opt[rf.Id].none{}; }
+    val p: Physical = at.some;
+    if (sel p.register) { ret opt[rf.Id].some{p.register}; }
+    ret opt[rf.Id].none{};
+}
+
+# whether an instruction of `count` operands accesses memory in `role`: through a memory operand or a frame slot at a
+# position of that role, or by an access its row's effect states
+fun accesses(op: mi.Opcode, ops: *Operand, count: u32, role: mo.Role) bool {
+    var n: u32 = 0;
     for (n < count) {
-        if ((mi.role(op, count, n) & mo.READ) != 0 && holds_secret(st, ops[n])) { reads = true; }
+        val o: Operand = ops[n];
+        if ((sel o.address || sel o.slot) && (mi.role(op, count, n) & role) != 0) { ret true; }
         n = n + 1;
     }
-    if (!reads) { ret; }
+    if (!(sel op.row))        { ret false; }
+    if (op.row.effect == nil) { ret false; }
+    val e: *effect.Effect = op.row.effect;
+    var i: u32            = 0;
+    for (i < e.memory.len) {
+        if ((e.memory.at[i].role & role) != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether an instruction of an expansion writes what may be a secret, and if so each temporary and fixed register it
+# writes marked as holding one: it reads a value that may be one, or memory whose bytes `moved` states secret. an
+# address is formed from public registers or refused, so it passes on nothing, and neither does a constant
+fun staged(st: *State, op: mi.Opcode, ops: *Operand, count: u32, fresh: *u32, hot: *Hot, moved: bool) res[bool, Error] {
+    var reads: bool = moved && accesses(op, ops, count, mo.READ);
+    var n:     u32  = 0;
+    for (n < count) {
+        if ((mi.role(op, count, n) & mo.READ) != 0 && holds_secret(st, hot, ops[n])) { reads = true; }
+        n = n + 1;
+    }
+    if (!reads) { ret res[bool, Error].ok{false}; }
     n = 0;
     for (n < count) {
         if ((mi.role(op, count, n) & mo.WRITE) != 0) {
             val t: opt[Virtual] = temporary_of(fresh, ops[n]);
             if (sel t.some) { mf.mark_secret(st.out, t.some); }
+            val r: opt[rf.Id] = fixed_of(ops[n]);
+            if (sel r.some) {
+                if (!hot_holds(st, hot, r.some)) {
+                    if (hot.count >= rule.MAX_FRESH) { ret res[bool, Error].err{defect(NONE, false, HOT)}; }
+                    hot.at[hot.count] = r.some;
+                    hot.count         = hot.count + 1;
+                }
+            }
         }
         n = n + 1;
     }
+    ret res[bool, Error].ok{true};
 }
 
 # whether an instruction of an expansion writes a register that holds no secret, as the address a constant is
@@ -2172,6 +2320,8 @@ fun writes_public(st: *State, op: mi.Opcode, ops: *Operand, count: u32) bool {
 # dest: the register a materialisation rule builds into, NONE for any other
 fun expand(st: *State, b: u32, r: *Rule, mt: *Match, dest: u32, md: Metadata, declassifies: bool) err[Error] {
     val secret:  bool = fresh_secret(st, mt, dest, md);
+    val moved:   bool = moves_secret(st, mt, md);
+    var hot:     Hot;
     var fresh:   [rule.MAX_FRESH]u32;
     var emitted: [rule.MAX_FRESH]Instruction;
     var labels:  [rule.MAX_FRESH]u32;
@@ -2347,12 +2497,19 @@ fun expand(st: *State, b: u32, r: *Rule, mt: *Match, dest: u32, md: Metadata, de
             }
             k = k + 1;
         }
-        staged(st, emit.opcode, ?ops[0], emit.operands.len, ?fresh[0]);
+        val carried: res[bool, Error] = staged(st, emit.opcode, ?ops[0], emit.operands.len, ?fresh[0], ?hot, moved);
+        if (sel carried.err) { ret err[Error].err{carried.err}; }
         val clobbered: res[Slice[rf.Id], Error] = clobbered_by(st, regs, emit.callee);
         if (sel clobbered.err) { ret err[Error].err{clobbered.err}; }
+        # where the mark states memory alone, an instruction that writes none of it and no secret states nothing. one
+        # writing both that memory and a public register would leave one of them misstated
         var marked: Metadata = md;
-        if (writes_public(st, emit.opcode, ?ops[0], emit.operands.len)) { marked.secret = false; }
-        val placed: res[Instruction, Error] = made(st, b, emit.opcode, ?ops[0], emit.operands.len, marked, declassifies, emit.state, clobbered.ok);
+        if (writes_public(st, emit.opcode, ?ops[0], emit.operands.len)) {
+            if (md.secret && accesses(emit.opcode, ?ops[0], emit.operands.len, mo.WRITE)) { ret err[Error].err{defect(NONE, false, SPLIT_MARK)}; }
+            marked.secret = false;
+        }
+        if (!secret && !carried.ok && !accesses(emit.opcode, ?ops[0], emit.operands.len, mo.WRITE)) { marked.secret = false; }
+        val placed: res[Instruction, Error] = made(st, b, emit.opcode, ?ops[0], emit.operands.len, marked, declassifies && carries_point(st, r, mt, e), emit.state, clobbered.ok);
         if (sel placed.err)     { ret err[Error].err{placed.err}; }
         if (e < rule.MAX_FRESH) { emitted[e] = placed.ok; }
         if (emit.implied.len > 0) {
@@ -2395,7 +2552,8 @@ fun lay_table(st: *State, b: u32, md: Metadata) res[Instruction, Error] {
 
 # the frame slot an alloca asks for: its type's size, in the space the target
 # states for its frame slots, at its alignment, addressed since the alloca's
-# result is its address. it is made once, however many operands name it
+# result is its address, and public where the alloca states its local's type
+# holds no secret. it is made once, however many operands name it
 fun slot_for(st: *State, root: id.Instruction) res[u32, Error] {
     if (st.frames.data[root] != NONE) { ret res[u32, Error].ok{st.frames.data[root]}; }
     val d:     *InstructionData = instruction(st, root);
@@ -2427,6 +2585,7 @@ fun slot_for(st: *State, root: id.Instruction) res[u32, Error] {
     if (sel size.err) { ret res[u32, Error].err{Error.layout{ty}}; }
     var slot: SlotData = mf.fixed_slot(size.ok, align);
     slot.addressed = true;
+    slot.public    = d.metadata.flags.public;
     val got: res[FrameSlot, mf.Error] = mf.slot(st.out, slot);
     if (sel got.err) { ret res[u32, Error].err{Error.machine{got.err}}; }
     val bound: res[Slice[Binding], module.Error] = module.bound(st.m, d.metadata.bindings);
@@ -2497,7 +2656,7 @@ fun stack_slot(st: *State, ty: Type, p: Placed, incoming: bool, addressed: bool)
     if (sel align.err) { ret res[FrameSlot, Error].err{Error.layout{ty}}; }
     val place: ir_place.Place = p.place;
     if (!(sel place.stack)) { ret res[FrameSlot, Error].err{Error.placed{p}}; }
-    var slot: SlotData = SlotData{size: size.ok, per: 0, scale: 0, align: align.ok, area: Area.local{}, secret: false, addressed: addressed};
+    var slot: SlotData = SlotData{size: size.ok, per: 0, scale: 0, align: align.ok, area: Area.local{}, secret: false, addressed: addressed, public: false};
     var at:   Argued   = mf.argued(place.stack.offset);
     if (sel p.scale.scaled) {
         slot.size  = 0;
@@ -3277,7 +3436,7 @@ fun bytes_of(st: *State, outer: u32, offset: u64, size: u64, align: u64) res[u32
             if (s.area.within.slot == outer && s.area.within.offset == offset && s.size == size) { ret res[u32, Error].ok{st.views.data[k]}; }
         }
     }
-    val made: res[FrameSlot, mf.Error] = mf.slot(st.out, SlotData{size: size, per: 0, scale: 0, align: align, area: Area.within{mf.Within{slot: outer, offset: offset}}, secret: false, addressed: false});
+    val made: res[FrameSlot, mf.Error] = mf.slot(st.out, SlotData{size: size, per: 0, scale: 0, align: align, area: Area.within{mf.Within{slot: outer, offset: offset}}, secret: false, addressed: false, public: false});
     if (sel made.err) { ret res[u32, Error].err{Error.machine{made.err}}; }
     val kept: err[Error] = push_u32(?st.views, made.ok);
     if (sel kept.err) { ret res[u32, Error].err{kept.err}; }
@@ -3606,12 +3765,22 @@ fun emit_block(st: *State, k: id.Block) err[Error] {
         val c:    *Choice          = ?st.choices.data[i];
         val d:    *InstructionData = instruction(st, c.found.nodes[0]);
         val decl: bool             = covers_declassify(st, ?c.found);
-        # the count-bounded and checked marks are read by the guards and are not carried to the machine form, and the
-        # public flag only where every access the expansion makes is the one the root states
-        var md: Metadata = d.metadata;
+        # the count-bounded and checked marks are read by the guards and are not carried to the machine form. the
+        # expansion states its access as the node making it does, and states none where no one node does
+        var md:     Metadata = d.metadata;
+        val access: opt[u32] = access_node(st, ?c.found);
         md.flags.bounded = false;
         md.flags.checked = false;
-        if (!states_access(st, ?c.found)) { md.flags.public = false; }
+        md.extent        = NO_EXTENT;
+        if (sel access.none) { md.flags.public = false; }
+        if (sel access.some) {
+            val made: Metadata = instruction(st, c.found.nodes[access.some]).metadata;
+            md.flags.public = made.flags.public;
+            md.secret       = md.secret || made.secret;
+            val framed: res[Extent, Error] = framed_slot(st, c.found.nodes[access.some]);
+            if (sel framed.err) { ret err[Error].err{framed.err}; }
+            md.extent = framed.ok;
+        }
         val before: u32 = st.out.instructions.len::u32;
         val root:   u32 = c.found.nodes[0];
         if (c.rule == NONE) {

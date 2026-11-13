@@ -73,7 +73,7 @@ done:
     ret(acc);
 }
 
-#[constant_time(soft)]
+#[constant_time(soft)] #[secret_parameters(0, 1, 2)]
 pub fun pick(a: ^i64, b: ^i64, c: ^i1) i64 {
     val r: ^i64 = select(c, a, b);
     ret(r);
@@ -280,6 +280,20 @@ decorators
                             secret values, `soft` or `hard` (see ir.md 7.1)
   #[init(n)]                the image's loader runs the function at load, at
                             priority n, a lower one first
+  #[secret_parameters(...)] the parameters of a function whose declaration
+                            states them secret, each its position, alone for
+                            one secret whole or followed by `[o, n]` ranges
+                            for one secret in part, no position twice and
+                            none past the signature (see ir.md 7.1)
+  #[secret_result]          the result of a function whose declaration states
+  #[secret_result([o, n], ...)]
+                            it secret, bare for one secret whole or with the
+                            byte ranges of one secret in part, and only on a
+                            signature with a result (see ir.md 7.1)
+  #[public_pointers(i, ...)] the parameters a function's declaration states
+                            are pointers to storage holding no secret, each
+                            its position, ascending and none past the
+                            signature (see ir.md 7.1)
   #[convention(name)]       the calling convention of a function's signature,
                             the default when left out
   #[placed(type, places)]   the abi legalisation has put the body in pieces:
@@ -291,10 +305,17 @@ decorators
   #[descending]
   #[public]                 a load or an atomic access states the memory it
                             reads public, where its results do not state it
-                            secret
+                            secret, a store the memory it writes public, a
+                            copy both the memory it reads and the memory it
+                            writes public, and an alloca the storage it makes
+                            public, the type of what it holds holding no
+                            secret (see ir.md 7)
   #[secret]                 an instruction's metadata states its results
                             secret where its row's secrecy does not, or it has
                             none
+  #[within(offset, length)] a load or store states the frame extent it
+                            reaches: that range of the slot of the alloca its
+                            address is formed from (see ir.md 5)
 
   `kept` marks a store or a fill whose write no pass may take away (see the
   specification's memory section). `bounded` marks a shift whose count is

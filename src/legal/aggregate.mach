@@ -8,7 +8,10 @@
 # vector, each a value of its own from then on.
 #
 # - a load is a load of each leaf at its offset, and a store a store of each,
-#   with the access's flags on every one.
+#   with the access's flags on every one. a store that is neither volatile nor
+#   kept also writes zero over the bytes no leaf holds, its padding, so it
+#   writes every byte of its type as the store it replaces did, and a slot it
+#   writes is never read stale through its padding (`mirl.ct.frame`).
 # - `extract` is the member's leaves, the one value of a scalar member, and
 #   `insert` the aggregate's leaves with the member's replaced. a select is a
 #   select of each leaf on its condition, and a block parameter one parameter
@@ -71,7 +74,6 @@ use ir_constant: mirl.ir.constant;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.contents;
 use mirl.ir.function.Body;
-use mirl.ir.function.in_constant_time;
 use mirl.ir.id.Block;
 use mirl.ir.id.Constant;
 use mirl.ir.id.Instruction;
@@ -179,7 +181,6 @@ rec Run {
 # caps:   the target's capabilities
 # word:   the widest access in bytes, the target's widest arithmetic
 # late:   the run after the abi legalisation
-# timed:  the function requires constant time
 # basis:  the build's selection
 # keep:   storage that lives until the visit ends
 # leaves: the leaves of every type shaped so far
@@ -199,7 +200,6 @@ rec Work {
     caps:   *Capabilities;
     word:   u64;
     late:   bool;
-    timed:  bool;
     basis:  opt[*Basis];
     keep:   *allocator.Allocator;
     leaves: Vector[Leaf];
@@ -433,14 +433,15 @@ fun alignment_of(d: *InstructionData) u64 {
     ret 1;
 }
 
+# the flags of a piece of an access, which states what the access it stands for does
 fun access_flags(f: Flags) Flags {
-    ret Flags{volatile: f.volatile, kept: f.kept, bounded: false};
+    ret Flags{volatile: f.volatile, kept: f.kept, bounded: false, public: f.public};
 }
 
 # the flags of a piece of a read, which reads what the read it stands for does
 fun read_flags(f: Flags) Flags {
     var r: Flags = access_flags(f);
-    r.public = f.public;
+    r.kept = false;
     ret r;
 }
 
@@ -1030,11 +1031,23 @@ fun copied(w: *Work, store: Instruction, x: Value) opt[Instruction] {
     ret opt[Instruction].some{l};
 }
 
+# the load a store moves from memory to memory, as `copied`, where the two state
+# no secret read into memory stated public, which the store's own check refuses
+fun moved(w: *Work, store: Instruction, x: Value) opt[Instruction] {
+    val from: opt[Instruction] = copied(w, store, x);
+    if (sel from.none) { ret from; }
+    val b: *Body = body_of(w);
+    if (b.instructions.data[from.some].metadata.secret && b.instructions.data[store].metadata.flags.public) { ret opt[Instruction].none{}; }
+    ret from;
+}
+
 # a run of bytes moved, or filled with one byte, in the widest words each
 # alignment allows, the last store in the store's place. every word is loaded
 # before the first store, so a move between overlapping runs reads the bytes
-# as they were
-fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, byte: u8, f: Flags) {
+# as they were. each load and store states what the move states, secret with
+# `secret` and public with the public flag of `f`
+fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, byte: u8, f: Flags, secret: bool) {
+    emit.secret(?w.site, secret);
     var loads: Vector[Value] = vector.init[Value](w.keep);
     var done:  u64           = 0;
     if (sel from.some) {
@@ -1046,7 +1059,7 @@ fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u
                 fail(w, ty.err);
                 ret;
             }
-            vector.push[Value](?loads, load_at(w, at_offset(w, from.some, done), ty.ok, at, NO_FLAGS));
+            vector.push[Value](?loads, load_at(w, at_offset(w, from.some, done), ty.ok, at, f));
             done = done + n;
         }
     }
@@ -1089,8 +1102,10 @@ fun filled(byte: u8, n: u64) Wide {
     ret x;
 }
 
-# a run of bytes moved or zeroed as one bulk operation in the store's place
-fun in_bulk(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, f: Flags) {
+# a run of bytes moved or zeroed as one bulk operation in the store's place,
+# stating what the move states, secret with `secret` and public with the
+# public flag of `f`
+fun in_bulk(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, f: Flags, secret: bool) {
     val length: Value        = length_of(w, to, size);
     var ops:    [3]Value     = [3]Value{to, 0, length};
     var imm:    [1]Immediate = [1]Immediate{Immediate.alignment{align}};
@@ -1113,7 +1128,8 @@ fun in_bulk(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u6
         ops[1] = z.ok;
     }
     emit.close(?w.site, origin);
-    emit.flags(?w.site, Flags{volatile: false, kept: f.kept, bounded: false});
+    emit.flags(?w.site, Flags{volatile: false, kept: f.kept, bounded: false, public: f.public});
+    emit.secret(?w.site, secret);
     emit.make(?w.site, code, Slice[Value]{data: ?ops[0], size: 3}, Slice[Immediate]{data: ?imm[0], size: 1});
     emit.flags(?w.site, NO_FLAGS);
 }
@@ -1148,18 +1164,23 @@ fun store(w: *Work, i: Instruction) err[refusal.Error] {
     if (!f.volatile && !f.kept) {
         var zero: bool = false;
         if (sel def.constant) { zero = zero_constant(w, def.constant); }
-        val from: opt[Instruction] = copied(w, i, x);
+        val from: opt[Instruction] = moved(w, i, x);
         if (zero || sel from.some) {
             var source: opt[Value] = opt[Value].none{};
             var both:   u64        = align;
+            var moving: Flags      = f;
+            var secret: bool       = d.metadata.secret;
             if (sel from.some) {
-                source = opt[Value].some{b.instructions.data[from.some].operands.data[0]};
-                val other: u64 = alignment_of(?b.instructions.data[from.some]);
+                val l: *InstructionData = ?b.instructions.data[from.some];
+                source        = opt[Value].some{l.operands.data[0]};
+                moving.public = f.public && l.metadata.flags.public;
+                secret        = secret || l.metadata.secret;
+                val other: u64 = alignment_of(l);
                 if (other < both) { both = other; }
             }
             emit.open(?w.site, i, k, position(b, k, i));
-            if (moves.in_words(w.caps, size.ok, both, w.word, zero, w.timed)) { in_words(w, i, to, source, size.ok, both, 0, f); }
-            or                                                                { in_bulk(w, i, to, source, size.ok, both, f); }
+            if (moves.in_words(w.caps, size.ok, both, w.word)) { in_words(w, i, to, source, size.ok, both, 0, moving, secret); }
+            or                                                 { in_bulk(w, i, to, source, size.ok, both, moving, secret); }
             val ok: err[refusal.Error] = emit.done(?w.site);
             if (sel ok.err)    { ret ok; }
             if (sel from.some) { ret gone(w, from.some); }
@@ -1172,19 +1193,83 @@ fun store(w: *Work, i: Instruction) err[refusal.Error] {
     if (parts.size == 0) { ret gone(w, i); }
     val s: res[Shaped, refusal.Error] = shaped(w, ty);
     if (sel s.err) { ret err[refusal.Error].err{s.err}; }
+    var gaps: Vector[Gap] = vector.init[Gap](w.keep);
+    if (!f.volatile && !f.kept) {
+        val found: err[refusal.Error] = padding(w, s.ok, parts.size, size.ok, ?gaps);
+        if (sel found.err) { ret found; }
+    }
     emit.open(?w.site, i, k, position(b, k, i));
     var n: usize = 0;
     for (n < parts.size) {
         val l:       Leaf  = leaf(w, s.ok, n);
         val address: Value = at_offset(w, to, l.offset);
         val stored:  Value = as_stored(w, parts.data[n]);
-        if (n + 1 == parts.size) { emit.close(?w.site, i); }
+        if (n + 1 == parts.size && gaps.len == 0) { emit.close(?w.site, i); }
         store_at(w, address, stored, moves.aligned_at(align, l.offset), f);
         n = n + 1;
+    }
+    var g: usize = 0;
+    for (g < gaps.len) {
+        zeroed(w, i, to, gaps.data[g], align, f, g + 1 == gaps.len);
+        g = g + 1;
     }
     val ok: err[refusal.Error] = emit.done(?w.site);
     if (sel ok.err) { ret ok; }
     ret failure_of(w);
+}
+
+# a run of bytes of an aggregate no leaf holds
+rec Gap {
+    offset: u64;
+    size:   u64;
+}
+
+# the runs of the `count` leaves of shape `s`, of a type of `size` bytes, that no leaf holds, in order, into `out`
+fun padding(w: *Work, s: Shaped, count: usize, size: u64, out: *Vector[Gap]) err[refusal.Error] {
+    var end: u64   = 0;
+    var n:   usize = 0;
+    for (n <= count) {
+        var start: u64 = size;
+        var past:  u64 = size;
+        if (n < count) {
+            val l:     Leaf                    = leaf(w, s, n);
+            val width: res[u64, refusal.Error] = size_of(w, l.ty);
+            if (sel width.err) { ret err[refusal.Error].err{width.err}; }
+            start = l.offset;
+            past  = l.offset + width.ok;
+        }
+        if (start > end) {
+            val pushed: res[usize, allocator.Error] = vector.push[Gap](out, Gap{offset: end, size: start - end});
+            if (sel pushed.err) { ret err[refusal.Error].err{lost(pushed.err)}; }
+        }
+        if (past > end) { end = past; }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# zero over gap `gap` of the aggregate store `origin` writes at `to`, in the widest words each alignment allows, with
+# the store's flags, the last word in the store's place where `last`
+fun zeroed(w: *Work, origin: Instruction, to: Value, gap: Gap, align: u64, f: Flags, last: bool) {
+    var done: u64 = 0;
+    for (done < gap.size) {
+        val at: u64                      = moves.aligned_at(align, gap.offset + done);
+        val n:  u64                      = moves.step(gap.size - done, at, w.word);
+        val ty: res[Type, refusal.Error] = integer(w, (n * 8)::u32);
+        if (sel ty.err) {
+            fail(w, ty.err);
+            ret;
+        }
+        val z: res[Value, refusal.Error] = emit.constant(?w.site, ty.ok, word.zero());
+        if (sel z.err) {
+            fail(w, z.err);
+            ret;
+        }
+        val address: Value = at_offset(w, to, gap.offset + done);
+        if (last && done + n >= gap.size) { emit.close(?w.site, origin); }
+        store_at(w, address, z.ok, at, f);
+        done = done + n;
+    }
 }
 
 # an aggregate a call or a return reads, which the abi legalisation places:
@@ -1253,12 +1338,12 @@ fun bulk(w: *Work, i: Instruction) err[refusal.Error] {
     if (sel second.some) {
         if (fill) { byte = (second.some & 0xff)::u8; }
     }
-    if (size.some == 0)                                                   { ret gone(w, i); }
-    if (!moves.in_words(w.caps, size.some, align, w.word, fill, w.timed)) { ret err[refusal.Error].ok{}; }
+    if (size.some == 0)                                    { ret gone(w, i); }
+    if (!moves.in_words(w.caps, size.some, align, w.word)) { ret err[refusal.Error].ok{}; }
     val f: Flags = d.metadata.flags;
     val k: Block = block_of(b, i);
     emit.open(?w.site, i, k, position(b, k, i));
-    in_words(w, i, to, from, size.some, align, byte, f);
+    in_words(w, i, to, from, size.some, align, byte, f, d.metadata.secret);
     val ok: err[refusal.Error] = emit.done(?w.site);
     if (sel ok.err) { ret ok; }
     ret failure_of(w);
@@ -1470,7 +1555,6 @@ fun visit(u: *Unit, late: bool) res[bool, refusal.Error] {
     w.layout = layout.of(c.t, ?c.m.types, basis.context_of(c.basis));
     w.caps   = ?c.t.caps;
     w.late   = late;
-    w.timed  = in_constant_time(c.m.functions.data[u.f].data.constant_time);
     w.basis  = c.basis;
     w.keep   = ?keep;
     w.leaves = vector.init[Leaf](?keep);

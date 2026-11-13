@@ -102,6 +102,7 @@ use mink.base.table.Id;
 use mirl.build.builder;
 use mirl.build.builder.Builder;
 use mirl.build.failure;
+use mirl.ct.contract;
 use mirl.fold.word;
 use mirl.ir.body;
 use mirl.ir.body.Records;
@@ -113,6 +114,7 @@ use mirl.ir.function.ConstantTime;
 use mirl.ir.function.FunctionData;
 use mirl.ir.function.NO_EXTENSIONS;
 use mirl.ir.function.in_constant_time;
+use mirl.ir.function.parameter_secrecy;
 use mirl.ir.global.GlobalData;
 use mirl.ir.global.Secrecy;
 use mirl.ir.global.Section;
@@ -530,19 +532,48 @@ pub fun carried(l: *Layout, ty: Type, offset: u64, size: u64) opt[Type] {
     ret opt[Type].none{};
 }
 
+# an instruction forming a piece from bytes the pass moves, which carries no secrecy mark: a mark would declare the
+# register it writes secret whatever the bytes hold (`machine/emit/handover.seed_results`), where the walk takes the
+# secrecy of what it computes from the loads, each marked as the value is
+fun derived_unary(bld: *Builder, code: Opcode, v: Value, to: Type) Value {
+    val marked: bool = bld.secret;
+    builder.secret(bld, false);
+    val x: Value = unary(bld, code, v, to);
+    builder.secret(bld, marked);
+    ret x;
+}
+
+fun derived_binary(bld: *Builder, code: Opcode, a: Value, b: Value) Value {
+    val marked: bool = bld.secret;
+    builder.secret(bld, false);
+    val x: Value = binary(bld, code, a, b);
+    builder.secret(bld, marked);
+    ret x;
+}
+
+# a load stated public where `public`, as the access the bytes it reads were loaded by states them
+fun stated_load(bld: *Builder, address: Value, ty: Type, align: u64, public: bool) Value {
+    var f: Flags = NO_FLAGS;
+    f.public = public;
+    builder.flags(bld, f);
+    val x: Value = load(bld, address, ty, align);
+    builder.flags(bld, NO_FLAGS);
+    ret x;
+}
+
 # read a piece of a size from memory into a type, in the widest words that
 # fit it when no integer has its size, a float it moves as its encoding
-# reinterpreted
-fun read(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u64, ty: Type) res[Value, refusal.Error] {
+# reinterpreted, each load stated public where `public`
+fun read(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u64, ty: Type, public: bool) res[Value, refusal.Error] {
     val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
     if (sel s.err) { ret res[Value, refusal.Error].err{s.err}; }
     if (sel s.ok.float) {
         val bits: res[opt[Type], refusal.Error] = encoded(w, ty, size);
         if (sel bits.err) { ret res[Value, refusal.Error].err{bits.err}; }
         if (sel bits.ok.some) {
-            val raw: res[Value, refusal.Error] = read(w, bld, base, offset, size, align, bits.ok.some);
+            val raw: res[Value, refusal.Error] = read(w, bld, base, offset, size, align, bits.ok.some, public);
             if (sel raw.err) { ret raw; }
-            ret res[Value, refusal.Error].ok{unary(bld, opcode_table.BITCAST, raw.ok, ty)};
+            ret res[Value, refusal.Error].ok{derived_unary(bld, opcode_table.BITCAST, raw.ok, ty)};
         }
     }
     var exact: bool = true;
@@ -550,7 +581,7 @@ fun read(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u6
     if (exact) {
         val at: res[Value, refusal.Error] = address(w, bld, base, offset);
         if (sel at.err) { ret at; }
-        ret res[Value, refusal.Error].ok{load(bld, at.ok, ty, aligned_at(align, offset))};
+        ret res[Value, refusal.Error].ok{stated_load(bld, at.ok, ty, aligned_at(align, offset), public)};
     }
     var acc:  Value = 0;
     var any:  bool  = false;
@@ -562,13 +593,13 @@ fun read(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u6
             if (sel narrow.err) { ret res[Value, refusal.Error].err{narrow.err}; }
             val at: res[Value, refusal.Error] = address(w, bld, base, offset + done);
             if (sel at.err) { ret at; }
-            var part: Value = unary(bld, opcode_table.EXT_U, load(bld, at.ok, narrow.ok, aligned_at(align, offset + done)), ty);
+            var part: Value = derived_unary(bld, opcode_table.EXT_U, stated_load(bld, at.ok, narrow.ok, aligned_at(align, offset + done), public), ty);
             if (done > 0) {
                 val by: res[Value, refusal.Error] = integer(w, ty, done * 8);
                 if (sel by.err) { ret by; }
-                part = binary(bld, opcode_table.SHL, part, by.ok);
+                part = derived_binary(bld, opcode_table.SHL, part, by.ok);
             }
-            if (any) { acc = binary(bld, opcode_table.OR, acc, part); }
+            if (any) { acc = derived_binary(bld, opcode_table.OR, acc, part); }
             or       { acc = part; }
             any  = true;
             done = done + word;
@@ -576,6 +607,104 @@ fun read(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u6
         word = word / 2;
     }
     if (!any) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a piece of no bytes"}}; }
+    ret res[Value, refusal.Error].ok{acc};
+}
+
+# the bytes of `[lo, lo + n)` of a value's memory image that a member of type `ty` laid at `at` holds, one bit for each
+# from bit 0, none where the layout states no size or place. a byte no member holds is padding, which nothing need
+# ever write
+fun held_bytes(l: *Layout, ty: Type, at: u64, lo: u64, n: u64) opt[u64] {
+    val res_shape: res[table.Shape, table.Error] = table.shape(l.types, ty);
+    if (sel res_shape.err) { ret opt[u64].none{}; }
+    val shape: table.Shape = res_shape.ok;
+    if (sel shape.structure) {
+        var mask: u64   = 0;
+        var i:    usize = 0;
+        for (i < shape.structure.members.size) {
+            val res_at: res[u64, target_record.Error] = layout.offset(l, ty, table.DEFAULT_SPACE, i::u32);
+            if (sel res_at.err) { ret opt[u64].none{}; }
+            val opt_member: opt[u64] = held_bytes(l, shape.structure.members.data[i], at + res_at.ok, lo, n);
+            if (sel opt_member.none) { ret opt_member; }
+            mask = mask | opt_member.some;
+            i    = i + 1;
+        }
+        ret opt[u64].some{mask};
+    }
+    if (sel shape.union) {
+        var mask: u64   = 0;
+        var j:    usize = 0;
+        for (j < shape.union.members.size) {
+            val opt_member: opt[u64] = held_bytes(l, shape.union.members.data[j], at, lo, n);
+            if (sel opt_member.none) { ret opt_member; }
+            mask = mask | opt_member.some;
+            j    = j + 1;
+        }
+        ret opt[u64].some{mask};
+    }
+    if (sel shape.array) {
+        val res_step: res[u64, target_record.Error] = layout.stride(l, ty, table.DEFAULT_SPACE);
+        if (sel res_step.err) { ret opt[u64].none{}; }
+        var mask: u64 = 0;
+        var k:    u64 = 0;
+        for (k < shape.array.count) {
+            val start: u64 = at + k * res_step.ok;
+            if (start >= lo + n) { brk; }
+            val opt_element: opt[u64] = held_bytes(l, shape.array.element, start, lo, n);
+            if (sel opt_element.none) { ret opt_element; }
+            mask = mask | opt_element.some;
+            k    = k + 1;
+        }
+        ret opt[u64].some{mask};
+    }
+    val res_size: res[u64, target_record.Error] = layout.size(l, ty, table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret opt[u64].none{}; }
+    var mask: u64 = 0;
+    var b:    u64 = at;
+    for (b < at + res_size.ok) {
+        if (b >= lo && b < lo + n) { mask = mask | (1::u64 << (b - lo)); }
+        b = b + 1;
+    }
+    ret opt[u64].some{mask};
+}
+
+# read a piece of a value of type `of` from memory into a type: an integer piece reads only the bytes the value's
+# members hold, its bits over padding zero, so no piece reads memory a store of the value need not have written and
+# no register carries stale padding out. any other piece, or one with no padding, is `read`. each load is stated public
+# where `public`, as the access the value was loaded by states its bytes
+fun read_piece(w: *Work, bld: *Builder, base: Value, of: Type, p: Piece, align: u64, ty: Type, public: bool) res[Value, refusal.Error] {
+    val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel s.err) { ret res[Value, refusal.Error].err{s.err}; }
+    val plain: bool = !(sel s.ok.integer) || p.size > 8 || p.size == 0;
+    if (plain) { ret read(w, bld, base, p.offset, p.size, align, ty, public); }
+    val opt_held: opt[u64] = held_bytes(w.l, of, 0, p.offset, p.size);
+    if (sel opt_held.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a piece of a value whose layout states no place for a member"}}; }
+    val held: u64 = opt_held.some;
+    val full: u64 = (1::u64 << p.size) - 1;
+    if (held == full) { ret read(w, bld, base, p.offset, p.size, align, ty, public); }
+    var acc:   Value = 0;
+    var any:   bool  = false;
+    var start: u64   = 0;
+    for (start < p.size) {
+        if (((held >> start) & 1) == 0) {
+            start = start + 1;
+            cnt;
+        }
+        var end: u64 = start;
+        for (end < p.size && ((held >> end) & 1) != 0) { end = end + 1; }
+        val res_run: res[Value, refusal.Error] = read(w, bld, base, p.offset + start, end - start, align, ty, public);
+        if (sel res_run.err) { ret res_run; }
+        var part: Value = res_run.ok;
+        if (start > 0) {
+            val by: res[Value, refusal.Error] = integer(w, ty, start * 8);
+            if (sel by.err) { ret by; }
+            part = derived_binary(bld, opcode_table.SHL, part, by.ok);
+        }
+        if (any) { acc = derived_binary(bld, opcode_table.OR, acc, part); }
+        or       { acc = part; }
+        any   = true;
+        start = end;
+    }
+    if (!any) { ret integer(w, ty, 0); }
     ret res[Value, refusal.Error].ok{acc};
 }
 
@@ -587,7 +716,7 @@ fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u
     if (sel s.ok.float) {
         val bits: res[opt[Type], refusal.Error] = encoded(w, ty, size);
         if (sel bits.err)     { ret err[refusal.Error].err{bits.err}; }
-        if (sel bits.ok.some) { ret write(w, bld, base, offset, size, align, unary(bld, opcode_table.BITCAST, v, bits.ok.some), bits.ok.some); }
+        if (sel bits.ok.some) { ret write(w, bld, base, offset, size, align, derived_unary(bld, opcode_table.BITCAST, v, bits.ok.some), bits.ok.some); }
     }
     var exact: bool = true;
     if (sel s.ok.integer) { exact = s.ok.integer.width::u64 == size * 8; }
@@ -607,9 +736,9 @@ fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u
             if (done > 0) {
                 val by: res[Value, refusal.Error] = integer(w, ty, done * 8);
                 if (sel by.err) { ret err[refusal.Error].err{by.err}; }
-                part = binary(bld, opcode_table.SHR_U, part, by.ok);
+                part = derived_binary(bld, opcode_table.SHR_U, part, by.ok);
             }
-            part = unary(bld, opcode_table.TRUNC, part, narrow.ok);
+            part = derived_unary(bld, opcode_table.TRUNC, part, narrow.ok);
             val at: res[Value, refusal.Error] = address(w, bld, base, offset + done);
             if (sel at.err) { ret err[refusal.Error].err{at.err}; }
             store(bld, at.ok, part, aligned_at(align, offset + done));
@@ -627,8 +756,7 @@ fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u
 # memory copied from can be, so the copy runs in either order
 fun copy(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64) err[refusal.Error] {
     if (from == to) { ret err[refusal.Error].ok{}; }
-    val timed: bool = in_constant_time(w.m.functions.data[w.f].data.constant_time);
-    if (!moves.in_words(?w.t.caps, size, align, WORD, false, timed)) {
+    if (!moves.in_words(?w.t.caps, size, align, WORD)) {
         val length: res[Value, refusal.Error] = integer(w, w.offset, size);
         if (sel length.err) { ret err[refusal.Error].err{length.err}; }
         var ops:   [3]Value     = [3]Value{to, from, length.ok};
@@ -933,15 +1061,16 @@ fun send(w: *Work, bld: *Builder, at: Instruction, side: Side, x: Sent, passed: 
         builder.derive(?near, from.some);
         builder.secret(?near, x.secret);
         builder.at(?near, k, position(b, k, from.some) + 1);
-        val base:  Value         = b.instructions.data[from.some].operands.data[0];
-        var reads: Vector[Value] = vector.init[Value](w.m.a);
+        val base:   Value         = b.instructions.data[from.some].operands.data[0];
+        val stated: bool          = b.instructions.data[from.some].metadata.flags.public && !x.secret;
+        var reads:  Vector[Value] = vector.init[Value](w.m.a);
         fin { vector.dnit[Value](?reads); }
         var n: u32 = 0;
         for (n < passed.count) {
             val p:  Piece                    = piece.piece(asg, passed.first + n);
             val ty: res[Type, refusal.Error] = piece_type(w, side, p, x.ty, false);
             if (sel ty.err) { ret err[refusal.Error].err{ty.err}; }
-            val v: res[Value, refusal.Error] = read(w, ?near, base, p.offset, p.size, al.ok, ty.ok);
+            val v: res[Value, refusal.Error] = read_piece(w, ?near, base, x.ty, p, al.ok, ty.ok, stated);
             if (sel v.err) { ret err[refusal.Error].err{v.err}; }
             val kept: res[usize, allocator.Error] = vector.push[Value](?reads, v.ok);
             if (sel kept.err) { ret refusal.lost(kept.err); }
@@ -965,7 +1094,7 @@ fun send(w: *Work, bld: *Builder, at: Instruction, side: Side, x: Sent, passed: 
         val p:  Piece                    = piece.piece(asg, passed.first + n);
         val ty: res[Type, refusal.Error] = piece_type(w, side, p, x.ty, false);
         if (sel ty.err) { ret err[refusal.Error].err{ty.err}; }
-        val v: res[Value, refusal.Error] = read(w, bld, home.ok, p.offset, p.size, al.ok, ty.ok);
+        val v: res[Value, refusal.Error] = read_piece(w, bld, home.ok, x.ty, p, al.ok, ty.ok, false);
         if (sel v.err) { ret err[refusal.Error].err{v.err}; }
         val pushed: err[refusal.Error] = push(w, bld, out, places, v.ok, p);
         if (sel pushed.err) { ret pushed; }
@@ -1109,12 +1238,14 @@ fun receive_types(w: *Work, side: Side, ty: Type, passed: Passed, asg: *Assignme
 # ---
 # home:   the slot an aggregate by value is rebuilt in
 # pieces: its piece values, one per piece of passed
-fun rebuild(w: *Work, bld: *Builder, ty: Type, passed: Passed, asg: *Assignment, home: opt[Value], pieces: Slice[Value]) res[Value, refusal.Error] {
+# public: whether the read of a copy by reference is stated public, as the declaration states the parameter it
+#         carries, whose copy the caller made of a value of its type
+fun rebuild(w: *Work, bld: *Builder, ty: Type, passed: Passed, asg: *Assignment, home: opt[Value], pieces: Slice[Value], public: bool) res[Value, refusal.Error] {
     val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
     if (sel s.err) { ret res[Value, refusal.Error].err{s.err}; }
     val al: res[u64, refusal.Error] = align_of(w, ty);
     if (sel al.err)                   { ret res[Value, refusal.Error].err{al.err}; }
-    if (sel passed.passing.reference) { ret res[Value, refusal.Error].ok{load(bld, pieces.data[0], ty, al.ok)}; }
+    if (sel passed.passing.reference) { ret res[Value, refusal.Error].ok{stated_load(bld, pieces.data[0], ty, al.ok, public)}; }
     val memory: res[bool, refusal.Error] = through_memory(w, ?s.ok, passed.count);
     if (sel memory.err) { ret res[Value, refusal.Error].err{memory.err}; }
     if (!memory.ok) {
@@ -1425,7 +1556,10 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
             if (sel owner.some) {
                 val old_value: Value  = olds.data[owner.some];
                 val passed:    Passed = asg.arguments.data[owner.some];
-                secret = body_of(w).values.data[old_value].secret && !(sel passed.passing.reference);
+                if (sel passed.passing.value) {
+                    val one: Piece = asg.pieces.data[passed.first::usize + piece_within(?counts, sel asg.address.some, i, owner.some)];
+                    secret = contract.piece_secret(parameter_secrecy(?w.m.functions.data[w.f].data, owner.some), one);
+                }
                 if (passed.count == 1 && sel passed.passing.value) { name = body_of(w).values.data[old_value].name; }
             }
         }
@@ -1455,7 +1589,7 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
             if (sel al.err) { ret res[opt[Value], refusal.Error].err{al.err}; }
             got = res[Value, refusal.Error].ok{load(?bld, area(w, ?bld, ty, lays.data[i].some, true), ty, al.ok)};
         }
-        or               { got = rebuild(w, ?bld, body_of(w).values.data[v].type, passed, asg, homes.data[i], Slice[Value]{data: ?params.data[at], size: passed.count::usize}); }
+        or               { got = rebuild(w, ?bld, body_of(w).values.data[v].type, passed, asg, homes.data[i], Slice[Value]{data: ?params.data[at], size: passed.count::usize}, !body_of(w).values.data[v].secret); }
         if (sel got.err) { ret res[opt[Value], refusal.Error].err{got.err}; }
         val done: err[refusal.Error] = built(?bld);
         if (sel done.err) { ret res[opt[Value], refusal.Error].err{done.err}; }
@@ -1481,11 +1615,11 @@ fun lower_entry(w: *Work, asg: *Assignment) res[opt[Value], refusal.Error] {
 
 # an aggregate that traveled in read where it is used: a load of the memory it
 # was rebuilt from, the caller's copy for one by reference and the entry's own
-# slot for one by value, just before each instruction that uses it. nothing in
-# the callee writes that memory after the entry, so each load reads what the
-# entry's would have, and a store of the value is a copy between memories with
-# no aggregate held across the body. the load at the entry goes once unused,
-# unless a variable is bound to it
+# slot for one by value, just before each instruction that uses it, stated as
+# the load at the entry is. nothing in the callee writes that memory after the
+# entry, so each load reads what the entry's would have, and a store of the
+# value is a copy between memories with no aggregate held across the body. the
+# load at the entry goes once unused, unless a variable is bound to it
 fun at_uses(w: *Work, v: Value) err[refusal.Error] {
     val ty: Type                            = body_of(w).values.data[v].type;
     val s:  res[table.Shape, refusal.Error] = shape_of(w, ty);
@@ -1496,6 +1630,7 @@ fun at_uses(w: *Work, v: Value) err[refusal.Error] {
     val l: Instruction = def.result.instruction;
     if (body_of(w).instructions.data[l].opcode != opcode_table.LOAD) { ret err[refusal.Error].ok{}; }
     val address: Value                   = body_of(w).instructions.data[l].operands.data[0];
+    val public:  bool                    = body_of(w).instructions.data[l].metadata.flags.public;
     val al:      res[u64, refusal.Error] = align_of(w, ty);
     if (sel al.err) { ret err[refusal.Error].err{al.err}; }
     for (body_of(w).values.data[v].uses.len > 0) {
@@ -1505,7 +1640,7 @@ fun at_uses(w: *Work, v: Value) err[refusal.Error] {
         builder.derive(?bld, u);
         builder.secret(?bld, body_of(w).values.data[v].secret);
         builder.before(?bld, u);
-        val here: Value              = load(?bld, address, ty, al.ok);
+        val here: Value              = stated_load(?bld, address, ty, al.ok, public);
         val done: err[refusal.Error] = built(?bld);
         if (sel done.err) { ret done; }
         val put: err[refusal.Error] = ir(body.substitute(w.m, w.f, u, v, here));
@@ -1539,6 +1674,18 @@ fun owner_of(carried: *Vector[u32], addressed: bool, at: usize) opt[usize] {
         i = i + 1;
     }
     ret opt[usize].none{};
+}
+
+# which piece of its argument `owner` the entry parameter `at` is, as `owner_of` counts them
+fun piece_within(carried: *Vector[u32], addressed: bool, at: usize, owner: usize) usize {
+    var k: usize = at;
+    if (addressed) { k = k - 1; }
+    var i: usize = 0;
+    for (i < owner) {
+        k = k - carried.data[i]::usize;
+        i = i + 1;
+    }
+    ret k;
 }
 
 # whether an instruction reads or writes memory, as its opcode row states,
@@ -1979,7 +2126,7 @@ fun lower_call(w: *Work, c: Instruction) err[refusal.Error] {
                 }
                 at = at + passed.count;
             }
-            val got: res[Value, refusal.Error] = rebuild(w, ?bld, ty, passed, ?asg, homes.data[i], Slice[Value]{data: pieces.data, size: pieces.len});
+            val got: res[Value, refusal.Error] = rebuild(w, ?bld, ty, passed, ?asg, homes.data[i], Slice[Value]{data: pieces.data, size: pieces.len}, false);
             if (sel got.err) { ret err[refusal.Error].err{got.err}; }
             val done: err[refusal.Error] = built(?bld);
             if (sel done.err) { ret done; }
@@ -2268,9 +2415,9 @@ fun declare_probe(c: *Context, b: *Build) res[bool, refusal.Error] {
             if (sel s.ok) {
                 val row: opt[*Resolved] = build_record.under(b, s.ok.convention);
                 if (sel row.some) {
-                    val made: res[bool, refusal.Error] = delivered_probe(c, convention.probe_helper(row.some.row));
-                    if (sel made.err) { ret made; }
-                    if (made.ok)      { changed = true; }
+                    val res_delivered: res[bool, refusal.Error] = delivered_probe(c, convention.probe_helper(row.some.row), in_constant_time(c.m.functions.data[i].data.constant_time));
+                    if (sel res_delivered.err) { ret res_delivered; }
+                    if (res_delivered.ok)      { changed = true; }
                 }
             }
         }
@@ -2280,20 +2427,22 @@ fun declare_probe(c: *Context, b: *Build) res[bool, refusal.Error] {
 }
 
 # deliver a probe routine by its name, none for a row with none, when the
-# module does not define it already
-fun delivered_probe(c: *Context, name: opt[str]) res[bool, refusal.Error] {
+# module does not define it already, local to the module where `local` says a
+# constant-time function's frame calls it
+fun delivered_probe(c: *Context, name: opt[str], local: bool) res[bool, refusal.Error] {
     if (sel name.none) { ret res[bool, refusal.Error].ok{false}; }
-    val as:    View        = View{data: name.some, len: str_len(name.some)};
-    val found: opt[Symbol] = module.find(c.m, as);
-    if (sel found.some) { ret res[bool, refusal.Error].ok{false}; }
-    var ar:   arena.Arena;
-    val made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
-    if (sel made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{made.err}}; }
+    val as:        View        = View{data: name.some, len: str_len(name.some)};
+    val opt_found: opt[Symbol] = module.find(c.m, as);
+    val held:      bool        = sel opt_found.some;
+    if (held && !local) { ret res[bool, refusal.Error].ok{false}; }
+    var ar:        arena.Arena;
+    val err_arena: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_arena.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_arena.err}}; }
     fin { arena.dnit(?ar); }
     var scratch: allocator.Allocator;
     arena.make(?scratch, ?ar);
-    val got: res[Function, refusal.Error] = deliver.probe(c.m, c.t, c.basis, ?scratch, name.some);
-    if (sel got.err) { ret res[bool, refusal.Error].err{got.err}; }
+    val res_probe: res[Function, refusal.Error] = deliver.probe(c.m, c.t, c.basis, ?scratch, name.some, local);
+    if (sel res_probe.err) { ret res[bool, refusal.Error].err{res_probe.err}; }
     ret res[bool, refusal.Error].ok{true};
 }
 

@@ -14,20 +14,26 @@
 # stale read as public.
 #
 # the stale part is a backward problem over the graph view, of the bytes of
-# each slot that is not escaped, up to `MOST` bytes, one part for a larger
-# slot. an access reaches its slot at a byte offset where every step moving
-# the address is constant: a `ptr.add` of a constant, a `ptr.member` at its
-# member's offset or a `ptr.index` of a constant index at its stride, as the
-# front end and the legalisations that take an aggregate apart form them. a
-# store writes the bytes of its value's type there and a load reads the bytes
-# of its result's, and a fill of a constant length writes that many, so a
-# fill a front end makes before it writes a secret aggregate's members covers
-# the aggregate's padding (the ir spec's rule that a secret aggregate's
-# padding is zero, mirl#560), while padding no fill or whole store writes is
-# read stale by a load of the whole. a load at an offset not known reads
-# every byte, a store at one writes none, and a slot of one part is written
-# only by an access covering all of it. a byte live into the entry is read
-# stale.
+# each slot that is not escaped, in parts: the runs between the first and
+# last byte of each access whose bytes it knows, so a slot of any size takes
+# as many parts as its accesses make. an access reaches its slot at a byte
+# offset where every step moving the address is constant: a `ptr.add` of a
+# constant, a `ptr.member` at its member's offset or a `ptr.index` of a
+# constant index at its stride, as the front end and the legalisations that
+# take an aggregate apart form them. a store writes the bytes of its value's
+# type there and a load reads the bytes of its result's, a fill of a constant
+# length writes that many and a copy of one reads that many of its source
+# before it writes as many of its destination, so a fill a front end makes
+# before it writes a secret aggregate's members covers the aggregate's padding
+# (the ir spec's rule that a secret aggregate's padding is zero, mirl#560),
+# while padding no fill or whole store writes is read stale by a load of the
+# whole. a load or store that states a frame extent (`mirl.ir.metadata.Extent`)
+# reads or writes the whole range it states, as each access of the loop the
+# bulk legalisation makes of a copy or fill stands for the copy or fill: a
+# load reads every byte of it and a store writes every byte of it before the
+# loop leaves, which is the statement trusted. a load at an offset not known
+# reads every byte, a store at one writes none, and a slot of no size the
+# layout states is written by none. a byte live into the entry is read stale.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -39,6 +45,7 @@ use std.types.size.usize;
 
 use std.allocator;
 use std.collections.slice.Slice;
+use std.collections.sort;
 use std.collections.vector;
 
 use mirl.base.slice;
@@ -52,6 +59,7 @@ use mirl.ir.id.Function;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.Value;
 use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata;
 use mirl.ir.module;
 use mirl.ir.module.Error;
 use mirl.ir.module.Module;
@@ -65,9 +73,6 @@ use mirl.ir.value.Def;
 use mirl.target.layout;
 use mirl.target.layout.Layout;
 use mirl.target.record;
-
-# the most bytes a slot is split into parts by, a larger one being one part
-pub val MOST: u64 = 1024;
 
 # the slots of one function, one bit per instruction of its body in each set, set where the instruction is an alloca
 # whose slot is so. a slot of either set is not readable
@@ -94,18 +99,46 @@ rec Span {
     len: u64;
 }
 
-# the parts of every slot of a body, the first bit of each alloca's, their count and its size, by instruction
+# the parts of every slot of a body, the first bit of each alloca's, their count and its size, by instruction, and the
+# offsets the parts run between
 # ---
 # words: the words of a block's set of parts
 # first: the first part of each alloca
-# count: the parts of each alloca, none for any other instruction: its bytes, or 1 for a slot of more than `MOST` or
-#        of no size the layout states
+# count: the parts of each alloca, none for any other instruction: one fewer than its cuts, or 1 for a slot of no size
+#        the layout states
 # size:  the bytes of each alloca, 0 where the layout states none
+# base:  where each alloca's cuts start in `cuts`
+# cuts:  each alloca's offsets in ascending order, 0, its size and each first and one past the last byte of an access
+#        within it, part `k` running from cut `k` to cut `k + 1`
 rec Parts {
     words: u32;
     first: vector.Vector[u32];
     count: vector.Vector[u32];
     size:  vector.Vector[u64];
+    base:  vector.Vector[u32];
+    cuts:  vector.Vector[u64];
+}
+
+# an offset of a slot a part starts or ends at
+rec Cut {
+    slot: u32;
+    at:   u64;
+}
+
+# what a scan of a body gathers: in `cutting`, the offsets each access's bytes start and end at, else each block's
+# stale reads and writes and the slots that escape
+rec Scan {
+    m:       *Module;
+    l:       *Layout;
+    b:       *Body;
+    p:       *Parts;
+    cutting: bool;
+    found:   vector.Vector[Cut];
+    escaped: *vector.Vector[u64];
+    gen:     *vector.Vector[u64];
+    kill:    *vector.Vector[u64];
+    base:    usize;
+    failed:  err[allocator.Error];
 }
 
 fun bit(s: *vector.Vector[u64], base: usize, n: u32) bool {
@@ -144,6 +177,25 @@ fun traced(b: *Body, v: Value) opt[Traced] {
     ret opt[Traced].none{};
 }
 
+# the alloca address `v` of body `b` is formed from through moves, none for an address of no alloca of the body
+pub fun slot_of(b: *Body, v: Value) opt[Instruction] {
+    val t: opt[Traced] = traced(b, v);
+    if (sel t.none) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{t.some.slot};
+}
+
+# the bytes the slot of alloca `slot` of body `b` takes under layout `l`, none where the layout states none
+pub fun slot_size(l: *Layout, b: *Body, slot: Instruction) opt[u64] {
+    val ty: opt[Type] = allocated(b, slot);
+    if (sel ty.none) { ret opt[u64].none{}; }
+    ret size_of(l, ty.some);
+}
+
+# the bytes a value of type `ty` takes under layout `l`, none where the layout states none
+pub fun bytes_of(l: *Layout, ty: Type) opt[u64] {
+    ret size_of(l, ty);
+}
+
 # the type immediate `i` of instruction `d` holds, none for none
 fun type_at(d: *InstructionData, i: usize) opt[Type] {
     if (i >= d.immediates.len) { ret opt[Type].none{}; }
@@ -162,6 +214,12 @@ fun size_of(l: *Layout, ty: Type) opt[u64] {
     val got: res[u64, record.Error] = layout.size(l, ty, type_table.DEFAULT_SPACE);
     if (sel got.err) { ret opt[u64].none{}; }
     ret opt[u64].some{got.ok};
+}
+
+# the byte offset from its slot address `v` of body `b` of `m` is at under layout `l`, none where a step moving it is
+# not constant or it is formed from no alloca
+pub fun offset_in(m: *Module, l: *Layout, b: *Body, v: Value) opt[u64] {
+    ret offset_of(m, l, b, v);
 }
 
 # the byte offset from its slot address `v` of body `b` is at, none where a step moving it is not constant
@@ -237,14 +295,42 @@ fun filled(m: *Module, b: *Body, d: *InstructionData) opt[u64] {
     ret opt[u64].some{n.some::u64};
 }
 
-# the parts of every alloca of body `b` of `m`, or the allocator's refusal
-fun parts_of(a: *allocator.Allocator, m: *Module, l: *Layout, b: *Body, p: *Parts) err[allocator.Error] {
-    var failed: err[allocator.Error] = slice.fill[u32](?p.first, b.instructions.len, 0);
-    if (!(sel failed.err)) { failed = slice.fill[u32](?p.count, b.instructions.len, 0); }
-    if (!(sel failed.err)) { failed = slice.fill[u64](?p.size, b.instructions.len, 0); }
+# the bytes copy `d` moves, its length where it is constant
+fun copied(m: *Module, b: *Body, d: *InstructionData) opt[u64] {
+    ret filled(m, b, d);
+}
+
+# the bytes of its slot the load or store `d` reaches through address `v`: the range it states where it states a frame
+# extent, else the bytes of `len` at the offset it is at
+fun reached(m: *Module, l: *Layout, b: *Body, d: *InstructionData, v: Value, len: opt[u64]) opt[Span] {
+    if (metadata.states_extent(?d.metadata)) { ret opt[Span].some{Span{at: d.metadata.extent.offset, len: d.metadata.extent.length}}; }
+    ret span(m, l, b, v, len);
+}
+
+fun compare_cuts(x: *Cut, y: *Cut) i64 {
+    if (x.slot != y.slot) {
+        if (x.slot < y.slot) { ret -1; }
+        ret 1;
+    }
+    if (x.at < y.at) { ret -1; }
+    if (x.at > y.at) { ret 1; }
+    ret 0;
+}
+
+fun cut(sc: *Scan, slot: u32, at: u64) {
+    val pushed: res[usize, allocator.Error] = vector.push[Cut](?sc.found, Cut{slot: slot, at: at});
+    if (sel pushed.err) { sc.failed = err[allocator.Error].err{pushed.err}; }
+}
+
+# the size of every alloca of body `b` of `m`, as the parts of a slot of no access, and the cuts at 0 and its size
+fun sized(sc: *Scan) err[allocator.Error] {
+    val b:      *Body                = sc.b;
+    var failed: err[allocator.Error] = slice.fill[u32](?sc.p.first, b.instructions.len, 0);
+    if (!(sel failed.err)) { failed = slice.fill[u32](?sc.p.count, b.instructions.len, 0); }
+    if (!(sel failed.err)) { failed = slice.fill[u64](?sc.p.size, b.instructions.len, 0); }
+    if (!(sel failed.err)) { failed = slice.fill[u32](?sc.p.base, b.instructions.len, 0); }
     if (sel failed.err)    { ret failed; }
-    var total: u32   = 0;
-    var k:     usize = 0;
+    var k: usize = 0;
     for (k < b.blocks.len) {
         if (!b.blocks.data[k].erased) {
             val list: *vector.Vector[Instruction] = ?b.blocks.data[k].instructions;
@@ -252,44 +338,86 @@ fun parts_of(a: *allocator.Allocator, m: *Module, l: *Layout, b: *Body, p: *Part
             for (i < list.len) {
                 val n: u32 = list.data[i];
                 if (b.instructions.data[n].opcode == table.ALLOCA) {
-                    var size:  u64       = 0;
-                    var count: u32       = 1;
-                    val ty:    opt[Type] = allocated(b, n);
-                    if (sel ty.some) {
-                        val got: opt[u64] = size_of(l, ty.some);
-                        if (sel got.some) { size = got.some; }
+                    val got: opt[u64] = slot_size(sc.l, b, n);
+                    sc.p.count.data[n] = 1;
+                    if (sel got.some) {
+                        if (got.some > 0) {
+                            sc.p.size.data[n] = got.some;
+                            cut(sc, n, 0);
+                            cut(sc, n, got.some);
+                        }
                     }
-                    if (size > 0 && size <= MOST) { count = size::u32; }
-                    p.first.data[n] = total;
-                    p.count.data[n] = count;
-                    p.size.data[n]  = size;
-                    total           = total + count;
                 }
                 i = i + 1;
             }
         }
         k = k + 1;
     }
+    ret sc.failed;
+}
+
+# the parts of every alloca of `sc.b` from the cuts its scan found: one between each two cuts of a slot of known size,
+# else one
+fun parted(sc: *Scan) err[allocator.Error] {
+    val p: *Parts = sc.p;
+    sort.sort_by[Cut](sc.found.data, sc.found.len, compare_cuts);
+    var total: u32   = 0;
+    var i:     usize = 0;
+    for (i < sc.found.len) {
+        val c: Cut = sc.found.data[i];
+        if (p.size.data[c.slot::usize] == 0) {
+            i = i + 1;
+            cnt;
+        }
+        if (p.cuts.len == 0 || i == 0 || sc.found.data[i - 1].slot != c.slot) { p.base.data[c.slot::usize] = p.cuts.len::u32; }
+        or (sc.found.data[i - 1].at == c.at) {
+            i = i + 1;
+            cnt;
+        }
+        val pushed: res[usize, allocator.Error] = vector.push[u64](?p.cuts, c.at);
+        if (sel pushed.err) { ret err[allocator.Error].err{pushed.err}; }
+        i = i + 1;
+    }
+    val b: *Body = sc.b;
+    var n: usize = 0;
+    for (n < b.instructions.len) {
+        if (p.count.data[n] != 0) {
+            if (p.size.data[n] != 0) {
+                var end: usize = p.base.data[n]::usize + 1;
+                for (end < p.cuts.len && p.cuts.data[end] < p.size.data[n]) { end = end + 1; }
+                p.count.data[n] = (end - p.base.data[n]::usize)::u32;
+            }
+            p.first.data[n] = total;
+            total           = total + p.count.data[n];
+        }
+        n = n + 1;
+    }
     p.words = (total + 63) / 64;
     ret err[allocator.Error].ok{};
 }
 
-# the parts of `slot` a span covers, as the first and one past the last, none for a slot of one part a span does not
-# wholly cover
-fun covered(p: *Parts, slot: u32, s: Span, first: *u32, last: *u32) bool {
-    val count: u32 = p.count.data[slot::usize];
-    val size:  u64 = p.size.data[slot::usize];
-    if (count == 1 && size != 1) {
-        if (s.at != 0 || s.len < size || size == 0) { ret false; }
-        @first = 0;
-        @last  = 1;
-        ret true;
+# the index among `slot`'s cuts of the cut at `at`, which the scan made one
+fun cut_at(p: *Parts, slot: u32, at: u64) u32 {
+    val from: usize = p.base.data[slot::usize]::usize;
+    var lo:   u32   = 0;
+    var hi:   u32   = p.count.data[slot::usize];
+    for (lo < hi) {
+        val mid: u32 = (lo + hi) / 2;
+        if (p.cuts.data[from + mid::usize] < at) { lo = mid + 1; }
+        or                                       { hi = mid; }
     }
-    if (s.at >= count::u64) { ret false; }
+    ret lo;
+}
+
+# the parts of `slot` a span covers, as the first and one past the last, none for a span of no byte within a slot of
+# known size
+fun covered(p: *Parts, slot: u32, s: Span, first: *u32, last: *u32) bool {
+    val size: u64 = p.size.data[slot::usize];
+    if (size == 0 || s.len == 0 || s.at >= size) { ret false; }
     var end: u64 = s.at + s.len;
-    if (end > count::u64) { end = count::u64; }
-    @first = s.at::u32;
-    @last  = end::u32;
+    if (end > size || end < s.at) { end = size; }
+    @first = cut_at(p, slot, s.at);
+    @last  = cut_at(p, slot, end);
     ret @first < @last;
 }
 
@@ -300,10 +428,9 @@ fun read(p: *Parts, s: opt[Span], slot: u32, base: usize, gen: *vector.Vector[u6
     var from:  u32 = 0;
     var to:    u32 = p.count.data[slot::usize];
     if (sel s.some) {
-        var a:     u32 = 0;
-        var z:     u32 = 0;
-        val count: u32 = p.count.data[slot::usize];
-        if (count != 1 || p.size.data[slot::usize] == 1) {
+        if (p.size.data[slot::usize] != 0) {
+            var a: u32 = 0;
+            var z: u32 = 0;
             if (!covered(p, slot, s.some, ?a, ?z)) { ret; }
             from = a;
             to   = z;
@@ -331,45 +458,83 @@ fun wrote(p: *Parts, s: opt[Span], slot: u32, base: usize, kill: *vector.Vector[
 }
 
 # whether operand `k` of `d` is a use of a slot's address that keeps it within the body: an address a load or store
-# reaches through, a base a move moves, or the destination of a fill of a constant length
+# reaches through, a base a move moves, the destination of a fill of a constant length, or either address of a copy
+# of one
 fun kept(m: *Module, b: *Body, d: *InstructionData, row: *Row, k: usize) bool {
     if (moves(d)) { ret k == 0; }
     if (d.opcode == table.MEM_FILL) {
         val n: opt[u64] = filled(m, b, d);
         ret k == 0 && (sel n.some);
     }
+    if (d.opcode == table.MEM_COPY) {
+        val n: opt[u64] = copied(m, b, d);
+        ret k < 2 && (sel n.some);
+    }
     if (d.opcode != table.LOAD && d.opcode != table.STORE) { ret false; }
     if (k >= $length_of(opcode_row.Operands))              { ret false; }
     ret sel row.operands[k].role.address;
 }
 
+# an access through address `v` of the bytes `s` names, a write where `writes`: in a scan cutting, the offsets they start
+# and end at, else a read or write of the block's set. none of a slot a secret offset moves
+fun access(sc: *Scan, v: Value, s: opt[Span], writes: bool) {
+    val t: opt[Traced] = traced(sc.b, v);
+    if (sel t.none)     { ret; }
+    if (!t.some.public) { ret; }
+    if (sc.cutting) {
+        if (sel s.some) {
+            if (s.some.len != 0) {
+                cut(sc, t.some.slot, s.some.at);
+                cut(sc, t.some.slot, s.some.at + s.some.len);
+            }
+        }
+        ret;
+    }
+    if (writes) { wrote(sc.p, s, t.some.slot, sc.base, sc.kill); }
+    or          { read(sc.p, s, t.some.slot, sc.base, sc.gen, sc.kill); }
+}
+
+# the accesses of instruction `d` to the slots, what a copy reads before what it writes
+fun accesses(sc: *Scan, d: *InstructionData) {
+    val m: *Module = sc.m;
+    val l: *Layout = sc.l;
+    val b: *Body   = sc.b;
+    if (d.opcode == table.LOAD && d.operands.len > 0)     { access(sc, d.operands.data[0], reached(m, l, b, d, d.operands.data[0], loaded(l, b, d)), false); }
+    or (d.opcode == table.STORE && d.operands.len > 0)    { access(sc, d.operands.data[0], reached(m, l, b, d, d.operands.data[0], stored(l, b, d)), true); }
+    or (d.opcode == table.MEM_FILL && d.operands.len > 0) { access(sc, d.operands.data[0], span(m, l, b, d.operands.data[0], filled(m, b, d)), true); }
+    or (d.opcode == table.MEM_COPY && d.operands.len > 1) {
+        access(sc, d.operands.data[1], span(m, l, b, d.operands.data[1], copied(m, b, d)), false);
+        access(sc, d.operands.data[0], span(m, l, b, d.operands.data[0], copied(m, b, d)), true);
+    }
+}
+
 # mark every slot an escaping or secretly moved address reaches, and gather each block's stale reads and writes of
-# the bytes of the slots
-fun scan(m: *Module, l: *Layout, b: *Body, p: *Parts, escaped: *vector.Vector[u64], gen: *vector.Vector[u64], kill: *vector.Vector[u64]) {
+# the parts of the slots, or in a scan cutting the offsets the parts run between
+fun scan(sc: *Scan) {
+    val b: *Body = sc.b;
     var k: usize = 0;
     for (k < b.blocks.len) {
         if (!b.blocks.data[k].erased) {
-            val base: usize                       = k * p.words::usize;
+            sc.base = k * sc.p.words::usize;
             val list: *vector.Vector[Instruction] = ?b.blocks.data[k].instructions;
             var i:    usize                       = 0;
             for (i < list.len) {
                 val d:   *InstructionData = ?b.instructions.data[list.data[i]];
                 val row: opt[*Row]        = table.at(d.opcode);
-                var j:   usize            = 0;
-                for (j < d.operands.len) {
-                    val v: Value       = d.operands.data[j];
-                    val t: opt[Traced] = traced(b, v);
-                    if (sel t.some) {
-                        var held: bool = t.some.public;
-                        if (sel row.some)                         { held = held && kept(m, b, d, row.some, j); }
-                        or                                        { held = false; }
-                        if (!held)                                { set(escaped, 0, t.some.slot); }
-                        or (d.opcode == table.LOAD)               { read(p, span(m, l, b, v, loaded(l, b, d)), t.some.slot, base, gen, kill); }
-                        or (d.opcode == table.STORE && j == 0)    { wrote(p, span(m, l, b, v, stored(l, b, d)), t.some.slot, base, kill); }
-                        or (d.opcode == table.MEM_FILL && j == 0) { wrote(p, span(m, l, b, v, filled(m, b, d)), t.some.slot, base, kill); }
+                if (!sc.cutting) {
+                    var j: usize = 0;
+                    for (j < d.operands.len) {
+                        val t: opt[Traced] = traced(b, d.operands.data[j]);
+                        if (sel t.some) {
+                            var held: bool = t.some.public;
+                            if (sel row.some) { held = held && kept(sc.m, b, d, row.some, j); }
+                            or                { held = false; }
+                            if (!held)        { set(sc.escaped, 0, t.some.slot); }
+                        }
+                        j = j + 1;
                     }
-                    j = j + 1;
                 }
+                accesses(sc, d);
                 i = i + 1;
             }
         }
@@ -396,7 +561,7 @@ pub fun of(a: *allocator.Allocator, m: *Module, l: *Layout, f: Function) res[Slo
     val b:     *Body              = got.ok;
     val words: u32                = (b.instructions.len::u32 + 63) / 64;
     var s:     Slots              = Slots{words: words, escaped: vector.init[u64](a), stale: vector.init[u64](a)};
-    var p:     Parts              = Parts{words: 0, first: vector.init[u32](a), count: vector.init[u32](a), size: vector.init[u64](a)};
+    var p:     Parts              = Parts{words: 0, first: vector.init[u32](a), count: vector.init[u32](a), size: vector.init[u64](a), base: vector.init[u32](a), cuts: vector.init[u64](a)};
     var gen:   vector.Vector[u64] = vector.init[u64](a);
     var kill:  vector.Vector[u64] = vector.init[u64](a);
     var into:  vector.Vector[u64] = vector.init[u64](a);
@@ -406,14 +571,23 @@ pub fun of(a: *allocator.Allocator, m: *Module, l: *Layout, f: Function) res[Slo
         vector.dnit[u32](?p.first);
         vector.dnit[u32](?p.count);
         vector.dnit[u64](?p.size);
+        vector.dnit[u32](?p.base);
+        vector.dnit[u64](?p.cuts);
         vector.dnit[u64](?gen);
         vector.dnit[u64](?kill);
         vector.dnit[u64](?into);
         vector.dnit[u64](?out);
         vector.dnit[u32](?order);
     }
-    var failed: err[allocator.Error] = parts_of(a, m, l, b, ?p);
-    val size:   usize                = b.blocks.len * p.words::usize;
+    var sc: Scan = Scan{m: m, l: l, b: b, p: ?p, cutting: true, found: vector.init[Cut](a), escaped: ?s.escaped, gen: ?gen, kill: ?kill, base: 0, failed: err[allocator.Error].ok{}};
+    fin { vector.dnit[Cut](?sc.found); }
+    var failed: err[allocator.Error] = sized(?sc);
+    if (!(sel failed.err)) {
+        scan(?sc);
+        failed = sc.failed;
+    }
+    if (!(sel failed.err)) { failed = parted(?sc); }
+    val size: usize = b.blocks.len * p.words::usize;
     if (!(sel failed.err)) { failed = slice.fill[u64](?s.escaped, words::usize, 0); }
     if (!(sel failed.err)) { failed = slice.fill[u64](?s.stale, words::usize, 0); }
     if (!(sel failed.err)) { failed = slice.fill[u64](?gen, size, 0); }
@@ -425,7 +599,8 @@ pub fun of(a: *allocator.Allocator, m: *Module, l: *Layout, f: Function) res[Slo
         release(?s);
         ret res[Slots, Error].err{Error.alloc{failed.err}};
     }
-    scan(m, l, b, ?p, ?s.escaped, ?gen, ?kill);
+    sc.cutting = false;
+    scan(?sc);
     var n: usize = 0;
     for (n < b.blocks.len) {
         order.data[n] = n::u32;
