@@ -6,7 +6,7 @@ A module and its text are interchangeable. The text form is the printed form of 
 
 ## Version and stability
 
-The text begins with a version statement that names the version of mirl that wrote it, and only that version reads it. A reader refuses any other version.
+The text begins with a version statement that names the version of mirl that wrote it, and only that version reads it. A reader refuses any other version, and a text that does not start with its version statement, naming the version it reads in both refusals. A file under `test/ir` is the other form, read by `parse_body`, and has no version statement.
 
 The text form has no stability or backward compatibility promise. A text written by one version of mirl may not be read by another, and its grammar may change between versions. A tool that must keep IR across versions keeps it in the form of the source that produced it and regenerates the text.
 
