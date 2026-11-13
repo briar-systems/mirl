@@ -278,6 +278,8 @@ decorators
                             none overlapping or touching the one before it
   #[constant_time(mode)]    the function must run in time independent of its
                             secret values, `soft` or `hard` (see ir.md 7.1)
+  #[init(n)]                the image's loader runs the function at load, at
+                            priority n, a lower one first
   #[convention(name)]       the calling convention of a function's signature,
                             the default when left out
   #[placed(type, places)]   the abi legalisation has put the body in pieces:
