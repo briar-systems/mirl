@@ -305,11 +305,14 @@ decorators
   #[descending]
   #[public]                 a load or an atomic access states the memory it
                             reads public, where its results do not state it
-                            secret, a store the memory it writes public, a
+                            secret, a store the memory it writes public, and a
                             copy both the memory it reads and the memory it
-                            writes public, and an alloca the storage it makes
-                            public, the type of what it holds holding no
-                            secret (see ir.md 7)
+                            writes public (see ir.md 7)
+  #[public([o, n], ...)]    an alloca states public the bytes of its slot from
+                            each offset o for n bytes, the bytes the type of
+                            what it holds lays out as public, ascending and
+                            none touching another, or `#[public()]` for none,
+                            the type secret in every byte (see ir.md 7)
   #[secret]                 an instruction's metadata states its results
                             secret where its row's secrecy does not, or it has
                             none
