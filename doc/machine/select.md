@@ -61,7 +61,7 @@ Selection is the one place the convention's clobbers reach the register allocato
 
 The other half of the allocator's request is the allowed set. `allowed.given(a, ?build, ?locations, keeps, ctx, registers)` lists it from the opened build once per context and row, with and without the frame pointer, when the build or a set of extensions past it opens, and every function takes the one its scope, row and `keeps_pointer` pick: every register the selection admits that masc gives no fixed role and the convention does not reserve, the frame pointer left out when `keeps_pointer` says the frame keeps it, every tuple of a class no instruction fixes whose members all are, as RISC-V's pair x12:x13 and never x4:x5 while tp is reserved, and every memory cell. `Request{at, registers, allowed, clobbers}` is that list beside selection's clobbers.
 
-A value of an aggregate type has no register and is refused as `aggregate`. The abi legalisation leaves one only where a value is loaded whole from memory, which a later legalisation has to split.
+A value of an aggregate type has no register and is refused as `aggregate`. The abi legalisation leaves one only where a value is loaded whole from memory or built from its pieces by `insert`, which the aggregates legalisation after it splits.
 
 ## The timing switch
 

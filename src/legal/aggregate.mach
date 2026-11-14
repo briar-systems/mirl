@@ -35,13 +35,16 @@
 #   whole. so a small aggregate copied through memory is never a block move.
 #
 # the pass runs twice in a register family's schedule. first ahead of the
-# abi legalisation: a value it places, at the entry, a
-# call or a return, is left whole for it: a store of one stays whole, any other
-# read of a parameter or a call's result reads its leaves from a stack slot it
-# is stored to, and an argument or a returned value built of leaves is stored
-# leaf by leaf to a slot and loaded whole for the call or return to read. it runs again after the abi
-# legalisation, which reads and writes the aggregates it places through memory
-# with loads and stores the second run takes apart. a bulk operation either
+# abi legalisation: a value it places, at the entry, a call or a return, is
+# left whole for it: a store of one stays whole, any other read of a parameter
+# or a call's result not marked secret takes its leaves out of it by `extract`
+# where its type is made of leaves an `extract` chain reaches
+# (mirl.legal.leaves) and reads them from a stack slot it is stored to
+# otherwise, and an argument or a returned value built of leaves is stored leaf
+# by leaf to a slot and loaded whole for the call or return to read. it runs
+# again after the abi legalisation, which builds a value that arrives in pieces
+# each holding its leaves whole by `insert`, and reads and writes the rest
+# through memory, with chains, loads and stores the second run takes apart. a bulk operation either
 # run makes is native or a loop the bulk legalisation makes after both
 # (mirl.legal.bulk). in the second a leaf of a format the build holds no unit
 # for moves as its encoding, reinterpreted, since the half precision
@@ -106,6 +109,7 @@ use mirl.ir.value.Declaration;
 use mirl.ir.value.Def;
 use mirl.legal.emit;
 use mirl.legal.emit.Site;
+use mirl.legal.leaves;
 use mirl.legal.moves;
 use mirl.pass.analysis;
 use mirl.pass.record.Context;
@@ -1129,8 +1133,177 @@ fun spilled(w: *Work, x: Value) Slice[Value] {
     ret out;
 }
 
+# whether x, a value of a type, is not marked secret and its type is made of
+# leaves an `extract` chain reaches, which the abi legalisation may build from
+# its pieces with no slot (mirl.legal.leaves). a secret keeps its slot, so the
+# walk reads its bytes through memory as before
+fun pulls(w: *Work, x: Value, ty: Type) bool {
+    if (body_of(w).values.data[x].secret) { ret false; }
+    val made: res[bool, allocator.Error] = leaves.scalars(?w.layout, w.basis, ty, 0, w.word, nil);
+    if (sel made.err) {
+        fail(w, lost(made.err));
+        ret false;
+    }
+    ret made.ok;
+}
+
+fun extract_at(w: *Work, x: Value, index: u32) Value {
+    var ops: [1]Value     = [1]Value{x};
+    var imm: [1]Immediate = [1]Immediate{Immediate.member{index}};
+    val i:   Instruction  = emit.make(?w.site, opcode_table.EXTRACT, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+    ret emit.result(?w.site, i, 0);
+}
+
+# the type of member i of a structure or element i of an array, and how many
+# members or elements it has
+fun member_type(shape: *table.Shape, i: usize) Type {
+    if (sel shape.structure) { ret shape.structure.members.data[i]; }
+    if (sel shape.array)     { ret shape.array.element; }
+    ret 0;
+}
+
+fun member_count(shape: *table.Shape) usize {
+    if (sel shape.structure) { ret shape.structure.members.size; }
+    if (sel shape.array)     { ret shape.array.count::usize; }
+    ret 0;
+}
+
+# the leaves of x, a value of a type made of leaves, taken out by `extract`
+# member by member into out from at. a union's one word is its cover's bits
+fun pull(w: *Work, x: Value, ty: Type, out: Slice[Value], at: *usize) {
+    val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel s.err) {
+        fail(w, s.err);
+        ret;
+    }
+    val shape: table.Shape = s.ok;
+    if (sel shape.union) {
+        val k:    opt[u32]                = leaves.cover(?w.layout, w.basis, ty, w.word);
+        val size: res[u64, refusal.Error] = size_of(w, ty);
+        if (sel size.err) {
+            fail(w, size.err);
+            ret;
+        }
+        if (sel k.none) {
+            fail(w, refusal.Error.reason{"a union taken apart by `extract` with no cover"});
+            ret;
+        }
+        out.data[@at] = as_integer(w, extract_at(w, x, k.some), size.ok);
+        @at           = @at + 1;
+        ret;
+    }
+    val count: usize = member_count(?shape);
+    var i:     usize = 0;
+    for (i < count && sel w.failed.none) {
+        val mt: Type                       = member_type(?shape, i);
+        val m:  res[Shaped, refusal.Error] = shaped(w, mt);
+        if (sel m.err) {
+            fail(w, m.err);
+            ret;
+        }
+        if (m.ok.count > 0) {
+            val v: Value = extract_at(w, x, i::u32);
+            if (aggregate(w, mt)) { pull(w, v, mt, out, at); }
+            or {
+                out.data[@at] = v;
+                @at           = @at + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# a value of a type made of leaves built from its leaves, in parts from at,
+# by `insert` from a zero of it: a member of no bytes left zero and a union's
+# word put in its cover
+fun chained(w: *Work, ty: Type, parts: Slice[Value], at: *usize) Value {
+    var acc: Value                           = constant_value(w, ConstantData.zero{ty});
+    val s:   res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel s.err) {
+        fail(w, s.err);
+        ret acc;
+    }
+    val shape: table.Shape = s.ok;
+    if (sel shape.union) {
+        val k:    opt[u32]                = leaves.cover(?w.layout, w.basis, ty, w.word);
+        val size: res[u64, refusal.Error] = size_of(w, ty);
+        if (sel size.err) {
+            fail(w, size.err);
+            ret acc;
+        }
+        if (sel k.none) {
+            fail(w, refusal.Error.reason{"a union built by `insert` with no cover"});
+            ret acc;
+        }
+        val part: Value = from_integer(w, parts.data[@at], size.ok, shape.union.members.data[k.some]);
+        @at = @at + 1;
+        ret inserted_at(w, acc, part, k.some);
+    }
+    val count: usize = member_count(?shape);
+    var i:     usize = 0;
+    for (i < count && sel w.failed.none) {
+        val mt: Type                       = member_type(?shape, i);
+        val m:  res[Shaped, refusal.Error] = shaped(w, mt);
+        if (sel m.err) {
+            fail(w, m.err);
+            ret acc;
+        }
+        if (m.ok.count > 0) {
+            var part: Value = 0;
+            if (aggregate(w, mt)) { part = chained(w, mt, parts, at); }
+            or {
+                part = parts.data[@at];
+                @at  = @at + 1;
+            }
+            acc = inserted_at(w, acc, part, i::u32);
+        }
+        i = i + 1;
+    }
+    ret acc;
+}
+
+fun inserted_at(w: *Work, whole: Value, part: Value, index: u32) Value {
+    var ops: [2]Value     = [2]Value{whole, part};
+    var imm: [1]Immediate = [1]Immediate{Immediate.member{index}};
+    val i:   Instruction  = emit.make(?w.site, opcode_table.INSERT, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 1});
+    ret emit.result(?w.site, i, 0);
+}
+
+# the leaves of a value the abi legalisation places whose type is made of
+# leaves: each taken out of it by `extract` just after it is made, so the abi
+# legalisation builds it from its pieces with `insert`, or through memory where
+# its pieces do not hold its leaves whole, and the second run reduces the chain
+fun pulled(w: *Work, x: Value) Slice[Value] {
+    val ty: Type                       = type_of(w, x);
+    val s:  res[Shaped, refusal.Error] = shaped(w, ty);
+    if (sel s.err) {
+        fail(w, s.err);
+        ret Slice[Value]{data: nil, size: 0};
+    }
+    val b:     *Body = body_of(w);
+    val def:   Def   = b.values.data[x].def;
+    var k:     Block = 0;
+    var index: u32   = w.head;
+    var entry: bool  = true;
+    if (sel def.result) {
+        val at: Instruction = def.result.instruction;
+        k     = block_of(b, at);
+        index = position(b, k, at) + 1;
+        entry = false;
+    }
+    val origin: Instruction = b.blocks.data[k].instructions.data[index];
+    emit.open(?w.site, origin, k, index);
+    val out: Slice[Value] = fresh(w, s.ok.count);
+    var at:  usize        = 0;
+    if (sel w.failed.none) { pull(w, x, ty, out, ?at); }
+    if (entry)             { w.head = w.head + w.site.made; }
+    val ok: err[refusal.Error] = emit.done(?w.site);
+    if (sel ok.err) { fail(w, ok.err); }
+    ret out;
+}
+
 # whether a value is one the abi legalisation places, which the first run
-# leaves whole and reads through a slot
+# leaves whole, its leaves taken out by `extract` or read through a slot
 fun placed(w: *Work, x: Value) bool {
     if (w.late) { ret false; }
     val b:   *Body = body_of(w);
@@ -1157,7 +1330,10 @@ fun leaves_of(w: *Work, x: Value) Slice[Value] {
         if (sel w.failed.some) { ret out; }
         constant_leaves(w, def.constant, ty, out, 0);
     }
-    or (placed(w, x)) { out = spilled(w, x); }
+    or (placed(w, x)) {
+        if (pulls(w, x, ty)) { out = pulled(w, x); }
+        or                   { out = spilled(w, x); }
+    }
     or (sel def.result) {
         val i:    Instruction = def.result.instruction;
         val code: Opcode      = b.instructions.data[i].opcode;
@@ -1556,8 +1732,11 @@ fun zeroed(w: *Work, origin: Instruction, to: Value, gap: Gap, align: u64, f: Fl
 }
 
 # an aggregate a call or a return reads, which the abi legalisation places:
-# left as it is where it is memory or a placed value, and otherwise built in
-# a slot from its leaves and loaded whole just ahead of it
+# left as it is where it is memory or a placed value, built from its leaves by
+# `insert` just ahead of it where it is not marked secret and its type is made
+# of leaves an `extract` chain reaches (mirl.legal.leaves), so the abi
+# legalisation forms its pieces from them, and otherwise built in a slot from
+# its leaves and loaded whole just ahead of it
 fun handed(w: *Work, i: Instruction, x: Value) err[refusal.Error] {
     val b:   *Body = body_of(w);
     val def: Def   = b.values.data[x].def;
@@ -1571,6 +1750,17 @@ fun handed(w: *Work, i: Instruction, x: Value) err[refusal.Error] {
     val parts: Slice[Value]               = leaves_of(w, x);
     val s:     res[Shaped, refusal.Error] = shaped(w, ty);
     if (sel s.err) { ret err[refusal.Error].err{s.err}; }
+    if (pulls(w, x, ty)) {
+        val k: Block = block_of(b, i);
+        emit.operand(?w.site, i, k, position(b, k, i), x);
+        var at:    usize              = 0;
+        val built: Value              = chained(w, ty, parts, ?at);
+        val ok:    err[refusal.Error] = emit.done(?w.site);
+        if (sel ok.err) { ret ok; }
+        val failed: err[refusal.Error] = failure_of(w);
+        if (sel failed.err) { ret failed; }
+        ret refusal.edit(body.substitute(w.site.m, w.site.f, i, x, built));
+    }
     val home:   Value              = slot(w, ty);
     val unmade: err[refusal.Error] = failure_of(w);
     if (sel unmade.err) { ret unmade; }
