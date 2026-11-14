@@ -2156,7 +2156,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - immediates: `member` a member index
 - targets: 0
 - typing:
-  - `aggregate` is a structure or an array
+  - `aggregate` is a structure, an array or a union
   - `member` is below the member count of `aggregate`, or its element count when it is an array
 - results:
   - one result of the type of the member `member` names of `aggregate`
@@ -2170,7 +2170,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - immediates: `member` a member index
 - targets: 0
 - typing:
-  - `aggregate` is a structure or an array
+  - `aggregate` is a structure, an array or a union
   - `member` is below the member count of `aggregate`, or its element count when it is an array
   - `value` is the type of the member `member` names of `aggregate`
 - results:

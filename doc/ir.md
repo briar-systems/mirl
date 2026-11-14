@@ -145,7 +145,7 @@ An instruction's typing, effects and secrecy are its opcode's row in the opcode 
 
 One checker, `mirl.ir.opcode.check`, types an instance of a row by interpreting its rules. A rule speaks of **subjects**, which are the type of a fixed operand or the type held by a type immediate, and of **classes**, which are sets of types. The reference writes each rule as a sentence. The vocabulary is
 
-- a subject is in a class: any type, an integer, an integer of a given width, a float, a pointer, a function type, an integer of a whole number of bytes, a vector, a scalar (an integer, a float or a pointer), a structure, an array, or an aggregate (a structure or an array),
+- a subject is in a class: any type, an integer, an integer of a given width, a float, a pointer, a function type, an integer of a whole number of bytes, a vector, a scalar (an integer, a float or a pointer), a structure, an array, or an aggregate (a structure, an array or a union),
 - two subjects are the same type,
 - both subjects are scalars, or both are vectors of the same lane count,
 - the lane types of two subjects are the same, a scalar being its own lane,
@@ -277,7 +277,7 @@ The reductions take one vector and give a scalar of its lane type. The integer r
 
 ### 6.7 Aggregates
 
-`extract` gives one member of a structure value or one element of an array value, by a constant index immediate, and `insert` gives the aggregate with that member replaced by a value of the member's type. They take an aggregate whole, so a target that holds aggregate values in no register has them taken apart before selection.
+`extract` gives one member of a structure or union value or one element of an array value, by a constant index immediate, and `insert` gives the aggregate with that member replaced by a value of the member's type. A union's member starts at its first byte: `extract` of one reads the union's first bytes, as many as the member has, as the member, and `insert` of one writes the member's bytes over those, the bytes inside the member that no scalar of it holds (its padding) zero, and keeps the union's bytes past the member. They take an aggregate whole, so a target that holds aggregate values in no register has them taken apart before selection.
 
 ### 6.8 Calls and returns
 

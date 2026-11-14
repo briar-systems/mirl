@@ -13,7 +13,11 @@
 #   writes every byte of its type as the store it replaces did, and a slot it
 #   writes is never read stale through its padding (`mirl.ct.frame`).
 # - `extract` is the member's leaves, the one value of a scalar member, and
-#   `insert` the aggregate's leaves with the member's replaced. a select is a
+#   `insert` the aggregate's leaves with the member's replaced. a union member
+#   has no run of the union's words: each of its leaves is read out of the
+#   words that hold its bytes, shifted down, cut and joined, and an `insert`
+#   of one makes each word of the member's leaves in it, moved to their places,
+#   the bytes past the member kept from the old word. a select is a
 #   select of each leaf on its condition, and a block parameter one parameter
 #   per leaf, every edge passing the leaves of its argument.
 # - a constant's leaves are its members' constants, a run of bytes' each byte,
@@ -755,13 +759,287 @@ fun member_of(d: *InstructionData) u32 {
     ret 0;
 }
 
-# the leaves of an insert: the aggregate's with the member's run replaced
+# whether a type is a union, whose members overlap from its first byte
+fun overlaid(w: *Work, ty: Type) bool {
+    val s: res[*table.Shape, table.Error] = table.shape_at(?w.site.m.types, ty);
+    if (sel s.err) { ret false; }
+    ret sel s.ok.union;
+}
+
+# the type of member i of a union
+fun union_member(w: *Work, ty: Type, i: u32) res[Type, refusal.Error] {
+    val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel s.err) { ret res[Type, refusal.Error].err{s.err}; }
+    val shape: table.Shape = s.ok;
+    if (sel shape.union) {
+        if (i::usize < shape.union.members.size) { ret res[Type, refusal.Error].ok{shape.union.members.data[i]}; }
+    }
+    ret res[Type, refusal.Error].err{refusal.Error.reason{WHOLE}};
+}
+
+# a leaf or a word as the integer of its bytes: an integer extended to them, a
+# pointer by its conversion and any other by its bits
+fun as_integer(w: *Work, x: Value, bytes: u64) Value {
+    val ty: Type                            = type_of(w, x);
+    val to: res[Type, refusal.Error]        = integer(w, (bytes * 8)::u32);
+    val s:  res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel to.err) {
+        fail(w, to.err);
+        ret x;
+    }
+    if (sel s.err) {
+        fail(w, s.err);
+        ret x;
+    }
+    if (table.same(ty, to.ok)) { ret x; }
+    if (sel s.ok.integer)      { ret emit.convert(?w.site, opcode_table.EXT_U, x, to.ok); }
+    if (sel s.ok.pointer)      { ret emit.convert(?w.site, opcode_table.PTRTOINT, x, to.ok); }
+    ret emit.convert(?w.site, opcode_table.BITCAST, x, to.ok);
+}
+
+# an integer of one width made another: cut or extended with zeros
+fun resized(w: *Work, x: Value, from: u64, to: u64) Value {
+    if (from == to) { ret x; }
+    val ty: res[Type, refusal.Error] = integer(w, (to * 8)::u32);
+    if (sel ty.err) {
+        fail(w, ty.err);
+        ret x;
+    }
+    if (from > to) { ret emit.convert(?w.site, opcode_table.TRUNC, x, ty.ok); }
+    ret emit.convert(?w.site, opcode_table.EXT_U, x, ty.ok);
+}
+
+# an integer of a width moved by a count of bytes, toward its high end where up
+fun shifted(w: *Work, x: Value, bytes: u64, by: u64, up: bool) Value {
+    if (by == 0) { ret x; }
+    val ty: res[Type, refusal.Error] = integer(w, (bytes * 8)::u32);
+    if (sel ty.err) {
+        fail(w, ty.err);
+        ret x;
+    }
+    val count: res[Value, refusal.Error] = emit.word_constant(?w.site, ty.ok, by * 8);
+    if (sel count.err) {
+        fail(w, count.err);
+        ret x;
+    }
+    if (up) { ret emit.binary(?w.site, opcode_table.SHL, x, count.ok); }
+    ret emit.binary(?w.site, opcode_table.SHR_U, x, count.ok);
+}
+
+# bytes [from, from + n) of a run of values laid out at their offsets, each the
+# integer of its bytes, joined into the integer of n bytes: each value's part
+# moved to its place, the bytes no value holds zero
+# ---
+# ints:    the values, each the integer of its bytes
+# offsets: the byte offset of each
+# sizes:   the bytes of each
+fun gathered(w: *Work, ints: Slice[Value], offsets: Slice[u64], sizes: Slice[u64], from: u64, n: u64) Value {
+    var acc: Value = 0;
+    var any: bool  = false;
+    var k:   usize = 0;
+    for (k < ints.size) {
+        val lo: u64 = offsets.data[k];
+        val hi: u64 = lo + sizes.data[k];
+        if (hi > from && lo < from + n) {
+            var start: u64 = lo;
+            if (from > start) { start = from; }
+            var part: Value = shifted(w, ints.data[k], sizes.data[k], start - lo, false);
+            part = resized(w, part, sizes.data[k], n);
+            part = shifted(w, part, n, start - from, true);
+            if (any) { acc = emit.binary(?w.site, opcode_table.OR, acc, part); }
+            or       { acc = part; }
+            any = true;
+        }
+        k = k + 1;
+    }
+    if (any) { ret acc; }
+    val ty: res[Type, refusal.Error] = integer(w, (n * 8)::u32);
+    if (sel ty.err) {
+        fail(w, ty.err);
+        ret 0;
+    }
+    val zero: res[Value, refusal.Error] = emit.word_constant(?w.site, ty.ok, 0);
+    if (sel zero.err) {
+        fail(w, zero.err);
+        ret 0;
+    }
+    ret zero.ok;
+}
+
+# the integers of a run of leaves, with their offsets and bytes, at a base
+fun integers(w: *Work, s: Shaped, parts: Slice[Value], ints: Slice[Value], offsets: Slice[u64], sizes: Slice[u64]) {
+    var n: usize = 0;
+    for (n < parts.size && sel w.failed.none) {
+        val l:     Leaf                    = leaf(w, s, n);
+        val bytes: res[u64, refusal.Error] = size_of(w, l.ty);
+        if (sel bytes.err) {
+            fail(w, bytes.err);
+            ret;
+        }
+        ints.data[n]    = as_integer(w, parts.data[n], bytes.ok);
+        offsets.data[n] = l.offset;
+        sizes.data[n]   = bytes.ok;
+        n               = n + 1;
+    }
+}
+
+# a leaf of a type read out of the integer of its bytes: an integer cut to its
+# width, a pointer by its conversion and any other by its bits
+fun from_integer(w: *Work, x: Value, bytes: u64, ty: Type) Value {
+    val s: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel s.err) {
+        fail(w, s.err);
+        ret x;
+    }
+    if (sel s.ok.integer) {
+        if (s.ok.integer.width::u64 == bytes * 8) { ret x; }
+        ret emit.convert(?w.site, opcode_table.TRUNC, x, ty);
+    }
+    if (sel s.ok.pointer) { ret emit.convert(?w.site, opcode_table.INTTOPTR, x, ty); }
+    ret emit.convert(?w.site, opcode_table.BITCAST, x, ty);
+}
+
+# the leaves of member index of a union value, read out of its words, made
+# ahead of the instruction at i: each leaf the bytes of the words that hold it,
+# as its type
+fun union_extracted(w: *Work, i: Instruction, whole: Value, index: u32) Slice[Value] {
+    val none: Slice[Value]             = Slice[Value]{data: nil, size: 0};
+    val ty:   Type                     = type_of(w, whole);
+    val mt:   res[Type, refusal.Error] = union_member(w, ty, index);
+    if (sel mt.err) {
+        fail(w, mt.err);
+        ret none;
+    }
+    val from: Slice[Value]               = leaves_of(w, whole);
+    val us:   res[Shaped, refusal.Error] = shaped(w, ty);
+    val ms:   res[Shaped, refusal.Error] = shaped(w, mt.ok);
+    if (sel us.err) {
+        fail(w, us.err);
+        ret none;
+    }
+    if (sel ms.err) {
+        fail(w, ms.err);
+        ret none;
+    }
+    if (sel w.failed.some) { ret none; }
+    val out:     Slice[Value] = fresh(w, ms.ok.count);
+    val ints:    Slice[Value] = fresh(w, from.size);
+    val offsets: Slice[u64]   = Slice[u64]{data: allocate_u64(w, from.size), size: from.size};
+    val sizes:   Slice[u64]   = Slice[u64]{data: allocate_u64(w, from.size), size: from.size};
+    if (sel w.failed.some) { ret none; }
+    val b: *Body = body_of(w);
+    val k: Block = block_of(b, i);
+    emit.open(?w.site, i, k, position(b, k, i));
+    integers(w, us.ok, from, ints, offsets, sizes);
+    var n: usize = 0;
+    for (n < out.size && sel w.failed.none) {
+        val l:     Leaf                    = leaf(w, ms.ok, n);
+        val bytes: res[u64, refusal.Error] = size_of(w, l.ty);
+        if (sel bytes.err) {
+            fail(w, bytes.err);
+            ret none;
+        }
+        out.data[n] = from_integer(w, gathered(w, ints, offsets, sizes, l.offset, bytes.ok), bytes.ok, l.ty);
+        n           = n + 1;
+    }
+    val ok: err[refusal.Error] = emit.done(?w.site);
+    if (sel ok.err) { fail(w, ok.err); }
+    ret out;
+}
+
+# the words of a union value with member index replaced, made ahead of the
+# instruction at i: each word the member's bytes that fall in it, its padding
+# zero, and the old word's bytes past the member's extent
+fun union_inserted(w: *Work, i: Instruction, whole: Value, part: Value, index: u32) Slice[Value] {
+    val none: Slice[Value]             = Slice[Value]{data: nil, size: 0};
+    val ty:   Type                     = type_of(w, whole);
+    val mt:   res[Type, refusal.Error] = union_member(w, ty, index);
+    if (sel mt.err) {
+        fail(w, mt.err);
+        ret none;
+    }
+    val from: Slice[Value] = leaves_of(w, whole);
+    var by:   Slice[Value] = Slice[Value]{data: nil, size: 0};
+    var one:  [1]Value     = [1]Value{part};
+    if (aggregate(w, mt.ok)) { by = leaves_of(w, part); }
+    or                       { by = Slice[Value]{data: ?one[0], size: 1}; }
+    val us:     res[Shaped, refusal.Error] = shaped(w, ty);
+    val ms:     res[Shaped, refusal.Error] = shaped(w, mt.ok);
+    val extent: res[u64, refusal.Error]    = size_of(w, mt.ok);
+    if (sel us.err) {
+        fail(w, us.err);
+        ret none;
+    }
+    if (sel ms.err) {
+        fail(w, ms.err);
+        ret none;
+    }
+    if (sel extent.err) {
+        fail(w, extent.err);
+        ret none;
+    }
+    if (sel w.failed.some) { ret none; }
+    val out:     Slice[Value] = fresh(w, from.size);
+    val ints:    Slice[Value] = fresh(w, by.size);
+    val offsets: Slice[u64]   = Slice[u64]{data: allocate_u64(w, by.size), size: by.size};
+    val sizes:   Slice[u64]   = Slice[u64]{data: allocate_u64(w, by.size), size: by.size};
+    if (sel w.failed.some) { ret none; }
+    val b: *Body = body_of(w);
+    val k: Block = block_of(b, i);
+    emit.open(?w.site, i, k, position(b, k, i));
+    integers(w, ms.ok, by, ints, offsets, sizes);
+    var n: usize = 0;
+    for (n < out.size && sel w.failed.none) {
+        val l:     Leaf = leaf(w, us.ok, n);
+        val bytes: u64  = (l.bits / 8)::u64;
+        if (l.offset >= extent.ok) { out.data[n] = from.data[n]; }
+        or {
+            var word: Value = gathered(w, ints, offsets, sizes, l.offset, bytes);
+            if (extent.ok < l.offset + bytes) {
+                val keep: u64                      = (extent.ok - l.offset) * 8;
+                val wty:  res[Type, refusal.Error] = integer(w, l.bits);
+                if (sel wty.err) {
+                    fail(w, wty.err);
+                    ret none;
+                }
+                var all: u64 = 0xffffffffffffffff;
+                if (l.bits < 64) { all = (1::u64 << l.bits::u64) - 1; }
+                val mask: res[Value, refusal.Error] = emit.word_constant(?w.site, wty.ok, all ^ ((1::u64 << keep) - 1));
+                if (sel mask.err) {
+                    fail(w, mask.err);
+                    ret none;
+                }
+                val past: Value = emit.binary(?w.site, opcode_table.AND, from.data[n], mask.ok);
+                word = emit.binary(?w.site, opcode_table.OR, word, past);
+            }
+            out.data[n] = word;
+        }
+        n = n + 1;
+    }
+    val ok: err[refusal.Error] = emit.done(?w.site);
+    if (sel ok.err) { fail(w, ok.err); }
+    ret out;
+}
+
+fun allocate_u64(w: *Work, n: usize) *u64 {
+    if (n == 0) { ret nil; }
+    val got: res[*u64, allocator.Error] = allocator.zallocate[u64](w.keep, n);
+    if (sel got.err) {
+        fail(w, lost(got.err));
+        ret nil;
+    }
+    ret got.ok;
+}
+
+# the leaves of an insert: the aggregate's with the member's run replaced, and
+# a union's words rebuilt
 fun inserted(w: *Work, i: Instruction) Slice[Value] {
-    val b:      *Body                   = body_of(w);
-    val d:      *InstructionData        = ?b.instructions.data[i];
-    val whole:  Value                   = d.operands.data[0];
-    val part:   Value                   = d.operands.data[1];
-    val index:  u32                     = member_of(d);
+    val b:     *Body            = body_of(w);
+    val d:     *InstructionData = ?b.instructions.data[i];
+    val whole: Value            = d.operands.data[0];
+    val part:  Value            = d.operands.data[1];
+    val index: u32              = member_of(d);
+    if (overlaid(w, type_of(w, whole))) { ret union_inserted(w, i, whole, part, index); }
     var member: Type                    = type_of(w, whole);
     val run:    res[Run, refusal.Error] = member_run(w, type_of(w, whole), index, ?member);
     if (sel run.err) {
@@ -784,11 +1062,13 @@ fun inserted(w: *Work, i: Instruction) Slice[Value] {
     ret out;
 }
 
-# the leaves of an extract of an aggregate member: the run of the member's
+# the leaves of an extract of an aggregate member: the run of the member's, and
+# a union member's read out of its words
 fun extracted(w: *Work, i: Instruction) Slice[Value] {
-    val b:      *Body                   = body_of(w);
-    val d:      *InstructionData        = ?b.instructions.data[i];
-    val whole:  Value                   = d.operands.data[0];
+    val b:     *Body            = body_of(w);
+    val d:     *InstructionData = ?b.instructions.data[i];
+    val whole: Value            = d.operands.data[0];
+    if (overlaid(w, type_of(w, whole))) { ret union_extracted(w, i, whole, member_of(d)); }
     var member: Type                    = type_of(w, whole);
     val run:    res[Run, refusal.Error] = member_run(w, type_of(w, whole), member_of(d), ?member);
     if (sel run.err) {
@@ -1372,15 +1652,12 @@ fun visit_one(w: *Work, i: Instruction) err[refusal.Error] {
     if (code == opcode_table.STORE) { ret store(w, i); }
     if (code == opcode_table.EXTRACT) {
         if (!gives) {
-            val whole:  Value                   = d.operands.data[0];
-            var member: Type                    = type_of(w, whole);
-            val run:    res[Run, refusal.Error] = member_run(w, type_of(w, whole), member_of(d), ?member);
-            if (sel run.err) { ret err[refusal.Error].err{run.err}; }
             val result: Value              = b.instructions.data[i].results.data[0];
-            val parts:  Slice[Value]       = leaves_of(w, whole);
+            val parts:  Slice[Value]       = extracted(w, i);
             val unmade: err[refusal.Error] = failure_of(w);
-            if (sel unmade.err) { ret unmade; }
-            val moved: err[refusal.Error] = refusal.edit(body.replace(w.site.m, w.site.f, result, parts.data[run.ok.start], Records.follow{}));
+            if (sel unmade.err)  { ret unmade; }
+            if (parts.size != 1) { ret err[refusal.Error].err{refusal.Error.reason{WHOLE}}; }
+            val moved: err[refusal.Error] = refusal.edit(body.replace(w.site.m, w.site.f, result, parts.data[0], Records.follow{}));
             if (sel moved.err) { ret moved; }
         }
         ret gone(w, i);
