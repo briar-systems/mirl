@@ -49,6 +49,7 @@ use mirl.ir.function.Body;
 use FunctionNode: mirl.ir.function.Node;
 use mirl.ir.id.Constant;
 use mirl.ir.id.Function;
+use mirl.ir.id.Global;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.Symbol;
 use mirl.ir.id.Value;
@@ -85,6 +86,7 @@ use mirl.target.spirv.emitter;
 use mirl.target.spirv.emitter.Emitter;
 use mirl.target.spirv.emitter.Frame;
 use mirl.target.spirv.emitter.Pointer;
+use mirl.target.spirv.error.Atomic;
 use mirl.target.spirv.error.Brought;
 use mirl.target.spirv.error.Error;
 use ImageRefused: mirl.target.spirv.error.Imaged;
@@ -126,6 +128,20 @@ fun block_of(d: *InstructionData) u32 {
     val p: Spot = d.place;
     if (sel p.placed) { ret p.placed; }
     ret NONE;
+}
+
+# whether instruction `a` stands ahead of instruction `b` in block `k`, by
+# their places in it: an instruction a pass adds ahead of another is made
+# after it, so an id says nothing of order
+fun ahead(e: *Emitter, k: u32, a: Instruction, b: Instruction) bool {
+    val list: *vector.Vector[Instruction] = ?e.b.blocks.data[k].instructions;
+    var j:    usize                       = 0;
+    for (j < list.len) {
+        if (list.data[j] == b) { ret false; }
+        if (list.data[j] == a) { ret true; }
+        j = j + 1;
+    }
+    ret false;
 }
 
 # the label an edge out of a block branches to: its target's, but the
@@ -1360,13 +1376,14 @@ tag Role: u8 {
     constant;
 }
 
-# the id of a constant a value is made of constants alone, a constant or a
-# vector built or splat of them, none for any other value
+# the id of a constant a value is made of constants alone, a constant, a
+# vector built or splat of them or a load of one, none for any other value
 fun constant_id(e: *Emitter, v: Value) opt[u32] {
     val d: Def = e.b.values.data[v].def;
     if (sel d.constant)  { ret opt[u32].some{emitter.id_of(e, v)}; }
     if (!(sel d.result)) { ret opt[u32].none{}; }
     val di: *InstructionData = ?e.b.instructions.data[d.result.instruction];
+    if (di.opcode == table.LOAD && di.operands.len == 1)        { ret loaded_constant(e, v, di.operands.data[0], d.result.instruction); }
     if (di.opcode != table.VBUILD && di.opcode != table.VSPLAT) { ret opt[u32].none{}; }
     val lanes: u32 = spirv_types.lanes_of(e.u, emitter.value_type(e, v));
     if (lanes > 16) { ret opt[u32].none{}; }
@@ -1386,6 +1403,63 @@ fun constant_id(e: *Emitter, v: Value) opt[u32] {
     val id:    u32     = unit.fresh(e.u);
     var slots: [3]Slot = [3]Slot{Slot.id{emitter.type_id(e, v)}, Slot.id{id}, Slot.list{unit.list(e.u, ?ids[0], lanes::usize)}};
     unit.put(e.u, buffer.TYPES, gen_row_index.OPCONSTANTCOMPOSITE, ?slots[0], 3);
+    ret opt[u32].some{id};
+}
+
+# the constant the load `at` of value `v` reads through `p`: a module-scope
+# `val` read whole, or a stack slot nothing writes but stores in the load's
+# block, the last of them ahead of the load a constant. none for any other
+fun loaded_constant(e: *Emitter, v: Value, p: Value, at: Instruction) opt[u32] {
+    val pd: Def = e.b.values.data[p].def;
+    if (sel pd.constant) {
+        val opt_global: opt[Global] = constant_global(e, pd.constant);
+        if (sel opt_global.none)                                                       { ret opt[u32].none{}; }
+        if (e.u.m.globals.data[opt_global.some].data.type != emitter.value_type(e, v)) { ret opt[u32].none{}; }
+        ret global_constant(e, opt_global.some);
+    }
+    if (!(sel pd.result))                                                    { ret opt[u32].none{}; }
+    if (e.b.instructions.data[pd.result.instruction].opcode != table.ALLOCA) { ret opt[u32].none{}; }
+    val home:   u32                   = block_of(?e.b.instructions.data[at]);
+    var last:   Instruction           = NONE;
+    var stored: Value                 = p;
+    val uses:   *Growing[Instruction] = ?e.b.values.data[p].uses;
+    var j:      usize                 = 0;
+    for (j < uses.len) {
+        val u:  Instruction      = uses.data[j];
+        val ud: *InstructionData = ?e.b.instructions.data[u];
+        j = j + 1;
+        if (ud.opcode == table.LOAD)                                                                              { cnt; }
+        if (ud.opcode != table.STORE || ud.operands.len != 2 || ud.operands.data[0] != p || block_of(ud) != home) { ret opt[u32].none{}; }
+        if (!ahead(e, home, u, at))                                                                               { cnt; }
+        if (last == NONE || ahead(e, home, last, u)) {
+            last   = u;
+            stored = ud.operands.data[1];
+        }
+    }
+    if (last == NONE) { ret opt[u32].none{}; }
+    ret constant_id(e, stored);
+}
+
+# the module-scope `val` the address constant `c` names whole, none for any
+# other address
+fun constant_global(e: *Emitter, c: Constant) opt[Global] {
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(e.u.m, c);
+    if (sel res_constant_data.err) { ret opt[Global].none{}; }
+    val data: ConstantData = res_constant_data.ok;
+    if (!(sel data.address))      { ret opt[Global].none{}; }
+    if (data.address.offset != 0) { ret opt[Global].none{}; }
+    val s: Symbol = data.address.symbol;
+    if (!(sel s.global))                             { ret opt[Global].none{}; }
+    if (!e.u.m.globals.data[s.global].data.constant) { ret opt[Global].none{}; }
+    ret opt[Global].some{s.global};
+}
+
+# the id of the constant a module-scope `val` holds, none where it holds none
+fun global_constant(e: *Emitter, g: Global) opt[u32] {
+    val initial: opt[Constant] = e.u.m.globals.data[g].data.initial;
+    if (sel initial.none) { ret opt[u32].none{}; }
+    val id: u32 = spirv_types.constant_of(e.u, initial.some, spirv_types.PLAIN);
+    if (id == NONE) { ret opt[u32].none{}; }
     ret opt[u32].some{id};
 }
 
@@ -1429,9 +1503,9 @@ fun slot_constant(e: *Emitter, slot: Value, at: Instruction, depth: u32) opt[u32
         j = j + 1;
         if (u == at || ud.opcode == table.LOAD)                                                                                { cnt; }
         if (ud.opcode == table.MEM_COPY && ud.operands.len == 3 && ud.operands.data[1] == slot && ud.operands.data[0] != slot) { cnt; }
-        if (block_of(ud) != home || u > at)                                                                                    { ret opt[u32].none{}; }
+        if (block_of(ud) != home || !ahead(e, home, u, at))                                                                    { ret opt[u32].none{}; }
         if ((ud.opcode == table.MEM_COPY || ud.opcode == table.MEM_FILL) && ud.operands.len == 3 && ud.operands.data[0] == slot) {
-            if (from == NONE || u > from) {
+            if (from == NONE || ahead(e, home, from, u)) {
                 val opt_whole: opt[Whole] = whole_constant(e, ud, ty, u, depth);
                 if (sel opt_whole.none) { ret opt[u32].none{}; }
                 whole = opt_whole.some;
@@ -1450,10 +1524,10 @@ fun slot_constant(e: *Emitter, slot: Value, at: Instruction, depth: u32) opt[u32
             val s:  Instruction      = writes.data[w];
             val sd: *InstructionData = ?e.b.instructions.data[s];
             w = w + 1;
-            if (sd.opcode == table.LOAD)                                                                                              { cnt; }
-            if (sd.opcode != table.STORE || sd.operands.len != 2 || sd.operands.data[0] != element || block_of(sd) != home || s > at) { ret opt[u32].none{}; }
+            if (sd.opcode == table.LOAD)                                                                                                              { cnt; }
+            if (sd.opcode != table.STORE || sd.operands.len != 2 || sd.operands.data[0] != element || block_of(sd) != home || !ahead(e, home, s, at)) { ret opt[u32].none{}; }
             val x: u32 = opt_index.some::u32;
-            if (when[x] == NONE || s > when[x]) {
+            if (when[x] == NONE || ahead(e, home, when[x], s)) {
                 when[x]   = s;
                 stored[x] = sd.operands.data[1];
             }
@@ -1463,7 +1537,7 @@ fun slot_constant(e: *Emitter, slot: Value, at: Instruction, depth: u32) opt[u32
     var element: bool = false;
     k = 0;
     for (k < n::u32) {
-        if (when[k] != NONE && (from == NONE || when[k] > from)) {
+        if (when[k] != NONE && (from == NONE || ahead(e, home, from, when[k]))) {
             val opt_lane: opt[u32] = constant_id(e, stored[k]);
             if (sel opt_lane.none) { ret opt[u32].none{}; }
             ids[k]  = opt_lane.some;
@@ -1521,19 +1595,11 @@ fun whole_constant(e: *Emitter, ud: *InstructionData, ty: Type, u: Instruction, 
         ret opt[Whole].some{Whole{id: opt_held.some, null: false}};
     }
     if (!(sel sd.constant)) { ret opt[Whole].none{}; }
-    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(e.u.m, sd.constant);
-    if (sel res_constant_data.err) { ret opt[Whole].none{}; }
-    val c: ConstantData = res_constant_data.ok;
-    if (!(sel c.address))      { ret opt[Whole].none{}; }
-    if (c.address.offset != 0) { ret opt[Whole].none{}; }
-    val s: Symbol = c.address.symbol;
-    if (!(sel s.global))                             { ret opt[Whole].none{}; }
-    if (!e.u.m.globals.data[s.global].data.constant) { ret opt[Whole].none{}; }
-    val initial: opt[Constant] = e.u.m.globals.data[s.global].data.initial;
-    if (sel initial.none) { ret opt[Whole].none{}; }
-    val id: u32 = spirv_types.constant_of(e.u, initial.some, spirv_types.PLAIN);
-    if (id == NONE) { ret opt[Whole].none{}; }
-    ret opt[Whole].some{Whole{id: id, null: false}};
+    val opt_global: opt[Global] = constant_global(e, sd.constant);
+    if (sel opt_global.none) { ret opt[Whole].none{}; }
+    val opt_id: opt[u32] = global_constant(e, opt_global.some);
+    if (sel opt_id.none) { ret opt[Whole].none{}; }
+    ret opt[Whole].some{Whole{id: opt_id.some, null: false}};
 }
 
 # the role of param `k` of the params an enumerant value brings, a constant
@@ -1923,6 +1989,13 @@ fun presence(e: *Emitter, i: Instruction, d: *InstructionData, tg: *typing.Typin
     }
 }
 
+# whether an atomic may operate on memory of storage class `c`: buffer memory,
+# workgroup memory or an image texel (VUID-StandaloneSpirv-None-04686)
+fun atomic_class(c: u32) bool {
+    val k: u64 = c::u64;
+    ret k == schema.UNIFORM || k == schema.STORAGE_BUFFER || k == schema.PHYSICAL_STORAGE_BUFFER || k == schema.WORKGROUP || k == schema.IMAGE;
+}
+
 # the capability a typed row needs for the type its data operand points to, as
 # a 64-bit integer atomic needs Int64Atomics, which the row's own requirement
 # does not state
@@ -1934,6 +2007,10 @@ fun typed_need(e: *Emitter, i: Instruction, d: *InstructionData, tg: *typing.Typ
     if (!spirv_types.pointer(e.u, emitter.value_type(e, v))) { ret; }
     val opt_pointer_of: opt[Pointer] = access.pointer_of(e, v, i);
     if (sel opt_pointer_of.none) { ret; }
+    if (!atomic_class(opt_pointer_of.some.class)) {
+        emitter.fail(e, Error.atomic{Atomic{at: emitter.at(e, i), class: class_name(opt_pointer_of.some.class)}});
+        ret;
+    }
     val pointee: Type = opt_pointer_of.some.pointee;
     val float:   bool = spirv_types.floating(e.u, pointee);
     val bits:    u32  = spirv_types.bits_of(e.u, pointee);
