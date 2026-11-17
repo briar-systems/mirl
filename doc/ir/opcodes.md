@@ -152,7 +152,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `target.op.memory` | any number of value operands | `op` a target op | none | propagates |
 | `atomic.cmpxchg.words` | `address`, then any number of value operands | `success` a memory ordering, `failure` a memory ordering | none | declared |
 | `timing.read` | none | `type` a type, `state` a state value | none | propagates |
-| `timing.set` | none | `state` a state value | none | propagates |
+| `timing.set` | `saved` | `state` a state value | none | propagates |
 | `timing.restore` | `saved` | `state` a state value | none | propagates |
 | `arg.incoming` | none | `type` a type, `pointer` a type, `places` a place list | none | propagates |
 | `arg.outgoing` | none | `type` a type, `pointer` a type, `places` a place list | none | propagates |
@@ -2267,10 +2267,11 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 
 ### `timing.set`
 
-- operands: none
+- operands: `saved`
 - immediates: `state` a state value
 - targets: 0
-- typing: none
+- typing:
+  - `saved` is an integer
 - results: none
 - effects: reads memory, writes memory
 - secrecy: propagates
