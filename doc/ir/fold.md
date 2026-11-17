@@ -46,6 +46,10 @@ Every row that reads or writes memory, transfers control, computes an address fr
 
 An operand carries a flag saying whether it is secret, and `folded` says whether the results are secret by the row's secrecy rule. A caller that places the results as constants never places a public constant over a secret result: folding never produces a public value from a secret computation, so the constant folding pass leaves such an instruction in place.
 
+## Formats the build does not hold
+
+The constant folding pass places no result of a float format the build holds no row of. Such a format is computed on its encoding by the half precision legalisation, which runs before the pass and makes a value of the format only where the convention places one, as its encoding reinterpreted. Folding that reinterpretation would give a constant of the format, which no rule of the target materialises.
+
 ## Not-a-number results
 
 A float operation that gives a not-a-number gives one with a sign and payload that the IR leaves unspecified, and the target states which one it returns for each format it holds (`Nans`). The folder computes one: a not-a-number operand gives itself quieted, the first such operand when there are several, or the first signalling one where the target's priority puts those first, and an invalid operation gives the target's default not-a-number. The result's format's rule then decides what the fold gives, in one place for every float operation, `fpromote` and `fdemote` among them.
