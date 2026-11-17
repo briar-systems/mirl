@@ -209,6 +209,12 @@ fun pointee(u: *Unit, f: Function, k: usize) opt[Type] {
         }
         j = j + 1;
     }
+    j = 0;
+    for (j < uses.len) {
+        val opt_typed: opt[Type] = op_pointee(u, b, ?b.instructions.data[uses.data[j]], v);
+        if (sel opt_typed.some) { ret opt_typed; }
+        j = j + 1;
+    }
     if (uses.len == 0) {
         val res_word: res[Type, type_table.Error] = type_table.intern(?u.m.types, type_table.Shape.integer{type_table.Integer{width: 32}});
         if (sel res_word.err) {
@@ -218,6 +224,37 @@ fun pointee(u: *Unit, f: Function, k: usize) opt[Type] {
         ret opt[Type].some{res_word.ok};
     }
     unit.fail(u, Error.unpointed{At{function: f, instruction: uses.data[0], location: ir_function.location(?u.m.functions.data[f].body, uses.data[0])}});
+    ret opt[Type].none{};
+}
+
+# what the pointer `v` points to as target op `d` reads it: the type of the
+# slot masc's typing states is the same as what that operand points to, as an
+# atomic's value is the type its pointer points to. none where the typing
+# states no such slot
+fun op_pointee(u: *Unit, b: *Body, d: *InstructionData, v: Value) opt[Type] {
+    val opt_located: opt[code.Located] = code.row_typing(u, d);
+    if (sel opt_located.none) { ret opt[Type].none{}; }
+    val tg:   *typing.Typing = opt_located.some.typing;
+    val lead: u32            = opt_located.some.lead;
+    var q:    usize          = 0;
+    for (q < d.operands.len) {
+        if (d.operands.data[q] == v) {
+            var k: u32 = 0;
+            for (k < tg.count) {
+                val f: *typing.Form = ?tg.forms[k];
+                k = k + 1;
+                if (f.relation != typing.SAME || f.to::u32 != q::u32 + lead) { cnt; }
+                if (f.slot == typing.RESULT) {
+                    if (d.results.len > 0) { ret opt[Type].some{b.values.data[d.results.data[0]].type}; }
+                    cnt;
+                }
+                if (f.slot::u32 < lead) { cnt; }
+                val at: usize = (f.slot::u32 - lead)::usize;
+                if (at < d.operands.len) { ret opt[Type].some{b.values.data[d.operands.data[at]].type}; }
+            }
+        }
+        q = q + 1;
+    }
     ret opt[Type].none{};
 }
 
@@ -526,37 +563,83 @@ fun put_zero(u: *Unit, g: usize, p: u32, t: u32) {
 # NonPrivatePointer
 val ZERO_STORE: u32 = 0x28;
 
-# the entry point compute stage `f` (entry `e` of the reach) is written as:
-# where the environment zeroes no workgroup memory and the stage reaches a
-# Workgroup variable, a function that zeroes each one it reaches, waits at a
-# workgroup barrier and calls the stage, so the barrier precedes all of the
-# stage's own code. an array's elements are zeroed by the invocations its
-# local invocation index reaches in steps of the workgroup size, and the
-# whole of any other variable by invocation 0. the stage's own id otherwise
-fun zeroed(u: *Unit, r: *Reach, e: usize, f: usize, list: Slice[Attribute], made: *u32, ids: *vector.Vector[u32]) u32 {
-    val id: u32 = u.functions.data[f];
-    if (spirv_types.guaranteed(u, ?vulkan.ZERO_INITIALIZED_WORKGROUP)) { ret id; }
+# the entry point stage `f` (entry `e` of the reach) is written as: where the
+# stage reaches a stage output of a carried type that starts at zero, or it
+# computes, its environment zeroes no workgroup memory and it reaches a
+# Workgroup variable, a function that stores each such output's zero,
+# converted from a 32-bit one since no constant of its type can be formed,
+# zeroes each Workgroup variable it reaches and waits at a workgroup barrier,
+# then calls the stage, so all of it precedes the stage's own code. an array's
+# elements are zeroed by the invocations its local invocation index reaches in
+# steps of the workgroup size, and the whole of any other variable by
+# invocation 0. the stage's own id otherwise
+fun prologue(u: *Unit, r: *Reach, e: usize, f: usize, list: Slice[Attribute], computes: bool, made: *u32, ids: *vector.Vector[u32]) u32 {
+    val id:      u32                = u.functions.data[f];
+    var outputs: vector.Vector[u32] = vector.init[u32](u.a);
+    fin { vector.dnit[u32](?outputs); }
     var reached: vector.Vector[u32] = vector.init[u32](u.a);
     fin { vector.dnit[u32](?reached); }
-    var g: usize = 0;
+    val zeroes: bool  = computes && !spirv_types.guaranteed(u, ?vulkan.ZERO_INITIALIZED_WORKGROUP);
+    var g:      usize = 0;
     for (g < u.m.globals.len) {
-        if (u.classes.data[g]::u64 == schema.WORKGROUP && reach.uses(r, e, (g::u32))) { push_u32(u, ?reached, (g::u32)); }
+        if (reach.uses(r, e, (g::u32))) {
+            if (spirv_types.zero_started(u, g))                       { push_u32(u, ?outputs, (g::u32)); }
+            if (zeroes && u.classes.data[g]::u64 == schema.WORKGROUP) { push_u32(u, ?reached, (g::u32)); }
+        }
         g = g + 1;
     }
-    if (reached.len == 0) { ret id; }
     var dims: [3]u32 = [3]u32{0, 0, 0};
-    if (!dimensions(u, f, list, ?dims[0])) { ret id; }
-    val index:  u32        = invocation_index(u, made, ids);
-    val sig:    *Signature = ?u.signatures.data[f];
-    val uint_t: u32        = spirv_types.int_type(u, 32);
-    val bool_t: u32        = spirv_types.bool_type(u);
-    val w:      u32        = unit.fresh(u);
-    var head:   [4]Slot    = [4]Slot{Slot.id{sig.result}, Slot.id{w}, unit.enumerant(0), Slot.id{sig.type}};
+    if (reached.len != 0 && !dimensions(u, f, list, ?dims[0])) { vector.truncate[u32](?reached, 0); }
+    if (outputs.len == 0 && reached.len == 0)                  { ret id; }
+    val sig:  *Signature = ?u.signatures.data[f];
+    val w:    u32        = unit.fresh(u);
+    var head: [4]Slot    = [4]Slot{Slot.id{sig.result}, Slot.id{w}, unit.enumerant(0), Slot.id{sig.type}};
     unit.put(u, buffer.DEFINITIONS, gen_row_index.OPFUNCTION, ?head[0], 4);
-    var prev: u32 = unit.fresh(u);
-    put_label(u, prev);
-    val at:   u32     = unit.fresh(u);
-    var load: [4]Slot = [4]Slot{Slot.id{uint_t}, Slot.id{at}, Slot.id{index}, Slot.none{}};
+    val entry: u32 = unit.fresh(u);
+    put_label(u, entry);
+    var k: usize = 0;
+    for (k < outputs.len) {
+        val x: usize = outputs.data[k]::usize;
+        carried_zero(u, u.globals.data[x], u.m.globals.data[x].data.type);
+        k = k + 1;
+    }
+    if (reached.len != 0) { zero_workgroup(u, entry, ?reached, ?dims[0], made, ids); }
+    var call: [4]Slot = [4]Slot{Slot.id{sig.result}, Slot.id{unit.fresh(u)}, Slot.id{id}, Slot.list{buffer.EMPTY}};
+    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPFUNCTIONCALL, ?call[0], 4);
+    var none: [1]Slot = [1]Slot{Slot.none{}};
+    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPRETURN, ?none[0], 0);
+    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPFUNCTIONEND, ?none[0], 0);
+    ret w;
+}
+
+# a store of the zero of the carried type `ty` into output `p`: the zero of its
+# shape at 32 bits, converted to its 16
+fun carried_zero(u: *Unit, p: u32, ty: Type) {
+    val float: bool = spirv_types.floating(u, ty);
+    val n:     u32  = spirv_types.lanes_of(u, ty);
+    var wide:  u32  = spirv_types.int_type(u, 32);
+    var row:   u32  = gen_row_index.OPUCONVERT;
+    if (float) {
+        wide = spirv_types.float_type(u, 32);
+        row  = gen_row_index.OPFCONVERT;
+    }
+    if (n > 1) { wide = spirv_types.vector_type(u, wide, n); }
+    val v:    u32     = unit.fresh(u);
+    var conv: [3]Slot = [3]Slot{Slot.id{spirv_types.type_of(u, ty, spirv_types.PLAIN)}, Slot.id{v}, Slot.id{spirv_types.null(u, wide)}};
+    unit.put(u, buffer.DEFINITIONS, row, ?conv[0], 3);
+    var store: [3]Slot = [3]Slot{Slot.id{p}, Slot.id{v}, Slot.none{}};
+    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPSTORE, ?store[0], 3);
+}
+
+# the zeroing of the Workgroup variables `reached` of a stage of workgroup
+# size `dims`, then a workgroup barrier
+fun zero_workgroup(u: *Unit, entry: u32, reached: *vector.Vector[u32], dims: *u32, made: *u32, ids: *vector.Vector[u32]) {
+    val index:  u32     = invocation_index(u, made, ids);
+    val uint_t: u32     = spirv_types.int_type(u, 32);
+    val bool_t: u32     = spirv_types.bool_type(u);
+    var prev:   u32     = entry;
+    val at:     u32     = unit.fresh(u);
+    var load:   [4]Slot = [4]Slot{Slot.id{uint_t}, Slot.id{at}, Slot.id{index}, Slot.none{}};
     unit.put(u, buffer.DEFINITIONS, gen_row_index.OPLOAD, ?load[0], 4);
     var arrays: usize = 0;
     var k:      usize = 0;
@@ -639,12 +722,6 @@ fun zeroed(u: *Unit, r: *Reach, e: usize, f: usize, list: Slice[Attribute], made
     val scope:   u32     = spirv_types.uint(u, 32, spirv_types.WORKGROUP_SCOPE::u64);
     var barrier: [3]Slot = [3]Slot{Slot.id{scope}, Slot.id{scope}, Slot.id{spirv_types.uint(u, 32, ZEROED_SEMANTICS::u64)}};
     unit.put(u, buffer.DEFINITIONS, gen_row_index.OPCONTROLBARRIER, ?barrier[0], 3);
-    var call: [4]Slot = [4]Slot{Slot.id{sig.result}, Slot.id{unit.fresh(u)}, Slot.id{id}, Slot.list{buffer.EMPTY}};
-    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPFUNCTIONCALL, ?call[0], 4);
-    var none: [1]Slot = [1]Slot{Slot.none{}};
-    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPRETURN, ?none[0], 0);
-    unit.put(u, buffer.DEFINITIONS, gen_row_index.OPFUNCTIONEND, ?none[0], 0);
-    ret w;
 }
 
 # whether a type is an array, whose elements a zeroing strides over
@@ -679,9 +756,7 @@ fun entries(u: *Unit, r: *Reach) {
             val opt_entry: opt[usize] = reach.entry_of(r, (f::u32));
             if (sel opt_entry.some) { interface(u, r, opt_entry.some, ?ids); }
             var id: u32 = u.functions.data[f];
-            if (sel opt_entry.some) {
-                if (schema.computes(opt_stage.some)) { id = zeroed(u, r, opt_entry.some, f, list, ?made, ?ids); }
-            }
+            if (sel opt_entry.some) { id = prologue(u, r, opt_entry.some, f, list, schema.computes(opt_stage.some), ?made, ?ids); }
             var s: [4]Slot = [4]Slot{unit.enumerant(opt_stage.some::u32), Slot.id{id}, Slot.literal{unit.text(u, name)}, Slot.list{unit.list(u, ids.data, ids.len)}};
             unit.put(u, buffer.ENTRIES, gen_row_index.OPENTRYPOINT, ?s[0], 4);
             val modes: Slice[u64] = schema.integers(list, "modes");
@@ -1124,17 +1199,9 @@ fun met(u: *Unit, d: *Declared, from: usize) usize {
             k = k + 1;
         }
         if (!found) {
-            val first: requirement.Alternative = r.at[0];
-            var named: bool                    = false;
-            var j:     u32                     = 0;
-            for (j < first.all.len && !named) {
-                if (!unit.holds(ctx, first.all.at[j])) {
-                    unmet(u, first.all.at[j]);
-                    named = true;
-                }
-                j = j + 1;
-            }
-            if (!named) { unit.fail(u, Error.unmet{"?"}); }
+            val opt_named: opt[requirement.Id] = unit.remedy(u, r);
+            if (sel opt_named.some) { unmet(u, opt_named.some); }
+            or                      { unit.fail(u, Error.unmet{"?"}); }
         }
         i = i + 1;
     }
