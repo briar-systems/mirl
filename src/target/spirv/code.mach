@@ -44,6 +44,7 @@ use mirl.ir.cfg.graph.NONE;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.function.Body;
 use FunctionNode: mirl.ir.function.Node;
+use mirl.ir.id.Constant;
 use mirl.ir.id.Function;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.Symbol;
@@ -1140,18 +1141,20 @@ fun op_operand(e: *Emitter, i: Instruction, d: *InstructionData, x: *mo.Operand,
     val v:  Value = d.operands.data[@taken];
     @taken = @taken + 1;
     if (sel x.shape.id) {
-        if (spirv_types.pointer(e.u, emitter.value_type(e, v))) {
-            val opt_pointer_of: opt[Pointer] = access.pointer_of(e, v, i);
-            if (sel opt_pointer_of.none) { ret Slot.none{}; }
-            ret Slot.id{opt_pointer_of.some.id};
-        }
         if (sel role.constant) {
-            val opt_constant: opt[u32] = constant_id(e, v);
+            var opt_constant: opt[u32] = opt[u32].none{};
+            if (spirv_types.pointer(e.u, emitter.value_type(e, v))) { opt_constant = slot_constant(e, v, i, 0); }
+            or                                                      { opt_constant = constant_id(e, v); }
             if (sel opt_constant.none) {
                 emitter.fail(e, Error.not_constant{Operand{at: emitter.at(e, i), operand: at}});
                 ret Slot.none{};
             }
             ret Slot.id{opt_constant.some};
+        }
+        if (spirv_types.pointer(e.u, emitter.value_type(e, v))) {
+            val opt_pointer_of: opt[Pointer] = access.pointer_of(e, v, i);
+            if (sel opt_pointer_of.none) { ret Slot.none{}; }
+            ret Slot.id{opt_pointer_of.some.id};
         }
         if (!(sel role.value)) {
             val opt_held: opt[u64] = constant_bits(e, v);
@@ -1383,6 +1386,153 @@ fun constant_id(e: *Emitter, v: Value) opt[u32] {
     ret opt[u32].some{id};
 }
 
+# the most elements of an aggregate a constant operand is read from
+val SLOT_ELEMENTS: u32 = 64;
+
+# the constant a call reads from the stack slot `slot` at instruction `at`,
+# none where what the slot holds there is no constant: the slot written whole,
+# by a copy of a module-scope `val`, of another slot that holds a constant or
+# by a fill of zero, and then any of its elements stored a constant, every
+# write in the call's own block ahead of it, as an aggregate literal or a copy
+# of a `val` passed whole is written. a write the slot takes any other way, a
+# write a run-time value makes, or an element a whole copy of a `val` leaves
+# under a store, is no constant
+fun slot_constant(e: *Emitter, slot: Value, at: Instruction, depth: u32) opt[u32] {
+    val d: Def = e.b.values.data[slot].def;
+    if (depth > 4 || !(sel d.result)) { ret opt[u32].none{}; }
+    if (sel d.result) {
+        if (e.b.instructions.data[d.result.instruction].opcode != table.ALLOCA) { ret opt[u32].none{}; }
+    }
+    val opt_pointer: opt[Pointer] = access.pointer_of(e, slot, at);
+    if (sel opt_pointer.none) { ret opt[u32].none{}; }
+    val ty:   Type = opt_pointer.some.pointee;
+    val n:    u64  = spirv_types.count_of(e.u, ty);
+    val home: u32  = block_of(?e.b.instructions.data[at]);
+    if (n == 0 || n > SLOT_ELEMENTS::u64) { ret opt[u32].none{}; }
+    var stored: [64]Value;
+    var when:   [64]u32;
+    var k:      u32 = 0;
+    for (k < n::u32) {
+        when[k] = NONE;
+        k       = k + 1;
+    }
+    var whole: Whole                 = Whole{id: NONE, null: false};
+    var from:  Instruction           = NONE;
+    val uses:  *Growing[Instruction] = ?e.b.values.data[slot].uses;
+    var j:     usize                 = 0;
+    for (j < uses.len) {
+        val u:  Instruction      = uses.data[j];
+        val ud: *InstructionData = ?e.b.instructions.data[u];
+        j = j + 1;
+        if (u == at || ud.opcode == table.LOAD)                                                                                { cnt; }
+        if (ud.opcode == table.MEM_COPY && ud.operands.len == 3 && ud.operands.data[1] == slot && ud.operands.data[0] != slot) { cnt; }
+        if (block_of(ud) != home || u > at)                                                                                    { ret opt[u32].none{}; }
+        if ((ud.opcode == table.MEM_COPY || ud.opcode == table.MEM_FILL) && ud.operands.len == 3 && ud.operands.data[0] == slot) {
+            if (from == NONE || u > from) {
+                val opt_whole: opt[Whole] = whole_constant(e, ud, ty, u, depth);
+                if (sel opt_whole.none) { ret opt[u32].none{}; }
+                whole = opt_whole.some;
+                from  = u;
+            }
+            cnt;
+        }
+        if (ud.opcode != table.PTR_INDEX || ud.operands.len != 2 || ud.operands.data[0] != slot || ud.results.len != 1) { ret opt[u32].none{}; }
+        val opt_index: opt[u64] = constant_bits(e, ud.operands.data[1]);
+        if (sel opt_index.none)  { ret opt[u32].none{}; }
+        if (opt_index.some >= n) { ret opt[u32].none{}; }
+        val element: Value                 = ud.results.data[0];
+        val writes:  *Growing[Instruction] = ?e.b.values.data[element].uses;
+        var w:       usize                 = 0;
+        for (w < writes.len) {
+            val s:  Instruction      = writes.data[w];
+            val sd: *InstructionData = ?e.b.instructions.data[s];
+            w = w + 1;
+            if (sd.opcode == table.LOAD)                                                                                              { cnt; }
+            if (sd.opcode != table.STORE || sd.operands.len != 2 || sd.operands.data[0] != element || block_of(sd) != home || s > at) { ret opt[u32].none{}; }
+            val x: u32 = opt_index.some::u32;
+            if (when[x] == NONE || s > when[x]) {
+                when[x]   = s;
+                stored[x] = sd.operands.data[1];
+            }
+        }
+    }
+    var ids:     [64]u32;
+    var element: bool = false;
+    k = 0;
+    for (k < n::u32) {
+        if (when[k] != NONE && (from == NONE || when[k] > from)) {
+            val opt_lane: opt[u32] = constant_id(e, stored[k]);
+            if (sel opt_lane.none) { ret opt[u32].none{}; }
+            ids[k]  = opt_lane.some;
+            element = true;
+        }
+        or {
+            val opt_member: opt[Type] = spirv_types.member_of(e.u, ty, k);
+            ids[k] = NONE;
+            if (sel opt_member.some) {
+                if (from != NONE && whole.null) { ids[k] = spirv_types.null(e.u, spirv_types.type_of(e.u, opt_member.some, spirv_types.PLAIN)); }
+            }
+        }
+        k = k + 1;
+    }
+    if (!element) {
+        if (from == NONE) { ret opt[u32].none{}; }
+        ret opt[u32].some{whole.id};
+    }
+    k = 0;
+    for (k < n::u32) {
+        if (ids[k] == NONE) { ret opt[u32].none{}; }
+        k = k + 1;
+    }
+    val id:    u32     = unit.fresh(e.u);
+    var slots: [3]Slot = [3]Slot{Slot.id{spirv_types.type_of(e.u, ty, spirv_types.PLAIN)}, Slot.id{id}, Slot.list{unit.list(e.u, ?ids[0], n::usize)}};
+    unit.put(e.u, buffer.TYPES, gen_row_index.OPCONSTANTCOMPOSITE, ?slots[0], 3);
+    ret opt[u32].some{id};
+}
+
+# the constant a whole write gives a slot
+# ---
+# id:   the constant
+# null: whether a fill of zero wrote it, whose elements are null constants a
+#       store may replace one of
+rec Whole {
+    id:   u32;
+    null: bool;
+}
+
+# the constant a write of a whole slot of type `ty` gives it: a fill of zero
+# its null constant, a copy of a module-scope `val` that `val`'s value, and a
+# copy of another slot what that slot holds there
+fun whole_constant(e: *Emitter, ud: *InstructionData, ty: Type, u: Instruction, depth: u32) opt[Whole] {
+    if (ud.opcode == table.MEM_FILL) {
+        val opt_byte: opt[u64] = constant_bits(e, ud.operands.data[1]);
+        if (sel opt_byte.none)  { ret opt[Whole].none{}; }
+        if (opt_byte.some != 0) { ret opt[Whole].none{}; }
+        ret opt[Whole].some{Whole{id: spirv_types.null(e.u, spirv_types.type_of(e.u, ty, spirv_types.PLAIN)), null: true}};
+    }
+    val src: Value = ud.operands.data[1];
+    val sd:  Def   = e.b.values.data[src].def;
+    if (sel sd.result) {
+        val opt_held: opt[u32] = slot_constant(e, src, u, depth + 1);
+        if (sel opt_held.none) { ret opt[Whole].none{}; }
+        ret opt[Whole].some{Whole{id: opt_held.some, null: false}};
+    }
+    if (!(sel sd.constant)) { ret opt[Whole].none{}; }
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(e.u.m, sd.constant);
+    if (sel res_constant_data.err) { ret opt[Whole].none{}; }
+    val c: ConstantData = res_constant_data.ok;
+    if (!(sel c.address))      { ret opt[Whole].none{}; }
+    if (c.address.offset != 0) { ret opt[Whole].none{}; }
+    val s: Symbol = c.address.symbol;
+    if (!(sel s.global))                             { ret opt[Whole].none{}; }
+    if (!e.u.m.globals.data[s.global].data.constant) { ret opt[Whole].none{}; }
+    val initial: opt[Constant] = e.u.m.globals.data[s.global].data.initial;
+    if (sel initial.none) { ret opt[Whole].none{}; }
+    val id: u32 = spirv_types.constant_of(e.u, initial.some, spirv_types.PLAIN);
+    if (id == NONE) { ret opt[Whole].none{}; }
+    ret opt[Whole].some{Whole{id: id, null: false}};
+}
+
 # the role of param `k` of the params an enumerant value brings, a constant
 # where the member bringing it is one of `constants`, as an image's
 # ConstOffset brings a constant offset
@@ -1587,6 +1737,29 @@ fun texel_type(e: *Emitter, ty: Type) opt[Type] {
     val x: type_table.HandleOperand = sh.handle.operands.data[0];
     if (sel x.typed) { ret opt[Type].some{x.typed}; }
     ret opt[Type].none{};
+}
+
+# the execution models masc's typing states instruction `d` executes in, none
+# for an instruction that is no target op or whose row states no models
+pub fun executes_in(u: *Unit, d: *InstructionData) opt[*typing.Executes] {
+    if (!table.target_op(d.opcode) || d.immediates.len == 0) { ret opt[*typing.Executes].none{}; }
+    val imm: Immediate = d.immediates.data[0];
+    if (!(sel imm.op)) { ret opt[*typing.Executes].none{}; }
+    val held: Ops = u.t.caps.ops;
+    if (!(sel held.catalog)) { ret opt[*typing.Executes].none{}; }
+    val opt_set: opt[*OpSet] = op_set(held.catalog, imm.op.set);
+    if (sel opt_set.none) { ret opt[*typing.Executes].none{}; }
+    val opt_row: opt[*mrow.Row] = op_row(held.catalog, opt_set.some, imm.op.name);
+    if (sel opt_row.none) { ret opt[*typing.Executes].none{}; }
+    val typed: opt[*typing.Typing] = typing.of(?gen_typing.TYPINGS[0], gen_typing.COUNT, opt_row.some.index);
+    if (sel typed.none)                  { ret opt[*typing.Executes].none{}; }
+    if (typed.some.executes.models == 0) { ret opt[*typing.Executes].none{}; }
+    ret opt[*typing.Executes].some{?typed.some.executes};
+}
+
+# whether execution model `model` is one of the models `x` names
+pub fun executes(x: *typing.Executes, model: u64) bool {
+    ret model < 32 && (x.models & ((1::u32) << model::u32)) != 0;
 }
 
 # a row's result received as a truth value: the integer type and id the call's
