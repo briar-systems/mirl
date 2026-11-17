@@ -567,7 +567,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: none
-- address: formed or read as a number, so only under physical addressing once legal
+- address: formed or read as a number, so only under physical addressing once legal, or of pointers the build's addressing model holds as addresses
 
 ### `br`
 
@@ -754,7 +754,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: none
-- address: formed or read as a number, so only under physical addressing once legal
+- address: formed or read as a number, so only under physical addressing once legal, or of pointers the build's addressing model holds as addresses
 
 ### `vsplat`
 
@@ -1551,7 +1551,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - effects: speculatable, mergeable
 - secrecy: propagates
 - vector: none
-- address: formed or read as a number, so only under physical addressing once legal
+- address: formed or read as a number, so only under physical addressing once legal, or of pointers the build's addressing model holds as addresses
 
 ### `reduce.mul`
 
