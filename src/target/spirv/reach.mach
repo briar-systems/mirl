@@ -8,10 +8,13 @@
 # a store or an atomic other than a load writes its root, a load or an atomic
 # other than a store reads it, and a call passes what the callee does to its
 # parameter on to the root of the argument, so an access is followed through
-# every call to a function of the module. a pointer that flows anywhere else,
-# into memory, a block argument, a call the module only declares or a target
-# instruction, escapes: what it is used for is not followed, so it counts as
-# a write and as a read, and is never the site of a refusal. a pointer loaded
+# every call to a function of the module. a target op reads and writes
+# through each operand as its row's effect states, and an image passed to one
+# is accessed in the variable it is loaded from, while loading the image reads
+# no memory. a pointer that flows anywhere else, into memory, a block
+# argument, a call the module only declares or an operand of a target op its
+# row states no access of, escapes: what it is used for is not followed, so
+# it counts as a write and as a read, and is never the site of a refusal. a pointer loaded
 # from memory or made from an integer has no root, so an access through it
 # is no access of the binding it was read from.
 
@@ -26,6 +29,11 @@ use std.types.size.usize;
 use std.allocator;
 use std.collections.vector;
 
+use me: masc.core.effect;
+use masc.core.field;
+use mo:   masc.core.operand;
+use mrow: masc.core.row;
+
 use mirl.ir.constant.ConstantData;
 use mirl.ir.debug.record.Location;
 use ir_function: mirl.ir.function;
@@ -38,10 +46,13 @@ use mirl.ir.id.Value;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.module;
 use mirl.ir.module.Module;
+use mirl.ir.native.Op;
 use mirl.ir.opcode.row.Immediate;
 use mirl.ir.opcode.table;
 use type_table: mirl.ir.type.table;
 use mirl.ir.value.Def;
+use mirl.target.capability;
+use mirl.target.capability.Ops;
 use mirl.target.spirv.access;
 use mirl.target.spirv.emitter.NOWHERE;
 use mirl.target.spirv.error.At;
@@ -90,6 +101,8 @@ rec Passing {
 # params:  what is done to each parameter of each function
 # cycle:   a call an entry point's call tree holds back to the function that
 #          makes it, none where its call graph holds no cycle
+# ops:     the instruction sets the target's catalog holds, whose rows state
+#          the memory a target op reads and writes through each operand
 pub rec Reach {
     a:       *allocator.Allocator;
     m:       *Module;
@@ -100,6 +113,7 @@ pub rec Reach {
     bases:   vector.Vector[u32];
     params:  vector.Vector[Done];
     cycle:   opt[At];
+    ops:     Ops;
 }
 
 val UNDONE: Done = Done{stored: opt[At].none{}, loaded: opt[At].none{}, escaped: false};
@@ -198,23 +212,109 @@ fun note(d: *Done, stored: opt[At], loaded: opt[At], escaped: bool) bool {
     ret first_store || first_load || first_leak;
 }
 
+# whether a value is an opaque handle, an image, a sampler or a sampled image
+fun handle(m: *Module, b: *Body, v: Value) bool {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?m.types, b.values.data[v].type);
+    if (sel res_shape.err) { ret false; }
+    val s: type_table.Shape = res_shape.ok;
+    ret sel s.handle;
+}
+
+# the root of a handle value: the root of the pointer it is loaded through,
+# as an image is read out of its UniformConstant variable, none for any other
+fun held(m: *Module, b: *Body, v: Value) Root {
+    val d: Def = b.values.data[v].def;
+    if (!(sel d.result)) { ret Root.none{}; }
+    val made: *InstructionData = ?b.instructions.data[d.result.instruction];
+    if (made.opcode != table.LOAD || made.operands.len == 0) { ret Root.none{}; }
+    ret root(m, b, made.operands.data[0]);
+}
+
+# the memory each operand of target op `d` is accessed through, as the role
+# its row's effect states (masc.core.effect.Access) into `roles` by the op's
+# operand index: READ, WRITE or READ_WRITE where the row reads or writes
+# memory through that operand, NONE for every other. false where the op names
+# no row of the target's catalog, or where an access lies past an operand the
+# op's operands do not take one to one, a variadic list or an enumerant, so
+# what the op does is not followed and its pointers escape
+fun accessed(r: *Reach, d: *InstructionData, roles: *vector.Vector[u8]) res[bool, allocator.Error] {
+    if (d.immediates.len == 0) { ret res[bool, allocator.Error].ok{false}; }
+    val imm: Immediate = d.immediates.data[0];
+    var o:   *Op       = nil;
+    if (sel imm.op) { o = imm.op; }
+    if (o == nil)   { ret res[bool, allocator.Error].ok{false}; }
+    val held_ops: Ops = r.ops;
+    if (!(sel held_ops.catalog)) { ret res[bool, allocator.Error].ok{false}; }
+    val opt_set: opt[*capability.OpSet] = capability.op_set(held_ops.catalog, o.set);
+    if (sel opt_set.none) { ret res[bool, allocator.Error].ok{false}; }
+    val opt_row: opt[*mrow.Row] = capability.op_row(held_ops.catalog, opt_set.some, o.name);
+    if (sel opt_row.none) { ret res[bool, allocator.Error].ok{false}; }
+    val row:  *mrow.Row = opt_row.some;
+    val lead: u32       = capability.supplies(opt_set.some, row);
+    var k:    usize     = 0;
+    for (k < d.operands.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[u8](roles, mo.NONE);
+        if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+        k = k + 1;
+    }
+    var a: u32 = 0;
+    for (a < row.effect.memory.len) {
+        val x: *me.Access = ?row.effect.memory.at[a];
+        a = a + 1;
+        if (x.operand == field.NO_OPERAND || x.operand::u32 < lead || x.operand::u32 >= row.operands.len) { cnt; }
+        var j: u32 = lead;
+        for (j < x.operand::u32) {
+            val before: *mo.Operand = ?row.operands.at[j];
+            if (before.quantity == mo.VARIADIC || sel before.shape.enumerant) { ret res[bool, allocator.Error].ok{false}; }
+            j = j + 1;
+        }
+        val at: usize = (x.operand::u32 - lead)::usize;
+        if (at < roles.len) { roles.data[at] = roles.data[at] | capability.access_role(row, x); }
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
 # what instruction `i` of function `f` does to the root of each pointer it
 # takes, keeping each call that passes one to a function of the module
 fun direct(r: *Reach, f: Function, b: *Body, i: Instruction, calls: *vector.Vector[Passing]) err[allocator.Error] {
-    val d:    *InstructionData = ?b.instructions.data[i];
-    val code: u32              = d.opcode;
-    var k:    usize            = 0;
+    val d:     *InstructionData  = ?b.instructions.data[i];
+    val code:  u32               = d.opcode;
+    var roles: vector.Vector[u8] = vector.init[u8](r.a);
+    fin { vector.dnit[u8](?roles); }
+    var rowed: bool = false;
+    if (table.target_op(code)) {
+        val res_rowed: res[bool, allocator.Error] = accessed(r, d, ?roles);
+        if (sel res_rowed.err) { ret err[allocator.Error].err{res_rowed.err}; }
+        rowed = res_rowed.ok;
+    }
+    var k: usize = 0;
     for (k < d.operands.len) {
         val v: Value = d.operands.data[k];
         k = k + 1;
-        if (!pointer(r.m, b, v)) { cnt; }
-        val x: Root = root(r.m, b, v);
-        if (sel x.none) { cnt; }
+        var role: u8 = mo.NONE;
+        if (rowed && k - 1 < roles.len) { role = roles.data[k - 1]; }
+        var x: Root = Root.none{};
+        if (pointer(r.m, b, v))                   { x = root(r.m, b, v); }
+        or (role != mo.NONE && handle(r.m, b, v)) { x = held(r.m, b, v); }
+        or                                        { cnt; }
+        if (sel x.none)                           { cnt; }
         val dn:  *Done   = done_of(r, f, x);
         val at:  opt[At] = opt[At].some{site(r.m, f, i)};
         val pos: usize   = k - 1;
         if (dn == nil)                                                         { cnt; }
         if ((code == table.PTR_MEMBER || code == table.PTR_INDEX) && pos == 0) { cnt; }
+        if (rowed && role != mo.NONE) {
+            var stored: opt[At] = opt[At].none{};
+            var loaded: opt[At] = opt[At].none{};
+            if ((role & mo.WRITE) != 0) { stored = at; }
+            if ((role & mo.READ) != 0)  { loaded = at; }
+            val changed: bool = note(dn, stored, loaded, false);
+            cnt;
+        }
+        # a handle loaded from its variable reads no memory: what reads or writes the image is the op it is passed to
+        if (code == table.LOAD && pos == 0 && d.results.len > 0) {
+            if (handle(r.m, b, d.results.data[0])) { cnt; }
+        }
         if (code == table.LOAD && pos == 0) {
             val changed: bool = note(dn, opt[At].none{}, at, false);
             cnt;
@@ -397,10 +497,10 @@ fun call_of(r: *Reach, f: Function, callee: Function) At {
 
 # the call graph of `m` and what each of its entry points reaches, where an
 # entry point is a function `staged` says has a stage
-pub fun init(a: *allocator.Allocator, m: *Module, staged: fun(*Module, Function) bool) res[Reach, allocator.Error] {
+pub fun init(a: *allocator.Allocator, m: *Module, staged: fun(*Module, Function) bool, ops: Ops) res[Reach, allocator.Error] {
     var r: Reach = Reach{
         a:      a, m: m, entries: vector.init[Function](a), reached: vector.init[bool](a), named: vector.init[bool](a), globals: vector.init[Done](a), bases: vector.init[u32](a),
-        params: vector.init[Done](a), cycle: opt[At].none{}
+        params: vector.init[Done](a), cycle: opt[At].none{}, ops: ops
     };
     var kept: bool = false;
     fin {
