@@ -62,9 +62,13 @@
 # the boundaries and the stack slots hold the encoding too: the function's
 # signature, its parameters, a call's arguments, results and signature, a
 # returned value, a slot and a constant left there are retyped as the
-# encoding, so the format is left only in memory. a vector of the format no
-# unit holds is taken lane by lane by the vector legalisation first, and one
-# a unit holds is left, and refused where it is computed.
+# encoding, so the format is left only in memory. a vector of the format a
+# unit holds whole is computed the same way at its width, lane for lane: its
+# widening, operation and narrowing are vector operations, each of which the
+# unit must compute over packed lanes, its constants are the vectors of their
+# lanes' encodings, and its splats, builds, shuffles, extracts and inserts
+# move encodings. a vector no unit holds is left, and none reaches a register
+# target, whose vector legalisation takes it lane by lane first.
 #
 # an operation no held format admits, on a soft float build every operation of
 # binary32 and binary64, is a call of a soft helper of mirl.legal.helper.table
@@ -99,6 +103,7 @@ use std.collections.map;
 use std.collections.slice.Slice;
 use std.collections.vector;
 
+use core_state: masc.core.state;
 use mirl.build.builder;
 use mirl.fold.record;
 use fold_table: mirl.fold.table;
@@ -107,6 +112,7 @@ use mirl.fold.word.Wide;
 use mirl.ir.body;
 use mirl.ir.body.Records;
 use mirl.ir.constant.Address;
+use mirl.ir.constant.Aggregate;
 use mirl.ir.constant.Bits;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.constant.Spec;
@@ -157,10 +163,12 @@ use mirl.target.capability;
 use mirl.target.capability.Capabilities;
 use mirl.target.capability.Held;
 use mirl.target.capability.Kept;
+use mirl.target.capability.LaneType;
 use mirl.target.capability.Lowered;
 use mirl.target.capability.Nans;
 use mirl.target.capability.Narrowing;
 use mirl.target.record.Target;
+use units: mirl.target.vector;
 
 # the pass: it adds instructions and block parameters and never touches an
 # edge's target or a block
@@ -222,6 +230,7 @@ fun wanted(g: *Ground) bool {
 # ---
 # site:   the function being rewritten
 # basis:  the build's selection
+# ctx:    the context the selection opened, which the vector units are read under
 # caps:   the target's declarations
 # t:      the target, whose helpers the soft rewrites deliver
 # plans:  the plan of each format, by its index
@@ -231,6 +240,7 @@ fun wanted(g: *Ground) bool {
 rec Work {
     site:   Site;
     basis:  opt[*Basis];
+    ctx:    opt[*core_state.Context];
     caps:   *Capabilities;
     t:      *Target;
     plans:  *Plan;
@@ -252,22 +262,51 @@ fun type_of(w: *Work, x: Value) Type {
     ret w.site.b.values.data[x].type;
 }
 
-# the format a scalar type is of, none for any other type
+# the format a scalar type is of, or a vector's lanes, none for any other type
 fun format_of(w: *Work, ty: Type) opt[Format] {
     val res_shape_at: res[*type_table.Shape, type_table.Error] = type_table.shape_at(?w.site.m.types, ty);
-    if (sel res_shape_at.err)      { ret opt[Format].none{}; }
-    if (sel res_shape_at.ok.float) { ret opt[Format].some{res_shape_at.ok.float.format}; }
+    if (sel res_shape_at.err)       { ret opt[Format].none{}; }
+    if (sel res_shape_at.ok.float)  { ret opt[Format].some{res_shape_at.ok.float.format}; }
+    if (sel res_shape_at.ok.vector) { ret format_of(w, res_shape_at.ok.vector.element); }
     ret opt[Format].none{};
 }
 
-# the format a scalar type is of when the pass computes it elsewhere
+# the lanes of a vector type, zero for any other type
+fun lanes_of(w: *Work, ty: Type) u32 {
+    val res_shape_at: res[*type_table.Shape, type_table.Error] = type_table.shape_at(?w.site.m.types, ty);
+    if (sel res_shape_at.err)       { ret 0; }
+    if (sel res_shape_at.ok.vector) { ret res_shape_at.ok.vector.lanes; }
+    ret 0;
+}
+
+# the format a scalar or vector type is of when the pass computes it
+# elsewhere. a vector is computed in a wider format's lanes alone, never by
+# helpers, and only where a unit holds it whole, any other being left as no
+# vector the target has
 fun expanded(w: *Work, ty: Type) opt[Format] {
     val opt_format_of: opt[Format] = format_of(w, ty);
     if (sel opt_format_of.none) { ret opt_format_of; }
-    val at: Format = opt_format_of.some;
-    val p:  Plan   = w.plans[at];
-    if (sel p.basic.none && !p.soft) { ret opt[Format].none{}; }
+    val at:    Format = opt_format_of.some;
+    val p:     Plan   = w.plans[at];
+    val lanes: u32    = lanes_of(w, ty);
+    if (lanes == 0) {
+        if (sel p.basic.none && !p.soft) { ret opt[Format].none{}; }
+        ret opt_format_of;
+    }
+    if (sel p.basic.none || !held_whole(w, ty, lanes)) { ret opt[Format].none{}; }
     ret opt_format_of;
+}
+
+# whether a unit of the build holds a vector type whole
+fun held_whole(w: *Work, ty: Type, lanes: u32) bool {
+    var f:        Format        = 0;
+    val opt_lane: opt[LaneType] = lane_type(w, ty, ?f);
+    if (sel opt_lane.none) { ret false; }
+    val res_split: res[units.Split, units.Error] = units.split(w.ctx, w.caps, opt_lane.some, lanes);
+    if (sel res_split.err) { ret false; }
+    val split: units.Split = res_split.ok;
+    if (!(sel split.pieces)) { ret false; }
+    ret split.pieces.lanes == lanes;
 }
 
 # the row of a format the pass read from the table, which has one
@@ -307,6 +346,66 @@ fun float(w: *Work, f: Format) Type {
 # the integer type of a format's encoding
 fun encoding(w: *Work, f: Format) Type {
     ret integer(w, row_of(f).width);
+}
+
+# a scalar type, or the vector of as many lanes of it where lanes is not zero
+fun shaped(w: *Work, scalar: Type, lanes: u32) Type {
+    if (lanes == 0) { ret scalar; }
+    val res_intern: res[Type, type_table.Error] = type_table.intern(?w.site.m.types, type_table.Shape.vector{type_table.Vector{lanes: lanes, element: scalar}});
+    if (sel res_intern.err) {
+        fail(w, refusal.Error.ir{module.Error.types{res_intern.err}});
+        ret 0;
+    }
+    ret res_intern.ok;
+}
+
+# the type of the encoding of a scalar or vector type of a format
+fun encoding_of(w: *Work, ty: Type, f: Format) Type {
+    ret shaped(w, encoding(w, f), lanes_of(w, ty));
+}
+
+val UNPACKED: str = "an operation on a vector of a format the build computes in a wider one that no vector unit of the build computes over packed lanes";
+
+# the lane type of the target's declarations a scalar or vector type's lanes
+# are, a float's format written to `format`, which must outlive the answer
+fun lane_type(w: *Work, ty: Type, format: *Format) opt[LaneType] {
+    val res_shape_at: res[*type_table.Shape, type_table.Error] = type_table.shape_at(?w.site.m.types, ty);
+    if (sel res_shape_at.err)        { ret opt[LaneType].none{}; }
+    if (sel res_shape_at.ok.vector)  { ret lane_type(w, res_shape_at.ok.vector.element, format); }
+    if (sel res_shape_at.ok.integer) { ret opt[LaneType].some{LaneType.integer{res_shape_at.ok.integer.width}}; }
+    if (sel res_shape_at.ok.float) {
+        @format = res_shape_at.ok.float.format;
+        ret opt[LaneType].some{LaneType.float{format}};
+    }
+    ret opt[LaneType].none{};
+}
+
+# hold an operation made over a vector to the unit that holds the vector: it
+# must compute the operation over packed lanes, reading lanes of `of` and,
+# for a conversion, giving lanes of `to`. a reinterpretation needs no row
+fun packed(w: *Work, code: Opcode, of: Type, to: Type) {
+    val lanes: u32 = lanes_of(w, of);
+    if (lanes == 0 || code == opcode_table.BITCAST) { ret; }
+    if (!computes(w, code, of, to, lanes))          { fail(w, refusal.Error.reason{UNPACKED}); }
+}
+
+# whether the unit holding a vector of `lanes` lanes of `of` computes an
+# operation over them packed
+fun computes(w: *Work, code: Opcode, of: Type, to: Type, lanes: u32) bool {
+    var fa:     Format        = 0;
+    var fb:     Format        = 0;
+    val opt_of: opt[LaneType] = lane_type(w, of, ?fa);
+    val opt_to: opt[LaneType] = lane_type(w, to, ?fb);
+    if (sel opt_of.none) { ret false; }
+    if (sel opt_to.none) { ret false; }
+    val res_split: res[units.Split, units.Error] = units.split(w.ctx, w.caps, opt_of.some, lanes);
+    if (sel res_split.err) { ret false; }
+    val split: units.Split = res_split.ok;
+    if (!(sel split.pieces))         { ret false; }
+    if (split.pieces.lanes != lanes) { ret false; }
+    val res_native: res[bool, units.Error] = units.native(w.ctx, split.pieces.unit, code, opt_of.some, opt_to.some);
+    if (sel res_native.err) { ret false; }
+    ret res_native.ok;
 }
 
 fun constant(w: *Work, ty: Type, x: Wide) Value {
@@ -356,14 +455,17 @@ fun canonical_of(b: type_format.Binary) Wide {
 }
 
 fun op2(w: *Work, code: Opcode, a: Value, b: Value) Value {
+    packed(w, code, type_of(w, a), type_of(w, a));
     ret emit.binary(?w.site, code, a, b);
 }
 
 fun pick(w: *Work, c: Value, a: Value, b: Value) Value {
+    packed(w, opcode_table.SELECT, type_of(w, a), type_of(w, a));
     ret emit.ternary(?w.site, opcode_table.SELECT, c, a, b);
 }
 
 fun cast(w: *Work, code: Opcode, x: Value, to: Type) Value {
+    packed(w, code, type_of(w, x), to);
     ret emit.convert(?w.site, code, x, to);
 }
 
@@ -405,14 +507,14 @@ fun converted(w: *Work, other: Format) Nan {
 }
 
 # the encoding of a narrow value widened exactly to a wide format, as a value
-# of the wide format
-fun widen(w: *Work, e: Value, from: Format, to: Format, nan: Nan) Value {
+# of the wide format, lane by lane over a vector of `lanes`
+fun widen(w: *Work, e: Value, from: Format, to: Format, nan: Nan, lanes: u32) Value {
     val n:       type_format.Binary = bits_of(from);
     val x:       type_format.Binary = bits_of(to);
     val nw:      u32                = row_of(from).width;
     val xw:      u32                = row_of(to).width;
-    val it:      Type               = encoding(w, to);
-    val ft:      Type               = float(w, to);
+    val it:      Type               = shaped(w, encoding(w, to), lanes);
+    val ft:      Type               = shaped(w, float(w, to), lanes);
     val gap:     u32                = x.significand - n.significand;
     val hz:      Value              = cast(w, opcode_table.EXT_U, e, it);
     val sign:    Value              = op2(w, opcode_table.SHL, op2(w, opcode_table.AND, hz, constant(w, it, pow2(nw - 1))), constant(w, it, small((xw - nw)::u64)));
@@ -439,15 +541,16 @@ fun widen(w: *Work, e: Value, from: Format, to: Format, nan: Nan) Value {
 }
 
 # a value of a wide format narrowed to a narrow one, rounded once to nearest
-# with ties to even, as the narrow encoding
-fun narrow(w: *Work, v: Value, from: Format, to: Format, nan: Nan) Value {
+# with ties to even, as the narrow encoding, lane by lane over a vector of
+# `lanes`
+fun narrow(w: *Work, v: Value, from: Format, to: Format, nan: Nan, lanes: u32) Value {
     val x:    type_format.Binary = bits_of(from);
     val n:    type_format.Binary = bits_of(to);
     val xw:   u32                = row_of(from).width;
     val nw:   u32                = row_of(to).width;
-    val it:   Type               = encoding(w, from);
-    val nt:   Type               = encoding(w, to);
-    val ft:   Type               = float(w, from);
+    val it:   Type               = shaped(w, encoding(w, from), lanes);
+    val nt:   Type               = shaped(w, encoding(w, to), lanes);
+    val ft:   Type               = shaped(w, float(w, from), lanes);
     val k:    u32                = x.significand - n.significand;
     val xb:   Value              = cast(w, opcode_table.BITCAST, v, it);
     val a:    Value              = op2(w, opcode_table.AND, xb, constant(w, it, low(xw - 1)));
@@ -479,25 +582,49 @@ fun narrow(w: *Work, v: Value, from: Format, to: Format, nan: Nan) Value {
     ret pick(w, isnan, lost, signed);
 }
 
-# the encoding of an operand of an expanded format: a constant's bits, or the
-# reinterpretation of the value made ahead of the instruction reading it
+# the encoding of an operand of an expanded format: a constant's bits, lane
+# by lane for a vector, or the reinterpretation of the value made ahead of the
+# instruction reading it
 fun encoded(w: *Work, x: Value, f: Format) Value {
-    val nt:       Type                                  = encoding(w, f);
+    val nt:       Type                                  = encoding_of(w, type_of(w, x), f);
     val res_read: res[opt[record.Value], refusal.Error] = number.read(w.site.m, w.site.b, w.site.scratch, x);
     if (sel res_read.err) {
         fail(w, res_read.err);
         ret x;
     }
     if (sel res_read.ok.some) {
-        if (res_read.ok.some.lanes.size == 1) { ret constant(w, nt, word.of(res_read.ok.some.lanes.data[0].words)); }
+        val read: record.Value = res_read.ok.some;
+        if (read.lanes.size == 1 && lanes_of(w, nt) == 0) { ret constant(w, nt, word.of(read.lanes.data[0].words)); }
+        if (read.lanes.size::u32 == lanes_of(w, nt))      { ret recoded(w, read, nt, encoding(w, f)); }
     }
     ret cast(w, opcode_table.BITCAST, x, nt);
+}
+
+# a vector constant's lanes read as the lanes of its encoding, a vector of
+# `lane`
+fun recoded(w: *Work, v: record.Value, nt: Type, lane: Type) Value {
+    val res_lanes: res[*Bits, allocator.Error] = allocator.zallocate[Bits](w.site.scratch, v.lanes.size);
+    if (sel res_lanes.err) {
+        fail(w, refusal.Error.alloc{res_lanes.err});
+        ret 0;
+    }
+    var k: usize = 0;
+    for (k < v.lanes.size) {
+        res_lanes.ok[k] = Bits{type: lane, words: v.lanes.data[k].words};
+        k               = k + 1;
+    }
+    val res_made: res[Value, refusal.Error] = number.place(w.site.m, w.site.f, w.site.scratch, record.Value{type: nt, lanes: Slice[Bits]{data: res_lanes.ok, size: v.lanes.size}});
+    if (sel res_made.err) {
+        fail(w, res_made.err);
+        ret 0;
+    }
+    ret res_made.ok;
 }
 
 # an operand of an expanded format widened to the format its operation
 # computes in
 fun widened(w: *Work, x: Value, f: Format, to: Format, nan: Nan) Value {
-    ret widen(w, encoded(w, x, f), f, to, nan);
+    ret widen(w, encoded(w, x, f), f, to, nan, lanes_of(w, type_of(w, x)));
 }
 
 # what one instruction to rewrite is, copied before the body grows under it
@@ -514,21 +641,33 @@ fun widened(w: *Work, x: Value, f: Format, to: Format, nan: Nan) Value {
 rec Copied {
     origin:   Instruction;
     code:     Opcode;
-    operands: [3]Value;
+    operands: *Value;
     count:    usize;
     result:   Value;
     results:  usize;
     flags:    Flags;
-    imm:      [3]Immediate;
+    imm:      *Immediate;
     imms:     usize;
 }
 
-fun copy_of(d: *InstructionData, i: Instruction) Copied {
+# the copy, its operands and immediates in the visit's scratch
+fun copy_of(w: *Work, d: *InstructionData, i: Instruction) Copied {
     var c: Copied;
     c.origin = i;
     c.code   = d.opcode;
-    c.count  = d.operands.len;
-    if (c.count > 3) { c.count = 3; }
+    val res_operands: res[*Value, allocator.Error] = allocator.zallocate[Value](w.site.scratch, d.operands.len + 1);
+    if (sel res_operands.err) {
+        fail(w, refusal.Error.alloc{res_operands.err});
+        ret c;
+    }
+    val res_imm: res[*Immediate, allocator.Error] = allocator.zallocate[Immediate](w.site.scratch, d.immediates.len + 1);
+    if (sel res_imm.err) {
+        fail(w, refusal.Error.alloc{res_imm.err});
+        ret c;
+    }
+    c.operands = res_operands.ok;
+    c.imm      = res_imm.ok;
+    c.count    = d.operands.len;
     var k: usize = 0;
     for (k < c.count) {
         c.operands[k] = d.operands.data[k];
@@ -539,8 +678,7 @@ fun copy_of(d: *InstructionData, i: Instruction) Copied {
     if (d.results.len > 0) { c.result = d.results.data[0]; }
     c.flags = d.metadata.flags;
     c.imms  = d.immediates.len;
-    if (c.imms > 3) { c.imms = 3; }
-    k = 0;
+    k       = 0;
     for (k < c.imms) {
         c.imm[k] = d.immediates.data[k];
         k        = k + 1;
@@ -551,7 +689,9 @@ fun copy_of(d: *InstructionData, i: Instruction) Copied {
 # make an instruction of any operands and immediates, giving its first result
 # where it has one
 fun made(w: *Work, code: Opcode, ops: *Value, n: usize, imm: *Immediate, slots: usize) Value {
-    val i: Instruction      = emit.emit(?w.site, code, Slice[Value]{data: ops, size: n}, Slice[Immediate]{data: imm, size: slots});
+    val i: Instruction = emit.emit(?w.site, code, Slice[Value]{data: ops, size: n}, Slice[Immediate]{data: imm, size: slots});
+    # a refused one is no instruction, and the refusal is the rewrite's
+    if (i::usize >= w.site.b.instructions.len) { ret 0; }
     val d: *InstructionData = ?w.site.b.instructions.data[i];
     if (d.results.len == 0) { ret 0; }
     ret emit.result(?w.site, i, 0);
@@ -638,10 +778,32 @@ fun classify(w: *Work, d: *InstructionData) Rewrite {
         if (out) { rw.how = How.demote{}; }
         or       { rw.how = How.promote{}; }
     }
-    if (sel e.bitcast)                                                   { rw.how = How.recast{}; }
-    if (sel e.select || sel e.identity)                                  { rw.how = How.held{}; }
+    if (sel e.bitcast)                  { rw.how = How.recast{}; }
+    if (sel e.select || sel e.identity) { rw.how = How.held{}; }
+    if (sel e.splat || sel e.build || sel e.shuffle || sel e.extract || sel e.insert) {
+        if (lanes_expanded(w, d)) { rw.how = How.held{}; }
+    }
     if (d.opcode == opcode_table.LOAD || d.opcode == opcode_table.STORE) { rw.how = How.held{}; }
     ret rw;
+}
+
+# whether every vector of a format a lane operation reads or gives is one the
+# pass computes elsewhere, so its lanes move as encodings
+fun lanes_expanded(w: *Work, d: *InstructionData) bool {
+    var k: usize = 0;
+    for (k < d.operands.len + d.results.len) {
+        var x: Value = 0;
+        if (k < d.operands.len) { x = d.operands.data[k]; }
+        or                      { x = d.results.data[k - d.operands.len]; }
+        val ty:         Type        = type_of(w, x);
+        val opt_format: opt[Format] = format_of(w, ty);
+        if (lanes_of(w, ty) != 0 && sel opt_format.some) {
+            val opt_expanded: opt[Format] = expanded(w, ty);
+            if (sel opt_expanded.none) { ret false; }
+        }
+        k = k + 1;
+    }
+    ret true;
 }
 
 # the format a plan computes an operation in
@@ -665,7 +827,7 @@ fun held_immediate(w: *Work, i: Immediate) Immediate {
     if (!(sel i.ty)) { ret i; }
     val opt_expanded: opt[Format] = expanded(w, i.ty);
     if (sel opt_expanded.none) { ret i; }
-    ret Immediate.ty{encoding(w, opt_expanded.some)};
+    ret Immediate.ty{encoding_of(w, i.ty, opt_expanded.some)};
 }
 
 # the end of a rewrite whose result is a value already made, which takes the
@@ -717,8 +879,15 @@ fun rewrite(w: *Work, k: Block, n: u32, i: Instruction) err[refusal.Error] {
     val d:  *InstructionData = ?w.site.b.instructions.data[i];
     val rw: Rewrite          = classify(w, d);
     if (sel rw.how.none) { ret bounding(w, k, n, i); }
-    var c: Copied = copy_of(d, i);
-    if (soft_rewrites(w, d, rw)) { ret soft_rewrite(w, k, n, i, ?c, rw); }
+    var c:          Copied             = copy_of(w, d, i);
+    val err_copied: err[refusal.Error] = failure_of(w);
+    if (sel err_copied.err) { ret err_copied; }
+    var lanes: u32 = 0;
+    if (c.count > 0) { lanes = lanes_of(w, type_of(w, c.operands[0])); }
+    if (soft_rewrites(w, d, rw)) {
+        if (lanes != 0) { ret err[refusal.Error].err{refusal.Error.reason{UNPACKED}}; }
+        ret soft_rewrite(w, k, n, i, ?c, rw);
+    }
     val f: Format = rw.format;
     # a reinterpretation or a held operation reads the encoding alone, so it
     # needs no format to compute in
@@ -726,7 +895,8 @@ fun rewrite(w: *Work, k: Block, n: u32, i: Instruction) err[refusal.Error] {
     val opt_computes_in: opt[Format] = computes_in(w, rw);
     if (sel opt_computes_in.some)                   { wide = opt_computes_in.some; }
     or (!(sel rw.how.recast) && !(sel rw.how.held)) { ret err[refusal.Error].ok{}; }
-    val ty: Type = float(w, f);
+    var ty: Type = 0;
+    if (c.results > 0) { ty = type_of(w, c.result); }
     # the other format of a conversion, which must be held
     var other: Format = 0;
     if (sel rw.how.promote || sel rw.how.demote) {
@@ -748,8 +918,9 @@ fun rewrite(w: *Work, k: Block, n: u32, i: Instruction) err[refusal.Error] {
         }
         var nan: Nan = rw.how.compute;
         if (!(sel nan.kept)) { nan = narrowed(w, f, nan); }
+        packed(w, c.code, type_of(w, ops[0]), type_of(w, ops[0]));
         val r: Value = made(w, c.code, ?ops[0], c.count, nil, 0);
-        val e: Value = narrow(w, r, wide, f, nan);
+        val e: Value = narrow(w, r, wide, f, nan, lanes);
         emit.end(?w.site, i);
         cast(w, opcode_table.BITCAST, e, ty);
     }
@@ -760,8 +931,8 @@ fun rewrite(w: *Work, k: Block, n: u32, i: Instruction) err[refusal.Error] {
         op2(w, c.code, a, b);
     }
     or (sel rw.how.to_float) {
-        val r: Value = cast(w, c.code, c.operands[0], float(w, wide));
-        val e: Value = narrow(w, r, wide, f, Nan.quiet{});
+        val r: Value = cast(w, c.code, c.operands[0], shaped(w, float(w, wide), lanes));
+        val e: Value = narrow(w, r, wide, f, Nan.quiet{}, lanes);
         emit.end(?w.site, i);
         cast(w, opcode_table.BITCAST, e, ty);
     }
@@ -780,15 +951,16 @@ fun rewrite(w: *Work, k: Block, n: u32, i: Instruction) err[refusal.Error] {
         cast(w, code, a, to);
     }
     or (sel rw.how.demote) {
-        val e: Value = narrow(w, c.operands[0], other, f, narrowed(w, f, converted(w, other)));
+        val e: Value = narrow(w, c.operands[0], other, f, narrowed(w, f, converted(w, other)), lanes);
         emit.end(?w.site, i);
         cast(w, opcode_table.BITCAST, e, ty);
     }
     or (sel rw.how.recast) {
-        val nt:      Type        = encoding(w, f);
         val to:      Type        = type_of(w, c.result);
         val from:    Type        = type_of(w, c.operands[0]);
         val opt_src: opt[Format] = expanded(w, from);
+        var nt:      Type        = encoding_of(w, to, f);
+        if (sel opt_src.some) { nt = encoding_of(w, from, f); }
         if (sel opt_src.some) {
             val e: Value = encoded(w, c.operands[0], f);
             if (type_table.same(to, nt)) { ret settle(w, i, c.result, e); }
@@ -803,26 +975,42 @@ fun rewrite(w: *Work, k: Block, n: u32, i: Instruction) err[refusal.Error] {
         }
     }
     or {
-        var ops: [3]Value;
-        var j:   usize = 0;
+        val res_ops: res[*Value, allocator.Error] = allocator.zallocate[Value](w.site.scratch, c.count + 1);
+        if (sel res_ops.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_ops.err}}; }
+        val res_imm: res[*Immediate, allocator.Error] = allocator.zallocate[Immediate](w.site.scratch, c.imms + 1);
+        if (sel res_imm.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_imm.err}}; }
+        val ops: *Value     = res_ops.ok;
+        val imm: *Immediate = res_imm.ok;
+        var j:   usize      = 0;
         for (j < c.count) {
             ops[j] = held_operand(w, ?c, j);
             j      = j + 1;
         }
-        var imm: [3]Immediate;
         j = 0;
         for (j < c.imms) {
             imm[j] = held_immediate(w, c.imm[j]);
             j      = j + 1;
         }
         var gives: bool = false;
+        var of:    Type = 0;
         if (c.results > 0) {
             val opt_expanded: opt[Format] = expanded(w, type_of(w, c.result));
             gives = sel opt_expanded.some;
+            of    = type_of(w, c.result);
+            if (sel opt_expanded.some) { of = encoding_of(w, of, opt_expanded.some); }
         }
+        # a select or a lane operation over a vector is held to the unit that
+        # holds its encoding, a load or a store needing no row
+        j = 0;
+        for (j < c.count && lanes_of(w, of) == 0) {
+            of = type_of(w, ops[j]);
+            j  = j + 1;
+        }
+        val entry: fold_table.Entry = fold_table.entry(c.code);
+        if (c.code != opcode_table.LOAD && c.code != opcode_table.STORE && !(sel entry.identity)) { packed(w, c.code, of, of); }
         if (gives) {
             emit.flags(?w.site, c.flags);
-            val r: Value = made(w, c.code, ?ops[0], c.count, ?imm[0], c.imms);
+            val r: Value = made(w, c.code, ops, c.count, imm, c.imms);
             emit.flags(?w.site, NO_FLAGS);
             emit.end(?w.site, i);
             cast(w, opcode_table.BITCAST, r, ty);
@@ -830,7 +1018,7 @@ fun rewrite(w: *Work, k: Block, n: u32, i: Instruction) err[refusal.Error] {
         or {
             emit.end(?w.site, i);
             emit.flags(?w.site, c.flags);
-            made(w, c.code, ?ops[0], c.count, ?imm[0], c.imms);
+            made(w, c.code, ops, c.count, imm, c.imms);
         }
     }
     val err_built: err[refusal.Error] = emit.done(?w.site);
@@ -851,7 +1039,7 @@ fun parameters(w: *Work, k: Block) err[refusal.Error] {
         val opt_expanded: opt[Format] = expanded(w, type_of(w, old));
         if (sel opt_expanded.none) { p = p + 1; }
         or {
-            val nt:       Type                         = encoding(w, opt_expanded.some);
+            val nt:       Type                         = encoding_of(w, type_of(w, old), opt_expanded.some);
             val zero:     Value                        = constant(w, nt, word.zero());
             val preds:    usize                        = b.blocks.data[k].predecessors.len;
             val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](w.site.scratch, preds + 1);
@@ -937,7 +1125,8 @@ fun recasts(w: *Work, i: Instruction, from: bool) bool {
         e            = r;
     }
     if (sel opt_expanded.none) { ret false; }
-    ret type_table.same(e, encoding(w, opt_expanded.some));
+    if (from)                  { ret type_table.same(e, encoding_of(w, a, opt_expanded.some)); }
+    ret type_table.same(e, encoding_of(w, r, opt_expanded.some));
 }
 
 # take out each pair of reinterpretations the rewrite left, an encoding read
@@ -1004,7 +1193,7 @@ fun visit(u: *Unit) res[bool, refusal.Error] {
     var scratch: allocator.Allocator;
     arena.allocator(?scratch, ?ar);
 
-    var w: Work  = Work{site: emit.init(c.m, u.f, res_body.ok, ?scratch), basis: c.basis, caps: ?c.t.caps, t: c.t, plans: res_plans.ok, start: res_body.ok.instructions.len, failed: opt[refusal.Error].none{}};
+    var w: Work  = Work{site: emit.init(c.m, u.f, res_body.ok, ?scratch), basis: c.basis, ctx: target_basis.context_of(c.basis), caps: ?c.t.caps, t: c.t, plans: res_plans.ok, start: res_body.ok.instructions.len, failed: opt[refusal.Error].none{}};
     var b: *Body = res_body.ok;
 
     # whether anything is of an expanded format, the body's types asked first
@@ -1082,7 +1271,7 @@ fun encoded_format(w: *Work, ty: Type) opt[Format] {
 # none where it stays
 fun kept_type(w: *Work, ty: Type) opt[Type] {
     val opt_format: opt[Format] = encoded_format(w, ty);
-    if (sel opt_format.some) { ret opt[Type].some{encoding(w, opt_format.some)}; }
+    if (sel opt_format.some) { ret opt[Type].some{encoding_of(w, ty, opt_format.some)}; }
     val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?w.site.m.types, ty);
     if (sel res_shape.err) {
         fail(w, refusal.Error.ir{module.Error.types{res_shape.err}});
@@ -1106,7 +1295,7 @@ fun kept_type(w: *Work, ty: Type) opt[Type] {
         res_params.ok[i] = fs.params.data[i];
         val opt_param: opt[Format] = encoded_format(w, fs.params.data[i]);
         if (sel opt_param.some) {
-            res_params.ok[i] = encoding(w, opt_param.some);
+            res_params.ok[i] = encoding_of(w, fs.params.data[i], opt_param.some);
             any              = true;
         }
         i = i + 1;
@@ -1116,7 +1305,7 @@ fun kept_type(w: *Work, ty: Type) opt[Type] {
         res_results.ok[i] = fs.results.data[i];
         val opt_result: opt[Format] = encoded_format(w, fs.results.data[i]);
         if (sel opt_result.some) {
-            res_results.ok[i] = encoding(w, opt_result.some);
+            res_results.ok[i] = encoding_of(w, fs.results.data[i], opt_result.some);
             any               = true;
         }
         i = i + 1;
@@ -1157,7 +1346,7 @@ fun keep_encodings(w: *Work) err[refusal.Error] {
             val ty:         Type        = b.values.data[v].type;
             val opt_format: opt[Format] = encoded_format(w, ty);
             if (sel opt_format.some) {
-                val nt: Type = encoding(w, opt_format.some);
+                val nt: Type = encoding_of(w, ty, opt_format.some);
                 b.values.data[v].type = nt;
                 val def: Def = b.values.data[v].def;
                 if (sel def.constant) {
@@ -1211,8 +1400,13 @@ fun kept_constant(w: *Work, v: Value, c: Constant, nt: Type) err[refusal.Error] 
     if (sel res_data.err) { ret err[refusal.Error].err{refusal.Error.ir{res_data.err}}; }
     val data: ConstantData = res_data.ok;
     var made: ConstantData = ConstantData.zero{nt};
-    if (sel data.float)   { made = ConstantData.integer{Bits{type: nt, words: data.float.words}}; }
-    or (sel data.spec)    { made = ConstantData.spec{Spec{id: data.spec.id, default: Bits{type: nt, words: data.spec.default.words}}}; }
+    if (sel data.float) { made = ConstantData.integer{Bits{type: nt, words: data.float.words}}; }
+    or (sel data.spec)  { made = ConstantData.spec{Spec{id: data.spec.id, default: Bits{type: nt, words: data.spec.default.words}}}; }
+    or (sel data.aggregate) {
+        val res_kept: res[ConstantData, refusal.Error] = kept_lanes(w, data.aggregate, nt);
+        if (sel res_kept.err) { ret err[refusal.Error].err{res_kept.err}; }
+        made = res_kept.ok;
+    }
     or (!(sel data.zero)) { ret err[refusal.Error].err{refusal.Error.reason{"a constant of a format kept as its encoding that is no number"}}; }
     val res_made: res[Constant, module.Error] = module.add_constant(w.site.m, made);
     if (sel res_made.err) { ret err[refusal.Error].err{refusal.Error.ir{res_made.err}}; }
@@ -1228,6 +1422,31 @@ fun kept_constant(w: *Work, v: Value, c: Constant, nt: Type) err[refusal.Error] 
     val res_kept: res[bool, allocator.Error] = map.insert[u32, Value](?b.constants, now, v);
     if (sel res_kept.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_kept.err}}; }
     ret err[refusal.Error].ok{};
+}
+
+# a vector constant of a format kept as its encoding made the vector of its
+# lanes' bits, a vector of type nt
+fun kept_lanes(w: *Work, v: Aggregate, nt: Type) res[ConstantData, refusal.Error] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?w.site.m.types, nt);
+    if (sel res_shape.err)          { ret res[ConstantData, refusal.Error].err{refusal.Error.ir{module.Error.types{res_shape.err}}}; }
+    if (!(sel res_shape.ok.vector)) { ret res[ConstantData, refusal.Error].err{refusal.Error.reason{"a constant of a format kept as its encoding that is no number"}}; }
+    val lane:      Type                            = res_shape.ok.vector.element;
+    val res_lanes: res[*Constant, allocator.Error] = allocator.zallocate[Constant](w.site.scratch, v.elements.size);
+    if (sel res_lanes.err) { ret res[ConstantData, refusal.Error].err{refusal.Error.alloc{res_lanes.err}}; }
+    var k: usize = 0;
+    for (k < v.elements.size) {
+        val res_data: res[ConstantData, module.Error] = module.constant_data(w.site.m, v.elements.data[k]);
+        if (sel res_data.err) { ret res[ConstantData, refusal.Error].err{refusal.Error.ir{res_data.err}}; }
+        val data: ConstantData = res_data.ok;
+        var made: ConstantData = ConstantData.zero{lane};
+        if (sel data.float)   { made = ConstantData.integer{Bits{type: lane, words: data.float.words}}; }
+        or (!(sel data.zero)) { ret res[ConstantData, refusal.Error].err{refusal.Error.reason{"a constant of a format kept as its encoding that is no number"}}; }
+        val res_made: res[Constant, module.Error] = module.add_constant(w.site.m, made);
+        if (sel res_made.err) { ret res[ConstantData, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+        res_lanes.ok[k] = res_made.ok;
+        k               = k + 1;
+    }
+    ret res[ConstantData, refusal.Error].ok{ConstantData.aggregate{Aggregate{type: nt, elements: Slice[Constant]{data: res_lanes.ok, size: v.elements.size}}}};
 }
 
 # whether a format is computed by helpers alone: the build holds none that

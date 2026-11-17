@@ -179,7 +179,7 @@ types
   signature   = "fun" [ "[" name "]" ] "(" [ param { "," param } ] ")" [ results ] ;
   param       = type [ "sext" | "zext" ] ;
   results     = param | "(" param { "," param } ")" ;
-  handle      = "handle" "[" name { "," ( uint | type ) } "]" ;  ; the target's kind, then its operands
+  handle      = "handle" "[" name { "," ( uint | [ "signed" ] type ) } "]" ;  ; the target's kind, then its operands
 
   typedef     = ( "rec" | "uni" ) ident [ "packed" ] [ "align" uint ] "{" { member } "}" ;
   member      = ident ":" type [ "at" uint ] ";" ;
