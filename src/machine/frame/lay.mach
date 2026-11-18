@@ -83,6 +83,7 @@ use mirl.machine.function;
 use mirl.machine.function.Function;
 use mirl.machine.function.SlotData;
 use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
 use mirl.machine.operand.Slot;
 use mirl.machine.storage;
 use mirl.machine.storage.Storage;
@@ -146,13 +147,10 @@ pub rec Request {
 # stackless: the row has no stack in memory and the function needs one
 # stack:     the row homes its stack pointer in no register
 # unlocated: a register the frame reads that the locations refused, and why
-# pointer:   the frame needs a frame pointer and the row has none
+# pointer:   the frame needs a frame pointer, or a base register beside it,
+#            and the row has none
 # taken:     the allocation took the frame pointer the frame keeps, or an
 #            inline block's footprint writes it
-# base:      a realigned frame that also allocates dynamically, which needs a
-#            base register the row does not state
-# moving:    a realigned frame whose stack pointer an instruction that is not a
-#            call or return moves, which moves every local addressed off it
 # record:    the row's record saves the return address away from where a call
 #            pushes it
 # outgoing:  an outgoing slot in a function that makes no call
@@ -194,8 +192,6 @@ pub tag Error: u8 {
     unlocated: location.Unlocated;
     pointer;
     taken: rf.Id;
-    base;
-    moving;
     record;
     outgoing: Slot;
     slot:     Slot;
@@ -409,6 +405,25 @@ pub fun keeps_pointer(f: *Function, x: *Facts, r: Request) res[bool, Error] {
     if (sel opt_stack_pointer.none)                         { ret res[bool, Error].err{Error.stack{}}; }
     if (needs_pointer(x, f, frame, held(row).context.view)) { ret res[bool, Error].ok{true}; }
     ret unreached(f, r, frame, x, opt_stack_pointer.some);
+}
+
+# whether a frame keeps the row's base register (`Keeper.base`), which the
+# allocator's allowed set must then leave out as it does the frame pointer: a
+# frame that realigns its stack pointer and moves it otherwise, by a dynamic
+# allocation or an instruction that is not a call or return, holds the
+# realigned stack pointer there for the life of the function and addresses
+# its locals off it
+# ---
+# f:   the function
+# x:   its facts, as `facts` reads them
+# r:   the convention and locations
+# ret: whether it keeps one
+pub fun keeps_base(f: *Function, x: *Facts, r: Request) bool {
+    val row: *Resolved = r.convention;
+    if (!(sel row.row.stack.memory)) { ret false; }
+    if (r.naked)                     { ret false; }
+    val frame: Frame = row.row.stack.memory;
+    ret (x.dynamic || x.moves) && realigns(f, frame.align);
 }
 
 # the facts of a function before allocation, which `keeps_pointer` reads and
@@ -661,7 +676,7 @@ fun place(base: Base, fixed: i64, per: i64, scale: u8) Place {
 
 fun init(a: *allocator.Allocator, stack: rf.Id) Plan {
     ret Plan{
-        layout:    Layout{entry: 0, size: record.bytes(0), outgoing: 0, red: 0, stack: stack, pointer: rf.NONE, at: 0, realign: 0, slots: vector.init[Place](a), saves: vector.init[Save](a), reserved: vector.init[Emergency](a), probe: opt[id.Symbol].none{}},
+        layout:    Layout{entry: 0, size: record.bytes(0), outgoing: 0, red: 0, stack: stack, pointer: rf.NONE, at: 0, realign: 0, base: rf.NONE, slots: vector.init[Place](a), saves: vector.init[Save](a), reserved: vector.init[Emergency](a), probe: opt[id.Symbol].none{}},
         added:     vector.init[SlotData](a),
         spots:     vector.init[Spot](a),
         facts:     scan.none(a),
@@ -692,7 +707,7 @@ fun relay(p: *Plan) {
     vector.clear[Emergency](?p.layout.reserved);
     vector.clear[SlotData](?p.added);
     vector.clear[Spot](?p.spots);
-    p.layout  = Layout{entry: 0, size: record.bytes(0), outgoing: 0, red: 0, stack: p.layout.stack, pointer: rf.NONE, at: 0, realign: 0, slots: p.layout.slots, saves: p.layout.saves, reserved: p.layout.reserved, probe: opt[id.Symbol].none{}};
+    p.layout  = Layout{entry: 0, size: record.bytes(0), outgoing: 0, red: 0, stack: p.layout.stack, pointer: rf.NONE, at: 0, realign: 0, base: rf.NONE, slots: p.layout.slots, saves: p.layout.saves, reserved: p.layout.reserved, probe: opt[id.Symbol].none{}};
     p.empty   = true;
     p.top     = 0;
     p.pushed  = 0;
@@ -843,6 +858,37 @@ fun laid_as(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regis
     }
     if (sel res_laid.err) { ret err[Error].err{res_laid.err}; }
     ret err[Error].ok{};
+}
+
+# whether an inline block writes a register sharing storage with `reg`, as
+# its implicit locations state
+pub fun block_writes(file: *rf.File, d: *InstructionData, reg: rf.Id) bool {
+    val op: instruction.Opcode = d.opcode;
+    if (!(sel op.inline)) { ret false; }
+    val opt_row: opt[*rf.Register] = rf.row_of(file, reg);
+    if (sel opt_row.none) { ret false; }
+    var m: usize = 0;
+    for (m < d.implicit.size) {
+        val l: Physical = d.implicit.data[m].location;
+        if (sel l.register) {
+            val opt_other: opt[*rf.Register] = rf.row_of(file, l.register);
+            if (sel opt_other.some) {
+                if (d.implicit.data[m].write && rf.overlap(file, opt_row.some, opt_other.some)) { ret true; }
+            }
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
+# whether any inline block of a function writes a register sharing storage with `reg`
+fun blocks_write(f: *Function, file: *rf.File, reg: rf.Id) bool {
+    var i: usize = 0;
+    for (i < f.instructions.len) {
+        if (block_writes(file, ?f.instructions.data[i], reg)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # whether a frame's record is its first pair saved, the shape compact unwind
@@ -1093,10 +1139,9 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
         keeper = frame.pointer.register;
         kept   = keeper.always || needs || keep;
     }
-    or (needs)                { ret res[bool, Error].err{Error.pointer{}}; }
-    if (realign && x.dynamic) { ret res[bool, Error].err{Error.base{}}; }
-    if (realign && x.moves)   { ret res[bool, Error].err{Error.moving{}}; }
-    var fp: rf.Id = rf.NONE;
+    or (needs) { ret res[bool, Error].err{Error.pointer{}}; }
+    val based: bool  = realign && (x.dynamic || x.moves);
+    var fp:    rf.Id = rf.NONE;
     if (kept) {
         if (sel regs.pointer.none) { ret res[bool, Error].err{Error.pointer{}}; }
         fp = regs.pointer.some;
@@ -1104,6 +1149,14 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
         if (sel res_taken.err) { ret res[bool, Error].err{res_taken.err}; }
         if (res_taken.ok)      { ret res[bool, Error].err{Error.taken{fp}}; }
         p.layout.pointer = fp;
+    }
+    # a realigned frame whose stack pointer moves addresses its locals off the base register instead
+    if (based) {
+        if (sel regs.base.none) { ret res[bool, Error].err{Error.pointer{}}; }
+        p.layout.base = regs.base.some;
+        val res_taken: res[bool, Error] = written(x, at, p.layout.base);
+        if (sel res_taken.err)                                                       { ret res[bool, Error].err{res_taken.err}; }
+        if (res_taken.ok && !blocks_write(f, regs.context.view.file, p.layout.base)) { ret res[bool, Error].err{Error.taken{p.layout.base}}; }
     }
     val high:   bool   = kept && !low;
     var linked: bool   = false;
@@ -1132,11 +1185,15 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
         val err_pushed: err[Error] = push_spot(p, regs.context.view, conv.row, link);
         if (sel err_pushed.err) { ret res[bool, Error].err{err_pushed.err}; }
     }
+    if (based && !listed(regs.preserved, p.layout.base)) {
+        val err_pushed: err[Error] = push_spot(p, regs.context.view, conv.row, p.layout.base);
+        if (sel err_pushed.err) { ret res[bool, Error].err{err_pushed.err}; }
+    }
     var i: usize = 0;
     for (i < regs.preserved.size) {
         val reg:  rf.Id = regs.preserved.data[i];
-        var save: bool  = false;
-        if (reg != p.layout.stack && reg != fp) {
+        var save: bool  = reg == p.layout.base;
+        if (!save && reg != p.layout.stack && reg != fp) {
             val res_wrote: res[bool, Error] = written(x, at, reg);
             if (sel res_wrote.err) { ret res[bool, Error].err{res_wrote.err}; }
             save = res_wrote.ok;
@@ -1385,6 +1442,7 @@ fun layout(a: *allocator.Allocator, f: *Function, conv: *Resolved, regs: *Regist
                 or        { at_ = place(Base.stack{}, locals::i64, whole - d, scale); }
             }
             or (kept && !realign) { at_ = place(Base.frame{}, d - total - pointer_at, 0 - per_i, scale); }
+            or (based)            { at_ = place(Base.aligned{}, d, out_i, scale); }
             or                    { at_ = place(Base.stack{}, d - shift, out_i, scale); }
         }
         vector.push[Place](?p.layout.slots, at_);
