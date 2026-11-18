@@ -29,7 +29,7 @@ The IR is specified in [doc/ir.md](doc/ir.md).
 
 ## Building
 
-mirl builds with mach 6.10.1 or later.
+mirl builds with mach 7.
 
 ```
 mach dep pull .
