@@ -290,6 +290,10 @@ decorators
                             it secret, bare for one secret whole or with the
                             byte ranges of one secret in part, and only on a
                             signature with a result (see ir.md 7.1)
+  #[result_follows]         the result of a function holds a secret only where
+                            an argument does: formed from its arguments alone,
+                            touching no memory and calling nothing (see ir.md
+                            7.1)
   #[public_pointers(i, ...)] the parameters a function's declaration states
                             are pointers to storage holding no secret, each
                             its position, ascending and none past the
