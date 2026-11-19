@@ -59,6 +59,14 @@
 # fixes, and nothing branches or reads a value to decide anything, so the
 # pass keeps constant time.
 #
+# an operation of the source the first run takes lane by lane where a unit
+# holds its lanes, because no unit the build meets computes it there, is given
+# as a warning (`mirl.target.warning.Scalarized`), once per source position and
+# only where the operation carries a location, so a module lowered without
+# debug information gives none. a lane no unit holds, as on a target with no
+# vector unit, is no such warning, nor is an operation the abi legalisation
+# made, which the second run takes.
+#
 # what it refuses, each by its own reason: a vector no unit holds at an entry,
 # a call or a return after the abi legalisation; a vector no unit holds that
 # an atomic, an inline block, a target op or an aggregate member reads or
@@ -88,6 +96,10 @@ use mirl.fold.word;
 use mirl.ir.body;
 use mirl.ir.body.Records;
 use mirl.ir.contents;
+use mirl.ir.debug.place;
+use mirl.ir.debug.record.Location;
+use mirl.ir.debug.record.Position;
+use debug_table: mirl.ir.debug.table;
 use mirl.ir.function.Body;
 use mirl.ir.id.Block;
 use mirl.ir.id.Instruction;
@@ -124,6 +136,8 @@ use mirl.target.basis;
 use mirl.target.capability;
 use target_layout: mirl.target.layout;
 use target_record: mirl.target.record;
+use mirl.target.warning.Scalarized;
+use mirl.target.warning.Warning;
 
 # the passes: each adds and removes instructions and block parameters and
 # never touches an edge's target or a block. the first runs ahead of every
@@ -199,25 +213,30 @@ rec Parameter {
 
 # the walk of one function
 # ---
-# w:      the lanes
-# late:   the run after the abi legalisation
-# little: the target's bytes are little endian
-# marks:  one per instruction the function had when the walk began
-# order:  the instructions to legalise, each after those defining what it reads
-# gone:   the instructions legalised that nothing takes the place of, removed
-#         at the end
-# params: the parameters split
-# before: for each block, how many parameters it had before its own were
-#         split, UNTOUCHED for a block none of whose were
+# w:        the lanes
+# late:     the run after the abi legalisation
+# little:   the target's bytes are little endian
+# marks:    one per instruction the function had when the walk began
+# order:    the instructions to legalise, each after those defining what it
+#           reads
+# gone:     the instructions legalised that nothing takes the place of,
+#           removed at the end
+# params:   the parameters split
+# before:   for each block, how many parameters it had before its own were
+#           split, UNTOUCHED for a block none of whose were
+# warnings: the list the warnings are given to
+# scalar:   the open rewrite took a run a unit holds lane by lane
 rec Walk {
-    w:      Work;
-    late:   bool;
-    little: bool;
-    marks:  vector.Vector[Mark];
-    order:  vector.Vector[Instruction];
-    gone:   vector.Vector[Instruction];
-    params: vector.Vector[Parameter];
-    before: vector.Vector[u32];
+    w:        Work;
+    late:     bool;
+    little:   bool;
+    marks:    vector.Vector[Mark];
+    order:    vector.Vector[Instruction];
+    gone:     vector.Vector[Instruction];
+    params:   vector.Vector[Parameter];
+    before:   vector.Vector[u32];
+    warnings: *vector.Vector[Warning];
+    scalar:   bool;
 }
 
 val UNTOUCHED: u32 = 0xffffffff;
@@ -332,18 +351,23 @@ fun packed_whole(wk: *Walk, d: *InstructionData, row: *Row, lane: Type) bool {
     ret lanes.packed(?wk.w, d.opcode, lane, to_lane(wk, d, row, lane), c, Slice[Type]{data: ?all[0], size: n});
 }
 
-# the lane type an operation is stated at: its first vector operand's, a
-# select's first selected vector's, or its result's where it reads none
-fun subject_lane(wk: *Walk, d: *InstructionData) Type {
+# the type an operation is stated at: its first vector operand's, a select's
+# first selected vector's, or its result's where it reads none
+fun subject(wk: *Walk, d: *InstructionData) Type {
     var k: usize = 0;
     if (d.opcode == opcode_table.SELECT) { k = 1; }
     for (k < d.operands.len) {
         val ty: Type = lanes.type_of(?wk.w, d.operands.data[k]);
-        if (is_vector(wk, ty)) { ret element(wk, ty); }
+        if (is_vector(wk, ty)) { ret ty; }
         k = k + 1;
     }
-    if (d.results.len > 0) { ret element(wk, lanes.type_of(?wk.w, d.results.data[0])); }
+    if (d.results.len > 0) { ret lanes.type_of(?wk.w, d.results.data[0]); }
     ret 0;
+}
+
+# the lane type an operation is stated at
+fun subject_lane(wk: *Walk, d: *InstructionData) Type {
+    ret element(wk, subject(wk, d));
 }
 
 # whether a type is an integer wider than the widest the target computes at,
@@ -832,6 +856,7 @@ fun lanewise(wk: *Walk, c: *Copied) Slice[Left] {
         val run: Run = runs.data[r];
         if (!run.scalar && lanes.packed(w, c.code, lane, to, run.count, Slice[Type]{data: ?all[0], size: n})) { lanewise_run(wk, c, run, ?out); }
         or {
+            if (!run.scalar) { wk.scalar = true; }
             val each: Slice[Run] = lanes_of(wk, run);
             var e:    usize      = 0;
             for (e < each.size) {
@@ -906,6 +931,7 @@ fun reduce_run(wk: *Walk, c: *Copied, x: Value, r: Run, acc: opt[Value]) opt[Val
         if (have) { ret opt[Value].some{combine(wk, c.code, into, one)}; }
         ret opt[Value].some{one};
     }
+    if (!r.scalar) { wk.scalar = true; }
     val each: Slice[Run] = lanes_of(wk, r);
     var e:    usize      = 0;
     for (e < each.size && sel w.failed.none) {
@@ -1396,9 +1422,12 @@ fun rewrite(wk: *Walk, i: Instruction) err[refusal.Error] {
     val d:           *InstructionData           = ?b.instructions.data[i];
     val form:        Form                       = wk.marks.data[i].form;
     val k:           Block                      = wk.marks.data[i].block;
+    val located:     opt[Location]              = d.metadata.location;
+    val stated:      Type                       = subject(wk, d);
     val res_copy_of: res[Copied, refusal.Error] = copy_of(wk, d);
     if (sel res_copy_of.err) { ret err[refusal.Error].err{res_copy_of.err}; }
     var c: Copied = res_copy_of.ok;
+    wk.scalar = false;
     lanes.begin(w, i, k, position(b, k, i));
     var left: Slice[Left] = Slice[Left]{data: nil, size: 0};
     var one:  [1]Left;
@@ -1466,6 +1495,40 @@ fun rewrite(wk: *Walk, i: Instruction) err[refusal.Error] {
         val res_listed: res[usize, allocator.Error] = vector.push[Instruction](?wk.gone, i);
         if (sel res_listed.err) { ret err[refusal.Error].err{lost(res_listed.err)}; }
     }
+    if (wk.scalar && !wk.late) {
+        if (sel located.some) { ret warn(wk, Scalarized{function: w.site.f, location: located.some, opcode: c.code, vector: stated}); }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the position of a location, none where the debug table holds none
+fun position_of(wk: *Walk, l: Location) opt[Position] {
+    val res_position: res[Position, debug_table.Error] = place.position(?wk.w.site.m.debug, l);
+    if (sel res_position.err) { ret opt[Position].none{}; }
+    ret opt[Position].some{res_position.ok};
+}
+
+# whether two locations name one source position
+fun same_place(wk: *Walk, x: Location, y: Location) bool {
+    if (x == y) { ret true; }
+    val opt_x: opt[Position] = position_of(wk, x);
+    val opt_y: opt[Position] = position_of(wk, y);
+    if (sel opt_x.none) { ret false; }
+    if (sel opt_y.none) { ret false; }
+    ret opt_x.some.file == opt_y.some.file && opt_x.some.line == opt_y.some.line && opt_x.some.column == opt_y.some.column;
+}
+
+# give the warning that an operation was taken lane by lane, unless one at the
+# same source position was given already
+fun warn(wk: *Walk, s: Scalarized) err[refusal.Error] {
+    var n: usize = 0;
+    for (n < wk.warnings.len) {
+        val given: Warning = wk.warnings.data[n];
+        if (sel given.scalarized && same_place(wk, given.scalarized.location, s.location)) { ret err[refusal.Error].ok{}; }
+        n = n + 1;
+    }
+    val res_pushed: res[usize, allocator.Error] = vector.push[Warning](wk.warnings, Warning.scalarized{s});
+    if (sel res_pushed.err) { ret err[refusal.Error].err{lost(res_pushed.err)}; }
     ret err[refusal.Error].ok{};
 }
 
@@ -1622,6 +1685,8 @@ fun visit(u: *Unit, late: bool) res[bool, refusal.Error] {
     wk.gone      = vector.init[Instruction](?keep);
     wk.params    = vector.init[Parameter](?keep);
     wk.before    = vector.init[u32](?keep);
+    wk.warnings  = c.warnings;
+    wk.scalar    = false;
 
     val res_any: res[bool, refusal.Error] = scan(?wk);
     if (sel res_any.err) { ret res_any; }
