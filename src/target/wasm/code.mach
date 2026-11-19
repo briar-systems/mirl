@@ -43,15 +43,20 @@
 #
 # an inline assembly block (mirl.target.wasm.assembly) reads every operand from
 # where it is held into a local of its own, so no operand of it stays on the
-# stack, and pushes each result from its local once its code has run.
+# stack, and pushes each result from its local once its code has run. in a
+# constant-time function each of its instructions is an inline seed
+# (`walk.Seed.inline`), so a secret it stores is refused, as nothing states
+# what memory a block writes.
 #
 # a constant-time function's code is walked once written. each memory
-# instruction a load or an atomic access is written in whose metadata states
-# what it reads, secret with its secret mark or public with the public flag,
-# seeds the walk with that secrecy at its offset (`walk.Seed.access`), by its
-# one access, the first of its footprint. an atomic read-modify-write is a
-# load and a store of the one address, each seeded alike, so the store follows
-# what the access states. any other store states nothing.
+# instruction a load, a store or an atomic access is written in whose metadata
+# states its secrecy, secret with its secret mark or public with the public
+# flag, seeds the walk with that secrecy at its offset (`walk.Seed.access`), by
+# its one access, the first of its footprint, as on a machine target. a load or
+# store of a frame slot is placed in the frame off the frame base local
+# (`placement`, a within seed of origin `walk.Origin.base`), and each slot is
+# stated private, or one object with its public bytes typed, as on a machine
+# target (`frame_seeds`).
 #
 # each call in such a function is walked through a model of its callee
 # (`mirl.machine.emit.timed`, `stream_model`), its extents off the local that
@@ -95,6 +100,7 @@ use mirl.ir.debug.record.Location;
 use ir_function: mirl.ir.function;
 use mirl.ir.function.Body;
 use mirl.ir.function.in_constant_time;
+use mirl.ir.global.Range;
 use mirl.ir.id.Constant;
 use mirl.ir.id.Function;
 use mirl.ir.id.Global;
@@ -104,6 +110,7 @@ use mirl.ir.id.Value;
 use mirl.ir.instruction.Edge;
 use mirl.ir.instruction.InstructionData;
 use Spot: mirl.ir.instruction.Place;
+use mirl.ir.metadata;
 use mirl.ir.module;
 use opcode_row: mirl.ir.opcode.row;
 use mirl.ir.opcode.row.Immediate;
@@ -167,6 +174,8 @@ pub rec Site {
 }
 
 # what the code of one function is emitted with
+# ---
+# opened: where the code of the instruction being selected begins, the pushes of its operands included
 pub rec Emitter {
     u:      *Unit;
     f:      Function;
@@ -180,6 +189,8 @@ pub rec Emitter {
     base:   u32;
     entry:  u32;
     stated: vector.Vector[walk.Seed];
+    points: vector.Vector[walk.Declassify];
+    opened: usize;
     sites:  vector.Vector[Site];
     rows:   vector.Vector[line.Row];
     tail:   u32;
@@ -413,6 +424,7 @@ fun push(e: *Emitter, v: Value) {
 # source location, the instruction's stated again before its own code
 fun tree(e: *Emitter, i: Instruction) {
     here(e, i);
+    val start: usize            = e.w.out.len;
     val d:     *InstructionData = ?e.b.instructions.data[i];
     var first: u32              = 0;
     if (d.operands.len > 0) { first = width_of(e, d.operands.data[0]); }
@@ -435,7 +447,9 @@ fun tree(e: *Emitter, i: Instruction) {
         }
         if (pushes.len > 0) { here(e, i); }
     }
-    if (ok(e)) { instruction(e, i, d); }
+    if (!ok(e)) { ret; }
+    e.opened = start;
+    instruction(e, i, d);
 }
 
 # an instruction that stays on no stack: its tree, then its results into their locals
@@ -957,6 +971,67 @@ fun state(e: *Emitter, d: *InstructionData) {
     if (sel res_pushed.err) { lost(e, res_pushed.err); }
 }
 
+# the frame base of `e`'s function, the origin of each frame statement of its walk
+fun frame_origin(e: *Emitter) walk.Origin {
+    ret walk.Origin.base{walk.Entry{space: wasm_kind.LOCALS, index: e.base}};
+}
+
+# where a load or store `d` of `bytes` through address `at` of `e`'s function lies, from the frame base local: exactly
+# at its bytes where `at` is the address of a frame slot moved only by constants and the access lies within the slot,
+# else within the range of the slot `d` states (`metadata.Extent`), as each access of a loop the bulk legalisation
+# makes of a copy or fill states the range it moves, which an index moves the address over. the first holds by
+# construction: `slot` writes a slot's address as the frame base local plus the slot's offset, a move by a constant
+# adds the constant, the memory instruction adds no offset of its own, and nothing writes the frame base local after
+# the frame code takes the frame, as no other code of the emitter names it and an inline block names no local but its
+# operands' own (`assembly`). the second is the legalisation's statement, as a machine target's within seed is. none
+# for an address formed any other way, as by an index known only when the code runs
+fun placement(e: *Emitter, d: *InstructionData, at: Value, bytes: u64) opt[walk.Within] {
+    if (e.base == local.NONE || bytes == 0) { ret opt[walk.Within].none{}; }
+    val opt_slot: opt[Instruction] = slots_of.slot_of(e.b, at);
+    if (sel opt_slot.none) { ret opt[walk.Within].none{}; }
+    val slot: Instruction = opt_slot.some;
+    if (!(sel e.b.instructions.data[slot].place.placed)) { ret opt[walk.Within].none{}; }
+    val opt_size: opt[u64] = slots_of.slot_size(e.u.l, e.b, slot);
+    if (sel opt_size.none) { ret opt[walk.Within].none{}; }
+    var where:      walk.Within = walk.Within{at: e.w.out.len::u64, access: walk.Accessor.index{0}, offset: 0, length: bytes, origin: frame_origin(e)};
+    val opt_offset: opt[u64]    = slots_of.offset_in(e.u.m, e.u.l, e.b, at);
+    if (sel opt_offset.some) {
+        if (opt_offset.some + bytes <= opt_size.some) {
+            where.offset = (e.slots.data[slot] + opt_offset.some)::i64;
+            ret opt[walk.Within].some{where};
+        }
+    }
+    val x: metadata.Extent = d.metadata.extent;
+    if (x.length < bytes || x.offset + x.length < x.offset || x.offset + x.length > opt_size.some) { ret opt[walk.Within].none{}; }
+    where.offset = (e.slots.data[slot] + x.offset)::i64;
+    where.length = x.length;
+    ret opt[walk.Within].some{where};
+}
+
+# the within seed of the load or store `d` of `bytes` written next through address `at`, for a constant-time function,
+# where `placement` places it
+fun placed(e: *Emitter, d: *InstructionData, at: Value, bytes: u64) {
+    if (!in_constant_time(e.u.m.functions.data[e.f].data.constant_time)) { ret; }
+    val opt_where: opt[walk.Within] = placement(e, d, at, bytes);
+    if (sel opt_where.none) { ret; }
+    val res_pushed: res[usize, allocator.Error] = vector.push[walk.Seed](?e.stated, walk.Seed.within{opt_where.some});
+    if (sel res_pushed.err) { lost(e, res_pushed.err); }
+}
+
+# the declassify point of a declassify, for a constant-time function. it writes no code, so the value its operand's
+# push leaves on top of the stack is its result: the point stands after the last instruction written, which pushed it.
+# an operand that pushes no code of its own names no instruction to stand after, and is refused
+fun declassified(e: *Emitter, i: Instruction) {
+    if (!in_constant_time(e.u.m.functions.data[e.f].data.constant_time)) { ret; }
+    if (e.w.out.len == e.opened || e.w.last < e.opened) {
+        invariant(e, i);
+        ret;
+    }
+    val point:      walk.Declassify             = walk.Declassify{at: e.w.last::u64, length: (e.w.out.len - e.w.last)::u64, side: walk.Side.after{}, place: walk.Place.value{0}};
+    val res_pushed: res[usize, allocator.Error] = vector.push[walk.Declassify](?e.points, point);
+    if (sel res_pushed.err) { lost(e, res_pushed.err); }
+}
+
 # the site of the call written next for instruction `d`, for a constant-time function, and the written seed of each
 # result of it the ir declares secret
 fun site(e: *Emitter, d: *InstructionData, callee: opt[Function]) {
@@ -1149,6 +1224,7 @@ fun assembled(e: *Emitter, i: Instruction, d: *InstructionData) {
     var code: assembly.Read = res_read.ok;
     fin { assembly.dnit(?code); }
     if (code.fenced) { writer.begin(e.w, gen_row_index.BLOCK); }
+    inlined(e, ?code);
     var n: usize = 0;
     for (n < code.code.len) {
         val res_pushed: res[usize, allocator.Error] = vector.push[u8](?e.w.out, code.code.data[n]);
@@ -1166,6 +1242,21 @@ fun assembled(e: *Emitter, i: Instruction, d: *InstructionData) {
             writer.index(e.w, gen_row_index.LOCALGET, binds.data[k].number::u32);
             mask(e, width_of(e, d.results.data[r]));
             r = r + 1;
+        }
+        k = k + 1;
+    }
+}
+
+# the inline seed of each instruction of block `code` about to be written, for a constant-time function: the walk takes
+# a secret such an instruction stores as stored where nothing states memory may hold one
+fun inlined(e: *Emitter, code: *assembly.Read) {
+    if (!in_constant_time(e.u.m.functions.data[e.f].data.constant_time)) { ret; }
+    var k: usize = 0;
+    for (k < code.starts.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[walk.Seed](?e.stated, walk.Seed.inline{(e.w.out.len + code.starts.data[k])::u64});
+        if (sel res_pushed.err) {
+            lost(e, res_pushed.err);
+            ret;
         }
         k = k + 1;
     }
@@ -1701,7 +1792,10 @@ fun instruction(e: *Emitter, i: Instruction, d: *InstructionData) {
         call(e, i, d);
         ret;
     }
-    if (op == table.DECLASSIFY) { ret; }
+    if (op == table.DECLASSIFY) {
+        declassified(e, i);
+        ret;
+    }
     if (op == table.ASM) {
         assembled(e, i, d);
         ret;
@@ -1731,6 +1825,7 @@ fun instruction(e: *Emitter, i: Instruction, d: *InstructionData) {
         var align: u64   = 0;
         if (op == table.LOAD) { align = alignment_of(d, 1); }
         state(e, d);
+        if (op == table.LOAD) { placed(e, d, d.operands.data[0], natural(code, w)); }
         writer.memory(e.w, load_row(code, w), 0, aligned(align, natural(code, w)));
         ret;
     }
@@ -1744,7 +1839,11 @@ fun instruction(e: *Emitter, i: Instruction, d: *InstructionData) {
         val code:  u32   = code_of(e, v);
         val w:     u32   = width_of(e, v);
         var align: u64   = 0;
-        if (op == table.STORE) { align = alignment_of(d, 0); }
+        state(e, d);
+        if (op == table.STORE) {
+            align = alignment_of(d, 0);
+            placed(e, d, d.operands.data[0], natural(code, w));
+        }
         writer.memory(e.w, store_row(code, w), 0, aligned(align, natural(code, w)));
         ret;
     }
@@ -2087,11 +2186,12 @@ pub fun function(u: *Unit, f: Function, out: *vector.Vector[u8], fixups: *vector
     }
     var w: Writer = writer.init(u.a, u.codec, u.ctx, ?u.features);
     fin { writer.dnit(?w); }
-    var e: Emitter = Emitter{u: u, f: f, b: b, s: res_analysed.ok, l: ?l, w: ?w, frames: vector.init[Frame](u.a), slots: vector.init[u64](u.a), frame: 0, base: local.NONE, entry: local.NONE, stated: vector.init[walk.Seed](u.a), sites: vector.init[Site](u.a), rows: vector.init[line.Row](u.a), tail: NONE, failed: opt[Error].none{}};
+    var e: Emitter = Emitter{u: u, f: f, b: b, s: res_analysed.ok, l: ?l, w: ?w, frames: vector.init[Frame](u.a), slots: vector.init[u64](u.a), frame: 0, base: local.NONE, entry: local.NONE, stated: vector.init[walk.Seed](u.a), points: vector.init[walk.Declassify](u.a), opened: 0, sites: vector.init[Site](u.a), rows: vector.init[line.Row](u.a), tail: NONE, failed: opt[Error].none{}};
     fin {
         vector.dnit[Frame](?e.frames);
         vector.dnit[u64](?e.slots);
         vector.dnit[walk.Seed](?e.stated);
+        vector.dnit[walk.Declassify](?e.points);
         vector.dnit[Site](?e.sites);
         vector.dnit[line.Row](?e.rows);
     }
@@ -2133,6 +2233,80 @@ pub fun function(u: *Unit, f: Function, out: *vector.Vector[u8], fixups: *vector
         n = n + 1;
     }
     if (in_constant_time(u.m.functions.data[f].data.constant_time)) { ret timed(u, f, b, ?l, ?e); }
+    ret err[Error].ok{};
+}
+
+# whether every use of the address of alloca `slot` of `e`'s function is a move towards, and finally the address of, a
+# load or a store `placement` places: so no access the walk does not place reaches the slot. an address an access it
+# does not place takes, as one moved by an index, an atomic access's, or one used any other way, as passed to a call or
+# an inline block or stored, makes it not so. an instruction taken out of the body, as a copy or fill the legalisation
+# lowered, uses nothing
+fun sealed_slot(e: *Emitter, slot: Instruction) bool {
+    var k: usize = 0;
+    for (k < e.b.instructions.len) {
+        val d:    *InstructionData = ?e.b.instructions.data[k];
+        val spot: Spot             = d.place;
+        var n:    usize            = 0;
+        if (!(sel spot.placed)) { n = d.operands.len; }
+        for (n < d.operands.len) {
+            val opt_from: opt[Instruction] = slots_of.slot_of(e.b, d.operands.data[n]);
+            if (sel opt_from.some && opt_from.some == slot) {
+                var fine: bool = false;
+                if (n == 0 && (d.opcode == table.PTR_ADD || d.opcode == table.PTR_MEMBER || d.opcode == table.PTR_INDEX)) { fine = true; }
+                if (n == 0 && d.opcode == table.LOAD && d.results.len == 1) {
+                    val opt_load: opt[walk.Within] = placement(e, d, d.operands.data[0], natural(code_of(e, d.results.data[0]), width_of(e, d.results.data[0])));
+                    fine = sel opt_load.some;
+                }
+                if (n == 0 && d.opcode == table.STORE && d.operands.len == 2) {
+                    val opt_store: opt[walk.Within] = placement(e, d, d.operands.data[0], natural(code_of(e, d.operands.data[1]), width_of(e, d.operands.data[1])));
+                    fine = sel opt_store.some;
+                }
+                if (!fine) { ret false; }
+            }
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the frame statements of `e`'s function into `seeds`, for a constant-time function, each off its frame base: a private
+# seed for each slot `sealed_slot` holds of, and for every other slot a local seed, one object a pointer into it stays
+# within, with a typed seed for each range of it its alloca states public, the bytes its front end's type lays out as
+# public (`metadata.Publics`). none for a function of no frame
+fun frame_seeds(e: *Emitter, seeds: *vector.Vector[walk.Seed]) err[Error] {
+    if (e.base == local.NONE) { ret err[Error].ok{}; }
+    val origin: walk.Origin = frame_origin(e);
+    var k:      usize       = 0;
+    for (k < e.b.instructions.len) {
+        val d:      *InstructionData = ?e.b.instructions.data[k];
+        val placed: Spot             = d.place;
+        k = k + 1;
+        if (d.opcode != table.ALLOCA || !(sel placed.placed)) { cnt; }
+        val opt_type_of: opt[Type] = type_of(d, 0);
+        if (sel opt_type_of.none) { cnt; }
+        val res_size: res[u64, record.Error] = layout.size(e.u.l, opt_type_of.some, type_table.DEFAULT_SPACE);
+        if (sel res_size.err) { ret err[Error].err{Error.layout{res_size.err}}; }
+        if (res_size.ok == 0) { cnt; }
+        val at: i64 = e.slots.data[k - 1]::i64;
+        if (sealed_slot(e, (k - 1)::u32)) {
+            val res_private: res[usize, allocator.Error] = vector.push[walk.Seed](seeds, walk.Seed.private{walk.Private{offset: at, length: res_size.ok, origin: origin}});
+            if (sel res_private.err) { ret err[Error].err{Error.alloc{res_private.err}}; }
+            cnt;
+        }
+        val publics:   metadata.Publics            = d.metadata.publics;
+        val res_local: res[usize, allocator.Error] = vector.push[walk.Seed](seeds, walk.Seed.local{walk.Local{offset: at, length: res_size.ok, stated: publics != metadata.NO_PUBLICS, origin: origin}});
+        if (sel res_local.err) { ret err[Error].err{Error.alloc{res_local.err}}; }
+        val res_ranges: res[Slice[Range], module.Error] = module.public_ranges(e.u.m, publics);
+        if (sel res_ranges.err) { ret err[Error].err{Error.ir{res_ranges.err}}; }
+        var r: usize = 0;
+        for (r < res_ranges.ok.size) {
+            val range:     Range                       = res_ranges.ok.data[r];
+            val res_typed: res[usize, allocator.Error] = vector.push[walk.Seed](seeds, walk.Seed.typed{walk.Private{offset: at + range.offset::i64, length: range.length, origin: origin}});
+            if (sel res_typed.err) { ret err[Error].err{Error.alloc{res_typed.err}}; }
+            r = r + 1;
+        }
+    }
     ret err[Error].ok{};
 }
 
@@ -2224,6 +2398,8 @@ fun timed(u: *Unit, f: Function, b: *Body, l: *Locals, e: *Emitter) err[Error] {
     }
     val err_globals: err[allocator.Error] = secret_globals.seeds(u.m, u.l, ?seeds);
     if (sel err_globals.err) { ret err[Error].err{Error.alloc{err_globals.err}}; }
+    val err_framed: err[Error] = frame_seeds(e, ?seeds);
+    if (sel err_framed.err) { ret err_framed; }
     var k: usize = 0;
     for (k < stated.len) {
         val res_pushed: res[usize, allocator.Error] = vector.push[walk.Seed](?seeds, stated.data[k]);
@@ -2242,10 +2418,15 @@ fun timed(u: *Unit, f: Function, b: *Body, l: *Locals, e: *Emitter) err[Error] {
     fin { timing.models_dnit(?x); }
     val err_modelled: err[Error] = models(u, e, ?x);
     if (sel err_modelled.err) { ret err_modelled; }
+    val res_left: res[opt[masc_operand.Positions], allocator.Error] = timing.stream_results(u.a, u.m, u.b, u.l, f);
+    if (sel res_left.err) { ret err[Error].err{Error.alloc{res_left.err}}; }
+    var left: walk.Results = walk.NO_RESULTS;
+    left.stack = res_left.ok;
     var walked:     walk.Code                       = walk.Code{set: u.b.basis.set, data: code.data, len: code.len, sites: walk.NO_SITES};
     var secrets:    walk.Secrets                    = walk.Secrets{at: seeds.data, len: seeds.len::u32};
+    var declared:   walk.Declassified               = walk.Declassified{at: e.points.data, len: e.points.len::u32};
     var calls:      walk.Calls                      = walk.Calls{at: x.calls.data, len: x.calls.len::u32};
-    val res_answer: res[ct.Answer, allocator.Error] = ct.check(u.a, ?walked, u.ctx, reading.context, reading.gated, u.ctx, ?secrets, ?walk.NO_DECLASSIFIED, ?calls, ?walk.NO_RESULTS, u.m.functions.data[f].data.constant_time);
+    val res_answer: res[ct.Answer, allocator.Error] = ct.check(u.a, ?walked, u.ctx, reading.context, reading.gated, u.ctx, ?secrets, ?declared, ?calls, ?left, u.m.functions.data[f].data.constant_time);
     if (sel res_answer.err) { ret err[Error].err{Error.alloc{res_answer.err}}; }
     val got: ct.Answer = res_answer.ok;
     if (sel got.refused) {
