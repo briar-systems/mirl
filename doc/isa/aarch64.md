@@ -51,6 +51,9 @@ The table selects NEON by lane width and by register size, a vector of at most 6
 - `addv`: a sum across the lanes, and `addp` for two lanes, moved to a general register by `umov` or `fmov`.
 - `saddlv` and `uaddlv`: a sum across the lanes of a vector extended to twice their width.
 - `sxtl` and `uxtl` (`sshll` and `ushll` by zero): an extension of each lane to twice its width, and `sxtl2` and `uxtl2` of the high half of a 128-bit vector a shuffle takes.
+- `sshll` and `ushll` by zero chained, an extension of each lane to four or eight times its width.
+- `cmeq`, `cmgt`, `cmge`, `cmhi`, `cmhs`, `fcmeq`, `fcmgt` and `fcmge` in the 128-bit arrangement of the lane width: a comparison with the sign extension of its mask as one pattern, the extension the root, the operands exchanged for `<` and `<=`, and `not` after `cmeq` and `fcmeq` for `!=`, whose float answer on a nan is the scalar's.
+- `ushl` and `sshl`: a shift by a count per lane. They read a count's low byte as signed, so `<<` and a logical `>>` clear each lane whose count is past the width less one (`cmhi` against a `dup` of it, then `bic`), shifting by the count, negated by `neg` for `>>`, and an arithmetic `>>` shifts by the count clamped to the width less one, by `umin`, or `cmhi` and `bsl` for doublewords, and negated.
 
 The lane rules are in `mirl.target.register.aarch64.lanes`. A lane's index and a shuffle's lanes are the root's immediates, which computed sources turn into the immediates of the instructions.
 
