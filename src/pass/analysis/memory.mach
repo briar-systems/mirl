@@ -2,12 +2,21 @@
 # may touch the same bytes
 #
 # an access lands at a base and an offset from it. a base is a stack slot or a
-# global, the allocation an address is built from through `ptr.add`, and
-# anything else is unknown. two accesses through distinct allocations never
-# alias, two through one base alias when their byte ranges overlap, and every
-# other pair may alias: an unknown base, an offset no rule follows or a size
-# the operation does not state. a pointer offset is a signed byte count, and it is followed at the width of
+# global, the allocation an address is built from through `ptr.add`, or else
+# the value the walk back through `ptr.add` stops at, a root: a parameter or
+# the result of an operation no rule follows, such as a load. two accesses
+# through distinct allocations never alias, two through one base or one root
+# alias when their byte ranges overlap, and every other pair may alias: an
+# unknown base, a root against any other base, since a pointer may point into
+# a global or an escaped slot, an offset no rule follows or a size the
+# operation does not state. a pointer offset is a signed byte count, and it is followed at the width of
 # the pointer in the address's space, the target's, never a fixed one.
+#
+# a slot whose address never escapes (`mirl.pass.analysis.slots`) is reached by
+# nothing but the accesses whose address is formed from it, so an access that
+# touches memory through no address, as a call, touches every byte but those
+# of such a slot. an access whose base no rule follows may still be formed
+# from one, and stays a place that may alias any other.
 #
 # an offset is a sum of one value, scaled, and a constant. `alias` compares two
 # accesses, the same value meaning the same number on both sides.
@@ -15,7 +24,9 @@
 # what an instruction does to memory is read from its opcode row alone: the row
 # says whether it reads or writes, its operands' roles say which addresses it
 # goes through and how many bytes, and an operation that touches memory through
-# no address, such as a call or a fence, touches all of it. an ordering
+# no address, such as a call or a fence, touches all of it, but for a call of a
+# function whose declaration states its effects (`FunctionData.effects`),
+# which reads and writes only as far as they reach. an ordering
 # immediate other than relaxed, or a volatile flag, orders the access against
 # every other. a kept flag makes the write a fixed fact that no pass removes,
 # narrows, merges or forwards away, and orders it against every other kept
@@ -41,6 +52,8 @@ use std.types.result.res;
 use std.types.size.usize;
 
 use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
 use std.collections.vector;
 
 use mo:         masc.core.operand;
@@ -54,9 +67,11 @@ use mirl.ir.assembly.Assembly;
 use AsmOperand: mirl.ir.assembly.Operand;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.function.Body;
+use mirl.ir.function.Effects;
 use mirl.ir.id.Block;
 use mirl.ir.id.Function;
 use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
 use mirl.ir.id.Symbol;
 use mirl.ir.id.Value;
 use mirl.ir.instruction.InstructionData;
@@ -74,6 +89,8 @@ use mirl.pass.analysis.range.Range;
 use mirl.pass.analysis.range.Ranges;
 use mirl.pass.analysis.read;
 use mirl.pass.analysis.read.Konst;
+use mirl.pass.analysis.slots;
+use mirl.pass.analysis.slots.Slots;
 use mirl.pass.refusal;
 use mirl.target.layout;
 use mirl.target.layout.Layout;
@@ -85,10 +102,12 @@ use mirl.target.record.Target;
 # unknown: no allocation is known
 # slot:    the stack slot an `alloca` made
 # symbol:  a function or global
+# value:   the root value the address is built from, of no allocation known
 pub tag Base: u8 {
     unknown;
     slot:   Instruction;
     symbol: Symbol;
+    value:  Value;
 }
 
 # an offset in bytes: scale times a value, plus a constant
@@ -112,15 +131,18 @@ pub rec Offset {
 
 # where an access lands
 # ---
-# base:   the allocation
-# offset: the byte offset from it
-# sized:  the access states how many bytes it covers
-# size:   that many bytes
+# base:    the allocation
+# offset:  the byte offset from it
+# sized:   the access states how many bytes it covers
+# size:    that many bytes
+# private: the base is a slot whose address never escapes, which an access
+#          through no address never reaches
 pub rec Place {
-    base:   Base;
-    offset: Offset;
-    sized:  bool;
-    size:   u64;
+    base:    Base;
+    offset:  Offset;
+    sized:   bool;
+    size:    u64;
+    private: bool;
 }
 
 # whether two accesses may touch the same bytes
@@ -225,11 +247,14 @@ pub rec Effect {
 # r:      its value ranges, which prove an operation narrower than the pointer
 #         does not wrap, valid as long as the cache holds this
 # layout: the module's types laid out for the target
+# slots:  its slots, which say which slots' addresses escape, valid as long
+#         as the cache holds this
 pub rec Memory {
     m:      *Module;
     f:      Function;
     r:      *Ranges;
     layout: Layout;
+    slots:  *Slots;
 }
 
 # the bounds a value takes, both inclusive
@@ -256,8 +281,8 @@ val TERMS: u32 = 8;
 # ---
 # ctx: the context the build's selection opened, none when it has none, which
 #      the layout of vectors reads
-pub fun make(m: *Module, t: *Target, ctx: opt[*core_state.Context], f: Function, r: *Ranges) Memory {
-    ret Memory{m: m, f: f, r: r, layout: layout.of(t, ?m.types, ctx)};
+pub fun make(m: *Module, t: *Target, ctx: opt[*core_state.Context], f: Function, r: *Ranges, s: *Slots) Memory {
+    ret Memory{m: m, f: f, r: r, layout: layout.of(t, ?m.types, ctx), slots: s};
 }
 
 fun fault(w: *Walk, e: module.Error) {
@@ -557,18 +582,6 @@ fun pointer_bits(w: *Walk, address: Value) opt[u32] {
     ret opt[u32].some{(res_size.ok * 8)::u32};
 }
 
-# the function whose address an instruction's row forms, none for any other
-fun function_of(ins: *InstructionData) opt[Function] {
-    val opt_opcode_at: opt[*opcode_row.Row] = opcode_table.at(ins.opcode);
-    if (sel opt_opcode_at.none)                   { ret opt[Function].none{}; }
-    if (!(sel opt_opcode_at.some.forms.function)) { ret opt[Function].none{}; }
-    val at: u32 = opt_opcode_at.some.forms.function;
-    if (at::usize >= ins.immediates.len) { ret opt[Function].none{}; }
-    val imm: opcode_row.Immediate = ins.immediates.data[at];
-    if (!(sel imm.function)) { ret opt[Function].none{}; }
-    ret opt[Function].some{imm.function};
-}
-
 # the place an address value lands, following `ptr.add` back to a slot, a
 # symbol or nothing known, at most `HOPS` steps
 fun locate(w: *Walk, address: Value) Place {
@@ -602,18 +615,27 @@ fun locate(w: *Walk, address: Value) Place {
             ret p;
         }
         val opt_made: opt[*InstructionData] = read.made(w.body, cur);
-        if (sel opt_made.none) { ret p; }
-        val ins: *InstructionData = opt_made.some;
-        if (ins.opcode == opcode_table.ALLOCA) {
-            if (sel vd.def.result) { p.base = Base.slot{vd.def.result.instruction}; }
+        if (sel opt_made.none) {
+            if (sel vd.def.parameter) { p.base = Base.value{cur}; }
             ret p;
         }
-        val opt_named: opt[Function] = function_of(ins);
+        val ins: *InstructionData = opt_made.some;
+        if (ins.opcode == opcode_table.ALLOCA) {
+            if (sel vd.def.result) {
+                p.base    = Base.slot{vd.def.result.instruction};
+                p.private = !slots.escaped(w.mem.slots, vd.def.result.instruction);
+            }
+            ret p;
+        }
+        val opt_named: opt[Function] = read.function_of(ins);
         if (sel opt_named.some) {
             p.base = Base.symbol{Symbol.function{opt_named.some}};
             ret p;
         }
-        if (ins.opcode != opcode_table.PTR_ADD || ins.operands.len != 2) { ret p; }
+        if (ins.opcode != opcode_table.PTR_ADD || ins.operands.len != 2) {
+            p.base = Base.value{cur};
+            ret p;
+        }
         val opt_sum: opt[Offset] = combine(p.offset, offset_of(w, ins.operands.data[1], 0, false), 1);
         if (sel opt_sum.none) {
             p.offset = opaque(ins.operands.data[1], w.bits, false);
@@ -631,6 +653,10 @@ fun same_base(a: Base, b: Base) bool {
         if (sel b.slot) { ret a.slot == b.slot; }
         ret false;
     }
+    if (sel a.value) {
+        if (sel b.value) { ret a.value == b.value; }
+        ret false;
+    }
     if (sel a.symbol) {
         if (sel b.symbol) {
             if (sel a.symbol.function) {
@@ -646,7 +672,7 @@ fun same_base(a: Base, b: Base) bool {
 }
 
 fun known(b: Base) bool {
-    ret sel b.slot || sel b.symbol;
+    ret sel b.slot || sel b.symbol || sel b.value;
 }
 
 # the group a place belongs to, for indexing accesses
@@ -666,8 +692,11 @@ pub fun group(p: Place) opt[u64] {
 # whether two accesses may touch the same bytes
 fun alias(a: Place, b: Place) Alias {
     if (!known(a.base) || !known(b.base)) { ret Alias.may{}; }
-    if (!same_base(a.base, b.base))       { ret Alias.no{}; }
-    if (a.offset.has != b.offset.has)     { ret Alias.may{}; }
+    if (!same_base(a.base, b.base)) {
+        if (sel a.base.value || sel b.base.value) { ret Alias.may{}; }
+        ret Alias.no{};
+    }
+    if (a.offset.has != b.offset.has) { ret Alias.may{}; }
     if (a.offset.has) {
         if (!same_term(a.offset, b.offset) || a.offset.scale != b.offset.scale) { ret Alias.may{}; }
     }
@@ -772,6 +801,20 @@ pub fun effect_of(mem: *Memory, i: Instruction) res[Effect, refusal.Error] {
     val r: *Row = opt_row.some;
     if (ins.opcode == opcode_table.ASM)     { ret assembled(?w, ins, e); }
     if (opcode_table.target_op(ins.opcode)) { ret targeted(ins, e); }
+    if (read.calls(ins)) {
+        val opt_callee: opt[Function] = read.callee(mem.m, w.body, ins);
+        if (sel opt_callee.some) {
+            val stated: Effects = mem.m.functions.data[opt_callee.some].data.effects;
+            if (sel stated.stated) {
+                e.reads    = sel stated.stated.reads.anywhere;
+                e.writes   = sel stated.stated.writes.anywhere;
+                e.anywhere = e.reads || e.writes;
+                e.ordered  = ordering_of(ins);
+                e.kept     = ins.metadata.flags.kept;
+                ret res[Effect, refusal.Error].ok{e};
+            }
+        }
+    }
     e.reads  = r.effects.reads;
     e.writes = r.effects.writes;
     if (!e.reads && !e.writes) { ret res[Effect, refusal.Error].ok{e}; }
@@ -813,14 +856,29 @@ pub fun dnit(e: *Effect) err[allocator.Error] {
     ret vector.dnit[Place](?e.places);
 }
 
-# whether two instructions' effects must keep their order
+# whether an effect may touch a byte outside every slot whose address never
+# escapes: it goes through no address, or through one of a place not private
+fun shared(e: Effect) bool {
+    if (e.anywhere) { ret true; }
+    var i: usize = 0;
+    for (i < e.places.len) {
+        if (!e.places.data[i].private) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether two instructions' effects must keep their order. an effect through
+# no address meets every byte the other may touch outside the slots whose
+# address never escapes, and every pair of their places is compared
 pub fun conflicts(a: Effect, b: Effect) bool {
     val touches: bool = (a.reads || a.writes) && (b.reads || b.writes);
-    if (!touches)                 { ret false; }
-    if (a.ordered || b.ordered)   { ret true; }
-    if (a.kept && b.kept)         { ret true; }
-    if (!a.writes && !b.writes)   { ret false; }
-    if (a.anywhere || b.anywhere) { ret true; }
+    if (!touches)                { ret false; }
+    if (a.ordered || b.ordered)  { ret true; }
+    if (a.kept && b.kept)        { ret true; }
+    if (!a.writes && !b.writes)  { ret false; }
+    if (a.anywhere && shared(b)) { ret true; }
+    if (b.anywhere && shared(a)) { ret true; }
     var i: usize = 0;
     for (i < a.places.len) {
         var j: usize = 0;
@@ -832,4 +890,158 @@ pub fun conflicts(a: Effect, b: Effect) bool {
         i = i + 1;
     }
     ret false;
+}
+
+# a link in a chain of the writes and orders a set of blocks holds
+# ---
+# at:   the position of its effect
+# next: the next link, or none
+rec Link {
+    at:   u32;
+    next: u32;
+}
+
+# no link
+val NO_LINK: u32 = 0xffffffff;
+
+# the instructions of a set of blocks that write or order an access, by the group of each place they touch, which a
+# load is asked against
+# ---
+# effects: the effect of each
+# links:   links of the chains of them
+# heads:   for each group of places, the first link of those that touch it
+# wild:    the first link of those that may touch any group
+pub rec Barriers {
+    effects: vector.Vector[Effect];
+    links:   vector.Vector[Link];
+    heads:   map.Map[u64, u32];
+    wild:    u32;
+}
+
+# no barriers, taking storage from `a`
+pub fun barriers_init(a: *allocator.Allocator) Barriers {
+    ret Barriers{effects: vector.init[Effect](a), links: vector.init[Link](a), heads: map.init[u64, u32](a), wild: NO_LINK};
+}
+
+# forget every barrier, keeping the storage
+pub fun barriers_clear(x: *Barriers) {
+    var i: usize = 0;
+    for (i < x.effects.len) {
+        dnit(?x.effects.data[i]);
+        i = i + 1;
+    }
+    vector.truncate[Effect](?x.effects, 0);
+    vector.truncate[Link](?x.links, 0);
+    map.clear[u64, u32](?x.heads);
+    x.wild = NO_LINK;
+}
+
+# give back the storage of barriers
+pub fun barriers_dnit(x: *Barriers) {
+    barriers_clear(x);
+    vector.dnit[Effect](?x.effects);
+    vector.dnit[Link](?x.links);
+    map.dnit[u64, u32](?x.heads);
+}
+
+# add a link to the barrier at position `at` in front of the chain starting at `head`, the new link being the
+# last of `x.links`
+fun link(x: *Barriers, at: u32, head: u32) err[refusal.Error] {
+    val res_pushed: res[usize, allocator.Error] = vector.push[Link](?x.links, Link{at: at, next: head});
+    if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+    ret err[refusal.Error].ok{};
+}
+
+# note one barrier, by the group of each place it touches, or as wild when it may touch any
+fun note(x: *Barriers, e: Effect) err[refusal.Error] {
+    val at:         u32                         = x.effects.len::u32;
+    val res_pushed: res[usize, allocator.Error] = vector.push[Effect](?x.effects, e);
+    if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+    var wild: bool  = e.ordered || e.anywhere;
+    var p:    usize = 0;
+    for (p < e.places.len) {
+        val opt_group: opt[u64] = group(e.places.data[p]);
+        if (!(sel opt_group.some)) { wild = true; }
+        p = p + 1;
+    }
+    if (wild) {
+        val err_made: err[refusal.Error] = link(x, at, x.wild);
+        if (sel err_made.err) { ret err_made; }
+        x.wild = (x.links.len - 1)::u32;
+        ret err[refusal.Error].ok{};
+    }
+    p = 0;
+    for (p < e.places.len) {
+        val opt_grp: opt[u64] = group(e.places.data[p]);
+        if (sel opt_grp.some) {
+            var key:      u64       = opt_grp.some;
+            val opt_head: opt[*u32] = map.get[u64, u32](?x.heads, ?key);
+            var first:    u32       = NO_LINK;
+            if (sel opt_head.some) { first = @opt_head.some; }
+            val err_made: err[refusal.Error] = link(x, at, first);
+            if (sel err_made.err) { ret err_made; }
+            val res_set: res[bool, allocator.Error] = map.insert[u64, u32](?x.heads, opt_grp.some, (x.links.len - 1)::u32);
+            if (sel res_set.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_set.err}}; }
+        }
+        p = p + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# note every instruction of the blocks of `mem`'s function that writes memory or orders an access into `x`
+pub fun barriers(mem: *Memory, blocks: Slice[u32], x: *Barriers) err[refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(mem.m, mem.f);
+    if (sel res_body.err) { ret err[refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b: *Body = res_body.ok;
+    var k: usize = 0;
+    for (k < blocks.size) {
+        var j: Instruction = b.blocks.data[blocks.data[k]].first;
+        for (j != NO_INSTRUCTION) {
+            val opt_row: opt[*Row] = opcode_table.at(b.instructions.data[j].opcode);
+            if (sel opt_row.none) { ret err[refusal.Error].err{refusal.Error.reason{"an instruction has no opcode row"}}; }
+            if (opt_row.some.effects.reads || opt_row.some.effects.writes) {
+                var res_effect_of: res[Effect, refusal.Error] = effect_of(mem, j);
+                if (sel res_effect_of.err) { ret err[refusal.Error].err{res_effect_of.err}; }
+                if (res_effect_of.ok.writes || res_effect_of.ok.ordered) {
+                    val err_noted: err[refusal.Error] = note(x, res_effect_of.ok);
+                    if (sel err_noted.err) {
+                        dnit(?res_effect_of.ok);
+                        ret err_noted;
+                    }
+                }
+                or { dnit(?res_effect_of.ok); }
+            }
+            j = b.instructions.data[j].next;
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether any barrier of a chain conflicts with a load's effect
+fun clashes(x: *Barriers, first: u32, load: Effect) bool {
+    var at: u32 = first;
+    for (at != NO_LINK) {
+        if (conflicts(x.effects.data[x.links.data[at].at], load)) { ret true; }
+        at = x.links.data[at].next;
+    }
+    ret false;
+}
+
+# whether load `i` reads what no barrier of `x` may write: a load of one place, neither ordered nor reaching anywhere,
+# that no barrier conflicts with, a load of a place no group holds only where `x` holds no barrier at all. a load
+# that reads from blocks whose writes and orders `x` notes, at an address that does not change while they run, reads
+# the same bytes each time they run
+pub fun invariant_load(mem: *Memory, x: *Barriers, i: Instruction) res[bool, refusal.Error] {
+    var res_effect_of: res[Effect, refusal.Error] = effect_of(mem, i);
+    if (sel res_effect_of.err) { ret res[bool, refusal.Error].err{res_effect_of.err}; }
+    fin { dnit(?res_effect_of.ok); }
+    if (res_effect_of.ok.ordered || res_effect_of.ok.anywhere || res_effect_of.ok.places.len != 1) { ret res[bool, refusal.Error].ok{false}; }
+    val opt_group: opt[u64] = group(res_effect_of.ok.places.data[0]);
+    if (!(sel opt_group.some))                { ret res[bool, refusal.Error].ok{x.effects.len == 0}; }
+    if (clashes(x, x.wild, res_effect_of.ok)) { ret res[bool, refusal.Error].ok{false}; }
+    var key:      u64       = opt_group.some;
+    val opt_head: opt[*u32] = map.get[u64, u32](?x.heads, ?key);
+    if (sel opt_head.some) { ret res[bool, refusal.Error].ok{!clashes(x, @opt_head.some, res_effect_of.ok)}; }
+    ret res[bool, refusal.Error].ok{true};
 }

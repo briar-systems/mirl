@@ -11,7 +11,8 @@
 # pointer, and the address is a `ptr.add` of it in the slot of the row it
 # replaces. a member of a member, or an element at a constant index, is one
 # add from the address the outer one starts at, their offsets summed, so a
-# nested field costs what a field does. the pass applies where the target's
+# nested field costs what a field does. an offset of zero is no add: the
+# address is the one it starts at, where it has the same type. the pass applies where the target's
 # addressing is physical, and a target whose addressing is logical keeps the
 # typed forms, which reach memory through access chains.
 #
@@ -31,6 +32,8 @@ use std.types.string.str;
 use std.allocator;
 use std.allocator.arena;
 
+use mirl.ir.body;
+use mirl.ir.body.Records;
 use mirl.ir.function.Body;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.NO_INSTRUCTION;
@@ -46,8 +49,8 @@ use mirl.ir.opcode.rule.Subject;
 use opcode_table: mirl.ir.opcode.table;
 use mirl.ir.type.table;
 use mirl.ir.type.table.Type;
-use mirl.ir.value.Def;
 use mirl.legal.emit;
+use mirl.legal.emit.Past;
 use mirl.legal.emit.Site;
 use mirl.pass.analysis;
 use mirl.pass.record.Context;
@@ -137,31 +140,11 @@ fun member_offset(w: *Work, d: *InstructionData, mb: Member, space: u32) res[u64
     ret res[u64, refusal.Error].ok{res_offset.ok};
 }
 
-# an address and the bytes `address` lies past it, where `address` is a constant number of
-# bytes past another address
-rec Past {
-    base:  Value;
-    bytes: u64;
-}
-
-fun past_of(w: *Work, address: Value) opt[Past] {
-    val s:   *Site = ?w.site;
-    val def: Def   = s.b.values.data[address].def;
-    if (sel def.result) {
-        val d: *InstructionData = ?s.b.instructions.data[def.result.instruction];
-        if (d.opcode == opcode_table.PTR_ADD && d.operands.len == 2) {
-            val opt_bytes: opt[u64] = emit.known(s, d.operands.data[1]);
-            if (sel opt_bytes.some) { ret opt[Past].some{Past{base: d.operands.data[0], bytes: opt_bytes.some}}; }
-        }
-    }
-    ret opt[Past].none{};
-}
-
 # the address a constant offset `bytes` from `address` is one add from, summed with the
-# offset of an outer constant add and wrapped to a word of `bits`
+# offset of an outer constant add (`emit.past`) and wrapped to a word of `bits`
 fun folded(w: *Work, address: Value, bytes: u64, bits: u32) Past {
     var at:        Past      = Past{base: address, bytes: bytes};
-    val opt_outer: opt[Past] = past_of(w, address);
+    val opt_outer: opt[Past] = emit.past(?w.site, address);
     if (sel opt_outer.some) {
         at.base  = opt_outer.some.base;
         at.bytes = bytes + opt_outer.some.bytes;
@@ -198,6 +181,30 @@ fun widened(s: *Site, index: Value, word_type: Type, bits: u32) res[Value, refus
     ret res[Value, refusal.Error].ok{index};
 }
 
+# the address of typed address `i` at a constant `bytes` past `from`: `from` itself where `bytes` is zero and it is of
+# the address's type and no more secret, else a `ptr.add` of the word in the slot of `i`
+fun placed(w: *Work, i: Instruction, from: Value, bytes: u64, word: Type) err[refusal.Error] {
+    val s:   *Site = ?w.site;
+    val old: Value = s.b.instructions.data[i].results.data[0];
+    if (bytes == 0 && table.same(s.b.values.data[from].type, s.b.values.data[old].type) && (s.b.values.data[old].secret || !s.b.values.data[from].secret)) {
+        val err_forwarded: err[refusal.Error] = refusal.edit(body.replace(s.m, s.f, old, from, Records.follow{}));
+        if (sel err_forwarded.err) { ret err_forwarded; }
+        val err_gone: err[refusal.Error] = refusal.edit(body.erase(s.m, s.f, i));
+        if (sel err_gone.err) { ret err_gone; }
+        w.changed = true;
+        ret err[refusal.Error].ok{};
+    }
+    val res_offset: res[Value, refusal.Error] = emit.word_constant(s, word, bytes);
+    if (sel res_offset.err) { ret err[refusal.Error].err{res_offset.err}; }
+    emit.begin(s, i);
+    emit.end(s, i);
+    emit.binary(s, opcode_table.PTR_ADD, from, res_offset.ok);
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret err_built; }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
 # fold an instruction if its row forms a typed address
 fun fold(w: *Work, i: Instruction) err[refusal.Error] {
     val s:       *Site            = ?w.site;
@@ -225,12 +232,8 @@ fun fold(w: *Work, i: Instruction) err[refusal.Error] {
         if (sel res_member_offset.err) { ret err[refusal.Error].err{res_member_offset.err}; }
         # a member of a member is one add from the address the outer one starts at, the sum
         # of their offsets, so no register holds the address between them
-        val past:       Past                      = folded(w, address, res_member_offset.ok, res_bits.ok);
-        val res_offset: res[Value, refusal.Error] = emit.word_constant(s, res_word_type.ok, past.bytes);
-        if (sel res_offset.err) { ret err[refusal.Error].err{res_offset.err}; }
-        emit.begin(s, i);
-        emit.end(s, i);
-        emit.binary(s, opcode_table.PTR_ADD, past.base, res_offset.ok);
+        val past: Past = folded(w, address, res_member_offset.ok, res_bits.ok);
+        ret placed(w, i, past.base, past.bytes, res_word_type.ok);
     }
     or (sel r.forms.index) {
         val ix: Indexed = r.forms.index;
@@ -243,12 +246,8 @@ fun fold(w: *Work, i: Instruction) err[refusal.Error] {
             # an element at a constant index is a constant offset, as a member is, summed with an outer one
             val res_width: res[u32, table.Error] = table.width(?s.m.types, s.b.values.data[index].type);
             if (sel res_width.err) { ret err[refusal.Error].err{refusal.Error.ir{module.Error.types{res_width.err}}}; }
-            val past:       Past                      = folded(w, address, element_offset(opt_known.some, res_width.ok, res_stride.ok, res_bits.ok), res_bits.ok);
-            val res_offset: res[Value, refusal.Error] = emit.word_constant(s, res_word_type.ok, past.bytes);
-            if (sel res_offset.err) { ret err[refusal.Error].err{res_offset.err}; }
-            emit.begin(s, i);
-            emit.end(s, i);
-            emit.binary(s, opcode_table.PTR_ADD, past.base, res_offset.ok);
+            val past: Past = folded(w, address, element_offset(opt_known.some, res_width.ok, res_stride.ok, res_bits.ok), res_bits.ok);
+            ret placed(w, i, past.base, past.bytes, res_word_type.ok);
         }
         or {
             val res_step: res[Value, refusal.Error] = emit.word_constant(s, res_word_type.ok, res_stride.ok);

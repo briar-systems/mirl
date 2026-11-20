@@ -81,7 +81,7 @@ use mirl.opt.instance.reads_only;
 use mirl.opt.instance.row_of;
 use mirl.pass.analysis;
 use mirl.pass.analysis.memory;
-use mirl.pass.analysis.memory.Effect;
+use mirl.pass.analysis.memory.Barriers;
 use mirl.pass.analysis.memory.Memory;
 use mirl.pass.analysis.range;
 use mirl.pass.analysis.range.Range;
@@ -102,21 +102,10 @@ use mirl.pass.refusal.lost;
 # dropped whenever it adds one and are valid again when they are next asked
 pub val LICM: Pass = Pass{name: "licm", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_LOOPS | analysis.OF_RANGES | analysis.OF_MEMORY, preserves: analysis.FLOW, time: Time.keeps{}};
 
-val NONE: u32 = 0xffffffff;
-
 # which fact about a value a trap needs
 val NOT_ZERO:  u8 = 0;
 val NOT_ONES:  u8 = 1;
 val NOT_LEAST: u8 = 2;
-
-# a link in a chain of the loop's instructions that write or order
-# ---
-# at:   the position of its effect
-# next: the next link, or none
-rec Node {
-    at:   u32;
-    next: u32;
-}
 
 # one run over a function
 # ---
@@ -131,12 +120,8 @@ rec Node {
 # picks:    the instructions chosen, in the order they move
 # sources:  the edges into the header from outside the loop
 # outside:  the block each of those edges leaves
-# barriers: the effect of each instruction of the loop that writes or orders
-# nodes:    links of the chains of barriers
-# heads:    for each group of places, the first link of the barriers that touch
-#           it
-# wild:     the first link of the barriers that may touch any group
-# indexed:  barriers, nodes, heads and wild describe the loop
+# barriers: the loop's instructions that write or order an access
+# indexed:  barriers describes the loop
 rec Run {
     m:        *Module;
     f:        Function;
@@ -151,47 +136,29 @@ rec Run {
     picks:    vector.Vector[Instruction];
     sources:  vector.Vector[Source];
     outside:  vector.Vector[Block];
-    barriers: vector.Vector[Effect];
-    nodes:    vector.Vector[Node];
-    heads:    map.Map[u64, u32];
-    wild:     u32;
+    barriers: Barriers;
     indexed:  bool;
-}
-
-fun barriers_dnit(s: *Run) {
-    var i: usize = 0;
-    for (i < s.barriers.len) {
-        memory.dnit(?s.barriers.data[i]);
-        i = i + 1;
-    }
-    vector.truncate[Effect](?s.barriers, 0);
 }
 
 # forget the loop worked on
 fun reset(s: *Run) {
-    barriers_dnit(s);
+    memory.barriers_clear(?s.barriers);
     vector.truncate[u8](?s.marks, 0);
     vector.truncate[Instruction](?s.picks, 0);
     vector.truncate[Source](?s.sources, 0);
     vector.truncate[Block](?s.outside, 0);
-    vector.truncate[Node](?s.nodes, 0);
-    map.clear[u64, u32](?s.heads);
-    s.wild    = NONE;
     s.indexed = false;
     s.mem     = nil;
     s.ranges  = nil;
 }
 
 fun run_dnit(s: *Run) {
-    barriers_dnit(s);
+    memory.barriers_dnit(?s.barriers);
     vector.dnit[u32](?s.headers);
     vector.dnit[u8](?s.marks);
     vector.dnit[Instruction](?s.picks);
     vector.dnit[Source](?s.sources);
     vector.dnit[Block](?s.outside);
-    vector.dnit[Effect](?s.barriers);
-    vector.dnit[Node](?s.nodes);
-    map.dnit[u64, u32](?s.heads);
 }
 
 fun need_memory(s: *Run) err[refusal.Error] {
@@ -270,108 +237,16 @@ fun harmless(s: *Run, d: *InstructionData, t: Trap, header_prefix: bool) res[boo
     ret res[bool, refusal.Error].ok{false};
 }
 
-# add a link to the barrier at a position in front of a chain, the new link
-# being the last of the nodes
-fun link(s: *Run, at: u32, head: u32) err[refusal.Error] {
-    val res_pushed: res[usize, allocator.Error] = vector.push[Node](?s.nodes, Node{at: at, next: head});
-    if (sel res_pushed.err) { ret lost(res_pushed.err); }
-    ret err[refusal.Error].ok{};
-}
-
-# note one barrier, by the group of each place it touches
-fun index(s: *Run, e: Effect) err[refusal.Error] {
-    val at:         u32                         = s.barriers.len::u32;
-    val res_pushed: res[usize, allocator.Error] = vector.push[Effect](?s.barriers, e);
-    if (sel res_pushed.err) { ret lost(res_pushed.err); }
-    var anywhere: bool  = e.ordered || e.anywhere;
-    var p:        usize = 0;
-    for (p < e.places.len) {
-        val opt_group: opt[u64] = memory.group(e.places.data[p]);
-        if (!(sel opt_group.some)) { anywhere = true; }
-        p = p + 1;
-    }
-    if (anywhere) {
-        val err_made: err[refusal.Error] = link(s, at, s.wild);
-        if (sel err_made.err) { ret err_made; }
-        s.wild = (s.nodes.len - 1)::u32;
-        ret err[refusal.Error].ok{};
-    }
-    p = 0;
-    for (p < e.places.len) {
-        val opt_grp: opt[u64] = memory.group(e.places.data[p]);
-        if (sel opt_grp.some) {
-            var key:      u64       = opt_grp.some;
-            val opt_head: opt[*u32] = map.get[u64, u32](?s.heads, ?key);
-            var first:    u32       = NONE;
-            if (sel opt_head.some) { first = @opt_head.some; }
-            val err_made: err[refusal.Error] = link(s, at, first);
-            if (sel err_made.err) { ret err_made; }
-            val res_set: res[bool, allocator.Error] = map.insert[u64, u32](?s.heads, opt_grp.some, (s.nodes.len - 1)::u32);
-            if (sel res_set.err) { ret lost(res_set.err); }
-        }
-        p = p + 1;
-    }
-    ret err[refusal.Error].ok{};
-}
-
-# note every instruction of the loop that writes memory or orders an access
-fun build_index(s: *Run) err[refusal.Error] {
-    if (s.indexed) { ret err[refusal.Error].ok{}; }
-    val err_ready: err[refusal.Error] = need_memory(s);
-    if (sel err_ready.err) { ret err_ready; }
-    val blocks: Slice[u32] = loops.body(s.l, s.lp);
-    var k:      usize      = 0;
-    for (k < blocks.size) {
-        var j: Instruction = s.b.blocks.data[blocks.data[k]].first;
-        for (j != NO_INSTRUCTION) {
-            val d:          *InstructionData         = ?s.b.instructions.data[j];
-            val res_row_of: res[*Row, refusal.Error] = row_of(d);
-            if (sel res_row_of.err) { ret err[refusal.Error].err{res_row_of.err}; }
-            if (res_row_of.ok.effects.reads || res_row_of.ok.effects.writes) {
-                var res_effect_of: res[Effect, refusal.Error] = memory.effect_of(s.mem, j);
-                if (sel res_effect_of.err) { ret err[refusal.Error].err{res_effect_of.err}; }
-                if (res_effect_of.ok.writes || res_effect_of.ok.ordered) {
-                    val err_noted: err[refusal.Error] = index(s, res_effect_of.ok);
-                    if (sel err_noted.err) {
-                        memory.dnit(?res_effect_of.ok);
-                        ret err_noted;
-                    }
-                }
-                or { memory.dnit(?res_effect_of.ok); }
-            }
-            j = s.b.instructions.data[j].next;
-        }
-        k = k + 1;
-    }
-    s.indexed = true;
-    ret err[refusal.Error].ok{};
-}
-
-# whether any barrier in a chain conflicts with a load's effect
-fun clashes(s: *Run, first: u32, load: Effect) bool {
-    var at: u32 = first;
-    for (at != NONE) {
-        if (memory.conflicts(s.barriers.data[s.nodes.data[at].at], load)) { ret true; }
-        at = s.nodes.data[at].next;
-    }
-    ret false;
-}
-
 # whether nothing in the loop may write what a load reads
 fun untouched(s: *Run, i: Instruction) res[bool, refusal.Error] {
-    val err_built: err[refusal.Error] = build_index(s);
-    if (sel err_built.err) { ret res[bool, refusal.Error].err{err_built.err}; }
-    var res_effect_of: res[Effect, refusal.Error] = memory.effect_of(s.mem, i);
-    if (sel res_effect_of.err) { ret res[bool, refusal.Error].err{res_effect_of.err}; }
-    fin { memory.dnit(?res_effect_of.ok); }
-    if (res_effect_of.ok.ordered || res_effect_of.ok.anywhere || res_effect_of.ok.places.len != 1) { ret res[bool, refusal.Error].ok{false}; }
-    val opt_group: opt[u64] = memory.group(res_effect_of.ok.places.data[0]);
-    if (!(sel opt_group.some))                { ret res[bool, refusal.Error].ok{s.barriers.len == 0}; }
-    if (clashes(s, s.wild, res_effect_of.ok)) { ret res[bool, refusal.Error].ok{false}; }
-    var key:      u64       = opt_group.some;
-    val opt_head: opt[*u32] = map.get[u64, u32](?s.heads, ?key);
-    if (sel opt_head.some) { ret res[bool, refusal.Error].ok{!clashes(s, @opt_head.some, res_effect_of.ok)}; }
-    ret res[bool, refusal.Error].ok{true};
+    if (!s.indexed) {
+        val err_ready: err[refusal.Error] = need_memory(s);
+        if (sel err_ready.err) { ret res[bool, refusal.Error].err{err_ready.err}; }
+        val err_noted: err[refusal.Error] = memory.barriers(s.mem, loops.body(s.l, s.lp), ?s.barriers);
+        if (sel err_noted.err) { ret res[bool, refusal.Error].err{err_noted.err}; }
+        s.indexed = true;
+    }
+    ret memory.invariant_load(s.mem, ?s.barriers, i);
 }
 
 # whether an instruction of the loop moves
@@ -572,10 +447,7 @@ fun visit(u: *Unit) res[bool, refusal.Error] {
     s.picks    = vector.init[Instruction](c.m.a);
     s.sources  = vector.init[Source](c.m.a);
     s.outside  = vector.init[Block](c.m.a);
-    s.barriers = vector.init[Effect](c.m.a);
-    s.nodes    = vector.init[Node](c.m.a);
-    s.heads    = map.init[u64, u32](c.m.a);
-    s.wild     = NONE;
+    s.barriers = memory.barriers_init(c.m.a);
     fin { run_dnit(?s); }
     val err_listed: err[refusal.Error] = list_headers(?s);
     if (sel err_listed.err) { ret res[bool, refusal.Error].err{err_listed.err}; }

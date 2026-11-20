@@ -10,21 +10,50 @@
 # copy back just after it, so the half can sit in a location its row fixes or
 # its tie needs while the value lives elsewhere. a decision is only ever
 # added, so the rounds end.
+#
+# in an optimised compilation a value in pieces is split at a loop: across
+# the outermost loop whose every instruction names it only as a plain read or
+# an address register, it is one value of its own, reloaded once at the end
+# of the loop's preheader, in place of a piece reloaded in each block. a
+# preheader is the one block outside the loop that enters its header, which
+# enters nothing else and ends in an instruction naming no virtual register.
+# the value in memory stays current, since the loop never writes it, so the
+# loop's exits need nothing. a split the scan cannot place is dropped for
+# good, and the value goes back to its pieces in that loop.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 
 use std.allocator;
+use std.collections.slice.Slice;
 use std.collections.vector;
 
 use mirl.base.fail.keep;
 use mirl.base.slice;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.graph.Lists;
+use mirl.ir.cfg.loops;
+use mirl.machine.function;
 use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.operand;
+use mirl.machine.operand.Block;
 use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
 use mirl.machine.operand.Virtual;
+
+use mo: masc.core.operand;
+
+# no loop or block
+pub val NONE: u32 = 0xffffffff;
 
 # a virtual register held in one location over its interval
 pub val WHOLE: u8 = 0;
@@ -42,6 +71,11 @@ pub val PIECES: u8 = 1;
 # remade: the slot each virtual register addresses when its every write is a
 #         slot address of that slot, spill.NONE for one with any other write,
 #         found once by the first form that is not the input
+# split:  each input virtual register's loop it is split at while in
+#         pieces, NONE for none
+# parent: each loop's loop around it, NONE for an outermost one
+# inner:  each block's innermost loop, NONE for one in none
+# lifts:  each block's values split at a loop it is the preheader of
 pub rec Plan {
     modes:  vector.Vector[u8];
     base:   vector.Vector[u64];
@@ -49,6 +83,10 @@ pub rec Plan {
     bare:   bool;
     gave:   bool;
     remade: vector.Vector[u32];
+    split:  vector.Vector[u32];
+    parent: vector.Vector[u32];
+    inner:  vector.Vector[u32];
+    lifts:  Lists[u32];
 }
 
 # size an emptied plan to `f`: every virtual register whole, each instruction's first operand numbered among all operands, no half on its own
@@ -68,19 +106,202 @@ fun fill(p: *Plan, f: *Function) err[allocator.Error] {
 
 # a plan of no function, holding no storage, for `reset` to fill
 pub fun init(a: *allocator.Allocator) Plan {
-    ret Plan{modes: vector.init[u8](a), base: vector.init[u64](a), own: vector.init[u64](a), bare: true, gave: false, remade: vector.init[u32](a)};
+    ret Plan{modes: vector.init[u8](a), base: vector.init[u64](a), own: vector.init[u64](a), bare: true, gave: false, remade: vector.init[u32](a), split: vector.init[u32](a), parent: vector.init[u32](a), inner: vector.init[u32](a), lifts: graph.lists_init[u32](a)};
 }
 
 # a plan of function `f` with every virtual register whole and no half on its
-# own, in place of what it held, its storage kept
-pub fun reset(p: *Plan, f: *Function) err[allocator.Error] {
+# own, in place of what it held, its storage kept, and each register's loop
+# to split it at once in pieces when `splits`
+pub fun reset(p: *Plan, f: *Function, splits: bool) err[allocator.Error] {
     vector.clear[u8](?p.modes);
     vector.clear[u64](?p.base);
     vector.clear[u64](?p.own);
     vector.clear[u32](?p.remade);
+    vector.clear[u32](?p.split);
+    vector.clear[u32](?p.parent);
+    vector.clear[u32](?p.inner);
+    vector.clear[u32](?p.lifts.first);
+    vector.clear[u32](?p.lifts.items);
     p.bare = true;
     p.gave = false;
-    ret fill(p, f);
+    val err_filled: err[allocator.Error] = fill(p, f);
+    if (sel err_filled.err) { ret err_filled; }
+    val err_none: err[allocator.Error] = slice.fill[u32](?p.split, f.virtuals.len, NONE);
+    if (sel err_none.err)             { ret err_none; }
+    if (!splits || f.blocks.len == 0) { ret err[allocator.Error].ok{}; }
+    ret find_splits(p, f);
+}
+
+# whether block `k` lies in loop `l`
+pub fun within(p: *Plan, k: Block, l: u32) bool {
+    var at: u32 = p.inner.data[k];
+    for (at != NONE) {
+        if (at == l) { ret true; }
+        at = p.parent.data[at];
+    }
+    ret false;
+}
+
+# the loop an input virtual register is split at, NONE for none
+pub fun split_at(p: *Plan, v: Virtual) u32 {
+    ret p.split.data[v];
+}
+
+# the values split at a loop block `k` is the preheader of
+pub fun lifts(p: *Plan, k: Block) Slice[u32] {
+    if (p.lifts.first.len == 0) { ret Slice[u32]{data: nil, size: 0}; }
+    ret graph.list[u32](?p.lifts, k);
+}
+
+# split an input virtual register at no loop from now on
+pub fun unsplit(p: *Plan, v: Virtual) {
+    p.split.data[v] = NONE;
+}
+
+# the preheader of loop `i`, NONE when it has none
+fun preheader(p: *Plan, f: *Function, g: *Graph, lp: *loops.Loops, i: u32) u32 {
+    val header: u32        = loops.loop(lp, i).header;
+    val preds:  Slice[u32] = graph.list[u32](?g.predecessors, header);
+    var found:  u32        = NONE;
+    var k:      usize      = 0;
+    for (k < preds.size) {
+        if (!within(p, preds.data[k], i)) {
+            if (found != NONE) { ret NONE; }
+            found = preds.data[k];
+        }
+        k = k + 1;
+    }
+    if (found == NONE || graph.list[u32](?g.successors, found).size != 1) { ret NONE; }
+    val list: Slice[Instruction] = function.instructions(f, found);
+    if (list.size == 0) { ret NONE; }
+    val d: *InstructionData = function.data(f, list.data[list.size - 1]);
+    var n: usize            = 0;
+    for (n < d.operands.size) {
+        var names: [operand.MOST_NAMED]Register;
+        val count: u32 = operand.named(d.operands.data[n], ?names[0]);
+        var j:     u32 = 0;
+        for (j < count) {
+            val r: Register = names[j];
+            if (sel r.virtual) { ret NONE; }
+            j = j + 1;
+        }
+        n = n + 1;
+    }
+    ret found;
+}
+
+# mark the virtual registers operand `k` of `d` names, `seen` for a plain
+# read or an address register and `bad` for any other naming
+fun note(f: *Function, d: *InstructionData, k: u32, mark: u32, seen: *vector.Vector[u32], bad: *vector.Vector[u32], named: *vector.Vector[u32]) err[allocator.Error] {
+    val o:     Operand = d.operands.data[k];
+    var names: [operand.MOST_NAMED]Register;
+    val count: u32     = operand.named(o, ?names[0]);
+    var plain: bool    = false;
+    if (sel o.virtual) { plain = instruction.stated_role(f.set, d, k) == mo.READ; }
+    or (sel o.address) { plain = true; }
+    var j: u32 = 0;
+    for (j < count) {
+        val r: Register = names[j];
+        if (sel r.virtual) {
+            var ok: bool = plain;
+            if (sel o.address) {
+                if (j == 0 && operand.writes_back(o.address)) { ok = false; }
+            }
+            if (seen.data[r.virtual] != mark && bad.data[r.virtual] != mark) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](named, r.virtual);
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+            }
+            if (ok) { seen.data[r.virtual] = mark; }
+            or      { bad.data[r.virtual] = mark; }
+        }
+        j = j + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# each virtual register's loop to split it at, and each preheader's values,
+# the loops walked outer first so a register takes the outermost it may
+fun find_splits(p: *Plan, f: *Function) err[allocator.Error] {
+    val a:            *allocator.Allocator        = p.split.a;
+    val res_graph_of: res[Graph, allocator.Error] = function.graph_of(f);
+    if (sel res_graph_of.err) { ret err[allocator.Error].err{res_graph_of.err}; }
+    var g: Graph = res_graph_of.ok;
+    fin { graph.dnit(?g); }
+    val res_dom: res[dominance.Dominance, allocator.Error] = dominance.compute(a, ?g);
+    if (sel res_dom.err) { ret err[allocator.Error].err{res_dom.err}; }
+    var d: dominance.Dominance = res_dom.ok;
+    fin { dominance.dnit(?d); }
+    val res_nest: res[loops.Loops, allocator.Error] = loops.compute(a, ?g, ?d);
+    if (sel res_nest.err) { ret err[allocator.Error].err{res_nest.err}; }
+    var lp: loops.Loops = res_nest.ok;
+    fin { loops.dnit(?lp); }
+    val count: u32 = loops.count(?lp);
+    if (count == 0) { ret err[allocator.Error].ok{}; }
+    var seen: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?seen); }
+    var bad: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?bad); }
+    var named: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?named); }
+    var keys: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?keys); }
+    var items: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?items); }
+    var err_failed: err[allocator.Error] = slice.fill[u32](?p.inner, f.blocks.len, NONE);
+    keep(?err_failed, slice.fill[u32](?p.parent, count::usize, NONE));
+    keep(?err_failed, slice.fill[u32](?seen, f.virtuals.len, NONE));
+    keep(?err_failed, slice.fill[u32](?bad, f.virtuals.len, NONE));
+    if (sel err_failed.err) { ret err_failed; }
+    var k: usize = 0;
+    for (k < f.blocks.len) {
+        p.inner.data[k] = lp.innermost.data[k];
+        k               = k + 1;
+    }
+    var i: u32 = 0;
+    for (i < count) {
+        p.parent.data[i] = loops.loop(?lp, i).parent;
+        i                = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        val pre: u32 = preheader(p, f, ?g, ?lp, i);
+        if (pre != NONE) {
+            vector.clear[u32](?named);
+            val body: Slice[u32] = loops.body(?lp, i);
+            var b:    usize      = 0;
+            for (b < body.size) {
+                val list: Slice[Instruction] = function.instructions(f, body.data[b]);
+                var n:    usize              = 0;
+                for (n < list.size) {
+                    val dd: *InstructionData = function.data(f, list.data[n]);
+                    var o:  u32              = 0;
+                    for (o::usize < dd.operands.size) {
+                        val err_noted: err[allocator.Error] = note(f, dd, o, i, ?seen, ?bad, ?named);
+                        if (sel err_noted.err) { ret err_noted; }
+                        o = o + 1;
+                    }
+                    n = n + 1;
+                }
+                b = b + 1;
+            }
+            var m: usize = 0;
+            for (m < named.len) {
+                val v: u32 = named.data[m];
+                if (seen.data[v] == i && bad.data[v] != i && p.split.data[v] == NONE) {
+                    p.split.data[v] = i;
+                    var err_pair: err[allocator.Error]        = err[allocator.Error].ok{};
+                    val res_key:  res[usize, allocator.Error] = vector.push[u32](?keys, pre);
+                    if (sel res_key.err) { keep(?err_pair, err[allocator.Error].err{res_key.err}); }
+                    val res_item: res[usize, allocator.Error] = vector.push[u32](?items, v);
+                    if (sel res_item.err) { keep(?err_pair, err[allocator.Error].err{res_item.err}); }
+                    if (sel err_pair.err) { ret err_pair; }
+                }
+                m = m + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret graph.group[u32](?p.lifts, f.blocks.len::u32, Slice[u32]{data: keys.data, size: keys.len}, Slice[u32]{data: items.data, size: items.len});
 }
 
 # give back a plan's storage
@@ -89,6 +310,10 @@ pub fun dnit(p: *Plan) err[allocator.Error] {
     keep(?err_failed, vector.dnit[u64](?p.base));
     keep(?err_failed, vector.dnit[u64](?p.own));
     keep(?err_failed, vector.dnit[u32](?p.remade));
+    keep(?err_failed, vector.dnit[u32](?p.split));
+    keep(?err_failed, vector.dnit[u32](?p.parent));
+    keep(?err_failed, vector.dnit[u32](?p.inner));
+    keep(?err_failed, graph.lists_dnit[u32](?p.lifts));
     ret err_failed;
 }
 

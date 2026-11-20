@@ -39,6 +39,14 @@
 # location of the set is held there as by a hold of its own, and one a later
 # instruction reads holds the value the call left it to that read.
 #
+# a location holds a value only from a write that reaches it, or from the
+# entry when the caller does not name it among those the entry hands no
+# value in, as the allocator names every register it may assign that is no
+# parameter's, link's or carrier's. a read no such write reaches, as an asm
+# block's read of a register nothing in the function set, reads nothing the
+# program can name, so it holds its location at its own instruction alone
+# and is live nowhere before it, on no path that does not define it.
+#
 # every register and flag a row's instruction touches comes from masc's
 # footprint of its operand values under the context and the configuration it
 # states, read once per function as its effects (`mirl.machine.effects`), which
@@ -403,6 +411,11 @@ pub rec Carried {
 # items:     the clobbers' sets
 # segments:  the segments grouped by virtual register
 # held:      the holds grouped by location
+# blind:     each event, whether it reads a location no write and not the
+#            entry reaches, which holds no value there
+# wrote:     each block's touched locations a write in it defines
+# defs:      each block's touched locations defined out of it
+# reach:     the touched locations defined at one point
 # later:     whether the last computation carried what was known, so its
 #            events are the scratch's and not the known's
 pub rec Scratch {
@@ -431,6 +444,10 @@ pub rec Scratch {
     items:     vector.Vector[u32];
     segments:  Lists[Segment];
     held:      Lists[Hold];
+    blind:     vector.Vector[bool];
+    wrote:     vector.Vector[u64];
+    defs:      vector.Vector[u64];
+    reach:     vector.Vector[u64];
     later:     bool;
 }
 
@@ -454,6 +471,8 @@ pub rec Events {
 # values: the virtual registers and the touched locations, the bits a set holds
 # words:  the words a set over the values spans
 # stated: a loop's step's operands
+# unset:  the locations that hold no value at the function's entry, sorted
+# tw:     the words a set over the touched locations spans
 # the rest is the scratch's, as it states
 rec Build {
     a:         *allocator.Allocator;
@@ -487,6 +506,8 @@ rec Build {
     hold_keys: *vector.Vector[u32];
     holds:     *vector.Vector[Hold];
     stated:    [mo.MAX_OPERANDS]Operand;
+    unset:     Slice[u32];
+    tw:        u32;
 }
 
 fun alloc_err(e: allocator.Error) err[Error] {
@@ -1067,6 +1088,154 @@ fun settle_values(b: *Build, l: *Live) err[Error] {
     ret err[Error].ok{};
 }
 
+# every touched location sharing storage with location `at` set in the
+# touched set of `into` at word `base`
+fun define(b: *Build, into: *vector.Vector[u64], base: usize, at: u32) {
+    val alias: Slice[u32] = location.shares(b.at, at);
+    var k:     usize      = 0;
+    for (k < alias.size) {
+        val n: u32 = b.k.index.data[alias.data[k]];
+        if (n != NONE) { set(into, base, n); }
+        k = k + 1;
+    }
+}
+
+# what an instruction's events define, a write of a location or of a clobber
+# set giving it and every location sharing its storage a value
+fun defines(b: *Build, into: *vector.Vector[u64], base: usize, ev: Slice[Event]) {
+    var j: usize = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set != NONE) {
+            val held: Slice[u32] = graph.list[u32](b.sets, e.set);
+            var i:    usize      = 0;
+            for (i < held.size) {
+                define(b, into, base, location_of(b, held.data[i]));
+                i = i + 1;
+            }
+        }
+        or (e.write && !is_virtual(b, e.value)) { define(b, into, base, location_of(b, e.value)); }
+        j = j + 1;
+    }
+}
+
+# the touched locations defined into block `k`, set in `reach`: what its
+# predecessors define out, and the entry's own for the entry and for a block
+# no edge enters
+fun reaching(b: *Build, k: u32) {
+    val tw:    usize      = b.tw::usize;
+    val preds: Slice[u32] = graph.list[u32](?b.k.graph.predecessors, k);
+    var w:     usize      = 0;
+    for (w < tw) {
+        b.w.reach.data[w] = 0;
+        w                 = w + 1;
+    }
+    if (k == b.k.graph.entry || preds.size == 0) {
+        w = 0;
+        for (w < tw) {
+            b.w.reach.data[w] = ~(0::u64);
+            w                 = w + 1;
+        }
+        var u: usize = 0;
+        for (u < b.unset.size) {
+            val n: u32 = b.k.index.data[b.unset.data[u]];
+            if (n != NONE) { clear(?b.w.reach, 0, n); }
+            u = u + 1;
+        }
+    }
+    var p: usize = 0;
+    for (p < preds.size) {
+        val base: usize = preds.data[p]::usize * tw;
+        w = 0;
+        for (w < tw) {
+            b.w.reach.data[w] = b.w.reach.data[w] | b.w.defs.data[base + w];
+            w                 = w + 1;
+        }
+        p = p + 1;
+    }
+}
+
+# which reads read a location no write reaches and the entry hands no value:
+# such a location holds nothing there, so the read holds it at its own
+# instruction alone and is live nowhere before it. defined is forward and
+# may: a block's locations defined out are those defined into it and those
+# it writes. none is blind when every location holds a value at the entry
+fun settle_defined(b: *Build, l: *Live) err[Error] {
+    val err_blind: err[allocator.Error] = slice.fill[bool](?b.w.blind, b.events.len, false);
+    if (sel err_blind.err) { ret alloc_err(err_blind.err); }
+    if (b.unset.size == 0) { ret err[Error].ok{}; }
+    b.tw = ((b.k.touched.len + 63) / 64)::u32;
+    val tw:         usize                = b.tw::usize;
+    val size:       usize                = b.f.blocks.len * tw;
+    var err_failed: err[allocator.Error] = slice.fill[u64](?b.w.wrote, size, 0);
+    keep(?err_failed, slice.fill[u64](?b.w.defs, size, 0));
+    keep(?err_failed, slice.fill[u64](?b.w.reach, tw, 0));
+    if (sel err_failed.err) { ret alloc_err(err_failed.err); }
+    var k: u32 = 0;
+    for (k::usize < b.f.blocks.len) {
+        val s: Segment = numbers_of(l, k);
+        var n: u32     = s.from;
+        for (n < s.to) {
+            defines(b, ?b.w.wrote, k::usize * tw, events_of(b, n));
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var i: usize = 0;
+        for (i < l.order.len) {
+            val kb:   u32   = l.order.data[i];
+            val base: usize = kb::usize * tw;
+            reaching(b, kb);
+            var w: usize = 0;
+            for (w < tw) {
+                val out: u64 = b.w.reach.data[w] | b.w.wrote.data[base + w];
+                if (out != b.w.defs.data[base + w]) {
+                    b.w.defs.data[base + w] = out;
+                    changed                 = true;
+                }
+                w = w + 1;
+            }
+            i = i + 1;
+        }
+    }
+    val virtuals: u32   = b.f.virtuals.len::u32;
+    var i:        usize = 0;
+    for (i < l.order.len) {
+        val kb: u32     = l.order.data[i];
+        val s:  Segment = numbers_of(l, kb);
+        reaching(b, kb);
+        var n: u32 = s.from;
+        for (n < s.to) {
+            val ev:    Slice[Event] = events_of(b, n);
+            val start: usize        = b.first.data[n]::usize;
+            var j:     usize        = 0;
+            for (j < ev.size) {
+                val e: Event = ev.data[j];
+                if (!e.write && e.set == NONE && !is_virtual(b, e.value) && !bit(?b.w.reach, 0, e.value - virtuals)) { b.w.blind.data[start + j] = true; }
+                j = j + 1;
+            }
+            defines(b, ?b.w.reach, 0, ev);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether event `j` of linear number `n` is a blind read
+fun blind(b: *Build, n: u32, j: usize) bool {
+    ret b.w.blind.data[b.first.data[n]::usize + j];
+}
+
+# whether a value is a location defined out of block `k`, or a virtual register
+fun defined_out(b: *Build, k: u32, value: u32) bool {
+    if (b.unset.size == 0 || is_virtual(b, value)) { ret true; }
+    ret bit(?b.w.defs, k::usize * b.tw::usize, value - b.f.virtuals.len::u32);
+}
+
 # every instruction's reads and writes, in linear order
 fun gather_all(b: *Build, l: *Live) err[Error] {
     var n: usize = 0;
@@ -1175,7 +1344,7 @@ fun local(b: *Build, l: *Live) err[Error] {
             val ev: Slice[Event] = events_of(b, n);
             var i:  usize        = 0;
             for (i < ev.size) {
-                if (!ev.data[i].write && !bit(b.kill, base, ev.data[i].value)) { set(b.gen, base, ev.data[i].value); }
+                if (!ev.data[i].write && !blind(b, n, i) && !bit(b.kill, base, ev.data[i].value)) { set(b.gen, base, ev.data[i].value); }
                 i = i + 1;
             }
             i = 0;
@@ -1213,19 +1382,46 @@ fun hold(b: *Build, at: u32, h: Hold) err[Error] {
     ret err[Error].ok{};
 }
 
-# close every value still open at a block's start
-fun close_all(b: *Build, cur: *vector.Vector[u64], open: *vector.Vector[u32], start: u32) err[Error] {
+# word `w` of the values live out of block `k` that hold a value there: every
+# virtual register live out, and a location only where it is defined out
+fun carried_out(b: *Build, k: u32, w: u32) u64 {
+    var word: u64 = b.live_out.data[k::usize * b.words::usize + w::usize];
+    if (b.unset.size == 0) { ret word; }
+    val virtuals: u32 = b.f.virtuals.len::u32;
+    if (w * 64 + 64 <= virtuals) { ret word; }
+    var rest: u64 = word;
+    for (rest != 0) {
+        val bit_at: u32 = bits.ctz(rest)::u32;
+        rest = rest & (rest - 1);
+        if (!defined_out(b, k, w * 64 + bit_at)) { word = word & ~((1::u64) << bit_at::u64); }
+    }
+    ret word;
+}
+
+# at a block's start, close every open value that the block laid out before
+# it, `prev`, does not hold out, and open at that block's end every value it
+# holds out that is not open, so a value live across the two keeps one segment.
+# with no block before it every open value closes
+fun hand_over(b: *Build, l: *Live, cur: *vector.Vector[u64], open: *vector.Vector[u32], start: u32, prev: u32) err[Error] {
     var w: u32 = 0;
     for (w < b.words) {
-        var word: u64 = cur.data[w];
-        for (word != 0) {
-            val value: u32 = w * 64 + bits.ctz(word)::u32;
-            word = word & (word - 1);
+        var out: u64 = 0;
+        if (prev != NONE) { out = carried_out(b, prev, w); }
+        var closing: u64 = cur.data[w] & ~out;
+        for (closing != 0) {
+            val value: u32 = w * 64 + bits.ctz(closing)::u32;
+            closing = closing & (closing - 1);
             val err_done: err[Error] = emit(b, value, start, open.data[value]);
             if (sel err_done.err) { ret err_done; }
             open.data[value] = NONE;
         }
-        cur.data[w] = 0;
+        var opening: u64 = out & ~cur.data[w];
+        for (opening != 0) {
+            val value: u32 = w * 64 + bits.ctz(opening)::u32;
+            opening          = opening & (opening - 1);
+            open.data[value] = l.ends.data[prev];
+        }
+        cur.data[w] = out;
         w           = w + 1;
     }
     ret err[Error].ok{};
@@ -1262,22 +1458,15 @@ fun walk(b: *Build, l: *Live) err[Error] {
     keep(?err_failed, slice.fill[u64](cur, b.words::usize, 0));
     if (sel err_failed.err) { ret alloc_err(err_failed.err); }
     var i: usize = l.order.len;
+    if (i > 0) {
+        val err_opened: err[Error] = hand_over(b, l, cur, open, l.ends.data[l.order.data[i - 1]], l.order.data[i - 1]);
+        if (sel err_opened.err) { ret err_opened; }
+    }
     for (i > 0) {
         i = i - 1;
-        val k:    u32     = l.order.data[i];
-        val base: usize   = k::usize * b.words::usize;
-        val s:    Segment = numbers_of(l, k);
-        var w:    u32     = 0;
-        for (w < b.words) {
-            var word: u64 = b.live_out.data[base + w::usize];
-            cur.data[w] = word;
-            for (word != 0) {
-                open.data[w * 64 + bits.ctz(word)::u32] = l.ends.data[k];
-                word                                    = word & (word - 1);
-            }
-            w = w + 1;
-        }
-        var n: u32 = s.to;
+        val k: u32     = l.order.data[i];
+        val s: Segment = numbers_of(l, k);
+        var n: u32     = s.to;
         for (n > s.from) {
             n = n - 1;
             val ev: Slice[Event] = events_of(b, n);
@@ -1305,15 +1494,21 @@ fun walk(b: *Build, l: *Live) err[Error] {
             j = 0;
             for (j < ev.size) {
                 val e: Event = ev.data[j];
-                if (!e.write && open.data[e.value] == NONE) {
+                if (!e.write && blind(b, n, j)) {
+                    val err_held: err[Error] = hold(b, location_of(b, e.value), Hold{from: 2 * n, to: 2 * n + 1, owner: NONE});
+                    if (sel err_held.err) { ret err_held; }
+                }
+                or (!e.write && open.data[e.value] == NONE) {
                     open.data[e.value] = 2 * n + 1;
                     set(cur, 0, e.value);
                 }
                 j = j + 1;
             }
         }
-        val err_closed: err[Error] = close_all(b, cur, open, l.starts.data[k]);
-        if (sel err_closed.err) { ret err_closed; }
+        var prev: u32 = NONE;
+        if (i > 0) { prev = l.order.data[i - 1]; }
+        val err_handed: err[Error] = hand_over(b, l, cur, open, l.starts.data[k], prev);
+        if (sel err_handed.err) { ret err_handed; }
     }
     reverse[Mark](l.marks.data, l.marks.len);
     reverse[u32](b.hold_keys.data, b.hold_keys.len);
@@ -1486,6 +1681,10 @@ pub fun scratch(a: *allocator.Allocator) Scratch {
         items:     vector.init[u32](a),
         segments:  graph.lists_init[Segment](a),
         held:      graph.lists_init[Hold](a),
+        blind:     vector.init[bool](a),
+        wrote:     vector.init[u64](a),
+        defs:      vector.init[u64](a),
+        reach:     vector.init[u64](a),
         later:     false,
     };
 }
@@ -1516,6 +1715,10 @@ pub fun scratch_dnit(w: *Scratch) err[allocator.Error] {
     keep(?err_failed, vector.dnit[u32](?w.items));
     keep(?err_failed, graph.lists_dnit[Segment](?w.segments));
     keep(?err_failed, graph.lists_dnit[Hold](?w.held));
+    keep(?err_failed, vector.dnit[bool](?w.blind));
+    keep(?err_failed, vector.dnit[u64](?w.wrote));
+    keep(?err_failed, vector.dnit[u64](?w.defs));
+    keep(?err_failed, vector.dnit[u64](?w.reach));
     ret err_failed;
 }
 
@@ -1545,6 +1748,10 @@ fun begin(w: *Scratch) {
     vector.clear[u32](?w.items);
     lists_clear[Segment](?w.segments);
     lists_clear[Hold](?w.held);
+    vector.clear[bool](?w.blind);
+    vector.clear[u64](?w.wrote);
+    vector.clear[u64](?w.defs);
+    vector.clear[u64](?w.reach);
 }
 
 fun lists_clear[T](l: *Lists[T]) {
@@ -1643,6 +1850,8 @@ fun run(b: *Build, l: *Live, clobbers: Clobbers) err[Error] {
     if (sel err_gathered.err) { ret err_gathered; }
     val err_valued: err[Error] = settle_values(b, l);
     if (sel err_valued.err) { ret err_valued; }
+    val err_defined: err[Error] = settle_defined(b, l);
+    if (sel err_defined.err) { ret err_defined; }
     val err_sets: err[Error] = local(b, l);
     if (sel err_sets.err) { ret err_sets; }
     flow.backward(?b.k.graph, Slice[u32]{data: l.order.data, size: l.order.len}, flow.Sets{words: b.words, gen: b.gen, kill: b.kill, live_in: b.live_in, live_out: b.live_out});
@@ -1681,7 +1890,7 @@ pub fun compute(a: *allocator.Allocator, f: *Function, ctx: *core_state.Context,
     var w: Scratch = scratch(a);
     fin { scratch_dnit(?w); }
     var l:        Live       = init(a);
-    val err_done: err[Error] = round(?w, ?l, f, ctx, at, ?fx, clobbers, ?k, Carried{sources: Slice[u32]{data: nil, size: 0}, renamed: Slice[bool]{data: nil, size: 0}});
+    val err_done: err[Error] = round(?w, ?l, f, ctx, at, ?fx, clobbers, ?k, Carried{sources: Slice[u32]{data: nil, size: 0}, renamed: Slice[bool]{data: nil, size: 0}}, Slice[u32]{data: nil, size: 0});
     if (sel err_done.err) {
         dnit(?l);
         ret res[Live, Error].err{err_done.err};
@@ -1755,8 +1964,12 @@ pub fun forget(k: *Known) err[allocator.Error] {
 #           the first round's, at this form's instructions
 # k:        what the first round knows
 # carried:  how the form stands to the first round's function, read past it
+# unset:    the locations that hold no value at the function's entry, sorted,
+#           whose reads no write reaches hold them at their instruction alone.
+#           empty when every location holds one, as after a frame is laid
+#           out, when every preserved register holds its caller's
 # ret:      ok, or why the liveness was refused
-pub fun round(w: *Scratch, l: *Live, f: *Function, ctx: *core_state.Context, at: *Locations, fx: *Effects, clobbers: Clobbers, k: *Known, carried: Carried) err[Error] {
+pub fun round(w: *Scratch, l: *Live, f: *Function, ctx: *core_state.Context, at: *Locations, fx: *Effects, clobbers: Clobbers, k: *Known, carried: Carried, unset: Slice[u32]) err[Error] {
     if (at.file != function.file(f)) { ret err[Error].err{Error.foreign{}}; }
     val total: u64 = f.virtuals.len::u64 + location.count(at)::u64;
     if (total >= 0xffffffff) { ret err[Error].err{Error.size{}}; }
@@ -1802,6 +2015,8 @@ pub fun round(w: *Scratch, l: *Live, f: *Function, ctx: *core_state.Context, at:
         use_items: ?w.use_items,
         hold_keys: ?w.hold_keys,
         holds:     ?w.holds,
+        unset:     unset,
+        tw:        0,
     };
     ret run(?b, l, clobbers);
 }

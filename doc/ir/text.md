@@ -298,6 +298,10 @@ decorators
                             are pointers to storage holding no secret, each
                             its position, ascending and none past the
                             signature (see ir.md 7.1)
+  #[effects(words)]         what a call of a function does beyond its own
+                            frame: `none`, or each of `reads`, `writes`,
+                            `traps` and `ends` it may do, in that order (see
+                            ir.md 6.8)
   #[convention(name)]       the calling convention of a function's signature,
                             the default when left out
   #[placed(type, places)]   the abi legalisation has put the body in pieces:
@@ -362,7 +366,7 @@ functions
   result      = ident ":" [ "^" ] type ;
   operation   = path [ "[" [ immediate { "," immediate } ] "]" ] [ callee ]
                 [ "(" [ operand { "," operand } ] ")" ] [ target { "," target } ]
-                [ "at" ident ] [ "in" ident ] [ "holds" "[" [ ident { "," ident } ] "]" ] ;
+                [ "at" ident ] [ "in" ident ] [ "holds" "[" [ ident { "," ident } ] "]" [ "[" uint "," uint "]" ] ] ;
   callee      = name ;
   operand     = ident | typed ;
   immediate   = [ ident ":" ] spelled ;
@@ -405,7 +409,9 @@ functions
   case value. results are typed, and a reader refuses a type other than the
   one the row derives. after the operation come its location, its inlining
   site and the debug bindings whose storage its result addresses, each left
-  out when empty.
+  out when empty. a bracketed pair after the bindings is the piece of each
+  variable the storage holds, as a binding record's is, the whole variable
+  when left out: `alloca[i64]() holds [v0][64, 64]` is the second word of `v0`.
 
   how an immediate is spelled follows what it holds:
 
