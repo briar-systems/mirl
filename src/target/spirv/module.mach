@@ -121,6 +121,7 @@ use mirl.target.spirv.error.Handled;
 use mirl.target.spirv.error.Import;
 use mirl.target.spirv.error.Interface;
 use mirl.target.spirv.error.Loaded;
+use mirl.target.spirv.error.Mixed;
 use mirl.target.spirv.error.Pushed;
 use mirl.target.spirv.error.Rule;
 use mirl.target.spirv.error.Site;
@@ -298,6 +299,100 @@ fun given_pointee(u: *Unit, f: Function, k: usize, depth: usize) opt[Type] {
     ret opt[Type].none{};
 }
 
+# the layout key the calls of a function pass for a pointer parameter
+# ---
+# none:  no call states it
+# key:   every call that states it passes a pointer of this key
+# mixed: two calls pass pointers of different keys
+tag Keyed: u8 {
+    none;
+    key:   u32;
+    mixed: Mixed;
+}
+
+# the layout key pointer parameter `k` of function `f`, into class `class` and pointing to `pointee`, is held by: the key
+# every call passes, a whole block variable's with the block's layout and a member's or an element's without it, else
+# where no call states one a block's where the pointee is a structure in a class that holds blocks and its class's
+# otherwise. `depth` bounds the walk through parameters as `read_pointee`'s does
+fun param_key(u: *Unit, f: Function, k: usize, class: u32, pointee: Type, depth: usize) Keyed {
+    val passed: Keyed = passed_key(u, f, k, depth);
+    if (!(sel passed.none)) { ret passed; }
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?u.m.types, pointee);
+    if (sel res_shape.ok) {
+        val sh: type_table.Shape = res_shape.ok;
+        if (sel sh.structure) { ret Keyed.key{spirv_types.variable_key(u, class)}; }
+    }
+    ret Keyed.key{spirv_types.laid(u, class)};
+}
+
+# the layout key every call of function `f` passes for its pointer parameter `k`, none where no call states one
+fun passed_key(u: *Unit, f: Function, k: usize, depth: usize) Keyed {
+    var out: Keyed = Keyed.none{};
+    if (depth > u.m.functions.len) { ret out; }
+    var g: usize = 0;
+    for (g < u.m.functions.len) {
+        val b: *Body = ?u.m.functions.data[g].body;
+        var i: usize = 0;
+        for (i < b.instructions.len) {
+            val d:  *InstructionData = ?b.instructions.data[i];
+            val at: Place            = d.place;
+            val n:  Instruction      = (i::u32);
+            i = i + 1;
+            if (d.opcode != table.CALL || d.operands.len <= k + 1 || !(sel at.placed)) { cnt; }
+            val opt_called: opt[Function] = reach.function_named(u.m, b, d.operands.data[0]);
+            if (sel opt_called.none)  { cnt; }
+            if (opt_called.some != f) { cnt; }
+            val given: Keyed = argument_key(u, (g::u32), b, d.operands.data[k + 1], depth);
+            if (sel given.mixed)  { ret given; }
+            if (!(sel given.key)) { cnt; }
+            if (sel out.key && out.key != given.key) {
+                val at: At = At{function: (g::u32), instruction: n, location: ir_function.location(b, n)};
+                ret Keyed.mixed{Mixed{at: at, callee: f, parameter: k::u32, whole: given.key != spirv_types.member_key(given.key)}};
+            }
+            out = given;
+        }
+        g = g + 1;
+    }
+    ret out;
+}
+
+# the layout key of pointer `a`, an argument function `g` passes, as the emitter keys it: a global's own, a member's or
+# an element's that of what it is reached in without the block's layout, a stack slot's the plain one, and what `g`'s
+# own parameter is held by. none for any other pointer
+fun argument_key(u: *Unit, g: Function, b: *Body, a: Value, depth: usize) Keyed {
+    val d: Def = b.values.data[a].def;
+    if (sel d.constant) {
+        val res_data: res[ConstantData, module.Error] = module.constant_data(u.m, d.constant);
+        if (sel res_data.err) { ret Keyed.none{}; }
+        val c: ConstantData = res_data.ok;
+        if (sel c.address) {
+            val s: Symbol = c.address.symbol;
+            if (sel s.global) {
+                if (c.address.offset == 0) { ret Keyed.key{u.keys.data[s.global]}; }
+            }
+        }
+        ret Keyed.none{};
+    }
+    if (sel d.parameter) {
+        if (d.parameter.block != 0) { ret Keyed.none{}; }
+        val k:        usize     = d.parameter.index::usize;
+        val opt_read: opt[Type] = read_pointee(u, g, k, 0, false);
+        if (sel opt_read.none) { ret Keyed.none{}; }
+        ret param_key(u, g, k, space_of(u, b.values.data[a].type), opt_read.some, depth + 1);
+    }
+    if (sel d.result) {
+        val made: *InstructionData = ?b.instructions.data[d.result.instruction];
+        if (made.opcode == table.ALLOCA)                              { ret Keyed.key{spirv_types.PLAIN}; }
+        if (made.opcode == table.DECLASSIFY && made.operands.len > 0) { ret argument_key(u, g, b, made.operands.data[0], depth); }
+        if ((made.opcode == table.PTR_MEMBER || made.opcode == table.PTR_INDEX) && made.operands.len > 0) {
+            val base: Keyed = argument_key(u, g, b, made.operands.data[0], depth);
+            if (sel base.key) { ret Keyed.key{spirv_types.member_key(base.key)}; }
+            ret base;
+        }
+    }
+    ret Keyed.none{};
+}
+
 # what pointer `a`, an argument function `g` passes, points to: a global's
 # type, a stack slot's, the member or element an access chain reaches, or
 # what `g`'s own parameter points to. none for any other pointer
@@ -417,9 +512,11 @@ fun signatures(u: *Unit, r: *Reach) {
         or (results.len > 1)  { result = spirv_types.struct_of(u, results.data, results.len); }
         var params:   vector.Vector[u32] = vector.init[u32](u.a);
         var pointees: vector.Vector[u32] = vector.init[u32](u.a);
+        var keys:     vector.Vector[u32] = vector.init[u32](u.a);
         fin {
             vector.dnit[u32](?params);
             vector.dnit[u32](?pointees);
+            vector.dnit[u32](?keys);
         }
         k = 0;
         for (k < fs.params.size && unit.ok(u)) {
@@ -427,14 +524,22 @@ fun signatures(u: *Unit, r: *Reach) {
             if (spirv_types.pointer(u, pt)) {
                 val opt_pointee: opt[Type] = pointee(u, id, k);
                 if (sel opt_pointee.none) { ret; }
-                val class: u32 = space_of(u, pt);
-                val key:   u32 = code.unit_key(u, class, opt_pointee.some);
+                val class: u32   = space_of(u, pt);
+                val keyed: Keyed = param_key(u, id, k, class, opt_pointee.some, 0);
+                if (sel keyed.mixed) {
+                    unit.fail(u, Error.mixed{keyed.mixed});
+                    ret;
+                }
+                var key: u32 = spirv_types.PLAIN;
+                if (sel keyed.key) { key = keyed.key; }
                 push_u32(u, ?params, spirv_types.pointer_type(u, class, spirv_types.type_of(u, opt_pointee.some, key)));
                 push_u32(u, ?pointees, opt_pointee.some + 1);
+                push_u32(u, ?keys, key);
             }
             or {
                 push_u32(u, ?params, spirv_types.type_of(u, pt, spirv_types.PLAIN));
                 push_u32(u, ?pointees, 0);
+                push_u32(u, ?keys, 0);
             }
             k = k + 1;
         }
@@ -444,6 +549,7 @@ fun signatures(u: *Unit, r: *Reach) {
             results:  results.len::u32,
             params:   unit.keep_list(u, params.data, params.len),
             pointees: unit.keep_list(u, pointees.data, pointees.len),
+            keys:     unit.keep_list(u, keys.data, keys.len),
         };
         val res_pushed: res[usize, allocator.Error] = vector.push[Signature](?u.signatures, sig);
         if (sel res_pushed.err) {
@@ -1556,7 +1662,7 @@ fun laid(u: *Unit, r: *Reach, relocatable: bool) {
 # ret:         the object, or why it was not made
 pub fun compile(a: *allocator.Allocator, m: *Module, b: *Build, t: *Target, relocatable: bool, sink: opt[*Stats]) res[object.Object, Error] {
     var l: Layout = layout.of(t, ?m.types, basis.context_of(opt[*basis.Basis].some{?b.basis}));
-    var c: Cache  = cache.init(m, t, opt[*basis.Basis].some{?b.basis}, analysis.rows());
+    var c: Cache  = cache.init(m, t, opt[*basis.Basis].some{?b.basis}, analysis.rows(), analysis.OF_STRUCTURE);
     fin { val err_dropped: err[allocator.Error] = cache.dnit(?c); }
     var u: Unit = unit.init(a, m, b, t, ?l, ?c);
     fin { unit.dnit(?u); }

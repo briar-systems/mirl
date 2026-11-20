@@ -948,7 +948,7 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
   - `source` is a pointer
   - `length` is an integer
 - results: none
-- effects: reads memory, writes memory
+- effects: reads memory, writes memory, may be marked ascending or descending
   - traps when the address in `destination` cannot be accessed
   - traps when the address in `source` cannot be accessed
 - secrecy: no results
