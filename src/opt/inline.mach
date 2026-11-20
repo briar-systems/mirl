@@ -1,0 +1,695 @@
+# inlining within a unit: a direct call of a function of the unit is replaced by a copy of the callee's body
+#
+# the functions are taken bottom up over the unit's call graph (`mirl.pass.analysis.calls`), so a callee is expanded
+# into before any caller copies it, and the copy is of the callee as its own calls left it. a call is expanded when
+# the callee states `always` (`mirl.ir.function.Inlining`), or states nothing and its size as promotion leaves it
+# (`mirl.opt.promote.size`) is at most TINY, or under SMALL at a call inside a loop of the caller. a call stays a call
+# where the callee states `never`, where caller and callee are in one strongly connected group (a recursion, which is
+# never expanded), where the call is kept or volatile, where the callee's function names an extension the caller's
+# does not, where its entry is already placed, where it makes a slot outside its entry block or of a size an operand
+# gives, where the call's arguments are not one per entry parameter of the parameter's type and no more secret, where a
+# return passes a secret the call's result does not hold, and, under logical addressing, where an argument is a
+# pointer, since there a call passing one states a capability the expansion would hide. a replaceable callee, one with
+# no body here and one reached through a pointer are no direct call the unit follows and stay calls, a call through a
+# function type marked constant time among them: the declaration it states its callee keeps (`Metadata.stated`) names
+# no body to copy.
+#
+# a function's selection is the build's widened by the extensions its function names (`mirl.target.widening`, whose
+# table is made from those names alone), so a callee whose names are all among the caller's stands on a selection the
+# caller's holds, and its copy is legalised and selected under one that admits everything it was written for.
+#
+# the expansion splits the call's block after the call (`body.split_block`): the instructions after it go to a new
+# block whose parameters take the call's results. every reachable block of the callee is copied in reverse postorder
+# with its parameters, the entry's taking the call's arguments by a branch in the call's place, each return becomes a
+# branch to the new block passing what it returns, and each slot of the callee is made at the head of the caller's
+# entry block. each copied instruction keeps its metadata record whole and each copied record its variable, and where
+# the call states a location the copies are inlined through a site of the debug table naming the call and the callee,
+# a site the callee's code was itself inlined through re-rooted under it.
+#
+# a callee's body may be an available copy of another module's definition (`FunctionData.available`), read as any
+# other and never expanded into, since the `available` legalisation drops it right after this pass.
+#
+# the pass never erases a function. a callee no call reaches any more is left to dead code removal and to the link's
+# collection of unused sections, so every function marked constant time is still emitted and walked as its own body,
+# and a marked body can never leave the walk by being expanded away (design 5, rule 6's record for stage b4 holds by
+# construction).
+#
+# constant time (design 5): a constant-time callee is expanded only into a constant-time caller whose call the two
+# declarations alone make trusted (`mirl.ct.contract.standing`), and a callee not marked constant time is never
+# expanded into a constant-time caller (rule 6). the copy keeps every secrecy bit, every kept and volatile statement and
+# every frame extent of its source, since each instruction is copied with its record and each block parameter with
+# its declaration, so the caller's walk seeds what the callee's walk seeded. after expanding a constant-time callee the
+# pass checks it of every copy and refuses a copy that lost one (`refusal.Error.copied`). no branch, address or
+# callee is made from a value, an argument passes to a parameter of the callee's declared secrecy and a result to one
+# holding the call result's, so rules 1 and 2 hold, a kept or volatile access is copied, never moved or merged (rule 3),
+# and the pass runs on open ir before any timing row exists (rule 4).
+#
+# cost: one scan of every body for its direct calls, one walk of the call graph, and per expansion the callee's
+# instructions and records copied, its dominance read and the moved part of the caller's block given its new block.
+# a caller's loops are read once, before any expansion into it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.slice;
+use mirl.build.builder;
+use mirl.build.builder.Builder;
+use mirl.build.failure;
+use mirl.build.remap;
+use mirl.build.remap.Remap;
+use mirl.ct.contract;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.debug.place;
+use mirl.ir.debug.record.Inlining;
+use mirl.ir.debug.record.Location;
+use mirl.ir.debug.record.Site;
+use debug_table: mirl.ir.debug.table;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.function.in_constant_time;
+use mirl.ir.id.Block;
+use mirl.ir.id.Declared;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.table;
+use mirl.ir.point;
+use type_table: mirl.ir.type.table;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.ir.value.ValueData;
+use mirl.opt.promote;
+use mirl.pass.analysis;
+use mirl.pass.analysis.calls;
+use mirl.pass.cache;
+use mirl.pass.record.Changed;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.changed;
+use mirl.pass.refusal;
+use mirl.pass.refusal.Copied;
+
+# the pass: it rewrites callers, so it keeps no analysis of them
+pub val INLINE: Pass = Pass{name: "inline", kind: Kind.optimise{}, scope: Scope.module{run}, needs: analysis.OF_DOMINANCE | analysis.OF_LOOPS, time: Time.keeps{}};
+
+# a callee this size or smaller is expanded at every call
+pub val TINY: usize = 5;
+
+# a callee smaller than this is expanded at a call inside a loop
+pub val SMALL: usize = 25;
+
+# no size worked out yet
+val UNSIZED: usize = 0xffffffffffffffff;
+
+# one run over the unit
+# ---
+# calls:  the direct calls of functions the unit follows
+# groups: their strongly connected groups, in closing order
+# sizes:  each callee's size as promotion leaves it, once worked out, which it is only after its own expansions
+rec Run {
+    calls:  calls.Calls;
+    groups: calls.Groups;
+    sizes:  vector.Vector[usize];
+}
+
+# a call chosen for expansion
+# ---
+# call:   the call
+# callee: the function it calls
+rec Chosen {
+    call:   Instruction;
+    callee: Function;
+}
+
+# a call the rules admit, and whether its size alone decides
+# ---
+# call:   the call
+# callee: the function it calls
+# block:  the block it stands in
+rec Candidate {
+    call:   Instruction;
+    callee: Function;
+    block:  Block;
+}
+
+# a module's refusal of an edit, as the pass's
+fun lift(e: err[module.Error]) err[refusal.Error] {
+    if (sel e.err) { ret err[refusal.Error].err{refusal.Error.ir{e.err}}; }
+    ret err[refusal.Error].ok{};
+}
+
+# a refusal of the allocator, as the pass's
+fun lost(e: allocator.Error) err[refusal.Error] {
+    ret err[refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+# whether every extension the callee's function names past the build's is one the caller's names, so the selection the
+# caller stands on holds the callee's (`mirl.target.widening` opens each from the names alone)
+fun admits(callee: *FunctionData, caller: *FunctionData) bool {
+    var i: usize = 0;
+    for (i < callee.extensions.size) {
+        var found: bool  = false;
+        var j:     usize = 0;
+        for (j < caller.extensions.size && !found) {
+            found = slice.same_view(callee.extensions.data[i], caller.extensions.data[j]);
+            j     = j + 1;
+        }
+        if (!found) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether the constant-time rule lets a call from `caller` of `callee` be expanded: a marked callee only into a marked
+# caller whose call the declarations alone trust, an unmarked callee never into a marked caller
+fun timed(m: *Module, caller: Function, callee: Function) bool {
+    val into: bool = in_constant_time(m.functions.data[caller].data.constant_time);
+    if (in_constant_time(m.functions.data[callee].data.constant_time)) { ret into && contract.standing(m, caller, Declared.function{callee}); }
+    ret !into;
+}
+
+# whether a callee's body can be copied into another: its entry is not yet placed, and every slot it makes stands in
+# its entry block with a size no operand gives
+fun movable(b: *Body) bool {
+    if (sel b.entry.placed) { ret false; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d: *InstructionData = ?b.instructions.data[i];
+                if (d.opcode == table.ALLOCA && (k != 0 || d.operands.len != 0)) { ret false; }
+                i = d.next;
+            }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether the call's arguments are one per entry parameter of the callee, each of the parameter's type and secret only
+# where the parameter is, none a pointer
+# where the target's addressing is logical, and whether no return of the callee passes a secret where the call's
+# result holds none
+fun fits(c: *Context, b: *Body, call: *InstructionData, g: *Body) res[bool, refusal.Error] {
+    val m:      *Module = c.m;
+    val params: usize   = g.blocks.data[0].parameters.len;
+    if (call.operands.len != params + 1) { ret res[bool, refusal.Error].ok{false}; }
+    val logical: bool  = sel c.t.caps.addressing.logical;
+    var k:       usize = 0;
+    for (k < params) {
+        val ty:    type_table.Type = b.values.data[call.operands.data[k + 1]].type;
+        val param: *ValueData      = ?g.values.data[g.blocks.data[0].parameters.data[k]];
+        if (!type_table.same(ty, param.type))                                 { ret res[bool, refusal.Error].ok{false}; }
+        if (b.values.data[call.operands.data[k + 1]].secret && !param.secret) { ret res[bool, refusal.Error].ok{false}; }
+        if (logical) {
+            val res_kind: res[type_table.Kind, type_table.Error] = type_table.kind(?m.types, ty);
+            if (sel res_kind.err)        { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_kind.err}}}; }
+            if (sel res_kind.ok.pointer) { ret res[bool, refusal.Error].ok{false}; }
+        }
+        k = k + 1;
+    }
+    var n: usize = 0;
+    for (n < g.blocks.len) {
+        if (!g.blocks.data[n].erased) {
+            val last: Instruction = g.blocks.data[n].last;
+            if (last != NO_INSTRUCTION && g.instructions.data[last].opcode == table.RET) {
+                val ret_data: *InstructionData = ?g.instructions.data[last];
+                if (ret_data.operands.len != call.results.len) { ret res[bool, refusal.Error].ok{false}; }
+                var r: usize = 0;
+                for (r < ret_data.operands.len) {
+                    if (g.values.data[ret_data.operands.data[r]].secret && !b.values.data[call.results.data[r]].secret) { ret res[bool, refusal.Error].ok{false}; }
+                    r = r + 1;
+                }
+            }
+        }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# whether the rules admit expanding call `i` of `f`, which calls `g`, before any size is read
+fun admitted(c: *Context, x: *Run, f: Function, i: Instruction, g: Function) res[bool, refusal.Error] {
+    val m:  *Module          = c.m;
+    val b:  *Body            = ?m.functions.data[f].body;
+    val gb: *Body            = ?m.functions.data[g].body;
+    val d:  *InstructionData = ?b.instructions.data[i];
+    val gd: *FunctionData    = ?m.functions.data[g].data;
+    if (calls.recursive(?x.groups, f, g))                   { ret res[bool, refusal.Error].ok{false}; }
+    if (sel gd.inlining.never)                              { ret res[bool, refusal.Error].ok{false}; }
+    if (d.metadata.flags.kept || d.metadata.flags.volatile) { ret res[bool, refusal.Error].ok{false}; }
+    if (!timed(m, f, g))                                    { ret res[bool, refusal.Error].ok{false}; }
+    if (!admits(gd, ?m.functions.data[f].data))             { ret res[bool, refusal.Error].ok{false}; }
+    if (sel b.entry.placed || !movable(gb))                 { ret res[bool, refusal.Error].ok{false}; }
+    ret fits(c, b, d, gb);
+}
+
+# the size of callee `g` as promotion leaves it, worked out once
+fun size_of(c: *Context, x: *Run, g: Function) res[usize, refusal.Error] {
+    if (x.sizes.data[g] == UNSIZED) {
+        val res_size: res[usize, refusal.Error] = promote.size(c.m, ?c.m.functions.data[g].body);
+        if (sel res_size.err) { ret res_size; }
+        x.sizes.data[g] = res_size.ok;
+    }
+    ret res[usize, refusal.Error].ok{x.sizes.data[g]};
+}
+
+# the calls of `f` to expand, in the order its blocks and their instructions stand: the rules admit them, and the
+# callee states always, or its size is at most TINY, or under SMALL where the call stands in a loop of `f`
+fun choose(c: *Context, x: *Run, f: Function, out: *vector.Vector[Chosen]) err[refusal.Error] {
+    val m:     *Module                  = c.m;
+    var found: vector.Vector[Candidate] = vector.init[Candidate](m.a);
+    fin { vector.dnit[Candidate](?found); }
+    val b: *Body = ?m.functions.data[f].body;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val opt_callee: opt[Function] = calls.direct(m, b, i);
+                if (sel opt_callee.some) {
+                    val res_admitted: res[bool, refusal.Error] = admitted(c, x, f, i, opt_callee.some);
+                    if (sel res_admitted.err) { ret err[refusal.Error].err{res_admitted.err}; }
+                    if (res_admitted.ok) {
+                        val res_pushed: res[usize, allocator.Error] = vector.push[Candidate](?found, Candidate{call: i, callee: opt_callee.some, block: k::u32});
+                        if (sel res_pushed.err) { ret lost(res_pushed.err); }
+                    }
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    var l: *Loops = nil;
+    var n: usize  = 0;
+    for (n < found.len) {
+        val at:   Candidate     = found.data[n];
+        val said: *FunctionData = ?m.functions.data[at.callee].data;
+        var take: bool          = sel said.inlining.always;
+        if (!take) {
+            val res_size: res[usize, refusal.Error] = size_of(c, x, at.callee);
+            if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
+            take = res_size.ok <= TINY;
+            if (!take && res_size.ok < SMALL) {
+                if (l == nil) {
+                    val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, f);
+                    if (sel res_loops_of.err) { ret err[refusal.Error].err{res_loops_of.err}; }
+                    l = res_loops_of.ok;
+                }
+                take = loops.depth(l, at.block) > 0;
+            }
+        }
+        if (take) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Chosen](out, Chosen{call: at.call, callee: at.callee});
+            if (sel res_pushed.err) { ret lost(res_pushed.err); }
+        }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the sites the copies of one expansion are inlined through
+# ---
+# root: the site naming the call and the callee, none where the call states no location
+# from: the callee's sites met so far
+# to:   the site each re-roots to
+rec Sites {
+    root: opt[Site];
+    from: vector.Vector[Site];
+    to:   vector.Vector[Site];
+}
+
+# give back the storage of the sites
+fun sites_dnit(s: *Sites) {
+    vector.dnit[Site](?s.from);
+    vector.dnit[Site](?s.to);
+}
+
+# the debug table's refusal of a site, as the pass's
+fun debugged(r: res[Site, debug_table.Error]) res[Site, refusal.Error] {
+    if (sel r.err) { ret res[Site, refusal.Error].err{refusal.Error.debug{r.err}}; }
+    ret res[Site, refusal.Error].ok{r.ok};
+}
+
+# the site a copy of an instruction of the callee inlined through `s` is inlined through: the root for none, and for a
+# site of the callee one naming its call and callee whose parent is re-rooted the same way
+fun rooted(m: *Module, x: *Sites, s: opt[Site]) res[opt[Site], refusal.Error] {
+    if (sel x.root.none) { ret res[opt[Site], refusal.Error].ok{s}; }
+    if (sel s.none)      { ret res[opt[Site], refusal.Error].ok{x.root}; }
+    var k: usize = 0;
+    for (k < x.from.len) {
+        if (x.from.data[k] == s.some) { ret res[opt[Site], refusal.Error].ok{opt[Site].some{x.to.data[k]}}; }
+        k = k + 1;
+    }
+    val res_inlining: res[Inlining, debug_table.Error] = place.inlining(?m.debug, s.some);
+    if (sel res_inlining.err) { ret res[opt[Site], refusal.Error].err{refusal.Error.debug{res_inlining.err}}; }
+    val res_parent: res[opt[Site], refusal.Error] = rooted(m, x, res_inlining.ok.parent);
+    if (sel res_parent.err) { ret res_parent; }
+    val res_made: res[Site, refusal.Error] = debugged(place.site(?m.debug, Inlining{call: res_inlining.ok.call, callee: res_inlining.ok.callee, parent: res_parent.ok}));
+    if (sel res_made.err) { ret res[opt[Site], refusal.Error].err{res_made.err}; }
+    val res_from: res[usize, allocator.Error] = vector.push[Site](?x.from, s.some);
+    if (sel res_from.err) { ret res[opt[Site], refusal.Error].err{refusal.Error.alloc{res_from.err}}; }
+    val res_to: res[usize, allocator.Error] = vector.push[Site](?x.to, res_made.ok);
+    if (sel res_to.err) { ret res[opt[Site], refusal.Error].err{refusal.Error.alloc{res_to.err}}; }
+    ret res[opt[Site], refusal.Error].ok{opt[Site].some{res_made.ok}};
+}
+
+# one expansion in progress
+# ---
+# c:     the run
+# f:     the caller
+# g:     the callee
+# bld:   the builder, in the caller
+# r:     the callee's values and blocks and their copies
+# sites: the sites the copies are inlined through
+# head:  the last slot made at the head of the caller's entry block, NO_INSTRUCTION before the first
+# pairs: each source instruction of a constant-time callee and its copy, for the check the copy kept its record
+# timed: the callee is marked constant time
+rec Expansion {
+    c:     *Context;
+    f:     Function;
+    g:     Function;
+    bld:   Builder;
+    r:     Remap;
+    sites: Sites;
+    head:  Instruction;
+    pairs: vector.Vector[Instruction];
+    timed: bool;
+}
+
+# the builder's refusal, as the pass's, where it stopped
+fun built(e: *Expansion) err[refusal.Error] {
+    val err_done: err[failure.Error] = builder.done(?e.bld);
+    if (sel err_done.err) { ret err[refusal.Error].err{refusal.Error.build{err_done.err}}; }
+    ret err[refusal.Error].ok{};
+}
+
+# the copy of a value of the callee: its bound copy, or the caller's value of the same constant
+fun mapped(e: *Expansion, v: Value) res[Value, refusal.Error] {
+    val opt_bound: opt[Value] = remap.value(?e.r, v);
+    if (sel opt_bound.some) { ret res[Value, refusal.Error].ok{opt_bound.some}; }
+    val def: Def = e.c.m.functions.data[e.g].body.values.data[v].def;
+    if (sel def.constant) {
+        val res_constant: res[Value, module.Error] = body.constant(e.c.m, e.f, def.constant);
+        if (sel res_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_constant.err}}; }
+        ret res[Value, refusal.Error].ok{res_constant.ok};
+    }
+    ret res[Value, refusal.Error].err{refusal.Error.ir{module.Error.value{v}}};
+}
+
+# copy the records of a run of the callee to the cursor
+fun records(e: *Expansion, run: point.Run) {
+    var p: u32 = run.first;
+    for (p != 0) {
+        val pt: point.Point = e.c.m.functions.data[e.g].body.points.data[p - 1];
+        builder.copy_binding(?e.bld, e.g, pt, ?e.r);
+        if (p == run.last) { brk; }
+        p = pt.next;
+    }
+}
+
+# the parameters a block of the callee is declared with, into `out`
+fun declared(e: *Expansion, k: Block, out: *vector.Vector[Declaration]) err[refusal.Error] {
+    vector.truncate[Declaration](out, 0);
+    val gb: *Body = ?e.c.m.functions.data[e.g].body;
+    var n:  usize = 0;
+    for (n < gb.blocks.data[k].parameters.len) {
+        val v:          Value                       = gb.blocks.data[k].parameters.data[n];
+        val res_pushed: res[usize, allocator.Error] = vector.push[Declaration](out, Declaration{type: gb.values.data[v].type, secret: gb.values.data[v].secret, name: opt[View].none{}});
+        if (sel res_pushed.err) { ret lost(res_pushed.err); }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# give a copy the site its source's is re-rooted to
+fun resite(e: *Expansion, made: Instruction, from: opt[Site]) err[refusal.Error] {
+    if (builder.failed(?e.bld)) { ret built(e); }
+    val res_site: res[opt[Site], refusal.Error] = rooted(e.c.m, ?e.sites, from);
+    if (sel res_site.err) { ret err[refusal.Error].err{res_site.err}; }
+    var md: Metadata = e.c.m.functions.data[e.f].body.instructions.data[made].metadata;
+    md.site = res_site.ok;
+    ret lift(body.set_metadata(e.c.m, e.f, made, md));
+}
+
+# copy instruction `i` of the callee to the cursor, which stands in block `into`: a slot goes to the head of the
+# caller's entry block, and a return becomes a branch to `tail` passing what it returns
+fun copy_one(e: *Expansion, i: Instruction, into: Block, tail: Block) err[refusal.Error] {
+    val gb:  *Body           = ?e.c.m.functions.data[e.g].body;
+    val src: InstructionData = gb.instructions.data[i];
+    records(e, src.points);
+    if (src.opcode == table.RET) {
+        var args: vector.Vector[Value] = vector.init[Value](e.c.m.a);
+        fin { vector.dnit[Value](?args); }
+        var n: usize = 0;
+        for (n < src.operands.len) {
+            val res_mapped: res[Value, refusal.Error] = mapped(e, src.operands.data[n]);
+            if (sel res_mapped.err) { ret err[refusal.Error].err{res_mapped.err}; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Value](?args, res_mapped.ok);
+            if (sel res_pushed.err) { ret lost(res_pushed.err); }
+            n = n + 1;
+        }
+        val res_site: res[opt[Site], refusal.Error] = rooted(e.c.m, ?e.sites, src.metadata.site);
+        if (sel res_site.err) { ret err[refusal.Error].err{res_site.err}; }
+        builder.plain(?e.bld);
+        builder.locate(?e.bld, src.metadata.location);
+        builder.site(?e.bld, res_site.ok);
+        var targets: [1]Branch = [1]Branch{Branch{block: tail, arguments: Slice[Value]{data: args.data, size: args.len}}};
+        builder.emit(?e.bld, Request{opcode: table.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?targets[0], size: 1}});
+        ret built(e);
+    }
+    if (src.opcode == table.ALLOCA) {
+        if (e.head == NO_INSTRUCTION) { builder.at_start(?e.bld, 0); }
+        or                            { builder.after(?e.bld, e.head); }
+    }
+    val made: Instruction = builder.copy(?e.bld, e.g, i, ?e.r);
+    if (src.opcode == table.ALLOCA) {
+        e.head = made;
+        builder.at_end(?e.bld, into);
+    }
+    val err_sited: err[refusal.Error] = resite(e, made, src.metadata.site);
+    if (sel err_sited.err) { ret err_sited; }
+    if (e.timed) {
+        val res_source: res[usize, allocator.Error] = vector.push[Instruction](?e.pairs, i);
+        if (sel res_source.err) { ret lost(res_source.err); }
+        val res_copy: res[usize, allocator.Error] = vector.push[Instruction](?e.pairs, made);
+        if (sel res_copy.err) { ret lost(res_copy.err); }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether a copy kept its source's record: the secrecy of the instruction and of each result, and its kept and
+# volatile statements and frame extent
+fun kept(e: *Expansion, from: Instruction, to: Instruction) bool {
+    val gb: *Body            = ?e.c.m.functions.data[e.g].body;
+    val fb: *Body            = ?e.c.m.functions.data[e.f].body;
+    val s:  *InstructionData = ?gb.instructions.data[from];
+    val d:  *InstructionData = ?fb.instructions.data[to];
+    if (s.metadata.secret != d.metadata.secret)                                                                                                                           { ret false; }
+    if (s.metadata.flags.kept != d.metadata.flags.kept)                                                                                                                   { ret false; }
+    if (s.metadata.flags.volatile != d.metadata.flags.volatile)                                                                                                           { ret false; }
+    if (s.metadata.extent.slot != d.metadata.extent.slot || s.metadata.extent.offset != d.metadata.extent.offset || s.metadata.extent.length != d.metadata.extent.length) { ret false; }
+    if (s.results.len != d.results.len)                                                                                                                                   { ret false; }
+    var k: usize = 0;
+    for (k < s.results.len) {
+        if (gb.values.data[s.results.data[k]].secret != fb.values.data[d.results.data[k]].secret) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# check every copy of a constant-time callee kept its source's record
+fun check(e: *Expansion) err[refusal.Error] {
+    var n: usize = 0;
+    for (n + 1 < e.pairs.len) {
+        if (!kept(e, e.pairs.data[n], e.pairs.data[n + 1])) { ret err[refusal.Error].err{refusal.Error.copied{Copied{callee: e.g, instruction: e.pairs.data[n]}}}; }
+        n = n + 2;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# give back the storage of an expansion
+fun expansion_dnit(e: *Expansion) {
+    remap.dnit(?e.r);
+    sites_dnit(?e.sites);
+    vector.dnit[Instruction](?e.pairs);
+}
+
+# expand call `call` of `f`, which calls `g`
+fun expand(c: *Context, f: Function, call: Instruction, g: Function) err[refusal.Error] {
+    val m: *Module              = c.m;
+    val a: *allocator.Allocator = m.a;
+    var e: Expansion            = Expansion{c: c, f: f, g: g, bld: builder.make(m), r: remap.init(a), sites: Sites{root: opt[Site].none{}, from: vector.init[Site](a), to: vector.init[Site](a)}, head: NO_INSTRUCTION, pairs: vector.init[Instruction](a), timed: in_constant_time(m.functions.data[g].data.constant_time)};
+    fin { expansion_dnit(?e); }
+    var arguments: vector.Vector[Value]       = vector.init[Value](a);
+    var results:   vector.Vector[Value]       = vector.init[Value](a);
+    var decls:     vector.Vector[Declaration] = vector.init[Declaration](a);
+    fin {
+        vector.dnit[Value](?arguments);
+        vector.dnit[Value](?results);
+        vector.dnit[Declaration](?decls);
+    }
+    val fb:       *Body           = ?m.functions.data[f].body;
+    val cd:       InstructionData = fb.instructions.data[call];
+    val location: opt[Location]   = cd.metadata.location;
+    val outer:    opt[Site]       = cd.metadata.site;
+    var n:        usize           = 1;
+    for (n < cd.operands.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?arguments, cd.operands.data[n]);
+        if (sel res_pushed.err) { ret lost(res_pushed.err); }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < cd.results.len) {
+        val v:          Value                       = cd.results.data[n];
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?results, v);
+        if (sel res_pushed.err) { ret lost(res_pushed.err); }
+        val res_declared: res[usize, allocator.Error] = vector.push[Declaration](?decls, Declaration{type: fb.values.data[v].type, secret: fb.values.data[v].secret, name: opt[View].none{}});
+        if (sel res_declared.err) { ret lost(res_declared.err); }
+        n = n + 1;
+    }
+    var from: Block = 0;
+    if (sel cd.place.placed) { from = cd.place.placed; }
+    or                       { ret err[refusal.Error].err{refusal.Error.ir{module.Error.detached{call}}}; }
+    if (sel location.some) {
+        val callee_name: View                     = module.name_of(m, m.functions.data[g].data.name);
+        val res_root:    res[Site, refusal.Error] = debugged(place.site(?m.debug, Inlining{call: location.some, callee: callee_name, parent: outer}));
+        if (sel res_root.err) { ret err[refusal.Error].err{res_root.err}; }
+        e.sites.root = opt[Site].some{res_root.ok};
+    }
+
+    val res_tail: res[Block, module.Error] = body.split_block(m, f, cd.next, Slice[Declaration]{data: decls.data, size: decls.len});
+    if (sel res_tail.err) { ret err[refusal.Error].err{refusal.Error.ir{res_tail.err}}; }
+    val tail: Block = res_tail.ok;
+    n = 0;
+    for (n < results.len) {
+        val param:        Value              = m.functions.data[f].body.blocks.data[tail].parameters.data[n];
+        val err_replaced: err[refusal.Error] = lift(body.replace(m, f, results.data[n], param, Records.follow{}));
+        if (sel err_replaced.err) { ret err_replaced; }
+        n = n + 1;
+    }
+    val err_erased: err[refusal.Error] = lift(body.erase(m, f, call));
+    if (sel err_erased.err) { ret err_erased; }
+
+    val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, g);
+    if (sel res_dominance_of.err) { ret err[refusal.Error].err{res_dominance_of.err}; }
+    val order: Slice[u32] = dominance.order(res_dominance_of.ok);
+    builder.enter(?e.bld, f);
+    n = 0;
+    for (n < order.size) {
+        val err_declared: err[refusal.Error] = declared(?e, order.data[n], ?decls);
+        if (sel err_declared.err) { ret err_declared; }
+        val k: Block = builder.block(?e.bld, Slice[Declaration]{data: decls.data, size: decls.len});
+        if (builder.failed(?e.bld)) { ret built(?e); }
+        val err_bound: err[allocator.Error] = remap.bind_block(?e.r, order.data[n], k);
+        if (sel err_bound.err) { ret lost(err_bound.err); }
+        var p: usize = 0;
+        for (p < decls.len) {
+            val err_value: err[allocator.Error] = remap.bind_value(?e.r, m.functions.data[g].body.blocks.data[order.data[n]].parameters.data[p], m.functions.data[f].body.blocks.data[k].parameters.data[p]);
+            if (sel err_value.err) { ret lost(err_value.err); }
+            p = p + 1;
+        }
+        n = n + 1;
+    }
+
+    val opt_entry: opt[Block] = remap.block(?e.r, 0);
+    if (sel opt_entry.none) { ret err[refusal.Error].err{refusal.Error.ir{module.Error.block{0}}}; }
+    builder.at_end(?e.bld, from);
+    builder.plain(?e.bld);
+    builder.locate(?e.bld, location);
+    builder.site(?e.bld, outer);
+    var targets: [1]Branch = [1]Branch{Branch{block: opt_entry.some, arguments: Slice[Value]{data: arguments.data, size: arguments.len}}};
+    builder.emit(?e.bld, Request{opcode: table.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?targets[0], size: 1}});
+    val err_jumped: err[refusal.Error] = built(?e);
+    if (sel err_jumped.err) { ret err_jumped; }
+
+    n = 0;
+    for (n < order.size) {
+        val kg:       Block      = order.data[n];
+        val opt_into: opt[Block] = remap.block(?e.r, kg);
+        if (sel opt_into.none) { ret err[refusal.Error].err{refusal.Error.ir{module.Error.block{kg}}}; }
+        builder.at_end(?e.bld, opt_into.some);
+        var i: Instruction = m.functions.data[g].body.blocks.data[kg].first;
+        for (i != NO_INSTRUCTION) {
+            val err_placed: err[refusal.Error] = copy_one(?e, i, opt_into.some, tail);
+            if (sel err_placed.err) { ret err_placed; }
+            i = m.functions.data[g].body.instructions.data[i].next;
+        }
+        records(?e, m.functions.data[g].body.blocks.data[kg].ending);
+        val err_ended: err[refusal.Error] = built(?e);
+        if (sel err_ended.err) { ret err_ended; }
+        n = n + 1;
+    }
+    if (e.timed) { ret check(?e); }
+    ret err[refusal.Error].ok{};
+}
+
+# give back the storage of a run
+fun dnit(x: *Run) {
+    calls.dnit(?x.calls);
+    calls.groups_dnit(?x.groups);
+    vector.dnit[usize](?x.sizes);
+}
+
+# expand the chosen calls of every function of the unit, callees first, marking each caller it rewrote
+fun run(c: *Context, ch: *Changed) res[bool, refusal.Error] {
+    val m: *Module              = c.m;
+    val a: *allocator.Allocator = m.a;
+    var x: Run                  = Run{calls: calls.init(a), groups: calls.groups_init(a), sizes: vector.init[usize](a)};
+    fin { dnit(?x); }
+    var err_failed: err[allocator.Error] = calls.of(m, ?x.calls);
+    if (!(sel err_failed.err)) { err_failed = calls.groups(a, m, ?x.calls, ?x.groups); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[usize](?x.sizes, m.functions.len, UNSIZED); }
+    if (sel err_failed.err)    { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_failed.err}}; }
+    var chosen: vector.Vector[Chosen] = vector.init[Chosen](a);
+    fin { vector.dnit[Chosen](?chosen); }
+    var any: bool  = false;
+    var n:   usize = 0;
+    for (n < x.groups.order.len) {
+        val f: Function = x.groups.order.data[n];
+        n = n + 1;
+        if (x.calls.first.data[f] == x.calls.first.data[f + 1]) { cnt; }
+        if (m.functions.data[f].data.available)                 { cnt; }
+        vector.truncate[Chosen](?chosen, 0);
+        val err_chosen: err[refusal.Error] = choose(c, ?x, f, ?chosen);
+        if (sel err_chosen.err) { ret res[bool, refusal.Error].err{err_chosen.err}; }
+        if (chosen.len == 0)    { cnt; }
+        var k: usize = 0;
+        for (k < chosen.len) {
+            val err_expanded: err[refusal.Error] = expand(c, f, chosen.data[k].call, chosen.data[k].callee);
+            if (sel err_expanded.err) { ret res[bool, refusal.Error].err{err_expanded.err}; }
+            k = k + 1;
+        }
+        val err_forgot: err[allocator.Error] = cache.forget(c.cache, f);
+        if (sel err_forgot.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_forgot.err}}; }
+        changed(ch, f);
+        any = true;
+    }
+    ret res[bool, refusal.Error].ok{any};
+}

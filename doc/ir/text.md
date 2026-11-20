@@ -302,6 +302,13 @@ decorators
                             frame: `none`, or each of `reads`, `writes`,
                             `traps` and `ends` it may do, in that order (see
                             ir.md 6.8)
+  #[inline(mode)]           whether a call of a function is expanded in
+                            place: `always` or `never`, nothing for the
+                            inliner's own rule (see ir.md 6.8)
+  #[available]              a function's body is a copy of the one
+                            definition another module holds, read by the
+                            inliner alone and dropped before any later pass
+                            (see ir.md 6.8)
   #[convention(name)]       the calling convention of a function's signature,
                             the default when left out
   #[placed(type, places)]   the abi legalisation has put the body in pieces:

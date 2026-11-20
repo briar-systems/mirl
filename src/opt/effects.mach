@@ -9,8 +9,8 @@
 # return, where its graph holds a cycle, since no rule here bounds one.
 #
 # the effects are joined bottom up over the unit's call graph one strongly connected group at a time, in the order the
-# groups close on a walk that takes the functions by index, so each group is joined after every group it calls and its
-# members share one statement. a group whose members call each other ends, as nothing bounds the recursion. a function
+# groups close (`mirl.pass.analysis.calls`), so each group is joined after every group it calls and its members share
+# one statement. a group whose members call each other ends, as nothing bounds the recursion. a function
 # with no body, or a replaceable one, states nothing, since no body here speaks for a call of it.
 #
 # the pass changes no body and reads no secret, so it keeps constant time. it states facts of the bodies as they
@@ -40,7 +40,6 @@ use mirl.ir.cfg.graph.Graph;
 use mirl.ir.function;
 use mirl.ir.function.Body;
 use mirl.ir.function.Effects;
-use mirl.ir.function.Node;
 use mirl.ir.function.Reach;
 use mirl.ir.function.Summary;
 use mirl.ir.id.Function;
@@ -53,6 +52,7 @@ use mirl.ir.opcode.row.Traps;
 use mirl.ir.opcode.rule.Trap;
 use mirl.ir.opcode.table;
 use mirl.pass.analysis;
+use mirl.pass.analysis.calls;
 use mirl.pass.analysis.memory;
 use mirl.pass.analysis.memory.Effect;
 use mirl.pass.analysis.memory.Memory;
@@ -66,41 +66,21 @@ use mirl.pass.record.Scope;
 use mirl.pass.record.Time;
 use mirl.pass.record.changed;
 use mirl.pass.refusal;
-use mirl.pass.refusal.lost;
 
 # the pass: it changes no body, so every analysis outlives it
 pub val EFFECTS: Pass = Pass{name: "effects", kind: Kind.optimise{}, scope: Scope.module{run}, needs: analysis.OF_GRAPH | analysis.OF_DOMINANCE | analysis.OF_MEMORY, preserves: cache.ALL, time: Time.keeps{}};
 
-# no function
-val NONE: u32 = 0xffffffff;
-
-# a function of the walk and how far through its calls it is
-rec Frame {
-    f:  u32;
-    at: u32;
-}
-
 # one run over the unit
 # ---
-# own:   each function's own effects, its calls of functions the unit follows apart
-# first: where each function's calls start in `calls`, then one past the last
-# calls: the callees of every function's calls the unit follows, function by function
-# index: the order each function was reached in, NONE before it is
-# low:   the earliest reached function each one reaches back to
-# open:  whether each function is on the stack
-# stack: the functions reached whose group is not closed
-# done:  each function's joined effects, once its group closes
+# own:    each function's own effects, its calls of functions the unit follows apart
+# calls:  the calls of functions the unit follows, function by function
+# groups: the strongly connected groups of those calls
+# done:   each function's joined effects, once its group is joined
 rec Run {
-    own:   vector.Vector[Summary];
-    first: vector.Vector[u32];
-    calls: vector.Vector[u32];
-    index: vector.Vector[u32];
-    low:   vector.Vector[u32];
-    open:  vector.Vector[bool];
-    stack: vector.Vector[u32];
-    walk:  vector.Vector[Frame];
-    done:  vector.Vector[Summary];
-    count: u32;
+    own:    vector.Vector[Summary];
+    calls:  calls.Calls;
+    groups: calls.Groups;
+    done:   vector.Vector[Summary];
 }
 
 # the effects of nothing
@@ -120,13 +100,6 @@ fun join(a: Summary, b: Summary) Summary {
     out.traps = a.traps || b.traps;
     out.ends  = a.ends || b.ends;
     ret out;
-}
-
-# whether the unit follows a function: it has a body here and no other definition may stand for it
-fun followed(m: *Module, f: Function) bool {
-    if (f::usize >= m.functions.len) { ret false; }
-    val n: *Node = ?m.functions.data[f];
-    ret n.body.blocks.len != 0 && !n.data.linkage.replaceable;
 }
 
 # whether a row states it may trap
@@ -194,13 +167,13 @@ fun scan(c: *Context, r: *Run, f: Function) res[Summary, refusal.Error] {
                 if (trapping(row) || d.opcode == table.UNREACHABLE) { own.traps = true; }
                 if (read.calls(d)) {
                     val opt_callee: opt[Function] = read.callee(m, b, d);
-                    var to:         u32           = NONE;
+                    var to:         u32           = calls.NONE;
                     if (sel opt_callee.some) {
-                        if (followed(m, opt_callee.some)) { to = opt_callee.some; }
+                        if (calls.followed(m, opt_callee.some)) { to = opt_callee.some; }
                     }
-                    if (to != NONE) {
-                        val res_pushed: res[usize, allocator.Error] = vector.push[u32](?r.calls, to);
-                        if (sel res_pushed.err) { ret res[Summary, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                    if (to != calls.NONE) {
+                        val err_added: err[allocator.Error] = calls.add(?r.calls, to);
+                        if (sel err_added.err) { ret res[Summary, refusal.Error].err{refusal.Error.alloc{err_added.err}}; }
                     }
                     or { own = everything(); }
                 }
@@ -229,86 +202,38 @@ fun scan(c: *Context, r: *Run, f: Function) res[Summary, refusal.Error] {
     ret res[Summary, refusal.Error].ok{own};
 }
 
-fun reach(r: *Run, f: u32) err[refusal.Error] {
-    r.index.data[f] = r.count;
-    r.low.data[f]   = r.count;
-    r.open.data[f]  = true;
-    r.count         = r.count + 1;
-    val res_stacked: res[usize, allocator.Error] = vector.push[u32](?r.stack, f);
-    if (sel res_stacked.err) { ret lost(res_stacked.err); }
-    val res_walked: res[usize, allocator.Error] = vector.push[Frame](?r.walk, Frame{f: f, at: r.first.data[f]});
-    if (sel res_walked.err) { ret lost(res_walked.err); }
-    ret err[refusal.Error].ok{};
-}
-
-# close the group `f` heads: its members are the stack from `f` up, every one called by another or itself in a cycle
-fun close(r: *Run, f: u32) {
-    var from: usize = r.stack.len;
-    for (r.stack.data[from - 1] != f) { from = from - 1; }
-    from = from - 1;
+# join group `g`'s effects: its members' own and those of every group they call, which closed before it. a group whose
+# members call each other or one that calls itself ends
+fun join_group(r: *Run, g: usize) {
+    val from:   u32     = r.groups.starts.data[g];
+    val to:     u32     = r.groups.starts.data[g + 1];
     var joined: Summary = nothing();
-    var cyclic: bool    = r.stack.len - from > 1;
-    var k:      usize   = from;
-    for (k < r.stack.len) {
-        val g: u32 = r.stack.data[k];
-        joined = join(joined, r.own.data[g]);
-        var at: u32 = r.first.data[g];
-        for (at < r.first.data[g + 1]) {
-            val to: u32 = r.calls.data[at];
-            if (r.open.data[to]) { cyclic = true; }
-            or                   { joined = join(joined, r.done.data[to]); }
+    var cyclic: bool    = to - from > 1;
+    var k:      u32     = from;
+    for (k < to) {
+        val x: u32 = r.groups.order.data[k];
+        joined = join(joined, r.own.data[x]);
+        var at: u32 = r.calls.first.data[x];
+        for (at < r.calls.first.data[x + 1]) {
+            val callee: u32 = r.calls.callees.data[at];
+            if (r.groups.group.data[callee] == g::u32) { cyclic = true; }
+            or                                         { joined = join(joined, r.done.data[callee]); }
             at = at + 1;
         }
         k = k + 1;
     }
     if (cyclic) { joined.ends = true; }
     k = from;
-    for (k < r.stack.len) {
-        val g: u32 = r.stack.data[k];
-        r.done.data[g] = joined;
-        r.open.data[g] = false;
-        k              = k + 1;
+    for (k < to) {
+        r.done.data[r.groups.order.data[k]] = joined;
+        k                                   = k + 1;
     }
-    vector.truncate[u32](?r.stack, from);
-}
-
-# walk the call graph from function `root`, closing each group as the walk leaves its head
-fun walk(r: *Run, root: u32) err[refusal.Error] {
-    val err_reached: err[refusal.Error] = reach(r, root);
-    if (sel err_reached.err) { ret err_reached; }
-    for (r.walk.len > 0) {
-        val top: *Frame = ?r.walk.data[r.walk.len - 1];
-        val f:   u32    = top.f;
-        if (top.at < r.first.data[f + 1]) {
-            val to: u32 = r.calls.data[top.at];
-            top.at = top.at + 1;
-            if (r.index.data[to] == NONE) {
-                val err_next: err[refusal.Error] = reach(r, to);
-                if (sel err_next.err) { ret err_next; }
-            }
-            or (r.open.data[to] && r.index.data[to] < r.low.data[f]) { r.low.data[f] = r.index.data[to]; }
-        }
-        or {
-            vector.truncate[Frame](?r.walk, r.walk.len - 1);
-            if (r.walk.len > 0) {
-                val up: u32 = r.walk.data[r.walk.len - 1].f;
-                if (r.low.data[f] < r.low.data[up]) { r.low.data[up] = r.low.data[f]; }
-            }
-            if (r.low.data[f] == r.index.data[f]) { close(r, f); }
-        }
-    }
-    ret err[refusal.Error].ok{};
 }
 
 fun dnit(r: *Run) {
     vector.dnit[Summary](?r.own);
-    vector.dnit[u32](?r.first);
-    vector.dnit[u32](?r.calls);
-    vector.dnit[u32](?r.index);
-    vector.dnit[u32](?r.low);
-    vector.dnit[bool](?r.open);
-    vector.dnit[u32](?r.stack);
-    vector.dnit[Frame](?r.walk);
+    calls.dnit(?r.calls);
+    calls.groups_dnit(?r.groups);
     vector.dnit[Summary](?r.done);
 }
 
@@ -317,39 +242,35 @@ fun run(c: *Context, ch: *Changed) res[bool, refusal.Error] {
     val m: *Module              = c.m;
     val n: usize                = m.functions.len;
     val a: *allocator.Allocator = m.a;
-    var r: Run                  = Run{own: vector.init[Summary](a), first: vector.init[u32](a), calls: vector.init[u32](a), index: vector.init[u32](a), low: vector.init[u32](a), open: vector.init[bool](a), stack: vector.init[u32](a), walk: vector.init[Frame](a), done: vector.init[Summary](a), count: 0};
+    var r: Run                  = Run{own: vector.init[Summary](a), calls: calls.init(a), groups: calls.groups_init(a), done: vector.init[Summary](a)};
     fin { dnit(?r); }
     var err_failed: err[allocator.Error] = slice.fill[Summary](?r.own, n, nothing());
-    if (!(sel err_failed.err)) { err_failed = slice.fill[u32](?r.first, n + 1, 0); }
-    if (!(sel err_failed.err)) { err_failed = slice.fill[u32](?r.index, n, NONE); }
-    if (!(sel err_failed.err)) { err_failed = slice.fill[u32](?r.low, n, NONE); }
-    if (!(sel err_failed.err)) { err_failed = slice.fill[bool](?r.open, n, false); }
     if (!(sel err_failed.err)) { err_failed = slice.fill[Summary](?r.done, n, nothing()); }
     if (sel err_failed.err)    { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_failed.err}}; }
     var f: usize = 0;
     for (f < n) {
-        r.first.data[f] = r.calls.len::u32;
-        if (followed(m, f::u32)) {
+        val err_begun: err[allocator.Error] = calls.begin(?r.calls);
+        if (sel err_begun.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_begun.err}}; }
+        if (calls.followed(m, f::u32)) {
             val res_scan: res[Summary, refusal.Error] = scan(c, ?r, f::u32);
             if (sel res_scan.err) { ret res[bool, refusal.Error].err{res_scan.err}; }
             r.own.data[f] = res_scan.ok;
         }
         f = f + 1;
     }
-    r.first.data[n] = r.calls.len::u32;
-    f               = 0;
-    for (f < n) {
-        if (followed(m, f::u32) && r.index.data[f] == NONE) {
-            val err_walked: err[refusal.Error] = walk(?r, f::u32);
-            if (sel err_walked.err) { ret res[bool, refusal.Error].err{err_walked.err}; }
-        }
-        f = f + 1;
+    var err_listed: err[allocator.Error] = calls.end(?r.calls, n);
+    if (!(sel err_listed.err)) { err_listed = calls.groups(a, m, ?r.calls, ?r.groups); }
+    if (sel err_listed.err)    { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_listed.err}}; }
+    var g: usize = 0;
+    for (g < calls.count(?r.groups)) {
+        join_group(?r, g);
+        g = g + 1;
     }
     var any: bool = false;
     f = 0;
     for (f < n) {
         var stated: Effects = Effects.unstated{};
-        if (followed(m, f::u32)) { stated = Effects.stated{r.done.data[f]}; }
+        if (calls.followed(m, f::u32)) { stated = Effects.stated{r.done.data[f]}; }
         if (!function.same_effects(m.functions.data[f].data.effects, stated)) {
             m.functions.data[f].data.effects = stated;
             changed(ch, f::u32);
