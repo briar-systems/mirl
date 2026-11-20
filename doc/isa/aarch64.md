@@ -70,7 +70,7 @@ A cost is two for each instruction an expansion emits, with a multiply counting 
 
 ## What the table does not select
 
-The declared operations are in `declared.mach`, each with the job that closes it.
+These operations reach no rule, each with the job that closes it.
 
 - `reduce.fminnum` and `reduce.fmaxnum`: `fminnmv` and `fmaxnmv` give a NaN for a signalling NaN lane where the IR's opcodes give the other operand, so no row of the NEON unit states them and the vector legalisation takes them lane by lane. A vector of a lane count no arrangement holds is refused naming the instruction.
 - `frem`, `mem.copy`, `mem.fill` and the wide division, since AArch64 states none natively. The helpers legalisation takes out `frem`, the wide division and a copy or fill of a length not constant, and the bulk legalisation makes a copy or fill of a constant length a loop of word moves (see [target](../ir/target.md)).

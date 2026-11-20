@@ -85,7 +85,7 @@ Where an extension is absent the rule for its row is dropped and a base form sta
 
 ## What the table does not select
 
-The declared operations are in `declared.mach`, each with the job that closes it. Every opcode of the ir has a rule, is declared, or is a float operation the helpers legalisation takes out on every build because no format the target holds computes it natively, and only one of them.
+These operations reach no rule, each with the job that closes it. Every opcode of the ir has a rule, is listed here, or is a float operation the helpers legalisation takes out on every build because no format the target holds computes it natively, and only one of them.
 
 - `vbuild` and `vshuffle`, which RVV makes only from a vector of indices (`vrgather`) that no rule builds, the product reductions, which RVV has no instruction for, and `reduce.fmin` and `reduce.fmax`, since `vfredmin` and `vfredmax` give the other operand for a NaN where the IR's IEEE minimum and maximum give a NaN. The V unit states no row of them, so the vector legalisation takes them lane by lane. Without `v` the target holds vectors in no register and takes every vector lane by lane.
 - `frem`, which no instruction does. The helpers legalisation calls the helper of its format in its place, since the RISC-V rows state no native `frem`, so it is not declared.
