@@ -139,7 +139,7 @@ example() {
 while read -r -u 3 target arch system env isa abi; do
     line="target { arch: \"$arch\", sys: \"$system\", env: \"$env\", abi: \"$abi\", isa: \"$isa\" };"
     masc_as="-t $target --env $env --isa $isa --abi $abi"
-    link="--kind static -t $target --env $env --abi $abi"
+    link="--kind bin --linkage static -t $target --env $env --abi $abi"
     qemu=qemu-$arch
     dir=$out/$target
     mkdir -p "$dir" || exit 2

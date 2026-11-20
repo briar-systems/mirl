@@ -56,6 +56,10 @@ IR text inputs live in `test/ir/` as `*.mirl` files. Each one is valid IR,
 verifier-clean. A file starts with its `target` statement and has no version statement,
 so no release touches the files. The commands read only whole texts, so a harness
 puts the library's version statement, `mirl "<mirl --version>";`, before a file it reads.
+`python3 test/run.py` is that harness: once mirl is built (`mach build . -a cli`) it
+compiles every file unoptimised and optimised with `--verify`, for its own target or for
+each target a `# targets:` line under its target statement names, and fails on any
+refusal.
 
 
 ## Branching

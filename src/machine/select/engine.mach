@@ -123,6 +123,7 @@ use mirl.machine.select.rule.Rule;
 use mirl.machine.select.rule.Slot;
 use mirl.machine.select.rule.Source;
 use mirl.machine.select.rule.Table;
+use mirl.machine.select.served;
 use machine_timing: mirl.machine.timing;
 use mirl.machine.vstate;
 use mirl.target.abi.convention;
@@ -201,6 +202,7 @@ pub val OFFSET_SYMBOL: str = "offset rule taking a symbol";
 pub val LANDING:       str = "landing instruction that is no row, or whose source is neither a literal nor a fixed register";
 pub val HOT:           str = "expansion writing what may be a secret into more fixed registers than MAX_FRESH";
 pub val UNFRAMED:      str = "a frame extent on an access whose address is formed from no alloca, which the ir verifier refuses";
+pub val COPYING:       str = "copy that is not one register written from one register read";
 pub val SPLIT_MARK:    str = "an expansion instruction writes secret memory and a public register, as a store with address writeback does, and one mark cannot state both";
 
 # a rule whose loop breaks the constraint its body keeps
@@ -255,6 +257,8 @@ pub rec Unmatched {
 # ambiguous:  more than one class of the table the build meets holds a value
 #             of this type
 # reach:      a type the target reaches has no class or two in the table
+# served:     a vector row the build packs that no rule of the table serves
+#             for every value of its operands, timed relative to its lanes
 # removed:    a value whose definition was removed
 # machine:    the machine form refused an instruction the table built
 # aggregate:  a value of an aggregate type, which no register holds
@@ -296,6 +300,7 @@ pub tag Error: u8 {
     unheld:    Type;
     ambiguous: Type;
     reach:     reach.Error;
+    served:    served.Error;
     removed:   id.Value;
     machine:   mf.Error;
     aggregate: Type;
@@ -320,6 +325,7 @@ pub fun starved(e: Error) opt[allocator.Error] {
     if (sel e.module)   { ret module.starved(e.module); }
     if (sel e.types)    { ret type_table.starved(e.types); }
     if (sel e.reach)    { ret reach.starved(e.reach); }
+    if (sel e.served)   { ret served.starved(e.served); }
     if (sel e.machine)  { ret mf.starved(e.machine); }
     if (sel e.assembly) { ret minline.starved(e.assembly.refusal); }
     ret opt[allocator.Error].none{};
@@ -641,6 +647,27 @@ fun made_before(r: *Rule, e: u32, t: u8) bool {
     ret false;
 }
 
+# whether a source names a register an instruction may write
+fun writable(s: Source) bool {
+    ret sel s.result || sel s.fresh || sel s.scratch || sel s.fixed || sel s.link || sel s.argument || sel s.returned || sel s.member;
+}
+
+# whether a source names a register an instruction may read, a result an
+# earlier instruction of the expansion wrote among them
+fun readable(s: Source) bool {
+    ret sel s.value || sel s.result || sel s.fresh || sel s.scratch || sel s.fixed || sel s.link || sel s.argument || sel s.returned || sel s.member;
+}
+
+# whether a copy keeps its contract: one register written from one register
+# read, which the lowering of copies moves exactly at their storage, so a copy
+# never stands for a write that changes a value's width, as an extension does
+fun copy_ok(emit: *Emit) bool {
+    val op: mi.Opcode = emit.opcode;
+    if (!(sel op.pseudo))         { ret true; }
+    if (op.pseudo != pseudo.COPY) { ret true; }
+    ret emit.operands.len == 2 && writable(emit.operands.at[0]) && readable(emit.operands.at[1]);
+}
+
 # what the expansion and the tests of rule `r` break of the schema, none when
 # they keep it
 fun expansion_ok(file: *rf.File, c: *Registers, r: *Rule) opt[str] {
@@ -657,6 +684,7 @@ fun expansion_ok(file: *rf.File, c: *Registers, r: *Rule) opt[str] {
             if (sel opt_bad.some) { ret opt_bad; }
         }
         if (!stated_where_needed(emit)) { ret opt[str].some{STATELESS}; }
+        if (!copy_ok(emit))             { ret opt[str].some{COPYING}; }
         var k: u32 = 0;
         for (k < emit.operands.len) {
             val s:       Source   = emit.operands.at[k];
@@ -829,6 +857,8 @@ pub fun index(a: *allocator.Allocator, isa: *Isa, target: *Target, context: *cor
     val set:         *mset.Set        = isa.set;
     val err_reached: err[reach.Error] = reach.check(a, table, target, context);
     if (sel err_reached.err) { ret res[Index, Error].err{reached(err_reached.err)}; }
+    val err_served: err[served.Error] = served.check(a, table, target, set, isa.moves, context);
+    if (sel err_served.err) { ret res[Index, Error].err{Error.served{err_served.err}}; }
     var file: *rf.File = nil;
     if (set.codec != nil) { file = set.codec.registers; }
     var i: u32 = 0;
@@ -3263,25 +3293,26 @@ fun leaf_reads(st: *State, c: *Choice, n: u32) {
 
 # choose a rule for every instruction of an ir block, its last first
 fun choose_block(st: *State, k: id.Block) err[Error] {
-    val list: *vector.Vector[id.Instruction] = ?st.body.blocks.data[k].instructions;
     vector.clear[Choice](?st.choices);
     vector.clear[u32](?st.impure);
     val err_first: err[Error] = push_u32(?st.impure, 0);
     if (sel err_first.err) { ret err_first; }
-    var i: usize = 0;
-    for (i < list.len) {
-        val at: id.Instruction = list.data[i];
+    var i:    usize          = 0;
+    var walk: id.Instruction = st.body.blocks.data[k].first;
+    for (walk != id.NO_INSTRUCTION) {
+        val at: id.Instruction = walk;
         st.position.data[at] = i::u32;
         var count: u32 = st.impure.data[i];
         if (!pure(instruction(st, at).opcode)) { count = count + 1; }
         val err_push_u32: err[Error] = push_u32(?st.impure, count);
         if (sel err_push_u32.err) { ret err_push_u32; }
-        i = i + 1;
+        i    = i + 1;
+        walk = st.body.instructions.data[at].next;
     }
-    i = list.len;
-    for (i > 0) {
-        i = i - 1;
-        val at: id.Instruction = list.data[i];
+    walk = st.body.blocks.data[k].last;
+    for (walk != id.NO_INSTRUCTION) {
+        val at: id.Instruction = walk;
+        walk = st.body.instructions.data[at].prev;
         if (st.shared.data[at] != 0 && read_by_matches(st, at)) { st.consumed.data[at] = true; }
         if (only_bound(st, at))                                 { st.consumed.data[at] = true; }
         if (unread(st, at))                                     { st.consumed.data[at] = true; }
@@ -3942,15 +3973,16 @@ fun place_points(st: *State) err[Error] {
     var k: usize = 0;
     for (k < st.body.blocks.len) {
         if (!st.body.blocks.data[k].erased) {
-            val list:    *vector.Vector[id.Instruction] = ?st.body.blocks.data[k].instructions;
-            var pending: usize                          = 0;
-            var p:       usize                          = 0;
-            for (p < list.len) {
-                val at: u32 = list.data[p];
+            var pending: id.Instruction = st.body.blocks.data[k].first;
+            var p:       id.Instruction = pending;
+            for (p != id.NO_INSTRUCTION) {
+                val at: u32 = p;
                 if (st.firsts.data[at] != NONE) {
-                    var q: usize = pending;
-                    for (q <= p) {
-                        var r: u32 = st.body.instructions.data[list.data[q]].points.first;
+                    var q:    id.Instruction = pending;
+                    var more: bool           = true;
+                    for (more) {
+                        more = q != p;
+                        var r: u32 = st.body.instructions.data[q].points.first;
                         for (r != 0) {
                             val pt:   IrPoint    = st.body.points.data[r - 1];
                             val read: Reads      = pt.reads;
@@ -3965,11 +3997,11 @@ fun place_points(st: *State) err[Error] {
                             if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
                             r = pt.next;
                         }
-                        q = q + 1;
+                        q = st.body.instructions.data[q].next;
                     }
-                    pending = p + 1;
+                    pending = st.body.instructions.data[p].next;
                 }
-                p = p + 1;
+                p = st.body.instructions.data[p].next;
             }
         }
         k = k + 1;
@@ -3983,15 +4015,14 @@ fun bare(st: *State) err[Error] {
     var k: usize = 0;
     for (k < st.body.blocks.len) {
         if (!st.body.blocks.data[k].erased) {
-            val list: *vector.Vector[id.Instruction] = ?st.body.blocks.data[k].instructions;
-            var i:    usize                          = 0;
-            for (i < list.len) {
-                val d:    *InstructionData = instruction(st, list.data[i]);
+            var i: id.Instruction = st.body.blocks.data[k].first;
+            for (i != id.NO_INSTRUCTION) {
+                val d:    *InstructionData = instruction(st, i);
                 val code: u32              = d.opcode;
                 val ends: bool             = code == opcode_table.UNREACHABLE;
                 val held: bool             = code == opcode_table.ASM && d.operands.len == 0 && d.results.len == 0;
-                if (!ends && !held) { ret err[Error].err{Error.naked{list.data[i]}}; }
-                i = i + 1;
+                if (!ends && !held) { ret err[Error].err{Error.naked{i}}; }
+                i = st.body.instructions.data[i].next;
             }
         }
         k = k + 1;
@@ -4041,15 +4072,15 @@ fun aligned(st: *State) err[Error] {
     for (k < st.body.blocks.len) {
         val bd: *BlockData = ?st.body.blocks.data[k];
         if (!bd.erased) {
-            var i: usize = 0;
-            for (i < bd.instructions.len) {
-                val opt_access: opt[Accessed] = access(st, instruction(st, bd.instructions.data[i]));
+            var i: id.Instruction = bd.first;
+            for (i != id.NO_INSTRUCTION) {
+                val opt_access: opt[Accessed] = access(st, instruction(st, i));
                 if (sel opt_access.some) {
                     val res_own: res[u64, target_record.Error] = layout.align(?st.layout, opt_access.some.ty, type_table.DEFAULT_SPACE);
                     if (sel res_own.err)                    { ret err[Error].err{Error.layout{opt_access.some.ty}}; }
                     if (opt_access.some.align < res_own.ok) { ret err[Error].err{Error.misaligned{opt_access.some.ty}}; }
                 }
-                i = i + 1;
+                i = st.body.instructions.data[i].next;
             }
         }
         k = k + 1;

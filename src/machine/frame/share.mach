@@ -1,0 +1,429 @@
+# the sharing of frame slots whose contents are never live at once
+#
+# after allocation, a local slot of fixed size whose address never leaves the
+# registers (`mirl.machine.addressed`) is read and written only where the
+# function names it: a spill writes a spill slot whole, a reload reads it,
+# and every other access reaches a slot through a register holding its
+# address. a slot is live at a point when some path from there reaches such a
+# read or access before a spill writes it whole, which a backward dataflow
+# over the blocks solves (`mirl.ir.cfg.flow`). two slots interfere when one
+# is written whole while the other is live, or both are live where the
+# function starts, which holds for every slot live anywhere the other is,
+# since a slot no spill writes is live from the start. slots that do not
+# interfere, of one size, the same secrecy and the same public bytes, share
+# one slot: the first of them in slot order takes the largest alignment of
+# the group, every operand, extent and record naming another names it instead,
+# and the others take no space, as a slot no operand names takes none. a
+# secret slot never shares with a public one.
+#
+# with s candidate slots, i instructions and b blocks, the gathering is O(i),
+# the dataflow O(b s) per pass, the interference O(i s) and the grouping
+# O(s s) over s s bits.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.flow;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.metadata;
+use mirl.machine.addressed;
+use mirl.machine.addressed.Reach;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.function.SlotData;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Slot;
+use mirl.machine.point.Reading;
+use mirl.machine.pseudo;
+
+val NONE: u32 = 0xffffffff;
+
+# what the sharing works in
+# ---
+# index:    each slot's candidate number, NONE for a slot that is not one
+# slots:    each candidate's slot
+# escaped:  whether each slot lets its address out
+# reached:  where each slot is reached through a register
+# gen:      what each block reads before it writes, by candidate
+# kill:     what each block writes whole
+# live_in:  what is live into each block
+# live_out: what is live out of each block
+# live:     what is live at the instruction the walk is at
+# meets:    each candidate's row of words, whether it interferes with each other
+# groups:   each candidate's row of words, for the first of a group the
+#           interference of the group's members
+# group:    each candidate's group, by its first candidate
+# order:    the blocks, in order
+# rep:      each slot's slot after sharing
+rec Work {
+    index:    vector.Vector[u32];
+    slots:    vector.Vector[u32];
+    escaped:  vector.Vector[bool];
+    reached:  vector.Vector[Reach];
+    at:       vector.Vector[u32];
+    gen:      vector.Vector[u64];
+    kill:     vector.Vector[u64];
+    live_in:  vector.Vector[u64];
+    live_out: vector.Vector[u64];
+    live:     vector.Vector[u64];
+    meets:    vector.Vector[u64];
+    groups:   vector.Vector[u64];
+    group:    vector.Vector[u32];
+    order:    vector.Vector[u32];
+    rep:      vector.Vector[u32];
+}
+
+fun work_init(a: *allocator.Allocator) Work {
+    ret Work{
+        index:    vector.init[u32](a),
+        slots:    vector.init[u32](a),
+        escaped:  vector.init[bool](a),
+        reached:  vector.init[Reach](a),
+        at:       vector.init[u32](a),
+        gen:      vector.init[u64](a),
+        kill:     vector.init[u64](a),
+        live_in:  vector.init[u64](a),
+        live_out: vector.init[u64](a),
+        live:     vector.init[u64](a),
+        meets:    vector.init[u64](a),
+        groups:   vector.init[u64](a),
+        group:    vector.init[u32](a),
+        order:    vector.init[u32](a),
+        rep:      vector.init[u32](a),
+    };
+}
+
+fun work_dnit(w: *Work) {
+    vector.dnit[u32](?w.index);
+    vector.dnit[u32](?w.slots);
+    vector.dnit[bool](?w.escaped);
+    vector.dnit[Reach](?w.reached);
+    vector.dnit[u32](?w.at);
+    vector.dnit[u64](?w.gen);
+    vector.dnit[u64](?w.kill);
+    vector.dnit[u64](?w.live_in);
+    vector.dnit[u64](?w.live_out);
+    vector.dnit[u64](?w.live);
+    vector.dnit[u64](?w.meets);
+    vector.dnit[u64](?w.groups);
+    vector.dnit[u32](?w.group);
+    vector.dnit[u32](?w.order);
+    vector.dnit[u32](?w.rep);
+}
+
+fun bit(words: *u64, n: u32) bool {
+    ret ((words[(n / 64)::usize] >> (n % 64)::u64) & 1) != 0;
+}
+
+fun set(words: *u64, n: u32) {
+    words[(n / 64)::usize] = words[(n / 64)::usize] | ((1::u64) << (n % 64)::u64);
+}
+
+fun clear(words: *u64, n: u32) {
+    words[(n / 64)::usize] = words[(n / 64)::usize] & ~((1::u64) << (n % 64)::u64);
+}
+
+# whether a slot may share: a local of fixed size whose address stays in and
+# that no slot lies within
+fun candidate(w: *Work, s: *SlotData, n: usize) bool {
+    if (!(sel s.area.local) || s.per != 0 || s.size == 0) { ret false; }
+    ret !w.escaped.data[n];
+}
+
+# the candidate a slot operand names, NONE for none
+fun named(w: *Work, o: Operand) u32 {
+    if (!(sel o.slot))                { ret NONE; }
+    if (o.slot::usize >= w.index.len) { ret NONE; }
+    ret w.index.data[o.slot::usize];
+}
+
+# the candidate an instruction writes whole, a spill's slot, NONE for none
+fun written(w: *Work, d: *InstructionData) u32 {
+    val op: Opcode = d.opcode;
+    if (!(sel op.pseudo))                                  { ret NONE; }
+    if (op.pseudo != pseudo.SPILL || d.operands.size != 2) { ret NONE; }
+    ret named(w, d.operands.data[0]);
+}
+
+# every candidate an instruction reads, a reload's slot, a slot address's
+# slot and every slot it reaches through a register, each set in `words`
+fun reads_into(w: *Work, d: *InstructionData, i: Instruction, words: *u64) {
+    val op: Opcode = d.opcode;
+    if (sel op.pseudo && op.pseudo != pseudo.SPILL) {
+        var n: usize = 0;
+        for (n < d.operands.size) {
+            val c: u32 = named(w, d.operands.data[n]);
+            if (c != NONE) { set(words, c); }
+            n = n + 1;
+        }
+    }
+    var k: u32 = w.at.data[i::usize];
+    for (k != NONE && k::usize < w.reached.len && w.reached.data[k::usize].at == i) {
+        val s: u32 = w.reached.data[k::usize].slot;
+        if (s::usize < w.index.len && w.index.data[s::usize] != NONE) { set(words, w.index.data[s::usize]); }
+        k = k + 1;
+    }
+}
+
+fun by_at(a: *Reach, b: *Reach) i64 {
+    if (a.at < b.at) { ret -1; }
+    if (a.at > b.at) { ret 1; }
+    ret 0;
+}
+
+# the first reach of each instruction, NONE for none, the reaches sorted by instruction
+fun index_reaches(w: *Work, count: usize) err[allocator.Error] {
+    sort.sort_by[Reach](w.reached.data, w.reached.len, by_at);
+    val err_filled: err[allocator.Error] = slice.fill[u32](?w.at, count, NONE);
+    if (sel err_filled.err) { ret err_filled; }
+    var k: usize = w.reached.len;
+    for (k > 0) {
+        k = k - 1;
+        val i: usize = w.reached.data[k].at::usize;
+        if (i < count) { w.at.data[i] = k::u32; }
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# block `b`'s gen and kill, walked from its end
+fun transfer(w: *Work, f: *Function, b: u32, words: usize) {
+    val base: usize              = b::usize * words;
+    val gen:  *u64               = ?w.gen.data[base];
+    val kill: *u64               = ?w.kill.data[base];
+    val list: Slice[Instruction] = function.instructions(f, b);
+    var i:    usize              = list.size;
+    for (i > 0) {
+        i = i - 1;
+        val d: *InstructionData = function.data(f, list.data[i]);
+        val c: u32              = written(w, d);
+        if (c != NONE) {
+            set(kill, c);
+            clear(gen, c);
+        }
+        reads_into(w, d, list.data[i], gen);
+    }
+}
+
+fun meet(w: *Work, words: usize, x: u32, y: u32) {
+    if (x == y) { ret; }
+    set(?w.meets.data[x::usize * words], y);
+    set(?w.meets.data[y::usize * words], x);
+}
+
+# every candidate live in `live` made to interfere with `c`
+fun meet_live(w: *Work, m: u32, words: usize, c: u32) {
+    var t: u32 = 0;
+    for (t < m) {
+        if (bit(?w.live.data[0], t)) { meet(w, words, c, t); }
+        t = t + 1;
+    }
+}
+
+# the interference of block `b`, walked from its end with what is live out of it
+fun interfere(w: *Work, f: *Function, b: u32, m: u32, words: usize) {
+    var k: usize = 0;
+    for (k < words) {
+        w.live.data[k] = w.live_out.data[b::usize * words + k];
+        k              = k + 1;
+    }
+    val list: Slice[Instruction] = function.instructions(f, b);
+    var i:    usize              = list.size;
+    for (i > 0) {
+        i = i - 1;
+        val d: *InstructionData = function.data(f, list.data[i]);
+        val c: u32              = written(w, d);
+        if (c != NONE) {
+            meet_live(w, m, words, c);
+            clear(?w.live.data[0], c);
+        }
+        reads_into(w, d, list.data[i], ?w.live.data[0]);
+    }
+}
+
+# whether two slots may hold one slot's storage, past their interference: of
+# one size, since a spill or reload moves its slot's whole size, and of one
+# secrecy and the same public bytes
+fun alike(x: *SlotData, y: *SlotData) bool {
+    ret x.size == y.size && x.secret == y.secret && x.publics == y.publics;
+}
+
+# each candidate put in the first earlier group of its kind none of whose
+# members it interferes with, or a group of its own, and each slot given its
+# group's first slot
+fun colour(w: *Work, f: *Function, m: u32, words: usize) {
+    var c: u32 = 0;
+    for (c < m) {
+        val s:    u32 = w.slots.data[c::usize];
+        var head: u32 = c;
+        var r:    u32 = 0;
+        for (r < c) {
+            val q: u32 = w.slots.data[r::usize];
+            if (w.group.data[r::usize] == r && alike(?f.slots.data[s::usize], ?f.slots.data[q::usize]) && !bit(?w.groups.data[r::usize * words], c)) {
+                head = r;
+                brk;
+            }
+            r = r + 1;
+        }
+        w.group.data[c::usize] = head;
+        var k: usize = 0;
+        for (k < words) {
+            w.groups.data[head::usize * words + k] = w.groups.data[head::usize * words + k] | w.meets.data[c::usize * words + k];
+            k                                      = k + 1;
+        }
+        w.rep.data[s::usize] = w.slots.data[head::usize];
+        c                    = c + 1;
+    }
+}
+
+fun renamed(w: *Work, o: Operand) Operand {
+    if (sel o.slot) {
+        if (o.slot::usize < w.rep.len) { ret Operand.slot{w.rep.data[o.slot::usize]}; }
+    }
+    ret o;
+}
+
+# every operand, extent and record naming a shared slot made to name its
+# group's first, which takes the group's largest alignment
+fun rename(w: *Work, f: *Function) {
+    var s: usize = 0;
+    for (s < f.slots.len) {
+        val r: u32 = w.rep.data[s];
+        if (r::usize != s) {
+            if (f.slots.data[s].align > f.slots.data[r::usize].align) { f.slots.data[r::usize].align = f.slots.data[s].align; }
+        }
+        s = s + 1;
+    }
+    var i: usize = 0;
+    for (i < f.instructions.len) {
+        val d: *InstructionData = ?f.instructions.data[i];
+        var n: usize            = 0;
+        for (n < d.operands.size) {
+            d.operands.data[n] = renamed(w, d.operands.data[n]);
+            n                  = n + 1;
+        }
+        if (metadata.states_extent(?d.metadata) && d.metadata.extent.slot::usize < w.rep.len) { d.metadata.extent.slot = w.rep.data[d.metadata.extent.slot::usize]; }
+        i = i + 1;
+    }
+    var p: usize = 0;
+    for (p < f.points.len) {
+        val reads: Reading = f.points.data[p].reads;
+        if (sel reads.slot) {
+            if (reads.slot::usize < w.rep.len) { f.points.data[p].reads = Reading.slot{w.rep.data[reads.slot::usize]}; }
+        }
+        p = p + 1;
+    }
+}
+
+fun shared(a: *allocator.Allocator, w: *Work, f: *Function) err[allocator.Error] {
+    val err_found: err[allocator.Error] = addressed.reaches(a, f, ?w.escaped, ?w.reached);
+    if (sel err_found.err) { ret err_found; }
+    var err_failed: err[allocator.Error] = slice.fill[u32](?w.index, f.slots.len, NONE);
+    keep(?err_failed, slice.fill[u32](?w.rep, f.slots.len, 0));
+    if (sel err_failed.err) { ret err_failed; }
+    var s: usize = 0;
+    for (s < f.slots.len) {
+        val area: function.Area = f.slots.data[s].area;
+        if (sel area.within) {
+            if (area.within.slot::usize < w.escaped.len) { w.escaped.data[area.within.slot::usize] = true; }
+        }
+        s = s + 1;
+    }
+    s = 0;
+    for (s < f.slots.len) {
+        w.rep.data[s] = s::u32;
+        if (candidate(w, ?f.slots.data[s], s)) {
+            w.index.data[s] = w.slots.len::u32;
+            val res_pushed: res[usize, allocator.Error] = vector.push[u32](?w.slots, s::u32);
+            if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        }
+        s = s + 1;
+    }
+    val m: u32 = w.slots.len::u32;
+    if (m < 2) { ret err[allocator.Error].ok{}; }
+    val err_indexed: err[allocator.Error] = index_reaches(w, f.instructions.len);
+    if (sel err_indexed.err) { ret err_indexed; }
+    val words:     usize                = ((m + 63) / 64)::usize;
+    val blocks:    usize                = f.blocks.len;
+    var err_sized: err[allocator.Error] = slice.fill[u64](?w.gen, blocks * words, 0);
+    keep(?err_sized, slice.fill[u64](?w.kill, blocks * words, 0));
+    keep(?err_sized, slice.fill[u64](?w.live_in, blocks * words, 0));
+    keep(?err_sized, slice.fill[u64](?w.live_out, blocks * words, 0));
+    keep(?err_sized, slice.fill[u64](?w.live, words, 0));
+    keep(?err_sized, slice.fill[u64](?w.meets, m::usize * words, 0));
+    keep(?err_sized, slice.fill[u64](?w.groups, m::usize * words, 0));
+    keep(?err_sized, slice.fill[u32](?w.group, m::usize, 0));
+    keep(?err_sized, slice.fill[u32](?w.order, blocks, 0));
+    if (sel err_sized.err) { ret err_sized; }
+    var b: usize = 0;
+    for (b < blocks) {
+        w.order.data[b] = b::u32;
+        transfer(w, f, b::u32, words);
+        b = b + 1;
+    }
+    val res_graph: res[Graph, allocator.Error] = function.graph_of(f);
+    if (sel res_graph.err) { ret err[allocator.Error].err{res_graph.err}; }
+    var g: Graph = res_graph.ok;
+    fin { graph.dnit(?g); }
+    flow.backward(?g, Slice[u32]{data: w.order.data, size: w.order.len}, flow.Sets{words: words::u32, gen: ?w.gen, kill: ?w.kill, live_in: ?w.live_in, live_out: ?w.live_out});
+    b = 0;
+    for (b < blocks) {
+        interfere(w, f, b::u32, m, words);
+        b = b + 1;
+    }
+    val entry: usize = graph.entry(?g)::usize;
+    var x:     u32   = 0;
+    for (x < m) {
+        if (bit(?w.live_in.data[entry * words], x)) {
+            var y: u32 = x + 1;
+            for (y < m) {
+                if (bit(?w.live_in.data[entry * words], y)) { meet(w, words, x, y); }
+                y = y + 1;
+            }
+        }
+        x = x + 1;
+    }
+    colour(w, f, m, words);
+    rename(w, f);
+    ret err[allocator.Error].ok{};
+}
+
+# share the frame slots of an allocated function whose contents are never
+# live at once, as the module header says
+# ---
+# a:   the allocator the sharing works in
+# f:   the allocated function, every virtual register replaced by its
+#      location, whose slots and operands are rewritten in place
+# out: filled with the slots that share another's storage, ascending, which
+#      nothing names any more and the frame lays out none of
+# ret: why there was no storage, the function then left as it was
+pub fun share(a: *allocator.Allocator, f: *Function, out: *vector.Vector[Slot]) err[allocator.Error] {
+    vector.clear[Slot](out);
+    var w: Work = work_init(a);
+    fin { work_dnit(?w); }
+    val err_shared: err[allocator.Error] = shared(a, ?w, f);
+    if (sel err_shared.err) { ret err_shared; }
+    var s: usize = 0;
+    for (s < w.rep.len) {
+        if (w.rep.data[s] != s::u32) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Slot](out, s::u32);
+            if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        }
+        s = s + 1;
+    }
+    ret err[allocator.Error].ok{};
+}

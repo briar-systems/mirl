@@ -9,6 +9,8 @@ lower(a, ?framed, ?request)                       # err[lower.Error]
 
 `index` is built once per target from the set's `Table`, the locations and the build's context, which admits each row and whose view fixes the storage each move takes. `lower` replaces the framed function with its copies lowered, or leaves it as it was when refused. `compile` calls it between the frame and the expansion of loops (see [loops](loop.md)), which comes before layout.
 
+An optimised compilation leaves some copies out before they reach the lowering. The allocator's value map (`mirl.machine.alloc.value`) follows which value of the input each register and frame slot holds after allocation, and the rewrite drops a copy, spill or reload whose destination already holds, on every path to it, a value its source holds. A copy that declassifies, a parallel copy, a copy naming a physical register and a copy between two values of different secrecy are kept. A checked compilation proves the result with the same map, the copies dropped.
+
 ## The set's moves
 
 A set's `Table` lists its moves and its swaps. A `Move` names the class it writes and the class it reads (`Holder`, a class row of masc's file or a memory class), the bits it moves (scaled as masc states widths), the row of masc's catalog, and what each operand position takes: the location written, the location read, or a fixed immediate. A swap is a move between two locations of one class that exchanges them.

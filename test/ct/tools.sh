@@ -6,6 +6,9 @@
 # over the pinned dep/std and dep/mink, once per set of pins into
 # out/ct/tools/<pins>, with the compiler $MACH (mach by default), as
 # test/example.sh builds them. $MASC and $MINK name built ones instead.
+#
+# $LEVEL is the optimisation level every case compiles at, 0 by default, so
+# each suite runs over the optimiser too: LEVEL=2 bash test/ct/oracle.sh.
 
 here=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$(CDPATH= cd -- "$here/../.." && pwd)
@@ -82,11 +85,11 @@ program() {
     read -r target arch system env isa abi <<<"$lane"
     # the case is a body, so it is read under the library's own version statement
     { printf 'mirl "%s";\n' "$("$mirl" --version)"; cat "$src"; } >"$at.text.mirl"
-    if ! "$mirl" compile "$at.text.mirl" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
+    if ! "$mirl" compile "$at.text.mirl" --level "${LEVEL:-0}" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
         echo "mirl compile refuses it: $(cat "$at.emit")"
         return 1
     fi
-    if ! "$mink" link "$at.o" "$@" -o "$at" --kind static -t "$target" --env "$env" --abi "$abi" 2>"$at.link"; then
+    if ! "$mink" link "$at.o" "$@" -o "$at" --kind bin --linkage static -t "$target" --env "$env" --abi "$abi" 2>"$at.link"; then
         echo "the link is refused: $(cat "$at.link")"
         return 1
     fi
