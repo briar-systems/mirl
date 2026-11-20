@@ -1,0 +1,529 @@
+# jump threading: an edge into a block whose branch the edge's own arguments decide goes straight to the target the
+# branch takes for them
+#
+# a block that holds nothing but a `cbr` on one of its parameters, or a compare of one of its parameters with a
+# constant read by that `cbr` alone, decides its branch for an edge that passes a constant for that parameter. such an
+# edge is moved to the target the branch takes, passing the arguments the branch passes there with each of the
+# block's parameters read as the edge's argument for it. the block keeps its other edges, and goes once no edge
+# enters it. a value the moved edge passes is a parameter's argument, defined where the edge starts, or one defined
+# above the block, which dominates every block that enters it. since a target may now be entered without passing
+# the block, a parameter read outside the block is first passed on: each of the block's targets entered by its edge
+# alone gets a parameter the block passes it, and every reader the target dominates, a value binding record
+# included, reads that parameter in its place.
+#
+# instructions whose results nothing reads and whose rows state no effect (the front end's dead widening of a test)
+# may stand beside them, since they do nothing an edge could skip.
+#
+# the rule by which an edge is left alone: the block holds anything else (a store, a call, a second compare), its
+# branch reads no parameter, a reader of one of its parameters outside it stands where no target of the block entered
+# by its edge alone dominates (as after the targets join again), the edge passes no constant the folder can decide the
+# branch by, the edge leaves a branch other than `br` or `cbr`, or a branch whose other edge already enters the
+# target, or the block is a loop's header (a predecessor it dominates enters it), since moving an edge from outside a
+# loop past its header into its body would give the loop a second way in. the compare is decided by the folder, so any
+# compare it computes on two constants is taken.
+#
+# it costs each block its predecessors, and a block whose parameters are passed on the function's records once per
+# parameter. it reads the dominator tree. it moves edges, which changes which branches a function takes, so it breaks
+# constant time and every function that requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.fold.eval;
+use mirl.fold.record;
+use mirl.ir.body;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.table;
+use mirl.ir.point;
+use mirl.ir.point.Reads;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.opt.number;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+use mirl.target.capability.Nans;
+
+# the pass: it moves edges, so it keeps no analysis
+pub val THREAD: Pass = Pass{name: "thread", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_DOMINANCE, preserves: cache.NONE, time: Time.breaks{}};
+
+# the decision a block makes: the parameter its branch reads, the compare between, and the branch
+# ---
+# param:    the parameter's place among the block's parameters
+# compare:  the compare, NO_INSTRUCTION where the branch reads the parameter itself
+# constant: the compare's other operand
+# swapped:  the parameter is the compare's second operand
+# branch:   the `cbr`
+rec Decision {
+    param:    usize;
+    compare:  Instruction;
+    constant: Value;
+    swapped:  bool;
+    branch:   Instruction;
+}
+
+# a run of the pass over one function
+# ---
+# c:       the run
+# f:       the function
+# b:       its body
+# scratch: storage for the folder's numbers
+# nans:    the nan rules the folder reads
+rec Run {
+    c:       *Context;
+    f:       Function;
+    b:       *Body;
+    scratch: *allocator.Allocator;
+    nans:    Slice[Nans];
+}
+
+fun nothing() res[opt[Decision], refusal.Error] {
+    ret res[opt[Decision], refusal.Error].ok{opt[Decision].none{}};
+}
+
+# the place of `v` among block `k`'s parameters, none where it is none of them
+fun param_of(b: *Body, k: Block, v: Value) opt[usize] {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.parameter))     { ret opt[usize].none{}; }
+    if (def.parameter.block != k) { ret opt[usize].none{}; }
+    ret opt[usize].some{def.parameter.index::usize};
+}
+
+# whether instruction `from` has an edge into block `to`
+fun enters(b: *Body, from: Instruction, to: Block) bool {
+    var e: usize = 0;
+    for (e < b.instructions.data[from].edges.len) {
+        if (b.instructions.data[from].edges.data[e].block == to) { ret true; }
+        e = e + 1;
+    }
+    ret false;
+}
+
+# whether instruction `i` gives only results nothing reads and its row states no effect, so it does nothing a moved
+# edge could skip (the widening of a test the front end makes, which dead code removal takes later)
+fun idle(b: *Body, i: Instruction) bool {
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (d.metadata.flags.kept || d.metadata.flags.volatile || d.results.len == 0) { ret false; }
+    val opt_row: opt[*Row] = table.at(d.opcode);
+    if (sel opt_row.none) { ret false; }
+    val r: *Row = opt_row.some;
+    if (r.terminator || r.effects.reads || r.effects.writes)                      { ret false; }
+    if (!(sel r.effects.traps[0].unstated) || !(sel r.effects.traps[1].unstated)) { ret false; }
+    var n: usize = 0;
+    for (n < d.results.len) {
+        if (b.values.data[d.results.data[n]].uses.len != 0) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# whether block `k` holds nothing but its compare (NO_INSTRUCTION for none), its branch and idle instructions
+fun only(b: *Body, k: Block, compare: Instruction, branch: Instruction) bool {
+    var i: Instruction = b.blocks.data[k].first;
+    for (i != NO_INSTRUCTION) {
+        if (i != compare && i != branch && !idle(b, i)) { ret false; }
+        i = b.instructions.data[i].next;
+    }
+    ret true;
+}
+
+# the decision block `k` makes, none where it holds anything else
+fun decision_of(x: *Run, k: Block) res[opt[Decision], refusal.Error] {
+    val b:      *Body       = x.b;
+    val branch: Instruction = b.blocks.data[k].last;
+    if (branch == NO_INSTRUCTION || k == 0) { ret nothing(); }
+    val d: *InstructionData = ?b.instructions.data[branch];
+    if (d.opcode != table.CBR || d.operands.len != 1 || d.edges.len != 2) { ret nothing(); }
+    val cond:      Value      = d.operands.data[0];
+    val opt_param: opt[usize] = param_of(b, k, cond);
+    if (sel opt_param.some) {
+        if (!only(b, k, NO_INSTRUCTION, branch)) { ret nothing(); }
+        ret res[opt[Decision], refusal.Error].ok{opt[Decision].some{Decision{param: opt_param.some, compare: NO_INSTRUCTION, constant: 0, swapped: false, branch: branch}}};
+    }
+    val def: Def = b.values.data[cond].def;
+    if (!(sel def.result)) { ret nothing(); }
+    val compare: Instruction = def.result.instruction;
+    val at:      Place       = b.instructions.data[compare].place;
+    if (!(sel at.placed))             { ret nothing(); }
+    if (at.placed != k)               { ret nothing(); }
+    if (!only(b, k, compare, branch)) { ret nothing(); }
+    var u: usize = 0;
+    for (u < b.values.data[cond].uses.len) {
+        val reader: Instruction = b.values.data[cond].uses.data[u];
+        if (reader != branch && !idle(b, reader)) { ret nothing(); }
+        u = u + 1;
+    }
+    val c: *InstructionData = ?b.instructions.data[compare];
+    if (c.operands.len != 2 || c.results.len != 1 || c.immediates.len != 0)      { ret nothing(); }
+    if (c.metadata.flags.kept || c.metadata.flags.volatile || c.metadata.secret) { ret nothing(); }
+    val opt_left: opt[usize] = param_of(b, k, c.operands.data[0]);
+    if (sel opt_left.some) {
+        val right: Def = b.values.data[c.operands.data[1]].def;
+        if (!(sel right.constant)) { ret nothing(); }
+        ret res[opt[Decision], refusal.Error].ok{opt[Decision].some{Decision{param: opt_left.some, compare: compare, constant: c.operands.data[1], swapped: false, branch: branch}}};
+    }
+    val opt_right: opt[usize] = param_of(b, k, c.operands.data[1]);
+    if (sel opt_right.some) {
+        val left: Def = b.values.data[c.operands.data[0]].def;
+        if (!(sel left.constant)) { ret nothing(); }
+        ret res[opt[Decision], refusal.Error].ok{opt[Decision].some{Decision{param: opt_right.some, compare: compare, constant: c.operands.data[0], swapped: true, branch: branch}}};
+    }
+    ret nothing();
+}
+
+# which edge of the branch an argument `a` for the decision's parameter takes, none where the folder cannot say
+fun taken(x: *Run, dc: Decision, a: Value) res[opt[usize], refusal.Error] {
+    val res_a: res[opt[record.Value], refusal.Error] = number.read(x.c.m, x.b, x.scratch, a);
+    if (sel res_a.err)     { ret res[opt[usize], refusal.Error].err{res_a.err}; }
+    if (sel res_a.ok.none) { ret res[opt[usize], refusal.Error].ok{opt[usize].none{}}; }
+    var bit: record.Value = res_a.ok.some;
+    if (dc.compare != NO_INSTRUCTION) {
+        val res_k: res[opt[record.Value], refusal.Error] = number.read(x.c.m, x.b, x.scratch, dc.constant);
+        if (sel res_k.err)     { ret res[opt[usize], refusal.Error].err{res_k.err}; }
+        if (sel res_k.ok.none) { ret res[opt[usize], refusal.Error].ok{opt[usize].none{}}; }
+        var ops: [2]record.Operand = [2]record.Operand{record.Operand{value: res_a.ok.some, secret: false}, record.Operand{value: res_k.ok.some, secret: false}};
+        if (dc.swapped) {
+            ops[0] = record.Operand{value: res_k.ok.some, secret: false};
+            ops[1] = record.Operand{value: res_a.ok.some, secret: false};
+        }
+        val req: record.Request = record.Request{opcode: x.b.instructions.data[dc.compare].opcode, operands: Slice[record.Operand]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: nil, size: 0}};
+        val out: record.Outcome = eval.fold(x.scratch, ?x.c.m.types, x.nans, req);
+        if (sel out.refused) {
+            if (sel out.refused.unfoldable || sel out.refused.trap || sel out.refused.nan) { ret res[opt[usize], refusal.Error].ok{opt[usize].none{}}; }
+            ret res[opt[usize], refusal.Error].err{number.unfolded(out.refused)};
+        }
+        if (out.folded.results.size != 1) { ret res[opt[usize], refusal.Error].ok{opt[usize].none{}}; }
+        bit = out.folded.results.data[0];
+    }
+    if (bit.lanes.size != 1) { ret res[opt[usize], refusal.Error].ok{opt[usize].none{}}; }
+    val words: Slice[u64] = bit.lanes.data[0].words;
+    var one:   bool       = false;
+    if (words.size > 0) { one = (words.data[0] & 1) != 0; }
+    if (one)            { ret res[opt[usize], refusal.Error].ok{opt[usize].some{0}}; }
+    ret res[opt[usize], refusal.Error].ok{opt[usize].some{1}};
+}
+
+# whether block `k` is a loop's header: a predecessor it dominates enters it
+fun header(b: *Body, d: *Dominance, k: Block) bool {
+    var p: usize = 0;
+    for (p < b.blocks.data[k].predecessors.len) {
+        val place: Place = b.instructions.data[b.blocks.data[k].predecessors.data[p]].place;
+        if (sel place.placed && dominance.dominates(d, k, place.placed)) { ret true; }
+        p = p + 1;
+    }
+    ret false;
+}
+
+# one edge to move: the branch it leaves, its place among the branch's edges, and the decision's edge it takes
+# ---
+# from: the branch
+# edge: the edge's place
+# take: the edge of the decision's branch it takes
+rec Move {
+    from: Instruction;
+    edge: usize;
+    take: usize;
+}
+
+# the target of the decision's branch entered by its edge alone that dominates block `u`, none where none does
+fun owner(x: *Run, d: *Dominance, k: Block, branch: Instruction, u: Block) opt[usize] {
+    val b: *Body = x.b;
+    var e: usize = 0;
+    for (e < b.instructions.data[branch].edges.len) {
+        val s: Block = b.instructions.data[branch].edges.data[e].block;
+        if (s != k && b.blocks.data[s].predecessors.len == 1 && dominance.dominates(d, s, u)) { ret opt[usize].some{e}; }
+        e = e + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# whether parameter `v` of block `k` is read by the records of run `run`
+fun run_reads(b: *Body, run: point.Run, v: Value) bool {
+    var p: u32 = run.first;
+    for (p != 0) {
+        val pt:       point.Point = b.points.data[p - 1];
+        val opt_read: opt[Value]  = point.read(pt.reads);
+        if (sel opt_read.some && opt_read.some == v) { ret true; }
+        if (p == run.last)                           { brk; }
+        p = pt.next;
+    }
+    ret false;
+}
+
+# whether every reader of a parameter of block `k` outside it, its records included, stands where a target of the
+# block entered by its edge alone dominates
+fun separable(x: *Run, d: *Dominance, k: Block, branch: Instruction) bool {
+    val b: *Body = x.b;
+    var j: usize = 0;
+    for (j < b.blocks.data[k].parameters.len) {
+        val v: Value = b.blocks.data[k].parameters.data[j];
+        var u: usize = 0;
+        for (u < b.values.data[v].uses.len) {
+            val place: Place = b.instructions.data[b.values.data[v].uses.data[u]].place;
+            if (!(sel place.placed)) { ret false; }
+            if (place.placed != k) {
+                val opt_owner: opt[usize] = owner(x, d, k, branch, place.placed);
+                if (sel opt_owner.none) { ret false; }
+            }
+            u = u + 1;
+        }
+        if (b.values.data[v].bound.len > 0) {
+            var n: usize = 0;
+            for (n < b.blocks.len) {
+                if (!b.blocks.data[n].erased && n::u32 != k) {
+                    var reads: bool        = run_reads(b, b.blocks.data[n].ending, v);
+                    var i:     Instruction = b.blocks.data[n].first;
+                    for (i != NO_INSTRUCTION && !reads) {
+                        reads = run_reads(b, b.instructions.data[i].points, v);
+                        i     = b.instructions.data[i].next;
+                    }
+                    if (reads) {
+                        val opt_owner: opt[usize] = owner(x, d, k, branch, n::u32);
+                        if (sel opt_owner.none) { ret false; }
+                    }
+                }
+                n = n + 1;
+            }
+        }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# make the records of run `run` that read `from` read `to`
+fun reread(x: *Run, run: point.Run, from: Value, to: Value) err[refusal.Error] {
+    val b: *Body = x.b;
+    var p: u32   = run.first;
+    for (p != 0) {
+        val pt:    point.Point = b.points.data[p - 1];
+        val reads: Reads       = pt.reads;
+        if (sel reads.operand) {
+            if (reads.operand.value == from) {
+                val err_rebound: err[refusal.Error] = edit(body.rebind(x.c.m, x.f, p - 1, Reads.operand{point.Operand{value: to, expression: reads.operand.expression}}));
+                if (sel err_rebound.err) { ret err_rebound; }
+            }
+        }
+        if (p == run.last) { brk; }
+        p = pt.next;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# pass each parameter of block `k` read outside it on to the targets that hold its readers, which read the target's
+# parameter from then on
+fun separate(x: *Run, d: *Dominance, k: Block, branch: Instruction) err[refusal.Error] {
+    val b:     *Body = x.b;
+    val count: usize = b.blocks.data[k].parameters.len;
+    var j:     usize = 0;
+    for (j < count) {
+        val v: Value = b.blocks.data[k].parameters.data[j];
+        # the parameter each target of the branch takes for v, made on its first reader
+        var made:  [2]Value                   = [2]Value{0, 0};
+        var have:  [2]bool                    = [2]bool{false, false};
+        var users: vector.Vector[Instruction] = vector.init[Instruction](x.scratch);
+        var u:     usize                      = 0;
+        for (u < b.values.data[v].uses.len) {
+            val i:     Instruction = b.values.data[v].uses.data[u];
+            val place: Place       = b.instructions.data[i].place;
+            if (sel place.placed && place.placed != k) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?users, i);
+                if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+            }
+            u = u + 1;
+        }
+        var n: usize = 0;
+        for (n < b.blocks.len) {
+            if (!b.blocks.data[n].erased && n::u32 != k) {
+                var reads: bool        = run_reads(b, b.blocks.data[n].ending, v);
+                var i:     Instruction = b.blocks.data[n].first;
+                for (i != NO_INSTRUCTION && !reads) {
+                    reads = run_reads(b, b.instructions.data[i].points, v);
+                    i     = b.instructions.data[i].next;
+                }
+                if (reads || users.len > 0) {
+                    # every user standing in block n reads the owner's parameter, and so do its records
+                    var stands: bool  = reads;
+                    var w:      usize = 0;
+                    for (w < users.len && !stands) {
+                        val place: Place = b.instructions.data[users.data[w]].place;
+                        if (sel place.placed && place.placed == n::u32) { stands = true; }
+                        w = w + 1;
+                    }
+                    if (stands) {
+                        val opt_owner: opt[usize] = owner(x, d, k, branch, n::u32);
+                        if (sel opt_owner.none) { ret err[refusal.Error].err{refusal.Error.reason{"jump threading passed on a parameter whose reader no target dominates"}}; }
+                        val e: usize = opt_owner.some;
+                        if (!have[e]) {
+                            var given:     [1]Value                 = [1]Value{v};
+                            val s:         Block                    = b.instructions.data[branch].edges.data[e].block;
+                            val res_param: res[Value, module.Error] = body.add_parameter(x.c.m, x.f, s, Declaration{type: b.values.data[v].type, secret: b.values.data[v].secret}, Slice[Value]{data: ?given[0], size: 1});
+                            if (sel res_param.err) { ret err[refusal.Error].err{refusal.Error.ir{res_param.err}}; }
+                            made[e] = res_param.ok;
+                            have[e] = true;
+                        }
+                        w = 0;
+                        for (w < users.len) {
+                            val place: Place = b.instructions.data[users.data[w]].place;
+                            if (sel place.placed && place.placed == n::u32) {
+                                val err_moved: err[refusal.Error] = edit(body.substitute(x.c.m, x.f, users.data[w], v, made[e]));
+                                if (sel err_moved.err) { ret err_moved; }
+                            }
+                            w = w + 1;
+                        }
+                        val err_ending: err[refusal.Error] = reread(x, b.blocks.data[n].ending, v, made[e]);
+                        if (sel err_ending.err) { ret err_ending; }
+                        i = b.blocks.data[n].first;
+                        for (i != NO_INSTRUCTION) {
+                            val err_points: err[refusal.Error] = reread(x, b.instructions.data[i].points, v, made[e]);
+                            if (sel err_points.err) { ret err_points; }
+                            i = b.instructions.data[i].next;
+                        }
+                    }
+                }
+            }
+            n = n + 1;
+        }
+        j = j + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# move each edge into block `k` that decides its branch, answering whether one moved
+fun thread_into(x: *Run, d: *Dominance, k: Block, dc: Decision) res[bool, refusal.Error] {
+    val b:     *Body               = x.b;
+    var moves: vector.Vector[Move] = vector.init[Move](x.scratch);
+    var p:     usize               = 0;
+    for (p < b.blocks.data[k].predecessors.len) {
+        val from: Instruction = b.blocks.data[k].predecessors.data[p];
+        val op:   u32         = b.instructions.data[from].opcode;
+        var e:    usize       = 0;
+        for ((op == table.BR || op == table.CBR) && e < b.instructions.data[from].edges.len) {
+            if (b.instructions.data[from].edges.data[e].block == k) {
+                val a:         Value                          = b.instructions.data[from].edges.data[e].arguments.data[dc.param];
+                val res_taken: res[opt[usize], refusal.Error] = taken(x, dc, a);
+                if (sel res_taken.err) { ret res[bool, refusal.Error].err{res_taken.err}; }
+                if (sel res_taken.ok.some) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Move](?moves, Move{from: from, edge: e, take: res_taken.ok.some});
+                    if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                }
+            }
+            e = e + 1;
+        }
+        p = p + 1;
+    }
+    if (moves.len == 0)                 { ret res[bool, refusal.Error].ok{false}; }
+    if (!separable(x, d, k, dc.branch)) { ret res[bool, refusal.Error].ok{false}; }
+    val err_separated: err[refusal.Error] = separate(x, d, k, dc.branch);
+    if (sel err_separated.err) { ret res[bool, refusal.Error].err{err_separated.err}; }
+
+    var args:  vector.Vector[Value] = vector.init[Value](x.scratch);
+    var moved: bool                 = false;
+    var m:     usize                = 0;
+    for (m < moves.len) {
+        val mv: Move  = moves.data[m];
+        val to: Block = b.instructions.data[dc.branch].edges.data[mv.take].block;
+        if (to != k && !enters(b, mv.from, to)) {
+            vector.truncate[Value](?args, 0);
+            var n: usize = 0;
+            for (n < b.instructions.data[dc.branch].edges.data[mv.take].arguments.len) {
+                var v:         Value      = b.instructions.data[dc.branch].edges.data[mv.take].arguments.data[n];
+                val opt_param: opt[usize] = param_of(b, k, v);
+                if (sel opt_param.some) { v = b.instructions.data[mv.from].edges.data[mv.edge].arguments.data[opt_param.some]; }
+                val res_pushed: res[usize, allocator.Error] = vector.push[Value](?args, v);
+                if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                n = n + 1;
+            }
+            val err_moved: err[refusal.Error] = edit(body.retarget(x.c.m, x.f, mv.from, mv.edge::u32, to, Slice[Value]{data: args.data, size: args.len}));
+            if (sel err_moved.err) { ret res[bool, refusal.Error].err{err_moved.err}; }
+            moved = true;
+        }
+        m = m + 1;
+    }
+    if (moved && b.blocks.data[k].predecessors.len == 0) {
+        var gone:       [1]Block           = [1]Block{k};
+        val err_erased: err[refusal.Error] = edit(body.erase_unreached(x.c.m, x.f, Slice[Block]{data: ?gone[0], size: 1}));
+        if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+    }
+    ret res[bool, refusal.Error].ok{moved};
+}
+
+# thread every edge of one function that decides the branch it enters
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:                *Body                          = res_body.ok;
+    val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, u.f);
+    if (sel res_dominance_of.err) { ret res[bool, refusal.Error].err{res_dominance_of.err}; }
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    val res_nans: res[Slice[Nans], refusal.Error] = number.rules(c, c.m.a);
+    if (sel res_nans.err) { ret res[bool, refusal.Error].err{res_nans.err}; }
+    fin { number.rules_free(c.m.a, res_nans.ok); }
+    var x:       Run        = Run{c: c, f: u.f, b: b, scratch: ?scratch, nans: res_nans.ok};
+    var d:       *Dominance = res_dominance_of.ok;
+    var stale:   bool       = false;
+    var changed: bool       = false;
+    var k:       usize      = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            arena.reset(?ar);
+            val res_decision: res[opt[Decision], refusal.Error] = decision_of(?x, k::u32);
+            if (sel res_decision.err) { ret res[bool, refusal.Error].err{res_decision.err}; }
+            if (sel res_decision.ok.some) {
+                # an edge moved since the dominator tree was made, so it is made again before a block is judged
+                if (stale) {
+                    val err_forgot: err[allocator.Error] = cache.forget(c.cache, u.f);
+                    if (sel err_forgot.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_forgot.err}}; }
+                    val res_again: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, u.f);
+                    if (sel res_again.err) { ret res[bool, refusal.Error].err{res_again.err}; }
+                    d     = res_again.ok;
+                    stale = false;
+                }
+                if (dominance.reachable(d, k::u32) && !header(b, d, k::u32)) {
+                    val res_moved: res[bool, refusal.Error] = thread_into(?x, d, k::u32, res_decision.ok.some);
+                    if (sel res_moved.err) { ret res_moved; }
+                    if (res_moved.ok) {
+                        changed = true;
+                        stale   = true;
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

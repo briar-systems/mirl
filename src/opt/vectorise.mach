@@ -1,0 +1,1175 @@
+# vectorisation: a counted innermost loop over arrays becomes, where a runtime test admits it, one copy or fill of
+# the bytes it moves, or a loop over vectors of the lanes the build's units hold followed by the loop for the rest
+#
+# a loop is taken when it is counted (`mirl.pass.analysis.induction`) by a compare of its stepping parameter itself,
+# stepping by one, against a bound it does not define, staying while `iv < bound`, `bound > iv` or `iv != bound`
+# (signed or unsigned), its header holding only that compare and its branch, and its one other block, the latch,
+# holding only the step and accesses through element addresses `ptr.index(base, iv)` of a base the loop does not
+# define, each element of the access's own size and the index as wide as the pointer. nothing secret, volatile or
+# kept takes part. a function that states `scalar` is left alone.
+#
+# a copy loop loads one element of a source and stores it to the same element of a destination. a fill loop stores
+# one value the loop does not define whose bytes are all one byte: a constant of equal bytes, or any byte. ahead of
+# the header the loop is entered through new blocks: where the loop runs at least one trip (its own compare of the
+# start against the bound), a copy of `trip * size` bytes from the start of the source to the start of the
+# destination, or a fill of them, stands for the loop, unless the destination lies past the source by between one
+# byte and the length less one, where the forward element loop would read an element an earlier trip wrote and so
+# differs from a copy. after it the header is entered with the bound as its stepping parameter, so the loop runs no
+# trip and every reader after it reads what it read before. otherwise the header is entered as before. a copy is
+# stated `ascending` (`mirl.ir.metadata.Flags`): with the destination at or below the source, or apart from it, an
+# upward copy gives what the loop gave. how the bytes move is the bulk legalisation's.
+#
+# a lanewise loop loads elements of its streams, computes lanewise operations (`lanewise`: each lane from the same lane
+# of its operands, no trap, no memory) of one scalar type over them and values the loop does not define, and stores
+# one element. its type's lane is held by the widest unit the function's code holds it on
+# (`mirl.target.vector.split_for`), a power of two lanes of at least two, and that unit packs for the function every
+# operation the vector loop forms (`mirl.target.vector.packed`): each lanewise operation of the latch, each
+# accumulator's reduction and the splat of a value the loop does not define. these are the questions the vector
+# legalisation asks of the same function on the same basis, after the served check's verdict, so nothing the pass
+# forms is split back into scalar operations. the target must carry out an access below its type's alignment, since a
+# vector access states only its element's.
+# where a trip runs and the trips round down to a whole number of vectors are at least one vector, and no stream it
+# loads lies below the one it stores by one byte up to a vector's bytes less one (where a lane would read what an
+# earlier lane of its own vector wrote), a vector loop runs those trips, each lane doing what one trip did, the values
+# the loop does not define splat to every lane once ahead of it, and then the header is entered with the index the
+# vector loop reached, so the loop runs the trips left. with the destination at or below a source, a vector reads
+# nothing an earlier element wrote that the loop would not have read, and with it a vector or more above, every
+# element a vector reads was written, if at all, by an earlier vector.
+#
+# every other header parameter of a lanewise loop must be an accumulator: the latch reads it once, in a lanewise
+# operation combining it with one other value, whose result only the branch back reads, and the operation regroups
+# exactly (integer sum, product, and, or, exclusive or) or is a float sum or product in a build that permits float
+# reassociation (`mirl.pass.relaxation`). without that permission a float sum keeps its order and the loop is left
+# alone. a loop may then store nothing. the vector loop carries a vector of partial values per accumulator, every
+# lane starting at the operation's identity (a float sum's negative zero, so a sum of negative zeros stays negative),
+# and after it the lanes are reduced (`reduce.add` and the rest, `reduce.fadd.any` for a float sum) and combined with
+# what the accumulator held before, which the header takes. a run shorter than a vector never enters the vector
+# loop, so it gives exactly what the loop gave.
+#
+# rules: 1 to 6 of design section 5 are not relied on. the pass makes a branch on the arrays' addresses and changes
+# how long the code takes, so it declares `Time.breaks` and every function that requires constant time is skipped.
+#
+# cost: per loop one look at its header and latch and their uses, and a constant number of instructions made for one
+# it takes. it reads the loops and the inductions of the function.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.fold.word;
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.function.ConstantTime;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.table;
+use mirl.ir.type.format.Binary;
+use mirl.ir.type.format.Format;
+use FormatRow:  mirl.ir.type.format.Row;
+use format_row: mirl.ir.type.format.row;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.ir.value.ValueData;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.pass.analysis;
+use mirl.pass.analysis.induction;
+use mirl.pass.analysis.induction.Counted;
+use mirl.pass.analysis.induction.Inductions;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+use mirl.pass.relaxation;
+use mirl.target.basis;
+use mirl.target.capability.LaneType;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use TargetError: mirl.target.record.Error;
+use units:       mirl.target.vector;
+use mirl.target.vector.Piece;
+use mirl.target.vector.Split;
+
+# the pass: it adds blocks and moves an edge, so it keeps no analysis
+pub val VECTORISE: Pass = Pass{name: "vectorise", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_LOOPS | analysis.OF_INDUCTIONS, preserves: cache.NONE, time: Time.breaks{}, applies: physical};
+
+# whether a target's addresses are numbers, so an element address is a byte offset from its base
+fun physical(g: *Ground) bool {
+    ret sel g.t.caps.addressing.physical;
+}
+
+# an array the loop walks one element a trip
+# ---
+# base:    the address of its element 0, which the loop does not define
+# indexed: the type the element address states, whose stride is the element's size
+# size:    the element's size in bytes
+# align:   the alignment its accesses state
+rec Stream {
+    base:    Value;
+    indexed: Type;
+    size:    u64;
+    align:   u64;
+}
+
+# a loop the pass may take
+# ---
+# head:     its header
+# latch:    its other block
+# iv:       the stepping parameter, by its position among the header's
+# word:     its type, an integer as wide as the pointer
+# bound:    the value it is compared with
+# compare:  the compare's opcode
+# left:     the stepping parameter is the compare's first operand
+# entering: the terminator of the one edge into the header from outside the loop
+# edge:     that edge's position among the terminator's
+# start:    what that edge passes the stepping parameter
+# step:     the latch's sum of the stepping parameter and one
+rec Shape {
+    head:     Block;
+    latch:    Block;
+    iv:       u32;
+    word:     Type;
+    bound:    Value;
+    compare:  Opcode;
+    left:     bool;
+    entering: Instruction;
+    edge:     u32;
+    start:    Value;
+    step:     Value;
+}
+
+# what the latch's accesses are
+# ---
+# loads:  each load: its stream and its result
+# stores: each store: its stream and the value it stores
+# ops:    each lanewise operation, in the order the latch holds them
+rec Accesses {
+    loads:  vector.Vector[Access];
+    stores: vector.Vector[Access];
+    ops:    vector.Vector[Instruction];
+}
+
+# one access of the latch
+# ---
+# stream: the array
+# value:  what a load gives or a store writes
+# at:     the access
+rec Access {
+    stream: Stream;
+    value:  Value;
+    at:     Instruction;
+}
+
+# one run over a function
+# ---
+# c:      the run
+# f:      the function
+# l:      its loops
+# layout: the target's data layout of the module's types
+# a:      storage for one loop's lists
+rec Run {
+    c:      *Context;
+    f:      Function;
+    l:      *Loops;
+    layout: Layout;
+    a:      *allocator.Allocator;
+}
+
+fun body_of(x: *Run) *Body {
+    ret ?x.c.m.functions.data[x.f].body;
+}
+
+fun no_values() Slice[Value] {
+    ret Slice[Value]{data: nil, size: 0};
+}
+
+fun no_immediates() Slice[Immediate] {
+    ret Slice[Immediate]{data: nil, size: 0};
+}
+
+# whether value `v` stands outside loop `n`: a constant, or a parameter or result of a block the loop does not hold
+fun outside(x: *Run, n: u32, v: Value) bool {
+    val b:   *Body = body_of(x);
+    val def: Def   = b.values.data[v].def;
+    if (sel def.constant)  { ret true; }
+    if (sel def.parameter) { ret !loops.contains(x.l, n, def.parameter.block); }
+    if (sel def.result) {
+        val place: Place = b.instructions.data[def.result.instruction].place;
+        if (sel place.placed) { ret !loops.contains(x.l, n, place.placed); }
+    }
+    ret false;
+}
+
+# whether an instruction reads or writes no memory, traps never and nothing reads its results, so a copy of the
+# loop may go without it
+fun idle(b: *Body, i: Instruction) bool {
+    val d:       *InstructionData = ?b.instructions.data[i];
+    val opt_row: opt[*Row]        = table.at(d.opcode);
+    if (sel opt_row.none) { ret false; }
+    val r: *Row = opt_row.some;
+    if (r.effects.reads || r.effects.writes || r.terminator) { ret false; }
+    var k: usize = 0;
+    for (k < d.results.len) {
+        if (b.values.data[d.results.data[k]].uses.len != 0) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether an instruction carries nothing the pass may not copy or drop: no secret, volatile or kept mark and no
+# secret operand or result
+fun plain(b: *Body, i: Instruction) bool {
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (d.metadata.secret || d.metadata.flags.volatile || d.metadata.flags.kept) { ret false; }
+    var k: usize = 0;
+    for (k < d.operands.len) {
+        if (b.values.data[d.operands.data[k]].secret) { ret false; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < d.results.len) {
+        if (b.values.data[d.results.data[k]].secret) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the alignment an access states, the layout's alignment of its type where it states none
+fun alignment_of(x: *Run, d: *InstructionData, ty: Type) opt[u64] {
+    var i: usize = 0;
+    for (i < d.immediates.len) {
+        val m: Immediate = d.immediates.data[i];
+        if (sel m.alignment) { ret opt[u64].some{m.alignment}; }
+        i = i + 1;
+    }
+    val res_align: res[u64, TargetError] = layout.align(?x.layout, ty, type_table.DEFAULT_SPACE);
+    if (sel res_align.err) { ret opt[u64].none{}; }
+    ret opt[u64].some{res_align.ok};
+}
+
+# the bits of an integer type, zero for any other type
+fun integer_bits(x: *Run, ty: Type) u32 {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?x.c.m.types, ty);
+    if (sel res_shape.err)           { ret 0; }
+    if (!(sel res_shape.ok.integer)) { ret 0; }
+    ret res_shape.ok.integer.width;
+}
+
+# whether a type is a scalar integer or float, the types an element of a stream may be
+fun scalar(x: *Run, ty: Type) bool {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?x.c.m.types, ty);
+    if (sel res_shape.err) { ret false; }
+    ret sel res_shape.ok.integer || sel res_shape.ok.float;
+}
+
+# the stream an element address of the latch walks, none where it is no `ptr.index(base, iv)` of a base the loop does
+# not define with an element of `ty`'s size
+fun stream_of(x: *Run, n: u32, s: *Shape, address: Value, ty: Type, access: *InstructionData) opt[Stream] {
+    val b:   *Body = body_of(x);
+    val def: Def   = b.values.data[address].def;
+    if (!(sel def.result)) { ret opt[Stream].none{}; }
+    val i: Instruction      = def.result.instruction;
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (d.opcode != table.PTR_INDEX || d.operands.len != 2 || d.immediates.len < 1) { ret opt[Stream].none{}; }
+    val iv: Value = b.blocks.data[s.head].parameters.data[s.iv];
+    if (d.operands.data[1] != iv || !outside(x, n, d.operands.data[0]) || !plain(b, i)) { ret opt[Stream].none{}; }
+    val imm: Immediate = d.immediates.data[0];
+    if (!(sel imm.ty)) { ret opt[Stream].none{}; }
+    val res_space: res[u32, type_table.Error] = type_table.space(?x.c.m.types, b.values.data[d.operands.data[0]].type);
+    if (sel res_space.err) { ret opt[Stream].none{}; }
+    val res_stride: res[u64, TargetError] = layout.stride(?x.layout, imm.ty, res_space.ok);
+    val res_size:   res[u64, TargetError] = layout.size(?x.layout, ty, res_space.ok);
+    if (sel res_stride.err)                               { ret opt[Stream].none{}; }
+    if (sel res_size.err)                                 { ret opt[Stream].none{}; }
+    if (res_size.ok == 0 || res_stride.ok != res_size.ok) { ret opt[Stream].none{}; }
+    val opt_align: opt[u64] = alignment_of(x, access, ty);
+    if (sel opt_align.none) { ret opt[Stream].none{}; }
+    ret opt[Stream].some{Stream{base: d.operands.data[0], indexed: imm.ty, size: res_size.ok, align: opt_align.some}};
+}
+
+# the shape of loop `n` where it is one the pass may take
+fun shape_of(x: *Run, ind: *Inductions, n: u32) opt[Shape] {
+    val b:    *Body = body_of(x);
+    val head: Block = loops.loop(x.l, n).header;
+    if (head == 0) { ret opt[Shape].none{}; }
+    val blocks: Slice[u32] = loops.body(x.l, n);
+    if (blocks.size != 2) { ret opt[Shape].none{}; }
+    val opt_counted: opt[Counted] = induction.counted(ind, n);
+    if (sel opt_counted.none) { ret opt[Shape].none{}; }
+    val ct: Counted = opt_counted.some;
+    if (ct.next || ct.leaves) { ret opt[Shape].none{}; }
+    if (sel ct.start.none)    { ret opt[Shape].none{}; }
+    val staying: bool = (ct.left && (ct.compare == table.LT_U || ct.compare == table.LT_S)) || (!ct.left && (ct.compare == table.GT_U || ct.compare == table.GT_S)) || ct.compare == table.NE;
+    if (!staying) { ret opt[Shape].none{}; }
+    val st: induction.Step = ind.steps.data[ct.step];
+    if (st.step != 1) { ret opt[Shape].none{}; }
+    var latch: Block = blocks.data[0];
+    if (latch == head) { latch = blocks.data[1]; }
+    val latches: Slice[u32] = loops.latches(x.l, n);
+    if (latches.size != 1 || latches.data[0] != latch) { ret opt[Shape].none{}; }
+    if (b.blocks.data[latch].parameters.len != 0)      { ret opt[Shape].none{}; }
+
+    # the header: the compare, its branch, and nothing anything reads
+    val cbr:     Instruction = b.blocks.data[head].last;
+    val compare: Value       = b.instructions.data[cbr].operands.data[0];
+    var i:       Instruction = b.blocks.data[head].first;
+    for (i != NO_INSTRUCTION) {
+        if (i != cbr) {
+            val d:          *InstructionData = ?b.instructions.data[i];
+            val is_compare: bool             = d.results.len == 1 && d.results.data[0] == compare;
+            if (!is_compare && !idle(b, i)) { ret opt[Shape].none{}; }
+            if (!plain(b, i))               { ret opt[Shape].none{}; }
+        }
+        i = b.instructions.data[i].next;
+    }
+
+    # the one edge from outside
+    val hd:       *BlockData  = ?b.blocks.data[head];
+    var entering: Instruction = NO_INSTRUCTION;
+    var edge:     u32         = 0;
+    var q:        usize       = 0;
+    for (q < hd.predecessors.len) {
+        val t:     Instruction = hd.predecessors.data[q];
+        val place: Place       = b.instructions.data[t].place;
+        if (sel place.placed && !loops.contains(x.l, n, place.placed)) {
+            var e: usize = 0;
+            for (e < b.instructions.data[t].edges.len) {
+                if (b.instructions.data[t].edges.data[e].block == head) {
+                    entering = t;
+                    edge     = e::u32;
+                }
+                e = e + 1;
+            }
+        }
+        q = q + 1;
+    }
+    if (entering == NO_INSTRUCTION) { ret opt[Shape].none{}; }
+    val word: Type = b.values.data[st.value].type;
+    ret opt[Shape].some{Shape{head: head, latch: latch, iv: st.index, word: word, bound: ct.bound, compare: ct.compare, left: ct.left, entering: entering, edge: edge, start: ct.start.some, step: st.next}};
+}
+
+# whether the stepping parameter is as wide as a pointer the streams' bases are
+fun pointer_wide(x: *Run, s: *Shape, base: Value) bool {
+    val res_size: res[u64, TargetError] = layout.size(?x.layout, body_of(x).values.data[base].type, type_table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret false; }
+    ret integer_bits(x, s.word)::u64 == res_size.ok * 8;
+}
+
+# whether every reader of value `v` stands in the latch
+fun kept_in_latch(x: *Run, s: *Shape, v: Value) bool {
+    val b: *Body = body_of(x);
+    var u: usize = 0;
+    for (u < b.values.data[v].uses.len) {
+        val place: Place = b.instructions.data[b.values.data[v].uses.data[u]].place;
+        if (!(sel place.placed))     { ret false; }
+        if (place.placed != s.latch) { ret false; }
+        u = u + 1;
+    }
+    ret true;
+}
+
+# whether an operation computes each lane from the same lane of its operands alone, never traps and reads no memory,
+# so its vector form gives in each lane what the scalar one gave
+fun lanewise(op: Opcode) bool {
+    ret op == table.ADD || op == table.SUB || op == table.MUL || op == table.AND || op == table.OR || op == table.XOR || op == table.NEG || op == table.NOT || op == table.FADD || op == table.FSUB || op == table.FMUL || op == table.FDIV || op == table.FNEG;
+}
+
+# the latch's accesses onto `into`, false where it holds anything but them, their element addresses, lanewise
+# operations, the step and the branch back
+fun accesses(x: *Run, n: u32, s: *Shape, into: *Accesses) res[bool, refusal.Error] {
+    val b:    *Body       = body_of(x);
+    val last: Instruction = b.blocks.data[s.latch].last;
+    val iv:   Value       = b.blocks.data[s.head].parameters.data[s.iv];
+    if (b.instructions.data[last].opcode != table.BR) { ret res[bool, refusal.Error].ok{false}; }
+    var i: Instruction = b.blocks.data[s.latch].first;
+    for (i != last) {
+        val d: *InstructionData = ?b.instructions.data[i];
+        if (!plain(b, i)) { ret res[bool, refusal.Error].ok{false}; }
+        if (d.opcode == table.LOAD && d.operands.len == 1 && d.results.len == 1) {
+            val ty: Type = b.values.data[d.results.data[0]].type;
+            if (!scalar(x, ty) || !kept_in_latch(x, s, d.results.data[0])) { ret res[bool, refusal.Error].ok{false}; }
+            val opt_stream: opt[Stream] = stream_of(x, n, s, d.operands.data[0], ty, d);
+            if (sel opt_stream.none) { ret res[bool, refusal.Error].ok{false}; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Access](?into.loads, Access{stream: opt_stream.some, value: d.results.data[0], at: i});
+            if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        or (d.opcode == table.STORE && d.operands.len == 2) {
+            val ty: Type = b.values.data[d.operands.data[1]].type;
+            if (!scalar(x, ty)) { ret res[bool, refusal.Error].ok{false}; }
+            val opt_stream: opt[Stream] = stream_of(x, n, s, d.operands.data[0], ty, d);
+            if (sel opt_stream.none) { ret res[bool, refusal.Error].ok{false}; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Access](?into.stores, Access{stream: opt_stream.some, value: d.operands.data[1], at: i});
+            if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        or (d.opcode == table.PTR_INDEX && d.operands.len == 2 && d.operands.data[1] == iv) {
+            # an element address, which `stream_of` reads where an access reads it
+            if (!kept_in_latch(x, s, d.results.data[0])) { ret res[bool, refusal.Error].ok{false}; }
+        }
+        or (d.results.len == 1 && d.results.data[0] == s.step) {
+            if (d.opcode != table.ADD) { ret res[bool, refusal.Error].ok{false}; }
+        }
+        or (lanewise(d.opcode) && d.results.len == 1 && (d.operands.len == 1 || d.operands.len == 2)) {
+            if (!scalar(x, b.values.data[d.results.data[0]].type) || !kept_in_latch(x, s, d.results.data[0])) { ret res[bool, refusal.Error].ok{false}; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?into.ops, i);
+            if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        or (!idle(b, i)) { ret res[bool, refusal.Error].ok{false}; }
+        i = b.instructions.data[i].next;
+    }
+    # the step is read by the branch back alone
+    val sv: *ValueData = ?b.values.data[s.step];
+    if (sv.uses.len != 1 || sv.uses.data[0] != last) { ret res[bool, refusal.Error].ok{false}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# end the block the builder is at in a branch to a block, passing arguments
+fun jump(st: *Site, to: Block, arguments: Slice[Value]) {
+    var targets: [1]Branch = [1]Branch{Branch{block: to, arguments: arguments}};
+    builder.emit(?st.bld, Request{opcode: table.BR, operands: no_values(), immediates: no_immediates(), targets: Slice[Branch]{data: ?targets[0], size: 1}});
+}
+
+# end the block the builder is at in a branch on a condition
+fun fork(st: *Site, condition: Value, yes: Block, yes_args: Slice[Value], no: Block, no_args: Slice[Value]) {
+    var ops:     [1]Value  = [1]Value{condition};
+    var targets: [2]Branch = [2]Branch{Branch{block: yes, arguments: yes_args}, Branch{block: no, arguments: no_args}};
+    builder.emit(?st.bld, Request{opcode: table.CBR, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: no_immediates(), targets: Slice[Branch]{data: ?targets[0], size: 2}});
+}
+
+# the element address of a stream at index `at`, in the form the loop states it
+fun element(st: *Site, s: Stream, at: Value) Value {
+    var ops: [2]Value     = [2]Value{s.base, at};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{s.indexed}};
+    ret builder.value(?st.bld, Request{opcode: table.PTR_INDEX, operands: Slice[Value]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+}
+
+# the compare of the loop's own kind between `iv` and the bound, true where a trip runs
+fun runs(st: *Site, s: *Shape, iv: Value) Value {
+    if (s.left) { ret emit.binary(st, s.compare, iv, s.bound); }
+    ret emit.binary(st, s.compare, s.bound, iv);
+}
+
+# the entry of the loop: a block in place of the edge from outside, which tests that a trip runs and branches to
+# `taken`, passing it nothing, or to the header as before, passing `starts`, what the edge passed. the builder is
+# left at the end of `taken`
+fun entry(x: *Run, st: *Site, s: *Shape, taken: Block, starts: Slice[Value]) err[refusal.Error] {
+    val gate: Block = builder.block(?st.bld, Slice[Declaration]{data: nil, size: 0});
+    builder.at_end(?st.bld, gate);
+    fork(st, runs(st, s, s.start), taken, no_values(), s.head, starts);
+    val err_built: err[refusal.Error] = emit.done(st);
+    if (sel err_built.err) { ret err_built; }
+    val err_moved: err[refusal.Error] = edit(body.retarget(x.c.m, x.f, s.entering, s.edge, gate, no_values()));
+    if (sel err_moved.err) { ret err_moved; }
+    builder.at_end(?st.bld, taken);
+    ret err[refusal.Error].ok{};
+}
+
+# the trips of a loop that runs at least one, as an unsigned count of the stepping parameter's width
+fun trips(st: *Site, s: *Shape) Value {
+    ret emit.binary(st, table.SUB, s.bound, s.start);
+}
+
+# the byte every byte of a constant of `bits` holds, none where they differ
+fun equal_bytes(x: u64, bits: u32) opt[u64] {
+    if (bits == 0 || bits > 64 || bits % 8 != 0) { ret opt[u64].none{}; }
+    val low: u64 = x & 0xff;
+    var k:   u32 = 8;
+    for (k < bits) {
+        if (((x >> k::u64) & 0xff) != low) { ret opt[u64].none{}; }
+        k = k + 8;
+    }
+    ret opt[u64].some{low};
+}
+
+# the type of a byte
+fun byte_type(x: *Run) res[Type, refusal.Error] {
+    val res_made: res[Type, type_table.Error] = type_table.intern(?x.c.m.types, type_table.Shape.integer{type_table.Integer{width: 8}});
+    if (sel res_made.err) { ret res[Type, refusal.Error].err{refusal.Error.ir{module.Error.types{res_made.err}}}; }
+    ret res[Type, refusal.Error].ok{res_made.ok};
+}
+
+# the byte a fill of value `v` stores, a value the builder may read, none where its bytes differ
+fun fill_byte(x: *Run, st: *Site, v: Value) res[opt[Value], refusal.Error] {
+    val b: *Body = body_of(x);
+    if (integer_bits(x, b.values.data[v].type) == 8) { ret res[opt[Value], refusal.Error].ok{opt[Value].some{v}}; }
+    val opt_known: opt[u64] = emit.known_in(x.c.m, b, v);
+    if (sel opt_known.none) { ret res[opt[Value], refusal.Error].ok{opt[Value].none{}}; }
+    val res_size: res[u64, TargetError] = layout.size(?x.layout, b.values.data[v].type, type_table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret res[opt[Value], refusal.Error].ok{opt[Value].none{}}; }
+    val opt_byte: opt[u64] = equal_bytes(opt_known.some, (res_size.ok * 8)::u32);
+    if (sel opt_byte.none) { ret res[opt[Value], refusal.Error].ok{opt[Value].none{}}; }
+    val res_byte_type: res[Type, refusal.Error] = byte_type(x);
+    if (sel res_byte_type.err) { ret res[opt[Value], refusal.Error].err{res_byte_type.err}; }
+    val res_made: res[Value, refusal.Error] = emit.constant(st, res_byte_type.ok, word.small(opt_byte.some));
+    if (sel res_made.err) { ret res[opt[Value], refusal.Error].err{res_made.err}; }
+    ret res[opt[Value], refusal.Error].ok{opt[Value].some{res_made.ok}};
+}
+
+# the destination lies past the source by between one byte and `bytes` less one, where an element loop that reads
+# each element before it writes the same one differs from the operation over the whole run: true where it does
+fun overlapping(st: *Site, s: *Shape, to: Value, from: Value, bytes: Value) res[Value, refusal.Error] {
+    var imm:     [1]Immediate              = [1]Immediate{Immediate.ty{s.word}};
+    var ops_t:   [1]Value                  = [1]Value{to};
+    var ops_f:   [1]Value                  = [1]Value{from};
+    val at_to:   Value                     = builder.value(?st.bld, Request{opcode: table.PTRTOINT, operands: Slice[Value]{data: ?ops_t[0], size: 1}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+    val at_from: Value                     = builder.value(?st.bld, Request{opcode: table.PTRTOINT, operands: Slice[Value]{data: ?ops_f[0], size: 1}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+    val res_one: res[Value, refusal.Error] = emit.word_constant(st, s.word, 1);
+    if (sel res_one.err) { ret res_one; }
+    val apart: Value = emit.binary(st, table.SUB, at_to, at_from);
+    ret res[Value, refusal.Error].ok{emit.binary(st, table.LT_U, emit.binary(st, table.SUB, apart, res_one.ok), emit.binary(st, table.SUB, bytes, res_one.ok))};
+}
+
+# the flags of a copy that may run upward
+fun ascending() Flags {
+    var f: Flags = NO_FLAGS;
+    f.ascending = true;
+    ret f;
+}
+
+# take a copy or fill loop: the copy or fill of its whole run stands for it where a trip runs and, for a copy, the
+# arrays do not overlap the way that would tell them apart. answers whether it took the loop
+fun bulk(x: *Run, n: u32, s: *Shape, acc: *Accesses) res[bool, refusal.Error] {
+    if (acc.stores.len != 1 || acc.loads.len > 1 || acc.ops.len != 0) { ret res[bool, refusal.Error].ok{false}; }
+    val b:   *Body  = body_of(x);
+    val out: Access = acc.stores.data[0];
+    if (b.blocks.data[s.head].parameters.len != 1) { ret res[bool, refusal.Error].ok{false}; }
+    if (!pointer_wide(x, s, out.stream.base))      { ret res[bool, refusal.Error].ok{false}; }
+    var copy: bool = false;
+    if (acc.loads.len == 1) {
+        val inp: Access = acc.loads.data[0];
+        if (inp.value != out.value || inp.stream.size != out.stream.size) { ret res[bool, refusal.Error].ok{false}; }
+        if (!pointer_wide(x, s, inp.stream.base))                         { ret res[bool, refusal.Error].ok{false}; }
+        copy = true;
+    }
+    or (!outside(x, n, out.value)) { ret res[bool, refusal.Error].ok{false}; }
+
+    var st: Site = emit.init(x.c.m, x.f, b, x.a);
+    fin { emit.dnit(?st); }
+    var opt_byte: opt[Value] = opt[Value].none{};
+    if (!copy) {
+        val res_byte: res[opt[Value], refusal.Error] = fill_byte(x, ?st, out.value);
+        if (sel res_byte.err)     { ret res[bool, refusal.Error].err{res_byte.err}; }
+        if (sel res_byte.ok.none) { ret res[bool, refusal.Error].ok{false}; }
+        opt_byte = res_byte.ok;
+    }
+    var start:     [1]Value           = [1]Value{s.start};
+    val taken:     Block              = builder.block(?st.bld, Slice[Declaration]{data: nil, size: 0});
+    val err_entry: err[refusal.Error] = entry(x, ?st, s, taken, Slice[Value]{data: ?start[0], size: 1});
+    if (sel err_entry.err) { ret res[bool, refusal.Error].err{err_entry.err}; }
+    val res_size: res[Value, refusal.Error] = emit.word_constant(?st, s.word, out.stream.size);
+    if (sel res_size.err) { ret res[bool, refusal.Error].err{res_size.err}; }
+    val bytes: Value    = emit.binary(?st, table.MUL, trips(?st, s), res_size.ok);
+    val to:    Value    = element(?st, out.stream, s.start);
+    var end:   [1]Value = [1]Value{s.bound};
+    if (copy) {
+        val from:     Value                     = element(?st, acc.loads.data[0].stream, s.start);
+        val res_over: res[Value, refusal.Error] = overlapping(?st, s, to, from, bytes);
+        if (sel res_over.err) { ret res[bool, refusal.Error].err{res_over.err}; }
+        val whole: Block = builder.block(?st.bld, Slice[Declaration]{data: nil, size: 0});
+        fork(?st, res_over.ok, s.head, Slice[Value]{data: ?start[0], size: 1}, whole, no_values());
+        builder.at_end(?st.bld, whole);
+        var ops:   [3]Value = [3]Value{to, from, bytes};
+        var align: u64      = out.stream.align;
+        if (acc.loads.data[0].stream.align < align) { align = acc.loads.data[0].stream.align; }
+        var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+        builder.flags(?st.bld, ascending());
+        builder.emit(?st.bld, Request{opcode: table.MEM_COPY, operands: Slice[Value]{data: ?ops[0], size: 3}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+        builder.flags(?st.bld, NO_FLAGS);
+    }
+    or (sel opt_byte.some) {
+        var ops: [3]Value     = [3]Value{to, opt_byte.some, bytes};
+        var imm: [1]Immediate = [1]Immediate{Immediate.alignment{out.stream.align}};
+        builder.emit(?st.bld, Request{opcode: table.MEM_FILL, operands: Slice[Value]{data: ?ops[0], size: 3}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+    }
+    jump(?st, s.head, Slice[Value]{data: ?end[0], size: 1});
+    val err_built: err[refusal.Error] = emit.done(?st);
+    if (sel err_built.err) { ret res[bool, refusal.Error].err{err_built.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# the most lanes the pass asks a unit for
+val MOST: u32 = 64;
+
+# what the pass made of each scalar value of the latch it carries out on vectors
+# ---
+# from: the scalar values
+# to:   the vector each stands as, in the same order
+rec Made {
+    from: vector.Vector[Value];
+    to:   vector.Vector[Value];
+}
+
+# the vector a scalar value stands as, none where none was made
+fun made_of(m: *Made, v: Value) opt[Value] {
+    var k: usize = 0;
+    for (k < m.from.len) {
+        if (m.from.data[k] == v) { ret opt[Value].some{m.to.data[k]}; }
+        k = k + 1;
+    }
+    ret opt[Value].none{};
+}
+
+fun note(m: *Made, from: Value, to: Value) err[refusal.Error] {
+    val res_from: res[usize, allocator.Error] = vector.push[Value](?m.from, from);
+    if (sel res_from.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_from.err}}; }
+    val res_to: res[usize, allocator.Error] = vector.push[Value](?m.to, to);
+    if (sel res_to.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_to.err}}; }
+    ret err[refusal.Error].ok{};
+}
+
+# whether a value of the latch is one the pass carries out on vectors: a load's result or a lanewise operation's
+fun carried(acc: *Accesses, b: *Body, v: Value) bool {
+    var k: usize = 0;
+    for (k < acc.loads.len) {
+        if (acc.loads.data[k].value == v) { ret true; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < acc.ops.len) {
+        if (b.instructions.data[acc.ops.data[k]].results.data[0] == v) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# whether an operand of the vector loop is one the pass can give it: a value it carries, or one of the lane type the
+# loop does not define, which a splat gives every lane
+fun given(x: *Run, n: u32, acc: *Accesses, lane: Type, v: Value) bool {
+    val b: *Body = body_of(x);
+    if (!type_table.same(b.values.data[v].type, lane)) { ret false; }
+    ret carried(acc, b, v) || outside(x, n, v);
+}
+
+# the lane type of the target's declarations a scalar type is, a float's format written to `format`
+fun lane_of(x: *Run, ty: Type, format: *Format) opt[LaneType] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?x.c.m.types, ty);
+    if (sel res_shape.err)        { ret opt[LaneType].none{}; }
+    if (sel res_shape.ok.integer) { ret opt[LaneType].some{LaneType.integer{res_shape.ok.integer.width}}; }
+    if (sel res_shape.ok.float) {
+        @format = res_shape.ok.float.format;
+        ret opt[LaneType].some{LaneType.float{format}};
+    }
+    ret opt[LaneType].none{};
+}
+
+# whether the vector loop splats a value: an operand of the latch's operations or the value it stores that the loop
+# does not define, as `splats` makes one of
+fun splatted(x: *Run, n: u32, acc: *Accesses) bool {
+    val b: *Body = body_of(x);
+    var k: usize = 0;
+    for (k < acc.ops.len) {
+        val d: *InstructionData = ?b.instructions.data[acc.ops.data[k]];
+        var j: usize            = 0;
+        for (j < d.operands.len) {
+            if (outside(x, n, d.operands.data[j])) { ret true; }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    ret acc.stores.len == 1 && outside(x, n, acc.stores.data[0].value);
+}
+
+# the unit and lane count the function's code holds vectors of a lane type in and packs every operation the vector
+# loop forms on: each operation of the latch, each accumulator's reduction and, where it splats a value, the splat.
+# asked as every legalisation asks it for the function (`mirl.target.vector.split_for` and `packed`, on the
+# function's basis and under its constant-time mode), so the vector legalisation splits none of them lane by lane
+# and the served check's verdict for the function is the one read. none where it holds fewer than two lanes, a count
+# that is no power of two, or packs one of them not
+fun unit_for(x: *Run, acc: *Accesses, accs: *vector.Vector[Accumulator], splat: bool, lane: LaneType) res[opt[Piece], refusal.Error] {
+    val time:      ConstantTime            = x.c.m.functions.data[x.f].data.constant_time;
+    val res_split: res[Split, units.Error] = units.split_for(x.c.basis, time, ?x.c.t.caps, lane, MOST);
+    if (sel res_split.err)          { ret res[opt[Piece], refusal.Error].err{refusal.Error.reason{"the target's vector units could not be read"}}; }
+    if (!(sel res_split.ok.pieces)) { ret res[opt[Piece], refusal.Error].ok{opt[Piece].none{}}; }
+    val p: Piece = res_split.ok.pieces;
+    if (p.lanes < 2 || (p.lanes & (p.lanes - 1)) != 0) { ret res[opt[Piece], refusal.Error].ok{opt[Piece].none{}}; }
+    val b: *Body = body_of(x);
+    var k: usize = 0;
+    for (k <= acc.ops.len + accs.len) {
+        var code: Opcode = table.VSPLAT;
+        if (k < acc.ops.len)            { code = b.instructions.data[acc.ops.data[k]].opcode; }
+        or (k < acc.ops.len + accs.len) { code = accs.data[k - acc.ops.len].reduce; }
+        if (k < acc.ops.len + accs.len || splat) {
+            val res_packed: res[bool, units.Error] = units.packed(x.c.basis, time, p.unit, code, lane, lane);
+            if (sel res_packed.err) { ret res[opt[Piece], refusal.Error].err{refusal.Error.reason{"the target's vector units could not be read"}}; }
+            if (!res_packed.ok)     { ret res[opt[Piece], refusal.Error].ok{opt[Piece].none{}}; }
+        }
+        k = k + 1;
+    }
+    ret res[opt[Piece], refusal.Error].ok{opt[Piece].some{p}};
+}
+
+# the vector of a lane type and count
+fun vector_type(x: *Run, lane: Type, lanes: u32) res[Type, refusal.Error] {
+    val res_made: res[Type, type_table.Error] = type_table.intern(?x.c.m.types, type_table.Shape.vector{type_table.Vector{lanes: lanes, element: lane}});
+    if (sel res_made.err) { ret res[Type, refusal.Error].err{refusal.Error.ir{module.Error.types{res_made.err}}}; }
+    ret res[Type, refusal.Error].ok{res_made.ok};
+}
+
+# the next instructions read as `origin` and carry its flags
+fun as_origin(x: *Run, st: *Site, origin: Instruction) {
+    builder.derive(?st.bld, origin);
+    builder.flags(?st.bld, body_of(x).instructions.data[origin].metadata.flags);
+}
+
+# a splat of every operand of the latch's operations and store the loop does not define, made where the builder is
+fun splats(x: *Run, n: u32, st: *Site, acc: *Accesses, vec: Type, into: *Made) err[refusal.Error] {
+    var k: usize = 0;
+    for (k <= acc.ops.len) {
+        var opt_values: opt[Slice[Value]] = opt[Slice[Value]].none{};
+        var one:        [1]Value          = [1]Value{0};
+        if (k < acc.ops.len) {
+            val d: *InstructionData = ?body_of(x).instructions.data[acc.ops.data[k]];
+            opt_values = opt[Slice[Value]].some{Slice[Value]{data: d.operands.data, size: d.operands.len}};
+        }
+        or (acc.stores.len == 1) {
+            one[0]     = acc.stores.data[0].value;
+            opt_values = opt[Slice[Value]].some{Slice[Value]{data: ?one[0], size: 1}};
+        }
+        if (sel opt_values.some) {
+            var j: usize = 0;
+            for (j < opt_values.some.size) {
+                val v:        Value      = opt_values.some.data[j];
+                val opt_made: opt[Value] = made_of(into, v);
+                if (outside(x, n, v) && sel opt_made.none) {
+                    var ops:       [1]Value           = [1]Value{v};
+                    var imm:       [1]Immediate       = [1]Immediate{Immediate.ty{vec}};
+                    val wide:      Value              = builder.value(?st.bld, Request{opcode: table.VSPLAT, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+                    val err_noted: err[refusal.Error] = note(into, v, wide);
+                    if (sel err_noted.err) { ret err_noted; }
+                }
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the vector form of the latch's loads, operations and store at index `at`, made where the builder is
+fun lanes_body(x: *Run, st: *Site, acc: *Accesses, vec: Type, at: Value, into: *Made) err[refusal.Error] {
+    var k: usize = 0;
+    for (k < acc.loads.len) {
+        val a: Access = acc.loads.data[k];
+        builder.plain(?st.bld);
+        val address: Value = element(st, a.stream, at);
+        as_origin(x, st, a.at);
+        var ops:       [1]Value           = [1]Value{address};
+        var imm:       [2]Immediate       = [2]Immediate{Immediate.ty{vec}, Immediate.alignment{a.stream.align}};
+        val loaded:    Value              = builder.value(?st.bld, Request{opcode: table.LOAD, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: Slice[Branch]{data: nil, size: 0}});
+        val err_noted: err[refusal.Error] = note(into, a.value, loaded);
+        if (sel err_noted.err) { ret err_noted; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < acc.ops.len) {
+        val i:      Instruction = acc.ops.data[k];
+        val code:   Opcode      = body_of(x).instructions.data[i].opcode;
+        val count:  usize       = body_of(x).instructions.data[i].operands.len;
+        val result: Value       = body_of(x).instructions.data[i].results.data[0];
+        var ops:    [2]Value    = [2]Value{0, 0};
+        var j:      usize       = 0;
+        for (j < count) {
+            val opt_made: opt[Value] = made_of(into, body_of(x).instructions.data[i].operands.data[j]);
+            if (sel opt_made.none) { ret err[refusal.Error].err{refusal.Error.reason{"a lanewise operand the vectoriser made no vector of"}}; }
+            ops[j] = opt_made.some;
+            j      = j + 1;
+        }
+        builder.derive(?st.bld, i);
+        val wide:      Value              = builder.value(?st.bld, Request{opcode: code, operands: Slice[Value]{data: ?ops[0], size: count}, immediates: no_immediates(), targets: Slice[Branch]{data: nil, size: 0}});
+        val err_noted: err[refusal.Error] = note(into, result, wide);
+        if (sel err_noted.err) { ret err_noted; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < acc.stores.len) {
+        val a:        Access     = acc.stores.data[k];
+        val opt_made: opt[Value] = made_of(into, a.value);
+        if (sel opt_made.none) { ret err[refusal.Error].err{refusal.Error.reason{"a stored value the vectoriser made no vector of"}}; }
+        builder.plain(?st.bld);
+        val address: Value = element(st, a.stream, at);
+        as_origin(x, st, a.at);
+        var ops: [2]Value     = [2]Value{address, opt_made.some};
+        var imm: [1]Immediate = [1]Immediate{Immediate.alignment{a.stream.align}};
+        builder.emit(?st.bld, Request{opcode: table.STORE, operands: Slice[Value]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+        k = k + 1;
+    }
+    builder.plain(?st.bld);
+    ret err[refusal.Error].ok{};
+}
+
+# the word a mask of the stepping parameter's bits holds with the low bits of a lane count clear
+fun rounding_mask(bits: u32, lanes: u32) u64 {
+    var all: u64 = ~(0::u64);
+    if (bits < 64) { all = (1::u64 << bits::u64) - 1; }
+    ret all & ~((lanes - 1)::u64);
+}
+
+# an accumulator of the loop: a header parameter each trip combines one value into by an operation the pass may
+# regroup
+# ---
+# index:  its position among the header's parameters
+# param:  the parameter
+# op:     the operation of the latch that combines into it, whose result the branch back passes it
+# reduce: the reduction of a vector's lanes by that operation
+# start:  what the edge from outside passes it
+rec Accumulator {
+    index:  u32;
+    param:  Value;
+    op:     Instruction;
+    reduce: Opcode;
+    start:  Value;
+}
+
+# the reduction of a vector's lanes by an operation an accumulator may combine with: integer sums, products and the
+# three bitwise operations, which regroup exactly, and float sums and products where the build permits float
+# reassociation (`mirl.pass.relaxation.FLOAT_REASSOC`), none for any other
+fun reducing(x: *Run, code: Opcode) opt[Opcode] {
+    if (code == table.ADD)                                       { ret opt[Opcode].some{table.REDUCE_ADD}; }
+    if (code == table.MUL)                                       { ret opt[Opcode].some{table.REDUCE_MUL}; }
+    if (code == table.AND)                                       { ret opt[Opcode].some{table.REDUCE_AND}; }
+    if (code == table.OR)                                        { ret opt[Opcode].some{table.REDUCE_OR}; }
+    if (code == table.XOR)                                       { ret opt[Opcode].some{table.REDUCE_XOR}; }
+    if (!relaxation.holds(x.c.floats, relaxation.FLOAT_REASSOC)) { ret opt[Opcode].none{}; }
+    if (code == table.FADD)                                      { ret opt[Opcode].some{table.REDUCE_FADD_ANY}; }
+    if (code == table.FMUL)                                      { ret opt[Opcode].some{table.REDUCE_FMUL_ANY}; }
+    ret opt[Opcode].none{};
+}
+
+# the accumulators of the loop onto `into`: every header parameter but the index, false where one is not an
+# accumulator. its latch reads it once, in an operation of the latch's lanewise ones that combines it with one other
+# value and that `reducing` takes, whose result only the branch back reads
+fun accumulators(x: *Run, s: *Shape, acc: *Accesses, into: *vector.Vector[Accumulator]) res[bool, refusal.Error] {
+    val b:      *Body       = body_of(x);
+    val last:   Instruction = b.blocks.data[s.latch].last;
+    val params: usize       = b.blocks.data[s.head].parameters.len;
+    if (b.instructions.data[last].edges.len != 1 || b.instructions.data[last].edges.data[0].block != s.head) { ret res[bool, refusal.Error].ok{false}; }
+    var k: usize = 0;
+    for (k < params) {
+        if (k != s.iv::usize) {
+            val p:   Value = b.blocks.data[s.head].parameters.data[k];
+            val r:   Value = b.instructions.data[last].edges.data[0].arguments.data[k];
+            val def: Def   = b.values.data[r].def;
+            if (!(sel def.result)) { ret res[bool, refusal.Error].ok{false}; }
+            val op:    Instruction = def.result.instruction;
+            var found: bool        = false;
+            var j:     usize       = 0;
+            for (j < acc.ops.len) {
+                if (acc.ops.data[j] == op) { found = true; }
+                j = j + 1;
+            }
+            if (!found) { ret res[bool, refusal.Error].ok{false}; }
+            val d:          *InstructionData = ?b.instructions.data[op];
+            val opt_reduce: opt[Opcode]      = reducing(x, d.opcode);
+            if (sel opt_reduce.none)                                    { ret res[bool, refusal.Error].ok{false}; }
+            if (d.operands.len != 2)                                    { ret res[bool, refusal.Error].ok{false}; }
+            if ((d.operands.data[0] == p) == (d.operands.data[1] == p)) { ret res[bool, refusal.Error].ok{false}; }
+            val rv: *ValueData = ?b.values.data[r];
+            if (rv.uses.len != 1 || rv.uses.data[0] != last) { ret res[bool, refusal.Error].ok{false}; }
+            val pv: *ValueData = ?b.values.data[p];
+            var u:  usize      = 0;
+            for (u < pv.uses.len) {
+                val user:  Instruction = pv.uses.data[u];
+                val place: Place       = b.instructions.data[user].place;
+                if (sel place.placed && place.placed == s.latch && user != op) { ret res[bool, refusal.Error].ok{false}; }
+                u = u + 1;
+            }
+            val start:      Value                       = b.instructions.data[s.entering].edges.data[s.edge].arguments.data[k];
+            val res_pushed: res[usize, allocator.Error] = vector.push[Accumulator](into, Accumulator{index: k::u32, param: p, op: op, reduce: opt_reduce.some, start: start});
+            if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# whether value `v` is the parameter of the accumulator operation `i` combines into
+fun own(accs: *vector.Vector[Accumulator], i: Instruction, v: Value) bool {
+    var k: usize = 0;
+    for (k < accs.len) {
+        if (accs.data[k].op == i && accs.data[k].param == v) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the vector every lane of which an accumulator's operation leaves a value as it is: zero for a sum, an or and an
+# exclusive or, one for a product, every bit for an and, and for floats the format's negative zero for a sum (a
+# positive zero would turn a sum of negative zeros positive) and one for a product
+fun identity(x: *Run, st: *Site, code: Opcode, lane: Type, vec: Type) res[Value, refusal.Error] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?x.c.m.types, lane);
+    if (sel res_shape.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{module.Error.types{res_shape.err}}}; }
+    if (sel res_shape.ok.integer) {
+        val bits: u32 = res_shape.ok.integer.width;
+        var all:  u64 = ~(0::u64);
+        if (bits < 64) { all = (1::u64 << bits::u64) - 1; }
+        var k: u64 = 0;
+        if (code == table.MUL) { k = 1; }
+        if (code == table.AND) { k = all; }
+        ret emit.constant(st, vec, word.small(k));
+    }
+    if (sel res_shape.ok.float) {
+        val opt_row: opt[FormatRow] = format_row(res_shape.ok.float.format);
+        if (sel opt_row.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a float accumulator of a format with no row"}}; }
+        val row: FormatRow = opt_row.some;
+        if (sel row.encoding.binary) {
+            val bin: Binary = row.encoding.binary;
+            if (row.width <= 64) {
+                var k: u64 = 1::u64 << (row.width - 1)::u64;
+                if (code == table.FMUL) { k = bin.bias::u64 << bin.significand::u64; }
+                ret emit.float_constant(st, vec, word.small(k));
+            }
+        }
+        ret res[Value, refusal.Error].err{refusal.Error.reason{"a float accumulator of a format the vectoriser states no identity of"}};
+    }
+    ret res[Value, refusal.Error].err{refusal.Error.reason{"an accumulator of a type that is no integer or float"}};
+}
+
+# take a lanewise loop: where a trip runs, the trips a whole number of vectors covers are at least one vector, and no
+# stream it loads lies just below the one it stores (by one byte up to a vector's bytes less one, where a lane would
+# read what an earlier element of its own vector wrote), a vector loop runs those trips and the loop the rest. each
+# accumulator is a vector of partial values in the vector loop, every lane starting at the operation's identity, and
+# its lanes are reduced and combined with what the accumulator held before the vector loop, which the header then
+# takes in its place. answers whether it took the loop
+fun lanes(x: *Run, n: u32, s: *Shape, acc: *Accesses) res[bool, refusal.Error] {
+    val b: *Body = body_of(x);
+    if (acc.stores.len > 1 || (acc.ops.len == 0 && acc.loads.len == 0)) { ret res[bool, refusal.Error].ok{false}; }
+    if (!x.c.t.misaligned || sel x.c.basis.none)                        { ret res[bool, refusal.Error].ok{false}; }
+    var accs:     vector.Vector[Accumulator] = vector.init[Accumulator](x.a);
+    val res_accs: res[bool, refusal.Error]   = accumulators(x, s, acc, ?accs);
+    if (sel res_accs.err)                     { ret res_accs; }
+    if (!res_accs.ok)                         { ret res[bool, refusal.Error].ok{false}; }
+    if (acc.stores.len == 0 && accs.len == 0) { ret res[bool, refusal.Error].ok{false}; }
+    val params: usize = b.blocks.data[s.head].parameters.len;
+    var lane:   Type  = 0;
+    if (acc.stores.len == 1) {
+        val out: Access = acc.stores.data[0];
+        lane = b.values.data[out.value].type;
+        if (!pointer_wide(x, s, out.stream.base) || !given(x, n, acc, lane, out.value)) { ret res[bool, refusal.Error].ok{false}; }
+    }
+    or { lane = b.values.data[accs.data[0].param].type; }
+    var k: usize = 0;
+    for (k < acc.loads.len) {
+        val a: Access = acc.loads.data[k];
+        if (!type_table.same(b.values.data[a.value].type, lane) || !pointer_wide(x, s, a.stream.base)) { ret res[bool, refusal.Error].ok{false}; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < acc.ops.len) {
+        val i: Instruction      = acc.ops.data[k];
+        val d: *InstructionData = ?b.instructions.data[i];
+        if (!type_table.same(b.values.data[d.results.data[0]].type, lane)) { ret res[bool, refusal.Error].ok{false}; }
+        var j: usize = 0;
+        for (j < d.operands.len) {
+            if (!own(?accs, i, d.operands.data[j]) && !given(x, n, acc, lane, d.operands.data[j])) { ret res[bool, refusal.Error].ok{false}; }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    var format:   Format;
+    val opt_lane: opt[LaneType] = lane_of(x, lane, ?format);
+    if (sel opt_lane.none) { ret res[bool, refusal.Error].ok{false}; }
+    val res_unit: res[opt[Piece], refusal.Error] = unit_for(x, acc, ?accs, splatted(x, n, acc), opt_lane.some);
+    if (sel res_unit.err)     { ret res[bool, refusal.Error].err{res_unit.err}; }
+    if (sel res_unit.ok.none) { ret res[bool, refusal.Error].ok{false}; }
+    val count:   u32                      = res_unit.ok.some.lanes;
+    val res_vec: res[Type, refusal.Error] = vector_type(x, lane, count);
+    if (sel res_vec.err) { ret res[bool, refusal.Error].err{res_vec.err}; }
+    val vec: Type = res_vec.ok;
+
+    # what the edge from outside passes the header, read before it moves
+    val res_starts: res[*Value, allocator.Error] = allocator.zallocate[Value](x.a, params + 1);
+    if (sel res_starts.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_starts.err}}; }
+    k = 0;
+    for (k < params) {
+        res_starts.ok[k] = b.instructions.data[s.entering].edges.data[s.edge].arguments.data[k];
+        k                = k + 1;
+    }
+    val starts: Slice[Value] = Slice[Value]{data: res_starts.ok, size: params};
+
+    var st: Site = emit.init(x.c.m, x.f, b, x.a);
+    fin { emit.dnit(?st); }
+    var made:      Made               = Made{from: vector.init[Value](x.a), to: vector.init[Value](x.a)};
+    val taken:     Block              = builder.block(?st.bld, Slice[Declaration]{data: nil, size: 0});
+    val err_entry: err[refusal.Error] = entry(x, ?st, s, taken, starts);
+    if (sel err_entry.err) { ret res[bool, refusal.Error].err{err_entry.err}; }
+    var size: u64 = 0;
+    if (acc.stores.len == 1) { size = acc.stores.data[0].stream.size; }
+    val res_mask:  res[Value, refusal.Error] = emit.word_constant(?st, s.word, rounding_mask(integer_bits(x, s.word), count));
+    val res_zero:  res[Value, refusal.Error] = emit.word_constant(?st, s.word, 0);
+    val res_step:  res[Value, refusal.Error] = emit.word_constant(?st, s.word, count::u64);
+    val res_bytes: res[Value, refusal.Error] = emit.word_constant(?st, s.word, count::u64 * size);
+    if (sel res_mask.err)  { ret res[bool, refusal.Error].err{res_mask.err}; }
+    if (sel res_zero.err)  { ret res[bool, refusal.Error].err{res_zero.err}; }
+    if (sel res_step.err)  { ret res[bool, refusal.Error].err{res_step.err}; }
+    if (sel res_bytes.err) { ret res[bool, refusal.Error].err{res_bytes.err}; }
+    val whole: Value = emit.binary(?st, table.AND, trips(?st, s), res_mask.ok);
+    var next:  Block = builder.block(?st.bld, Slice[Declaration]{data: nil, size: 0});
+    fork(?st, emit.binary(?st, table.EQ, whole, res_zero.ok), s.head, starts, next, no_values());
+    builder.at_end(?st.bld, next);
+    if (acc.stores.len == 1) {
+        val to: Value = element(?st, acc.stores.data[0].stream, s.start);
+        k = 0;
+        for (k < acc.loads.len) {
+            val from:     Value                     = element(?st, acc.loads.data[k].stream, s.start);
+            val res_over: res[Value, refusal.Error] = overlapping(?st, s, to, from, res_bytes.ok);
+            if (sel res_over.err) { ret res[bool, refusal.Error].err{res_over.err}; }
+            next = builder.block(?st.bld, Slice[Declaration]{data: nil, size: 0});
+            fork(?st, res_over.ok, s.head, starts, next, no_values());
+            builder.at_end(?st.bld, next);
+            k = k + 1;
+        }
+    }
+    val end:        Value              = emit.binary(?st, table.ADD, s.start, whole);
+    val err_splats: err[refusal.Error] = splats(x, n, ?st, acc, vec, ?made);
+    if (sel err_splats.err) { ret res[bool, refusal.Error].err{err_splats.err}; }
+
+    # the vector loop's parameters: its index, then one vector per accumulator, entered at the start and the identities
+    val res_decls: res[*Declaration, allocator.Error] = allocator.zallocate[Declaration](x.a, accs.len + 1);
+    val res_first: res[*Value, allocator.Error]       = allocator.zallocate[Value](x.a, accs.len + 1);
+    val res_again: res[*Value, allocator.Error]       = allocator.zallocate[Value](x.a, accs.len + 1);
+    if (sel res_decls.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_decls.err}}; }
+    if (sel res_first.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_first.err}}; }
+    if (sel res_again.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_again.err}}; }
+    res_decls.ok[0] = Declaration{type: s.word, secret: false, name: opt[View].none{}};
+    res_first.ok[0] = s.start;
+    k               = 0;
+    for (k < accs.len) {
+        res_decls.ok[k + 1] = Declaration{type: vec, secret: false, name: opt[View].none{}};
+        val res_identity: res[Value, refusal.Error] = identity(x, ?st, body_of(x).instructions.data[accs.data[k].op].opcode, lane, vec);
+        if (sel res_identity.err) { ret res[bool, refusal.Error].err{res_identity.err}; }
+        res_first.ok[k + 1] = res_identity.ok;
+        k                   = k + 1;
+    }
+    val inner: Block = builder.block(?st.bld, Slice[Declaration]{data: res_decls.ok, size: accs.len + 1});
+    jump(?st, inner, Slice[Value]{data: res_first.ok, size: accs.len + 1});
+    builder.at_end(?st.bld, inner);
+    val at: Value = builder.parameter(?st.bld, inner, 0);
+    k = 0;
+    for (k < accs.len) {
+        val err_noted: err[refusal.Error] = note(?made, accs.data[k].param, builder.parameter(?st.bld, inner, (k + 1)::u32));
+        if (sel err_noted.err) { ret res[bool, refusal.Error].err{err_noted.err}; }
+        k = k + 1;
+    }
+    val err_body: err[refusal.Error] = lanes_body(x, ?st, acc, vec, at, ?made);
+    if (sel err_body.err) { ret res[bool, refusal.Error].err{err_body.err}; }
+    val after: Value = emit.binary(?st, table.ADD, at, res_step.ok);
+    res_again.ok[0] = after;
+    k               = 0;
+    for (k < accs.len) {
+        val opt_made: opt[Value] = made_of(?made, body_of(x).instructions.data[accs.data[k].op].results.data[0]);
+        if (sel opt_made.none) { ret res[bool, refusal.Error].err{refusal.Error.reason{"an accumulator the vectoriser made no vector of"}}; }
+        res_again.ok[k + 1] = opt_made.some;
+        k                   = k + 1;
+    }
+    val tail: Block = builder.block(?st.bld, Slice[Declaration]{data: nil, size: 0});
+    fork(?st, emit.binary(?st, table.NE, after, end), inner, Slice[Value]{data: res_again.ok, size: accs.len + 1}, tail, no_values());
+
+    # the vectors' lanes reduced and combined with what each accumulator held before, the header entered with them
+    builder.at_end(?st.bld, tail);
+    val res_leave: res[*Value, allocator.Error] = allocator.zallocate[Value](x.a, params + 1);
+    if (sel res_leave.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_leave.err}}; }
+    res_leave.ok[s.iv] = end;
+    k                  = 0;
+    for (k < accs.len) {
+        val a: Accumulator = accs.data[k];
+        builder.derive(?st.bld, a.op);
+        val code:    Opcode = body_of(x).instructions.data[a.op].opcode;
+        val reduced: Value  = emit.unary(?st, a.reduce, res_again.ok[k + 1]);
+        res_leave.ok[a.index] = emit.binary(?st, code, a.start, reduced);
+        k                     = k + 1;
+    }
+    builder.plain(?st.bld);
+    jump(?st, s.head, Slice[Value]{data: res_leave.ok, size: params});
+    val err_built: err[refusal.Error] = emit.done(?st);
+    if (sel err_built.err) { ret res[bool, refusal.Error].err{err_built.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# take loop `n` where a form of the pass applies, answering whether it did
+fun take(x: *Run, ind: *Inductions, n: u32) res[bool, refusal.Error] {
+    var opt_shape: opt[Shape] = shape_of(x, ind, n);
+    if (sel opt_shape.none) { ret res[bool, refusal.Error].ok{false}; }
+    var s:        Shape                    = opt_shape.some;
+    var acc:      Accesses                 = Accesses{loads: vector.init[Access](x.a), stores: vector.init[Access](x.a), ops: vector.init[Instruction](x.a)};
+    val res_read: res[bool, refusal.Error] = accesses(x, n, ?s, ?acc);
+    if (sel res_read.err) { ret res_read; }
+    if (!res_read.ok)     { ret res[bool, refusal.Error].ok{false}; }
+    val res_bulk: res[bool, refusal.Error] = bulk(x, n, ?s, ?acc);
+    if (sel res_bulk.err) { ret res_bulk; }
+    if (res_bulk.ok)      { ret res_bulk; }
+    ret lanes(x, n, ?s, ?acc);
+}
+
+# take every loop of one function a form applies to. a loop taken changes the graph, so the loops and inductions
+# are read again before the next
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c: *Context = u.context;
+    if (c.m.functions.data[u.f].data.scalar) { ret res[bool, refusal.Error].ok{false}; }
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var changed: bool = false;
+    var more:    bool = true;
+    for (more) {
+        more = false;
+        arena.reset(?ar);
+        val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, u.f);
+        if (sel res_loops_of.err) { ret res[bool, refusal.Error].err{res_loops_of.err}; }
+        val res_inductions_of: res[*Inductions, refusal.Error] = analysis.inductions_of(c.cache, u.f);
+        if (sel res_inductions_of.err) { ret res[bool, refusal.Error].err{res_inductions_of.err}; }
+        var x: Run = Run{c: c, f: u.f, l: res_loops_of.ok, layout: layout.of(c.t, ?c.m.types, basis.context_of(c.basis)), a: ?scratch};
+        var n: u32 = 0;
+        for (n < loops.count(x.l) && !more) {
+            val res_taken: res[bool, refusal.Error] = take(?x, res_inductions_of.ok, n);
+            if (sel res_taken.err) { ret res_taken; }
+            if (res_taken.ok) {
+                changed = true;
+                more    = true;
+            }
+            n = n + 1;
+        }
+        # the loop taken is entered from more than one place now, so it is no longer counted and is not taken again
+        if (more) {
+            val err_forgot: err[allocator.Error] = cache.forget(c.cache, u.f);
+            if (sel err_forgot.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_forgot.err}}; }
+        }
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

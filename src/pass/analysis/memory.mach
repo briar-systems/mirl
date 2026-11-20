@@ -2,9 +2,10 @@
 # may touch the same bytes
 #
 # an access lands at a base and an offset from it. a base is a stack slot or a
-# global, the allocation an address is built from through `ptr.add`, or else
-# the value the walk back through `ptr.add` stops at, a root: a parameter or
-# the result of an operation no rule follows, such as a load. two accesses
+# global, the allocation an address is built from through `ptr.add`, a member
+# address or an element address (`formed`), or else the value the walk back
+# through them stops at, a root: a parameter or the result of an operation no
+# rule follows, such as a load. two accesses
 # through distinct allocations never alias, two through one base or one root
 # alias when their byte ranges overlap, and every other pair may alias: an
 # unknown base, a root against any other base, since a pointer may point into
@@ -84,7 +85,10 @@ use mirl.ir.module;
 use mirl.ir.module.Module;
 use ni:         mirl.ir.native;
 use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.row.Indexed;
 use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.rule.Member;
+use mirl.ir.opcode.rule.Subject;
 use opcode_table: mirl.ir.opcode.table;
 use mirl.ir.type.table;
 use mirl.ir.type.table.Type;
@@ -637,20 +641,121 @@ fun locate(w: *Walk, address: Value) Place {
             p.base = Base.symbol{Symbol.function{opt_named.some}};
             ret p;
         }
-        if (ins.opcode != opcode_table.PTR_ADD || ins.operands.len != 2) {
+        val f: Formed = formed(w, ins);
+        if (sel f.root) {
             p.base = Base.value{cur};
             ret p;
         }
-        val opt_sum: opt[Offset] = combine(p.offset, offset_of(w, ins.operands.data[1], 0, false), 1);
-        if (sel opt_sum.none) {
-            p.offset = opaque(ins.operands.data[1], w.bits, false);
-            ret p;
+        if (!(sel f.moved) || w.failed) { ret p; }
+        if (sel f.moved) {
+            val opt_sum: opt[Offset] = combine(p.offset, f.moved.offset, 1);
+            if (sel opt_sum.none) { ret p; }
+            p.offset = opt_sum.some;
+            cur      = f.moved.from;
         }
-        p.offset = opt_sum.some;
-        cur      = ins.operands.data[0];
-        hops     = hops + 1;
+        hops = hops + 1;
     }
     ret p;
+}
+
+# one step of an address walk: the address an address is formed from and the
+# byte offset it adds to it
+# ---
+# from:   the address it is formed from
+# offset: the bytes it adds
+rec Step {
+    from:   Value;
+    offset: Offset;
+}
+
+# how an address is formed from another, by the one list of operations the walk
+# follows
+# ---
+# root:  by no operation the walk follows, so the address is a root of its own
+# lost:  from another address, at an offset no rule follows, so no base is known
+# moved: from another address at an offset the walk knows
+tag Formed: u8 {
+    root;
+    lost;
+    moved: Step;
+}
+
+# the type a subject of a row names in an instruction, none where it holds none
+fun subject_of(w: *Walk, ins: *InstructionData, at: Subject) opt[Type] {
+    if (sel at.operand) {
+        val n: u32 = at.operand;
+        if (n::usize < ins.operands.len && checked(w, ins.operands.data[n])) { ret opt[Type].some{w.body.values.data[ins.operands.data[n]].type}; }
+    }
+    if (sel at.immediate) {
+        val n: u32 = at.immediate;
+        if (n::usize < ins.immediates.len) {
+            val imm: opcode_row.Immediate = ins.immediates.data[n];
+            if (sel imm.ty) { ret opt[Type].some{imm.ty}; }
+        }
+    }
+    ret opt[Type].none{};
+}
+
+# the address space of the address an instruction forms its own from, none where
+# its type is no pointer
+fun space_from(w: *Walk, from: Value) opt[u32] {
+    if (!checked(w, from)) { ret opt[u32].none{}; }
+    val res_space: res[u32, table.Error] = table.space(?w.mem.m.types, w.body.values.data[from].type);
+    if (sel res_space.err) { ret opt[u32].none{}; }
+    ret opt[u32].some{res_space.ok};
+}
+
+# how an instruction forms its address. the walk follows exactly three
+# operations: `ptr.add`, its offset an integer as wide as the pointer, a member
+# address (`ptr.member`), its offset the member's offset in the data layout, and
+# an element address (`ptr.index`), its offset the index read as signed times
+# the array's stride, which is what the `address` legalisation folds each into.
+# a typed form the layout does not place, or an index wider than the pointer,
+# leaves the address a root of its own
+fun formed(w: *Walk, ins: *InstructionData) Formed {
+    if (ins.opcode == opcode_table.PTR_ADD) {
+        if (ins.operands.len != 2) { ret Formed.root{}; }
+        val o: Offset = offset_of(w, ins.operands.data[1], 0, false);
+        ret Formed.moved{Step{from: ins.operands.data[0], offset: o}};
+    }
+    val opt_row: opt[*Row] = opcode_table.at(ins.opcode);
+    if (sel opt_row.none) { ret Formed.root{}; }
+    val r:         *Row     = opt_row.some;
+    val opt_start: opt[u32] = opcode_row.base(r);
+    if (sel opt_start.none)                        { ret Formed.root{}; }
+    if (opt_start.some::usize >= ins.operands.len) { ret Formed.root{}; }
+    val from:      Value    = ins.operands.data[opt_start.some];
+    val opt_space: opt[u32] = space_from(w, from);
+    if (sel opt_space.none) { ret Formed.root{}; }
+    if (sel r.forms.member) {
+        val mb:       Member    = r.forms.member;
+        val opt_type: opt[Type] = subject_of(w, ins, mb.of);
+        if (sel opt_type.none)                    { ret Formed.root{}; }
+        if (mb.slot::usize >= ins.immediates.len) { ret Formed.root{}; }
+        val imm: opcode_row.Immediate = ins.immediates.data[mb.slot];
+        if (!(sel imm.member)) { ret Formed.root{}; }
+        val res_offset: res[u64, TargetError] = layout.offset(?w.mem.layout, opt_type.some, opt_space.some, imm.member);
+        if (sel res_offset.err) { ret Formed.root{}; }
+        val opt_narrowed: opt[i64] = narrowed(res_offset.ok::i128, w.bits);
+        if (sel opt_narrowed.none) { ret Formed.lost{}; }
+        ret Formed.moved{Step{from: from, offset: constant(opt_narrowed.some, w.bits)}};
+    }
+    if (sel r.forms.index) {
+        val ix:       Indexed   = r.forms.index;
+        val opt_type: opt[Type] = subject_of(w, ins, ix.of);
+        if (sel opt_type.none)                     { ret Formed.root{}; }
+        if (ix.operand::usize >= ins.operands.len) { ret Formed.root{}; }
+        val index: Value = ins.operands.data[ix.operand];
+        if (width_of(w, index) > w.bits) { ret Formed.root{}; }
+        val res_stride: res[u64, TargetError] = layout.stride(?w.mem.layout, opt_type.some, opt_space.some);
+        if (sel res_stride.err) { ret Formed.root{}; }
+        val opt_narrowed: opt[i64] = narrowed(res_stride.ok::i128, w.bits);
+        if (sel opt_narrowed.none) { ret Formed.lost{}; }
+        val opt_scaled: opt[Offset] = scaled(offset_of(w, index, 0, false), opt_narrowed.some);
+        if (sel opt_scaled.none) { ret Formed.lost{}; }
+        ret Formed.moved{Step{from: from, offset: opt_scaled.some}};
+    }
+    ret Formed.root{};
 }
 
 fun same_base(a: Base, b: Base) bool {
@@ -695,7 +800,7 @@ pub fun group(p: Place) opt[u64] {
 }
 
 # whether two accesses may touch the same bytes
-fun alias(a: Place, b: Place) Alias {
+pub fun alias(a: Place, b: Place) Alias {
     if (!known(a.base) || !known(b.base)) { ret Alias.may{}; }
     if (!same_base(a.base, b.base)) {
         if (sel a.base.value || sel b.base.value) { ret Alias.may{}; }

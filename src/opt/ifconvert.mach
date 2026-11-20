@@ -1,0 +1,246 @@
+# if-conversion: a branch whose arms only compute values for the block they join becomes a `select` of each value
+#
+# a block ending in `cbr(c) t, e` whose arms each hold at most ARM instructions and a `br` to one join block, or one
+# arm doing so whose other side is the join itself, is rewritten: the arms' instructions move ahead of the branch,
+# and the branch becomes a `br` to the join passing, for each of its parameters, the one value both sides pass or
+# `select(c, then, else)` of the two. the arms are entered from the branch alone and take no parameters, so every
+# value they read is defined above the branch, and the emptied arms are erased.
+#
+# the rule by which a branch is left alone: an arm holds an instruction that writes or reads memory, may trap, has
+# an effect of any kind its row states, is volatile, kept or secret, or is no operation the row states may run where
+# its result is not needed (`speculatable`), so a side effect or a fault on one arm never runs on the other path. an
+# arm of more than ARM instructions, one entered from elsewhere or taking parameters, two arms that join different
+# blocks, a condition that is secret, and a join parameter whose two arguments differ and are no scalar integer,
+# float or pointer leave it too.
+#
+# it costs each block its arms' instructions. it reads nothing an analysis gives. it removes a branch and computes
+# both arms on every path, which changes which code runs, so it is held to no constant-time proof of its own and
+# breaks constant time: every function that requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+
+use mirl.build.builder;
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.table;
+use type_table: mirl.ir.type.table;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it removes blocks and edges, so it keeps no analysis
+pub val IFCONVERT: Pass = Pass{name: "ifconvert", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: 0, preserves: cache.NONE, time: Time.breaks{}};
+
+# the most instructions an arm holds besides its branch
+val ARM: usize = 4;
+
+# an arm: the block, none where the side goes straight to the join, and the edge it joins by
+# ---
+# block: the arm, or the join where the side is the join itself
+# own:   the side has an arm of its own
+# join:  the block it joins
+# edge:  the instruction whose edge enters the join: the arm's `br`, or the branch itself
+# index: that edge's place among the instruction's edges
+rec Arm {
+    block: Block;
+    own:   bool;
+    join:  Block;
+    edge:  Instruction;
+    index: usize;
+}
+
+fun refused[T](e: allocator.Error) res[T, refusal.Error] {
+    ret res[T, refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+# whether an instruction may move ahead of the branch: it runs where its result is not needed, touches no memory,
+# never traps and is plain
+fun movable(d: *InstructionData) bool {
+    if (d.metadata.flags.volatile || d.metadata.flags.kept || d.metadata.secret) { ret false; }
+    val opt_row: opt[*Row] = table.at(d.opcode);
+    if (sel opt_row.none) { ret false; }
+    val r: *Row = opt_row.some;
+    if (r.terminator || !r.effects.speculatable || r.effects.reads || r.effects.writes) { ret false; }
+    if (!(sel r.effects.traps[0].unstated) || !(sel r.effects.traps[1].unstated))       { ret false; }
+    ret true;
+}
+
+# side `side` of the branch `branch` in block `from`, none where its block is no arm the pass takes
+fun arm_of(b: *Body, branch: Instruction, side: usize) opt[Arm] {
+    val d:  *InstructionData = ?b.instructions.data[branch];
+    val to: Block            = d.edges.data[side].block;
+    val bd: *BlockData       = ?b.blocks.data[to];
+    if (bd.predecessors.len != 1 || bd.parameters.len != 0 || to == 0) {
+        ret opt[Arm].some{Arm{block: to, own: false, join: to, edge: branch, index: side}};
+    }
+    var count: usize       = 0;
+    var i:     Instruction = bd.first;
+    for (i != bd.last) {
+        if (!movable(?b.instructions.data[i])) { ret opt[Arm].none{}; }
+        count = count + 1;
+        if (count > ARM) { ret opt[Arm].none{}; }
+        i = b.instructions.data[i].next;
+    }
+    val end: *InstructionData = ?b.instructions.data[bd.last];
+    if (end.opcode != table.BR || end.edges.len != 1) { ret opt[Arm].none{}; }
+    ret opt[Arm].some{Arm{block: to, own: true, join: end.edges.data[0].block, edge: bd.last, index: 0}};
+}
+
+# the arguments the side `x` passes its join
+fun passed(b: *Body, x: Arm) Slice[Value] {
+    val d: *InstructionData = ?b.instructions.data[x.edge];
+    ret Slice[Value]{data: d.edges.data[x.index].arguments.data, size: d.edges.data[x.index].arguments.len};
+}
+
+# whether each pair of arguments the two sides pass may meet in a select: both public, and a scalar integer, float or
+# pointer
+fun joinable(s: *Site, then: Slice[Value], other: Slice[Value]) res[bool, refusal.Error] {
+    val b: *Body = s.b;
+    if (then.size != other.size) { ret res[bool, refusal.Error].ok{false}; }
+    var n: usize = 0;
+    for (n < then.size) {
+        val x: Value = then.data[n];
+        val y: Value = other.data[n];
+        if (x != y) {
+            if (b.values.data[x].secret || b.values.data[y].secret) { ret res[bool, refusal.Error].ok{false}; }
+            val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?s.m.types, b.values.data[x].type);
+            if (sel res_shape.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_shape.err}}}; }
+            val shape: type_table.Shape = res_shape.ok;
+            if (!(sel shape.integer) && !(sel shape.float) && !(sel shape.pointer)) { ret res[bool, refusal.Error].ok{false}; }
+        }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# move an arm's instructions ahead of the branch
+fun hoist(s: *Site, x: Arm, branch: Instruction) err[refusal.Error] {
+    if (!x.own) { ret err[refusal.Error].ok{}; }
+    val b: *Body       = s.b;
+    var i: Instruction = b.blocks.data[x.block].first;
+    for (i != b.blocks.data[x.block].last) {
+        val next:      Instruction        = b.instructions.data[i].next;
+        val err_moved: err[refusal.Error] = edit(body.relocate(s.m, s.f, i, branch));
+        if (sel err_moved.err) { ret err_moved; }
+        i = next;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# convert the branch block `k` ends in where its arms allow, answering whether it did
+fun convert(s: *Site, k: Block) res[bool, refusal.Error] {
+    val b:      *Body       = s.b;
+    val branch: Instruction = b.blocks.data[k].last;
+    if (branch == NO_INSTRUCTION) { ret res[bool, refusal.Error].ok{false}; }
+    val d: *InstructionData = ?b.instructions.data[branch];
+    if (d.opcode != table.CBR || d.edges.len != 2 || d.operands.len != 1) { ret res[bool, refusal.Error].ok{false}; }
+    val c: Value = d.operands.data[0];
+    if (b.values.data[c].secret || d.metadata.flags.kept || d.metadata.flags.volatile) { ret res[bool, refusal.Error].ok{false}; }
+    if (d.edges.data[0].block == d.edges.data[1].block)                                { ret res[bool, refusal.Error].ok{false}; }
+    val opt_then: opt[Arm] = arm_of(b, branch, 0);
+    if (sel opt_then.none) { ret res[bool, refusal.Error].ok{false}; }
+    val opt_else: opt[Arm] = arm_of(b, branch, 1);
+    if (sel opt_else.none) { ret res[bool, refusal.Error].ok{false}; }
+    val then:  Arm = opt_then.some;
+    val other: Arm = opt_else.some;
+    if (!then.own && !other.own)                                                                            { ret res[bool, refusal.Error].ok{false}; }
+    if (then.join != other.join)                                                                            { ret res[bool, refusal.Error].ok{false}; }
+    if (then.join == k || (then.own && then.join == then.block) || (other.own && then.join == other.block)) { ret res[bool, refusal.Error].ok{false}; }
+    val res_joinable: res[bool, refusal.Error] = joinable(s, passed(b, then), passed(b, other));
+    if (sel res_joinable.err) { ret res_joinable; }
+    if (!res_joinable.ok)     { ret res[bool, refusal.Error].ok{false}; }
+
+    # the arguments are read before the arms' branches go
+    val join:      Block                        = then.join;
+    val from_then: Slice[Value]                 = passed(b, then);
+    val from_else: Slice[Value]                 = passed(b, other);
+    val res_args:  res[*Value, allocator.Error] = allocator.zallocate[Value](s.scratch, from_then.size + 1);
+    if (sel res_args.err) { ret refused[bool](res_args.err); }
+    val err_then: err[refusal.Error] = hoist(s, then, branch);
+    if (sel err_then.err) { ret res[bool, refusal.Error].err{err_then.err}; }
+    val err_else: err[refusal.Error] = hoist(s, other, branch);
+    if (sel err_else.err) { ret res[bool, refusal.Error].err{err_else.err}; }
+    emit.begin(s, branch);
+    var n: usize = 0;
+    for (n < from_then.size) {
+        var v: Value = from_then.data[n];
+        if (from_else.data[n] != v) { v = emit.ternary(s, table.SELECT, c, v, from_else.data[n]); }
+        res_args.ok[n] = v;
+        n              = n + 1;
+    }
+    emit.end(s, branch);
+    var targets: [1]Branch = [1]Branch{Branch{block: join, arguments: Slice[Value]{data: res_args.ok, size: from_then.size}}};
+    builder.emit(?s.bld, Request{opcode: table.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?targets[0], size: 1}});
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret res[bool, refusal.Error].err{err_built.err}; }
+    var gone:  [2]Block = [2]Block{0, 0};
+    var count: usize    = 0;
+    if (then.own) {
+        gone[count] = then.block;
+        count       = count + 1;
+    }
+    if (other.own) {
+        gone[count] = other.block;
+        count       = count + 1;
+    }
+    val err_erased: err[refusal.Error] = edit(body.erase_unreached(s.m, s.f, Slice[Block]{data: ?gone[0], size: count}));
+    if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# convert every branch of one function its arms allow
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:        *Body                = res_body.ok;
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var s: Site = emit.init(c.m, u.f, b, ?scratch);
+    fin { emit.dnit(?s); }
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            arena.reset(?ar);
+            val res_done: res[bool, refusal.Error] = convert(?s, k::u32);
+            if (sel res_done.err) { ret res_done; }
+            if (res_done.ok)      { changed = true; }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

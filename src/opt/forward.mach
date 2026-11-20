@@ -1,0 +1,177 @@
+# load elimination past common subexpressions: a load of the bytes a store of the same block just wrote is the value
+# the store wrote
+#
+# common subexpression elimination merges a load with an earlier load of the same place. this pass takes what it
+# leaves: a load whose bytes an earlier store of its block wrote, with nothing between that may write any of them,
+# becomes the stored value. the blocks are walked one at a time in order, keeping the stores whose bytes still hold
+# what they wrote: a store joins the list, and an instruction that may write a byte a listed store wrote ends that
+# store's place in it, as the memory analysis places both (an access through no address, as a call that may write,
+# ends every one but those of a slot whose address never escapes, and an ordered access ends every one). a load is
+# taken when a listed store's place is exactly its own (`must`), the store wrote a value of the load's type and of
+# its secrecy, and both are plain.
+#
+# the rule by which a load is left alone: it is volatile, ordered or kept, no listed store covers exactly its bytes
+# (a wider or a narrower store, or one whose place only may be the same), the stored value's type or secrecy is not
+# the load's, or the store is kept, volatile or ordered, since a kept write is a fixed fact nothing forwards away. a
+# store in another block is never forwarded, so a block's list starts empty.
+#
+# it costs, per block, its instructions times the stores still listed. it reads the memory analysis (and through it
+# ranges, loops, slots and inductions). it removes a load, which can change when a function's memory traffic
+# happens, so it is held to no constant-time proof of its own and breaks constant time: every function that
+# requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.function.Body;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.opcode.table;
+use mirl.ir.type.table.same;
+use mirl.pass.analysis;
+use mirl.pass.analysis.memory;
+use mirl.pass.analysis.memory.Alias;
+use mirl.pass.analysis.memory.Effect;
+use mirl.pass.analysis.memory.Memory;
+use mirl.pass.analysis.memory.Place;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it removes loads in place and changes no edge
+pub val FORWARD: Pass = Pass{name: "forward", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_MEMORY, preserves: analysis.FLOW, time: Time.breaks{}};
+
+# a store whose bytes still hold what it wrote
+# ---
+# place: where it wrote
+# value: what it wrote
+rec Held {
+    place: Place;
+    value: Value;
+}
+
+# whether an instruction is a plain access: not volatile, kept or ordered
+fun plain(d: *InstructionData, e: *Effect) bool {
+    ret !d.metadata.flags.volatile && !d.metadata.flags.kept && !e.ordered;
+}
+
+# drop each held store a write of effect `e` may reach
+fun written(held: *vector.Vector[Held], e: *Effect) {
+    if (!e.writes && !e.ordered) { ret; }
+    var k: usize = 0;
+    for (k < held.len) {
+        var ends: bool  = e.ordered || (e.anywhere && !held.data[k].place.private);
+        var j:    usize = 0;
+        for (j < e.places.len && !ends) {
+            val al: Alias = memory.alias(e.places.data[j], held.data[k].place);
+            if (!(sel al.no)) { ends = true; }
+            j = j + 1;
+        }
+        if (ends) {
+            held.data[k] = held.data[held.len - 1];
+            vector.truncate[Held](held, held.len - 1);
+        }
+        or { k = k + 1; }
+    }
+}
+
+# the value a held store gives the load at `place` of `ty` and secrecy `secret`, none where none does
+fun given(b: *Body, held: *vector.Vector[Held], place: Place, result: Value) opt[Value] {
+    var k: usize = 0;
+    for (k < held.len) {
+        val al: Alias = memory.alias(held.data[k].place, place);
+        if (sel al.must) {
+            val v: Value = held.data[k].value;
+            if (same(b.values.data[v].type, b.values.data[result].type) && b.values.data[v].secret == b.values.data[result].secret) { ret opt[Value].some{v}; }
+        }
+        k = k + 1;
+    }
+    ret opt[Value].none{};
+}
+
+# forward the stores of one block to its loads, answering whether a load went
+fun block(c: *Context, mem: *Memory, b: *Body, held: *vector.Vector[Held], first: Instruction) res[bool, refusal.Error] {
+    vector.truncate[Held](held, 0);
+    var changed: bool        = false;
+    var i:       Instruction = first;
+    for (i != NO_INSTRUCTION) {
+        val next:       Instruction                = b.instructions.data[i].next;
+        val d:          *InstructionData           = ?b.instructions.data[i];
+        var res_effect: res[Effect, refusal.Error] = memory.effect_of(mem, i);
+        if (sel res_effect.err) { ret res[bool, refusal.Error].err{res_effect.err}; }
+        var e:     Effect = res_effect.ok;
+        var taken: bool   = false;
+        if (d.opcode == table.LOAD && d.results.len == 1 && e.places.len == 1 && e.places.data[0].sized && plain(d, ?e)) {
+            val result:    Value      = d.results.data[0];
+            val opt_given: opt[Value] = given(b, held, e.places.data[0], result);
+            if (sel opt_given.some) {
+                val err_replaced: err[refusal.Error] = edit(body.replace(c.m, mem.f, result, opt_given.some, Records.follow{}));
+                if (sel err_replaced.err) {
+                    memory.dnit(?e);
+                    ret res[bool, refusal.Error].err{err_replaced.err};
+                }
+                val err_erased: err[refusal.Error] = edit(body.erase(c.m, mem.f, i));
+                if (sel err_erased.err) {
+                    memory.dnit(?e);
+                    ret res[bool, refusal.Error].err{err_erased.err};
+                }
+                taken   = true;
+                changed = true;
+            }
+        }
+        if (!taken) {
+            written(held, ?e);
+            if (d.opcode == table.STORE && d.operands.len == 2 && e.places.len == 1 && e.places.data[0].sized && plain(d, ?e)) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Held](held, Held{place: e.places.data[0], value: d.operands.data[1]});
+                if (sel res_pushed.err) {
+                    memory.dnit(?e);
+                    ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}};
+                }
+            }
+        }
+        memory.dnit(?e);
+        i = next;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# forward the stores of each block of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:             *Body                       = res_body.ok;
+    val res_memory_of: res[*Memory, refusal.Error] = analysis.memory_of(c.cache, u.f);
+    if (sel res_memory_of.err) { ret res[bool, refusal.Error].err{res_memory_of.err}; }
+    var held: vector.Vector[Held] = vector.init[Held](c.m.a);
+    fin { vector.dnit[Held](?held); }
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            val res_block: res[bool, refusal.Error] = block(c, res_memory_of.ok, b, ?held, b.blocks.data[k].first);
+            if (sel res_block.err) { ret res_block; }
+            if (res_block.ok)      { changed = true; }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

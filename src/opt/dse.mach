@@ -1,0 +1,172 @@
+# dead store elimination: a store whose bytes a later store of its block writes again, with nothing between that may
+# read them, is removed, and so is one into a slot whose address never escapes that nothing reads before its block
+# returns
+#
+# the blocks are walked one at a time in order, keeping the stores whose bytes nothing has read since: a store joins
+# the list, and an instruction that may read a byte a listed store wrote takes that store off it, as the memory
+# analysis places both (an access through no address that reads, as a call, takes off every one but those of a slot
+# whose address never escapes, and an ordered access takes off every one). a plain store whose place is exactly a
+# listed store's (`must`) ends that store, which goes. where the block ends in a return, every listed store into a
+# slot whose address never escapes goes too, since nothing can read that slot once the function has returned.
+#
+# the rule by which a store is left alone: it is volatile, ordered or kept (a kept write is a fixed fact no pass
+# removes), it is overwritten only in part or by a store whose place only may be its own, a read that may reach its
+# bytes comes first, or its block ends in anything but a return while the store is listed, since a later block may
+# read it. a write that is no plain store, as a call or a fill, ends nothing.
+#
+# it costs, per block, its instructions times the stores still listed. it reads the memory analysis (and through it
+# ranges, loops, slots and inductions). it removes stores, which changes when a function's memory traffic happens,
+# so it breaks constant time and every function that requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.function.Body;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.opcode.table;
+use mirl.pass.analysis;
+use mirl.pass.analysis.memory;
+use mirl.pass.analysis.memory.Alias;
+use mirl.pass.analysis.memory.Effect;
+use mirl.pass.analysis.memory.Memory;
+use mirl.pass.analysis.memory.Place;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it removes stores in place and changes no edge
+pub val DSE: Pass = Pass{name: "dse", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_MEMORY, preserves: analysis.FLOW, time: Time.breaks{}};
+
+# a store nothing has read since
+# ---
+# store: the store
+# place: where it wrote
+rec Pending {
+    store: Instruction;
+    place: Place;
+}
+
+fun take_off(list: *vector.Vector[Pending], k: usize) {
+    list.data[k] = list.data[list.len - 1];
+    vector.truncate[Pending](list, list.len - 1);
+}
+
+# take each listed store a read of effect `e` may reach off the list
+fun read_by(list: *vector.Vector[Pending], e: *Effect) {
+    if (!e.reads && !e.ordered) { ret; }
+    var k: usize = 0;
+    for (k < list.len) {
+        var reached: bool  = e.ordered || (e.anywhere && !list.data[k].place.private);
+        var j:       usize = 0;
+        for (j < e.places.len && !reached) {
+            val al: Alias = memory.alias(e.places.data[j], list.data[k].place);
+            if (!(sel al.no)) { reached = true; }
+            j = j + 1;
+        }
+        if (reached) { take_off(list, k); }
+        or           { k = k + 1; }
+    }
+}
+
+# remove the listed stores whose place is exactly `place`, answering whether one went
+fun overwritten(c: *Context, mem: *Memory, list: *vector.Vector[Pending], place: Place) res[bool, refusal.Error] {
+    var gone: bool  = false;
+    var k:    usize = 0;
+    for (k < list.len) {
+        val al: Alias = memory.alias(list.data[k].place, place);
+        if (sel al.must) {
+            val err_erased: err[refusal.Error] = edit(body.erase(c.m, mem.f, list.data[k].store));
+            if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+            take_off(list, k);
+            gone = true;
+        }
+        or { k = k + 1; }
+    }
+    ret res[bool, refusal.Error].ok{gone};
+}
+
+# remove the dead stores of one block, answering whether one went
+fun block(c: *Context, mem: *Memory, b: *Body, list: *vector.Vector[Pending], first: Instruction) res[bool, refusal.Error] {
+    vector.truncate[Pending](list, 0);
+    var changed: bool        = false;
+    var i:       Instruction = first;
+    for (i != NO_INSTRUCTION) {
+        val next:       Instruction                = b.instructions.data[i].next;
+        val d:          *InstructionData           = ?b.instructions.data[i];
+        val res_effect: res[Effect, refusal.Error] = memory.effect_of(mem, i);
+        if (sel res_effect.err) { ret res[bool, refusal.Error].err{res_effect.err}; }
+        var e: Effect = res_effect.ok;
+        read_by(list, ?e);
+        val plain: bool = !d.metadata.flags.volatile && !d.metadata.flags.kept && !e.ordered;
+        if (d.opcode == table.STORE && e.places.len == 1 && e.places.data[0].sized && plain) {
+            val res_gone: res[bool, refusal.Error] = overwritten(c, mem, list, e.places.data[0]);
+            if (sel res_gone.err) {
+                memory.dnit(?e);
+                ret res_gone;
+            }
+            if (res_gone.ok) { changed = true; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Pending](list, Pending{store: i, place: e.places.data[0]});
+            if (sel res_pushed.err) {
+                memory.dnit(?e);
+                ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}};
+            }
+        }
+        if (d.opcode == table.RET) {
+            var k: usize = 0;
+            for (k < list.len) {
+                if (list.data[k].place.private && sel list.data[k].place.base.slot) {
+                    val err_erased: err[refusal.Error] = edit(body.erase(c.m, mem.f, list.data[k].store));
+                    if (sel err_erased.err) {
+                        memory.dnit(?e);
+                        ret res[bool, refusal.Error].err{err_erased.err};
+                    }
+                    take_off(list, k);
+                    changed = true;
+                }
+                or { k = k + 1; }
+            }
+        }
+        memory.dnit(?e);
+        i = next;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# remove the dead stores of each block of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:             *Body                       = res_body.ok;
+    val res_memory_of: res[*Memory, refusal.Error] = analysis.memory_of(c.cache, u.f);
+    if (sel res_memory_of.err) { ret res[bool, refusal.Error].err{res_memory_of.err}; }
+    var list: vector.Vector[Pending] = vector.init[Pending](c.m.a);
+    fin { vector.dnit[Pending](?list); }
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            val res_block: res[bool, refusal.Error] = block(c, res_memory_of.ok, b, ?list, b.blocks.data[k].first);
+            if (sel res_block.err) { ret res_block; }
+            if (res_block.ok)      { changed = true; }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

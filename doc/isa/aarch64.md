@@ -44,7 +44,7 @@ A compare and exchange of two words, which the wide legalisation makes of a 128-
 
 ## Vectors
 
-The table selects NEON by lane width and by register size, a vector of at most 64 bits in a 64-bit arrangement and one of 128 in a 128-bit arrangement: integer `add`, `sub`, `mul`, `and`, `orr`, `eor`, `not` and `neg`, float `fadd`, `fsub`, `fmul`, `fdiv`, `fneg`, `fabs` and `fsqrt`, a splat by `dup`, and loads and stores of 16, 32, 64 and 128 bits. A vector narrower than its register leaves the bytes above it undefined, so no rule reads a lane past the vector's. It selects these directly:
+The table selects NEON by lane width and by register size, a vector of at most 64 bits in a 64-bit arrangement and one of 128 in a 128-bit arrangement: integer `add`, `sub`, `mul`, `and`, `orr`, `eor`, `not` and `neg`, float `fadd`, `fsub`, `fmul`, `fdiv`, `fneg`, `fabs` and `fsqrt`, the conversions between integer and float lanes of one width, `scvtf` and `ucvtf` in the rounding mode and `fcvtzs` and `fcvtzu` toward zero, saturating at the integer's bounds and giving 0 for a NaN as the scalar forms and the IR's casts do, a splat by `dup`, and loads and stores of 16, 32, 64 and 128 bits. A vector narrower than its register leaves the bytes above it undefined, so no rule reads a lane past the vector's. It selects these directly:
 
 - `smull` and `umull`: the product of two extensions of 64-bit vectors to twice their width, and `smull2` and `umull2` of the high halves of 128-bit vectors taken by a shuffle.
 - `smlal`, `umlal`, `smlal2` and `umlal2`: a sum of a value and such a product, the accumulator tied.

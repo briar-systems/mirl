@@ -305,6 +305,8 @@ decorators
   #[inline(mode)]           whether a call of a function is expanded in
                             place: `always` or `never`, nothing for the
                             inliner's own rule (see ir.md 6.8)
+  #[scalar]                 a function's loops are never vectorised, and no
+                            call is expanded into it or of it (see ir.md 6.8)
   #[available]              a function's body is a copy of the one
                             definition another module holds, read by the
                             inliner alone and dropped before any later pass

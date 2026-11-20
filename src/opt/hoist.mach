@@ -1,0 +1,218 @@
+# constant hoisting: a wide integer constant read inside a loop is made once ahead of it and carried through the loop
+# as a parameter of its header
+#
+# a register target makes an integer constant in the code each time an instruction reads it, and one no 32-bit
+# immediate encodes takes the longest sequence to make. for each loop that no other loop holds, every such constant
+# an instruction of the loop's blocks reads as an operand becomes a new parameter of the loop's header: each edge
+# entering the header from outside the loop passes the constant and each back edge passes the parameter, so the
+# parameter holds the constant on every trip, and the loop's instructions read the parameter in its place. the
+# constant is made once, where the loop is entered, and held in a register through the loop, which the allocator
+# may spill like any other value.
+#
+# the rule by which a constant is left alone: it fits a signed 32-bit immediate read at its width, it is no scalar
+# integer of at most 64 bits, or no instruction of the loop reads it as a fixed operand whose role is a value or a
+# stored value (an offset, an index, a length, a call's argument and a branch's argument keep their constant, since
+# selection folds those into the instruction). a loop held by another loop is left to its outermost loop, which
+# carries the constant for both, so a constant is carried once per nest, and a loop whose header is the function's
+# entry is left alone, since the entry's parameters are the function's.
+#
+# it costs each outermost loop its instructions times the constants it carries. it reads the loops of the function
+# (and through them its graph and dominator tree). it adds a parameter and edge arguments and moves no edge, and it
+# changes which registers a loop holds, so it is held to no constant-time proof and breaks constant time: every
+# function that requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.table;
+use mirl.ir.value.Declaration;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it adds parameters and arguments and moves no edge, so only the control flow analyses outlive it
+pub val HOIST: Pass = Pass{name: "hoist", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_LOOPS, preserves: analysis.FLOW, time: Time.breaks{}};
+
+# one use of a constant the pass carries: the instruction and the operand's place
+# ---
+# at:      the instruction
+# operand: the operand's place
+rec Use {
+    at:      Instruction;
+    operand: usize;
+}
+
+# whether constant `v` of a scalar integer type no signed 32-bit immediate holds, read at its width
+fun wide(m: *module.Module, b: *Body, v: Value) res[bool, refusal.Error] {
+    if (!(sel b.values.data[v].def.constant) || b.values.data[v].secret) { ret res[bool, refusal.Error].ok{false}; }
+    val res_lane: res[opt[Lane], refusal.Error] = emit.lane_of(m, b.values.data[v].type);
+    if (sel res_lane.err)     { ret res[bool, refusal.Error].err{res_lane.err}; }
+    if (sel res_lane.ok.none) { ret res[bool, refusal.Error].ok{false}; }
+    val bits: u32 = res_lane.ok.some.bits;
+    if (res_lane.ok.some.lanes != 0 || bits <= 32 || bits > 64) { ret res[bool, refusal.Error].ok{false}; }
+    val opt_known: opt[u64] = emit.known_in(m, b, v);
+    if (sel opt_known.none) { ret res[bool, refusal.Error].ok{false}; }
+    var x: u64 = opt_known.some;
+    if (bits < 64) {
+        x = x & ((1::u64 << bits::u64) - 1);
+        if ((x >> (bits - 1)::u64) != 0) { x = x | ~((1::u64 << bits::u64) - 1); }
+    }
+    val s: i64 = x:~i64;
+    ret res[bool, refusal.Error].ok{s < -0x80000000 || s > 0x7fffffff};
+}
+
+# whether operand `k` of an instruction of row `r` is one the pass may carry: a fixed operand that is a value or a
+# stored value
+fun carried(r: *Row, k: usize) bool {
+    if (k >= opcode_row.fixed(r)::usize) { ret false; }
+    ret sel r.operands[k].role.value || sel r.operands[k].role.stored;
+}
+
+# carry each wide constant the blocks of loop `n` read through a new parameter of its header, answering whether one
+# was
+fun carry(c: *Context, f: Function, l: *Loops, n: u32, scratch: *allocator.Allocator) res[bool, refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(c.m, f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:      *Body      = res_body.ok;
+    val head:   Block      = loops.loop(l, n).header;
+    val blocks: Slice[u32] = loops.body(l, n);
+    if (head == 0) { ret res[bool, refusal.Error].ok{false}; }
+    # the constants in the order first read, and every use of each
+    var constants: vector.Vector[Value] = vector.init[Value](scratch);
+    var uses:      vector.Vector[Use]   = vector.init[Use](scratch);
+    var owner:     vector.Vector[usize] = vector.init[usize](scratch);
+    var k:         usize                = 0;
+    for (k < blocks.size) {
+        var i: Instruction = b.blocks.data[blocks.data[k]].first;
+        for (i != NO_INSTRUCTION) {
+            val d:       *InstructionData = ?b.instructions.data[i];
+            val opt_row: opt[*Row]        = table.at(d.opcode);
+            var r:       *Row             = nil;
+            if (sel opt_row.some) { r = opt_row.some; }
+            if (r != nil && !d.metadata.secret) {
+                var o: usize = 0;
+                for (o < d.operands.len) {
+                    val v: Value = d.operands.data[o];
+                    if (carried(r, o)) {
+                        val res_wide: res[bool, refusal.Error] = wide(c.m, b, v);
+                        if (sel res_wide.err) { ret res[bool, refusal.Error].err{res_wide.err}; }
+                        if (res_wide.ok) {
+                            var at: usize = 0;
+                            for (at < constants.len && constants.data[at] != v) { at = at + 1; }
+                            if (at == constants.len) {
+                                val res_pushed: res[usize, allocator.Error] = vector.push[Value](?constants, v);
+                                if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                            }
+                            val res_use: res[usize, allocator.Error] = vector.push[Use](?uses, Use{at: i, operand: o});
+                            if (sel res_use.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_use.err}}; }
+                            val res_owner: res[usize, allocator.Error] = vector.push[usize](?owner, at);
+                            if (sel res_owner.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_owner.err}}; }
+                        }
+                    }
+                    o = o + 1;
+                }
+            }
+            i = d.next;
+        }
+        k = k + 1;
+    }
+    if (constants.len == 0) { ret res[bool, refusal.Error].ok{false}; }
+    # each constant's parameter: an edge from outside the loop passes the constant, a back edge the parameter, which
+    # is the value being made, so every edge passes the constant and a back edge's argument is set once it exists
+    val preds: usize = b.blocks.data[head].predecessors.len;
+    var j:     usize = 0;
+    for (j < constants.len) {
+        val v:        Value                        = constants.data[j];
+        val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](scratch, preds + 1);
+        if (sel res_room.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_room.err}}; }
+        var p: usize = 0;
+        for (p < preds) {
+            res_room.ok[p] = v;
+            p              = p + 1;
+        }
+        val res_param: res[Value, module.Error] = body.add_parameter(c.m, f, head, Declaration{type: b.values.data[v].type, secret: false}, Slice[Value]{data: res_room.ok, size: preds});
+        if (sel res_param.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_param.err}}; }
+        val param: Value = res_param.ok;
+        p = 0;
+        for (p < b.blocks.data[head].predecessors.len) {
+            val from:  Instruction = b.blocks.data[head].predecessors.data[p];
+            val place: Place       = b.instructions.data[from].place;
+            if (sel place.placed && loops.contains(l, n, place.placed)) {
+                val err_back: err[refusal.Error] = edit(body.substitute(c.m, f, from, v, param));
+                if (sel err_back.err) { ret res[bool, refusal.Error].err{err_back.err}; }
+            }
+            p = p + 1;
+        }
+        var u: usize = 0;
+        for (u < uses.len) {
+            if (owner.data[u] == j) {
+                val at:       Instruction        = uses.data[u].at;
+                val err_read: err[refusal.Error] = edit(body.substitute(c.m, f, at, v, param));
+                if (sel err_read.err) { ret res[bool, refusal.Error].err{err_read.err}; }
+            }
+            u = u + 1;
+        }
+        j = j + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# carry the wide constants of each outermost loop of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:            *Context                   = u.context;
+    val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, u.f);
+    if (sel res_loops_of.err) { ret res[bool, refusal.Error].err{res_loops_of.err}; }
+    val l:        *Loops               = res_loops_of.ok;
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var changed: bool = false;
+    var n:       u32  = 0;
+    for (n < loops.count(l)) {
+        if (loops.loop(l, n).parent == NONE) {
+            arena.reset(?ar);
+            val res_done: res[bool, refusal.Error] = carry(c, u.f, l, n, ?scratch);
+            if (sel res_done.err) { ret res_done; }
+            if (res_done.ok)      { changed = true; }
+        }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

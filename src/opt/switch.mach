@@ -1,0 +1,358 @@
+# switch recognition: a chain of tests of one value against constants becomes one multi-way branch
+#
+# a chain starts at a block ending in `cbr` on `eq(x, k)`, k a constant integer of at most 64 bits and x no constant,
+# and goes on through the block its false edge enters while that block takes no parameter, is entered by that edge
+# alone, and holds nothing but `eq(x, k')` of the same x, read by its `cbr` alone, and that `cbr`. the chain's tests
+# become one `switch x`, each case the constant's bits read unsigned at x's width, to the target its test branched
+# to, and the last false edge is the switch's first. the blocks the chain passed through are erased, and so is the
+# first test where nothing else reads it. a constant tested again later is never true there, so its later test
+# goes with its block. the cases are put in increasing order, which changes no outcome, since no two are equal.
+#
+# the rule by which a chain is left alone: it is fewer than three tests, since a switch of two lowers to the same
+# two compares. a test of another value, a range test, a block that holds anything else, takes a parameter or is
+# entered from elsewhere ends the chain before it, and may start a chain of its own. a test of a secret value, or
+# one marked kept or volatile, is no link of a chain. an edge into a block that an earlier edge of the switch enters
+# with other arguments ends the chain before its test, since a structured target's multi-way form gives one block
+# one set of arguments however many cases reach it, and the chain's last tests are dropped until the first edge
+# agrees with every earlier one.
+#
+# the pass reads only the bodies' own predecessor lists, so it needs no analysis. it makes a branch on a value that
+# a constant-time function may hold secret, and a dense switch becomes a table jump on a register target, so it
+# breaks constant time (section 5 rule 2) and every function that requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.ir.body;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.table;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.legal.emit.Site;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it removes blocks and edges, so it keeps no analysis
+pub val SWITCH: Pass = Pass{name: "switch", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: 0, preserves: cache.NONE, time: Time.breaks{}};
+
+# the fewest tests a chain becomes a switch at
+val LEAST: usize = 3;
+
+# one test of a block's end: its compare, its branch and the constant's bits at the selector's width
+# ---
+# compare:  the `eq`
+# branch:   the `cbr` on it
+# selector: the value tested
+# value:    the constant's bits, read unsigned
+rec Test {
+    compare:  Instruction;
+    branch:   Instruction;
+    selector: Value;
+    value:    u64;
+}
+
+# one case of a chain, in chain order
+# ---
+# value: the case's bits
+# order: its place in the chain, which keeps the first of equal values
+# to:    the edge its test took
+rec Case {
+    value: u64;
+    order: usize;
+    to:    Branch;
+}
+
+# a chain being gathered, in the run's scratch storage
+# ---
+# cases:  the cases so far
+# passed: the blocks after the first, each erased with the chain
+rec Chain {
+    cases:  vector.Vector[Case];
+    passed: vector.Vector[Block];
+}
+
+fun refused[T](e: allocator.Error) res[T, refusal.Error] {
+    ret res[T, refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+fun mask(bits: u32, x: u64) u64 {
+    if (bits >= 64) { ret x; }
+    ret x & ((1::u64 << bits::u64) - 1);
+}
+
+# the test block `k` ends in, none where it ends in no `cbr` on an `eq` of a value the pass may take and a constant
+fun test_of(s: *Site, k: Block) res[opt[Test], refusal.Error] {
+    val b:      *Body       = s.b;
+    val branch: Instruction = b.blocks.data[k].last;
+    if (branch == NO_INSTRUCTION) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val d: *InstructionData = ?b.instructions.data[branch];
+    if (d.opcode != table.CBR || d.operands.len != 1 || d.edges.len != 2) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val cond: Value = d.operands.data[0];
+    val def:  Def   = b.values.data[cond].def;
+    if (b.values.data[cond].secret) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    if (!(sel def.result))          { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val compare: Instruction      = def.result.instruction;
+    val c:       *InstructionData = ?b.instructions.data[compare];
+    if (c.opcode != table.EQ || c.operands.len != 2 || c.results.len != 1)       { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    if (c.metadata.flags.kept || c.metadata.flags.volatile || c.metadata.secret) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    var x:      Value    = c.operands.data[0];
+    val opt_k:  opt[u64] = emit.known(s, c.operands.data[1]);
+    val opt_k0: opt[u64] = emit.known(s, c.operands.data[0]);
+    var k:      u64      = 0;
+    if (sel opt_k.some) { k = opt_k.some; }
+    or (sel opt_k0.some) {
+        x = c.operands.data[1];
+        k = opt_k0.some;
+    }
+    or { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val tested: Def = b.values.data[x].def;
+    if (b.values.data[x].secret) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    if (sel tested.constant)     { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val res_lane: res[opt[Lane], refusal.Error] = emit.lane_of(s.m, b.values.data[x].type);
+    if (sel res_lane.err)     { ret res[opt[Test], refusal.Error].err{res_lane.err}; }
+    if (sel res_lane.ok.none) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val bits: u32 = res_lane.ok.some.bits;
+    if (res_lane.ok.some.lanes != 0 || bits == 0 || bits > 64) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    ret res[opt[Test], refusal.Error].ok{opt[Test].some{Test{compare: compare, branch: branch, selector: x, value: mask(bits, k)}}};
+}
+
+# the test of block `k` where it can stand inside a chain on `x` entered by its one edge: no parameter, one
+# predecessor, and nothing but the test, whose compare its branch alone reads
+fun link_of(s: *Site, k: Block, x: Value) res[opt[Test], refusal.Error] {
+    val b: *Body = s.b;
+    if (b.blocks.data[k].erased || k == 0)                                              { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    if (b.blocks.data[k].parameters.len != 0 || b.blocks.data[k].predecessors.len != 1) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val res_test: res[opt[Test], refusal.Error] = test_of(s, k);
+    if (sel res_test.err)     { ret res_test; }
+    if (sel res_test.ok.none) { ret res_test; }
+    val t: Test = res_test.ok.some;
+    if (t.selector != x)                                                                        { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    if (b.blocks.data[k].first != t.compare || b.instructions.data[t.compare].next != t.branch) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    val cond: Value = b.instructions.data[t.compare].results.data[0];
+    if (b.values.data[cond].uses.len != 1) { ret res[opt[Test], refusal.Error].ok{opt[Test].none{}}; }
+    ret res_test;
+}
+
+# whether block `k` stands inside a chain: a link whose one predecessor is a test of the same value whose false edge
+# enters it
+fun inside(s: *Site, k: Block) res[bool, refusal.Error] {
+    val b: *Body = s.b;
+    if (b.blocks.data[k].erased || b.blocks.data[k].predecessors.len != 1) { ret res[bool, refusal.Error].ok{false}; }
+    val from:  Instruction      = b.blocks.data[k].predecessors.data[0];
+    val p:     *InstructionData = ?b.instructions.data[from];
+    val place: Place            = p.place;
+    if (!(sel place.placed)) { ret res[bool, refusal.Error].ok{false}; }
+    val res_before: res[opt[Test], refusal.Error] = test_of(s, place.placed);
+    if (sel res_before.err)                                              { ret res[bool, refusal.Error].err{res_before.err}; }
+    if (sel res_before.ok.none)                                          { ret res[bool, refusal.Error].ok{false}; }
+    if (res_before.ok.some.branch != from || p.edges.data[1].block != k) { ret res[bool, refusal.Error].ok{false}; }
+    val res_link: res[opt[Test], refusal.Error] = link_of(s, k, res_before.ok.some.selector);
+    if (sel res_link.err) { ret res[bool, refusal.Error].err{res_link.err}; }
+    ret res[bool, refusal.Error].ok{sel res_link.ok.some};
+}
+
+# edge `e` of a branch, its arguments copied into the scratch storage
+fun copied(s: *Site, d: *InstructionData, e: usize) res[Branch, refusal.Error] {
+    val from:     *Edge                        = ?d.edges.data[e];
+    val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](s.scratch, from.arguments.len + 1);
+    if (sel res_room.err) { ret refused[Branch](res_room.err); }
+    var j: usize = 0;
+    for (j < from.arguments.len) {
+        res_room.ok[j] = from.arguments.data[j];
+        j              = j + 1;
+    }
+    ret res[Branch, refusal.Error].ok{Branch{block: from.block, arguments: Slice[Value]{data: res_room.ok, size: from.arguments.len}}};
+}
+
+fun same_arguments(x: Branch, y: Branch) bool {
+    if (x.arguments.size != y.arguments.size) { ret false; }
+    var j: usize = 0;
+    for (j < x.arguments.size) {
+        if (x.arguments.data[j] != y.arguments.data[j]) { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# whether edge `to` agrees with the first `n` cases: every one entering its block passes its arguments
+fun agrees(ch: *Chain, n: usize, to: Branch) bool {
+    var j: usize = 0;
+    for (j < n) {
+        val other: Branch = ch.cases.data[j].to;
+        if (other.block == to.block && !same_arguments(other, to)) { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# whether `value` equals an earlier case's
+fun repeated(ch: *Chain, value: u64) bool {
+    var j: usize = 0;
+    for (j < ch.cases.len) {
+        if (ch.cases.data[j].value == value) { ret true; }
+        j = j + 1;
+    }
+    ret false;
+}
+
+fun by_value(x: *Case, y: *Case) i64 {
+    if (x.value < y.value) { ret -1; }
+    if (x.value > y.value) { ret 1; }
+    if (x.order < y.order) { ret -1; }
+    if (x.order > y.order) { ret 1; }
+    ret 0;
+}
+
+# the chain that starts at test `head`, rewritten to a switch where it is long enough, answering whether it was
+fun chain_from(s: *Site, head: Test) res[bool, refusal.Error] {
+    val b:  *Body = s.b;
+    var ch: Chain = Chain{cases: vector.init[Case](s.scratch), passed: vector.init[Block](s.scratch)};
+    var t:  Test  = head;
+    # the tests of the chain, in order, each block after the first listed as passed
+    var tests: vector.Vector[Test] = vector.init[Test](s.scratch);
+    for {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Test](?tests, t);
+        if (sel res_pushed.err) { ret refused[bool](res_pushed.err); }
+        val next:     Block                         = b.instructions.data[t.branch].edges.data[1].block;
+        val res_link: res[opt[Test], refusal.Error] = link_of(s, next, head.selector);
+        if (sel res_link.err)     { ret res[bool, refusal.Error].err{res_link.err}; }
+        if (sel res_link.ok.none) { brk; }
+        t = res_link.ok.some;
+    }
+    # each test's case, a repeated value dropped, ending before an edge that disagrees with an earlier one
+    var used: usize = 0;
+    for (used < tests.len) {
+        val x:      Test                       = tests.data[used];
+        val res_to: res[Branch, refusal.Error] = copied(s, ?b.instructions.data[x.branch], 0);
+        if (sel res_to.err) { ret res[bool, refusal.Error].err{res_to.err}; }
+        if (!repeated(?ch, x.value)) {
+            if (!agrees(?ch, ch.cases.len, res_to.ok)) { brk; }
+            val res_case: res[usize, allocator.Error] = vector.push[Case](?ch.cases, Case{value: x.value, order: used, to: res_to.ok});
+            if (sel res_case.err) { ret refused[bool](res_case.err); }
+        }
+        used = used + 1;
+    }
+    # the first edge, the false edge of the last test taken, dropping tests until it agrees with the cases
+    var otherwise: Branch = Branch{block: 0, arguments: Slice[Value]{data: nil, size: 0}};
+    for {
+        if (used == 0) { ret res[bool, refusal.Error].ok{false}; }
+        val last:   Test                       = tests.data[used - 1];
+        val res_to: res[Branch, refusal.Error] = copied(s, ?b.instructions.data[last.branch], 1);
+        if (sel res_to.err) { ret res[bool, refusal.Error].err{res_to.err}; }
+        var taken: usize = 0;
+        for (taken < ch.cases.len && ch.cases.data[taken].order < used) { taken = taken + 1; }
+        vector.truncate[Case](?ch.cases, taken);
+        if (agrees(?ch, ch.cases.len, res_to.ok)) {
+            otherwise = res_to.ok;
+            brk;
+        }
+        used = used - 1;
+    }
+    if (ch.cases.len < LEAST) { ret res[bool, refusal.Error].ok{false}; }
+    var j: usize = 1;
+    for (j < used) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Block](?ch.passed, b.instructions.data[tests.data[j - 1].branch].edges.data[1].block);
+        if (sel res_pushed.err) { ret refused[bool](res_pushed.err); }
+        j = j + 1;
+    }
+
+    val count: usize = ch.cases.len;
+    sort.sort_by[Case](ch.cases.data, count, by_value);
+    val res_values: res[*u64, allocator.Error] = allocator.zallocate[u64](s.scratch, count);
+    if (sel res_values.err) { ret refused[bool](res_values.err); }
+    val res_targets: res[*Branch, allocator.Error] = allocator.zallocate[Branch](s.scratch, count + 1);
+    if (sel res_targets.err) { ret refused[bool](res_targets.err); }
+    res_targets.ok[0] = otherwise;
+    j                 = 0;
+    for (j < count) {
+        res_values.ok[j]      = ch.cases.data[j].value;
+        res_targets.ok[j + 1] = ch.cases.data[j].to;
+        j                     = j + 1;
+    }
+    emit.begin(s, head.branch);
+    emit.end(s, head.branch);
+    var ops:  [1]Value     = [1]Value{head.selector};
+    var list: [1]Immediate = [1]Immediate{Immediate.cases{Slice[u64]{data: res_values.ok, size: count}}};
+    builder.emit(?s.bld, Request{opcode: table.SWITCH, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: ?list[0], size: 1}, targets: Slice[Branch]{data: res_targets.ok, size: count + 1}});
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret res[bool, refusal.Error].err{err_built.err}; }
+    if (ch.passed.len > 0) {
+        val err_erased: err[refusal.Error] = edit(body.erase_unreached(s.m, s.f, Slice[Block]{data: ch.passed.data, size: ch.passed.len}));
+        if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+    }
+    val cond: Value = b.instructions.data[head.compare].results.data[0];
+    if (b.values.data[cond].uses.len == 0) {
+        val err_erased: err[refusal.Error] = edit(body.erase(s.m, s.f, head.compare));
+        if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# turn each chain of one function into a switch
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b: *Body = res_body.ok;
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var s: Site = emit.init(c.m, u.f, b, ?scratch);
+    fin { emit.dnit(?s); }
+
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            arena.reset(?ar);
+            val res_test: res[opt[Test], refusal.Error] = test_of(?s, k::u32);
+            if (sel res_test.err) { ret res[bool, refusal.Error].err{res_test.err}; }
+            if (sel res_test.ok.some) {
+                val res_inside: res[bool, refusal.Error] = inside(?s, k::u32);
+                if (sel res_inside.err) { ret res[bool, refusal.Error].err{res_inside.err}; }
+                if (!res_inside.ok) {
+                    val res_made: res[bool, refusal.Error] = chain_from(?s, res_test.ok.some);
+                    if (sel res_made.err) { ret res[bool, refusal.Error].err{res_made.err}; }
+                    if (res_made.ok)      { changed = true; }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

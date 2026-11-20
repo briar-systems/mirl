@@ -433,11 +433,15 @@ fun push(e: *Emitter, v: Value) {
 # source location, the instruction's stated again before its own code
 fun tree(e: *Emitter, i: Instruction) {
     here(e, i);
-    val start: usize            = e.w.out.len;
-    val d:     *InstructionData = ?e.b.instructions.data[i];
-    var first: u32              = 0;
-    if (d.operands.len > 0) { first = width_of(e, d.operands.data[0]); }
-    if (!operand.rereads(e.u.m, d, first)) {
+    val start:  usize            = e.w.out.len;
+    val d:      *InstructionData = ?e.b.instructions.data[i];
+    var first:  u32              = 0;
+    var column: opt[u32]         = opt[u32].none{};
+    if (d.operands.len > 0) {
+        first  = width_of(e, d.operands.data[0]);
+        column = lane_column(e, e.b.values.data[d.operands.data[0]].type);
+    }
+    if (!operand.rereads(e.u.m, d, first, column)) {
         var pushes: vector.Vector[usize] = vector.init[usize](e.u.a);
         fin { vector.dnit[usize](?pushes); }
         val res_ordered: res[bool, allocator.Error] = operand.order(e.u.m, e.b, d, ?pushes);
@@ -1325,6 +1329,153 @@ fun simple(e: *Emitter, i: Instruction, op: Opcode, class: u32) {
     writer.plain(e.w, opt_simple.some);
 }
 
+# the lane column of a vector type's lanes, none for a type that is no
+# vector or whose lanes simd128 does not pack
+fun lane_column(e: *Emitter, ty: Type) opt[u32] {
+    ret select.column_of(?e.u.m.types, ty);
+}
+
+# the lanes of a vector of conditions, a comparison's mask, 0 for any other type
+fun mask_lanes(e: *Emitter, ty: Type) u32 {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?e.u.m.types, ty);
+    if (sel res_shape.err)          { ret 0; }
+    if (!(sel res_shape.ok.vector)) { ret 0; }
+    val res_width: res[u32, type_table.Error] = type_table.width(?e.u.m.types, res_shape.ok.vector.element);
+    if (sel res_width.err) { ret 0; }
+    if (res_width.ok != 1) { ret 0; }
+    ret res_shape.ok.vector.lanes;
+}
+
+# a lanewise operation of simd128, keyed on its lane type: the lanes of its
+# first operand where that is a vector, as a comparison's or a conversion's,
+# and else of its result, as a splat's. a comparison's mask is a v128 holding
+# each lane all ones or zeros at the width of the lanes compared
+# (`mirl.target.wasm.value`), so the sign extension of it to lanes that wide,
+# the one reader the vector legalisation leaves it, writes nothing. false for
+# an instruction with no vector operand or result, or one that is no
+# lanewise row
+fun vectored(e: *Emitter, i: Instruction, d: *InstructionData) bool {
+    if (d.results.len != 1) { ret false; }
+    var ty: Type = e.b.values.data[d.results.data[0]].type;
+    if (d.operands.len > 0) {
+        val first: Type = e.b.values.data[d.operands.data[0]].type;
+        val lanes: u32  = mask_lanes(e, first);
+        if (d.opcode == table.EXT_S && lanes != 0) {
+            val opt_wide: opt[u32] = lane_column(e, ty);
+            if (sel opt_wide.none) {
+                invariant(e, i);
+                ret true;
+            }
+            if (select.lane_bytes(opt_wide.some) * lanes != 16) { invariant(e, i); }
+            ret true;
+        }
+        val opt_first: opt[u32] = lane_column(e, first);
+        if (sel opt_first.some) { ty = first; }
+    }
+    val opt_column: opt[u32] = lane_column(e, ty);
+    if (sel opt_column.none)            { ret false; }
+    if (!select.lanewise_row(d.opcode)) { ret false; }
+    val opt_row: opt[u32] = select.lanewise(d.opcode, opt_column.some);
+    if (sel opt_row.none) {
+        unselected(e, i);
+        ret true;
+    }
+    val row: u32 = opt_row.some;
+    if (d.opcode == table.VEXTRACT || d.opcode == table.VINSERT) {
+        val at: Immediate = d.immediates.data[0];
+        if (!(sel at.lane)) {
+            invariant(e, i);
+            ret true;
+        }
+        writer.immediate(e.w, row, at.lane::i64);
+        ret true;
+    }
+    if (d.opcode == table.VSHUFFLE) {
+        shuffled(e, i, d, row, opt_column.some);
+        ret true;
+    }
+    writer.plain(e.w, row);
+    ret true;
+}
+
+# a lanewise operation simd128 has no one instruction for, as a sequence
+# that pushes its operands itself (`select.sequenced`): a product of bytes as
+# the unsigned products of the low and of the high halves widened to words,
+# each masked to its low byte and narrowed back unsigned, which is exact below
+# 256, and an unsigned order of quadwords as the signed one with the sign bit
+# of both operands flipped. false for any other instruction
+fun sequenced(e: *Emitter, i: Instruction, d: *InstructionData) bool {
+    if (d.results.len != 1 || d.operands.len != 2) { ret false; }
+    val x:          Value    = d.operands.data[0];
+    val y:          Value    = d.operands.data[1];
+    val opt_column: opt[u32] = lane_column(e, e.b.values.data[x].type);
+    if (sel opt_column.none)                          { ret false; }
+    if (!select.sequenced(d.opcode, opt_column.some)) { ret false; }
+    if (d.opcode == table.MUL) {
+        push(e, x);
+        push(e, y);
+        writer.plain(e.w, gen_row_index.I16X8EXTMULLOWI8X16U);
+        low_bytes(e);
+        push(e, x);
+        push(e, y);
+        writer.plain(e.w, gen_row_index.I16X8EXTMULHIGHI8X16U);
+        low_bytes(e);
+        writer.plain(e.w, gen_row_index.I8X16NARROWI16X8U);
+        ret true;
+    }
+    push(e, x);
+    sign_flipped(e);
+    push(e, y);
+    sign_flipped(e);
+    if (d.opcode == table.LT_U) { writer.plain(e.w, gen_row_index.I64X2LTS); }
+    or                          { writer.plain(e.w, gen_row_index.I64X2LES); }
+    ret true;
+}
+
+# the low byte of each word of the v128 on the stack
+fun low_bytes(e: *Emitter) {
+    writer.i32(e.w, 255);
+    writer.plain(e.w, gen_row_index.I16X8SPLAT);
+    writer.plain(e.w, gen_row_index.V128AND);
+}
+
+# the v128 on the stack with the sign bit of each quadword flipped
+fun sign_flipped(e: *Emitter) {
+    writer.i64(e.w, -9223372036854775808);
+    writer.plain(e.w, gen_row_index.I64X2SPLAT);
+    writer.plain(e.w, gen_row_index.V128XOR);
+}
+
+# a shuffle of two vectors joined, by the bytes of each lane its list picks
+fun shuffled(e: *Emitter, i: Instruction, d: *InstructionData, row: u32, column: u32) {
+    val list: Immediate = d.immediates.data[0];
+    if (!(sel list.lanes)) {
+        invariant(e, i);
+        ret;
+    }
+    val bytes: u32 = select.lane_bytes(column);
+    if (list.lanes.size::u32 * bytes != 16) {
+        invariant(e, i);
+        ret;
+    }
+    var picked: [16]u8;
+    var k:      usize = 0;
+    for (k < list.lanes.size) {
+        val from: u32 = list.lanes.data[k];
+        if (from * bytes >= 32) {
+            invariant(e, i);
+            ret;
+        }
+        var b: u32 = 0;
+        for (b < bytes) {
+            picked[k::u32 * bytes + b] = (from * bytes + b)::u8;
+            b                          = b + 1;
+        }
+        k = k + 1;
+    }
+    writer.one(e.w, row, masc_operand.Value.literal{masc_operand.Bytes{at: ?picked[0], len: 16}});
+}
+
 # an atomic read, modify and write where one thread runs: the value held
 # before, read once into a local, and the update stored over it
 fun update(e: *Emitter, i: Instruction, d: *InstructionData) {
@@ -1850,6 +2001,8 @@ fun instruction(e: *Emitter, i: Instruction, d: *InstructionData) {
         update(e, i, d);
         ret;
     }
+    if (sequenced(e, i, d)) { ret; }
+    if (vectored(e, i, d))  { ret; }
     if (op == table.FNE_O || op == table.FEQ_U || op == table.FORD || op == table.FUNO) {
         unordered(e, i, d);
         ret;
