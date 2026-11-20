@@ -6,9 +6,9 @@ constructive, and professional.
 
 ## Building
 
-mirl is built with the released Mach compiler that CI pins (`MACH_VERSION` in
-`.github/workflows/ci.yml`). Install that release for your host and put `mach`
-on `PATH`.
+mirl is built with the Mach compiler at the commit CI pins (`MACH_REF` in
+`.github/workflows/ci.yml`), which CI builds through that commit's own bootstrap
+chain. Build that commit for your host and put `mach` on `PATH`.
 
 ```bash
 git clone https://github.com/briar-systems/mirl.git
@@ -50,7 +50,7 @@ mirl has no unit tests. It is held correct by the calling conventions and the
 object and debug format specifications its rules cite, never by agreement with
 another compiler. Checks that need outside tools, such as differential
 execution of the mach corpus, spirv-val, wasm-validate, llvm-dwarfdump and the
-timing-leak harness, run locally and never in CI. CI builds every target.
+timing-leak harness, run locally and never in CI. CI builds every artifact on linux.
 
 IR text inputs live in `test/ir/` as `*.mirl` files. Each one is valid IR,
 verifier-clean. A file starts with its `target` statement and has no version statement,
@@ -90,8 +90,7 @@ no scope, and a release commit is `chore(release): <version>`.
 - Leave `CHANGELOG.md` alone. The changelog is written from the merged
   commits when `dev` is released to `main`.
 - Say briefly what changed and which checks you ran. Every pull request runs
-  CI on linux. To test a windows or darwin change before it merges, dispatch
-  CI on the branch with `-f runners='["macos-15"]'` or another runner.
+  CI on linux, and CI has no windows or darwin leg.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.

@@ -3,13 +3,13 @@
 masc states each row's operand register constraints on `row.Row.constraints`: an output written before every input is read, two operands that must differ, a register group kept apart from another or from a mask register. `mirl.machine.constraint` is the one place mirl asks them, through masc's `constraint.violated`. mirl states no constraint of its own and keeps no list of constrained rows.
 
 ```
-grouping_of(f, row, state)    # res[Grouping, Breach]
-asks(f, d)                    # bool
-ask(f, row, state, values)    # opt[Breach]
-stands(f, d)                  # opt[Breach]
+grouping_of(f, ctx, row, state)    # res[Grouping, Breach]
+asks(f, ctx, row, state)           # bool
+ask(f, ctx, row, state, values)    # opt[Breach]
+stands(f, ctx, d)                  # opt[Breach]
 ```
 
-`ask` hands masc the operand values of an instruction of a row under its grouping and answers the breach, or none when every constraint stands and the grouping admits every group. `asks` and `stands` take an instruction and ask each row its opcode stands for: a row's own instruction, and each step of a loop (doc/machine/loop.md), the step's operands read from the loop's through `instruction.operands_in`, the one place a step's sources become operands, which the loop expansion writes through too. So a loop's operands stand against every row they reach at every choice that asks. The values come from `instruction.values_of`, the one place an operand becomes masc's value, which the instruction's transfer, emission and liveness read as well, a tie as its dest half unless a reader asks for its source through `halves_of`. masc answers a transfer as decided or undecided, and every reader of one, selection, the frame scan, layout and loop expansion, refuses an undecided one by type. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as the kind its row position states: an immediate, an enumerant or a condition.
+`ask` hands masc the operand values of an instruction of a row under its grouping and answers the breach, or none when every constraint stands and the grouping admits every group. `asks` says whether a row under a state has anything to ask, a constraint, a group past one register or no grouping at all. `stands` takes an instruction and asks each row its opcode stands for: a row's own instruction, and each step of a loop (doc/machine/loop.md), the step's operands read from the loop's through `instruction.operands_in`, the one place a step's sources become operands, which the loop expansion writes through too. So a loop's operands stand against every row they reach at every choice that asks. The values come from `instruction.values_of`, the one place an operand becomes masc's value, which the instruction's transfer, emission and liveness read as well, a tie as its dest half unless a reader asks for its source through `halves_of`. masc answers a transfer as decided or undecided, and every reader of one, selection, the frame scan, layout and loop expansion, refuses an undecided one by type. A virtual register is a value not chosen yet, which masc reads as one that may take any register. A constant goes to masc as the kind its row position states: an immediate, an enumerant or a condition.
 
 ## Breaches
 
@@ -17,9 +17,8 @@ stands(f, d)                  # opt[Breach]
 - `outside`: an operand whose group runs past the last register of its class, or whose first register is off the group's alignment, answered only where the grouping states its length.
 - `inexact`: a constraint whose answer turns on an element width the grouping does not state. The state no operand holds decides whether the form is reserved, so it is never read as clear. The constraint names its sides. A grouping masc forms under a vtype states every width, so only a grouping with no element width meets it.
 - `needs`: an operand whose groups turn on a vector state the instruction does not state. The checker refuses such an instruction when it is made.
-- `reserved`: an operand whose groups the instruction's vtype cannot form, as a widening destination under LMUL 8.
+- `reserved`: an operand whose groups the instruction's vtype cannot form, as a widening destination under LMUL 8, or a vtype whose bits encode none.
 - `grouped`: an operand naming a virtual register of other than the class one value of it is under the grouping (`constraint.grouped`), as a register of `v` where `vadd.vv` under m2 covers a group of two.
-- `unencodable`: the instruction's vtype has no encoding.
 
 `broken`, `outside` and `inexact` are a conflict for the choice that met them, never a refusal by themselves. The others do not depend on a location: they refuse the instruction wherever it is asked, and liveness refuses it as `live.Error.ungrouped`.
 

@@ -73,7 +73,7 @@ done:
     ret(acc);
 }
 
-#[constant_time(soft)] #[secret_parameters(0, 1, 2)]
+#[constant_time(soft)] #[secret_parameters(0, 1, 2)] #[secret_result]
 pub fun pick(a: ^i64, b: ^i64, c: ^i1) i64 {
     val r: ^i64 = select(c, a, b);
     ret(r);
@@ -82,7 +82,7 @@ pub fun pick(a: ^i64, b: ^i64, c: ^i1) i64 {
 #[export]
 pub fun main() i64 {
     val t: i64 = call total(?weights, 3);
-    val old: i64 = atomic.add[i64, ordering: seq_cst](?counter, 1);
+    val old: i64 = atomic.add[order: seq_cst](?counter, 1);
     ret(t);
 }
 ```
@@ -171,7 +171,7 @@ types
   type        = integer | float | pointer | vector | array | named
               | signature | handle ;
   integer     = ident ;                ; `i` and a legal width: i1 i8 ... i512
-  float       = ident ;                ; f16 f32 f64, or a number format row's name
+  float       = ident ;                ; a number format row's word: f16 f32 f64
   pointer     = "ptr" [ "[" uint "]" ] ;               ; its address space, 0 when left out
   vector      = "vec" "[" uint "," type "]" ;          ; lanes, lane type
   array       = "[" uint [ "," "stride" uint ] "]" type ;  ; count, stated stride, element type
@@ -185,7 +185,7 @@ types
   member      = ident ":" type [ "at" uint ] ";" ;
 
   f16, f32 and f64 are the binary16, binary32 and binary64 number formats,
-  and any other format is spelled by its row's name. a structure and a
+  and any other format is spelled by its row's word. a structure and a
   union are declared once by a typedef and named by it everywhere else. a
   structure states every member's byte offset with `at`, or none and leaves
   them to the data layout, and a union states none. `packed` places a
@@ -389,7 +389,8 @@ functions
 
   an operation is spelled from its opcode's row alone. its path is the row's
   name. the brackets hold one immediate per slot of the row, in order: the
-  first bare and every other led by its slot's name. a slot whose value is
+  first bare where it holds a type, a function, an assembly block or a
+  target op, and every other led by its slot's name. a slot whose value is
   the one the text leaves out is left out, and an empty bracket is left out
   with it. the text leaves out an alignment that is the byte size of the
   type accessed when that type is an integer, a float or a vector of either
@@ -418,8 +419,10 @@ functions
   scale       = "fixed" | "scaled" "(" uint ")" ;
   fill        = "exact" | "undefined" | "boxed"
               | ( "sign" | "zero" | "declared" ) "(" uint ")" ;
-  block       = string "{" [ bound { "," bound } ] "}" { "reads" | "writes" } ;
-  bound       = ident ":" ( "in" | "out" | "inout" | "none" ) constraint type ;
+  block       = string "{" [ bound { "," bound } ] "}" [ "reads" ] [ "writes" ]
+                [ "under" string ] ;
+  bound       = ident ":" ( "in" | "out" | "inout" | "none" ) constraint type
+                [ "points" "(" ( "public" | "secret" ) ")" ] ;
   constraint  = "reg" "(" uint ")" | "mem"
               | "imm" "(" uint "," ( "signed" | "unsigned" ) [ "," "symbolic" ] ")" ;
   op          = "op" "(" string "," string "," "[" [ type { "," type } ] "]"
@@ -435,12 +438,14 @@ functions
 
   an inline assembly item is the `asm` operation, whose block is the
   block's text in the set's source dialect, its operands in order, each its
-  name, role, constraint and the type of the value it binds, and `reads`
+  name, role, constraint and the type of the value it binds, then, for
+  memory holding a pointer, `points` and what the pointer's type states of
+  the storage it reaches, `public` or `secret`, and `reads`
   and `writes` where it declares it touches memory beyond its memory
   operands, and `under` with the selection it states, in the set's own
   spelling, where it states one. a class is masc's handle of a class of the
   set's register file. the item's operands are the values the block binds:
-  `val d: i64 = asm["addi {d}, {a}, {k}" {d: out reg(0) i64, a: in reg(0) i64, k: in imm(12, signed) i64}](x, 7);`
+  `val d: i64 = asm["addi {d}, {a}, {k}" {d: out reg(0) i64, a: in reg(0) i64, k: in imm(12, signed) i64}](x, 7::i64);`
   and `val d: i64 = asm["andn {d}, {a}, {b}" {d: out reg(0) i64, a: in reg(0) i64, b: in reg(0) i64} under "rv64i_zbb"](x, y);`.
 
   a target op is the `target.op` operation, or `target.op.memory` where it

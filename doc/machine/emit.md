@@ -4,9 +4,9 @@
 
 ```
 prepare(?build, a, ?target, isas)                  # err[compile.Error]
-compile(a, ?module, ?build, ?target, options)      # res[object.Object, compile.Error]
+compile(a, ?module, ?build, ?target, options)      # res[object.Object, compile.Failed]
 lay(a, ?function)                                  # res[Laid, lay.Error]
-emit(a, ?module, ?build, ?target, units)           # res[object.Object, emit.Error]
+emit(a, ?module, ?build, ?target, units, modes, shorts, listing, marks, sink, name)  # res[object.Object, emit.Error]
 ```
 
 `mirl.machine.compile` is the register family's back end, which `mirl.target.compile` reaches through the family, and `compile` returns the object in memory. `emit` is the hand-over it ends in. The machine form text and masc's listing of the result are for debugging.

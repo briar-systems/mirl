@@ -1,6 +1,6 @@
 # RISC-V selection rules
 
-`mirl.target.register.riscv.isa.TABLE` is the selection table for RV32 and RV64, the first table the selection engine reads (see [selection](../machine/select.md)). It is static data. It names rows of masc's RISC-V catalog and nothing else, so mirl never encodes and never invents an instruction.
+`mirl.target.register.riscv.rules.TABLE` is the selection table for RV32 and RV64, the first table the selection engine reads (see [selection](../machine/select.md)). It is static data. It names rows of masc's RISC-V catalog and nothing else, so mirl never encodes and never invents an instruction.
 
 ## What it reads
 
@@ -92,7 +92,7 @@ These operations reach no rule, each with the job that closes it. Every opcode o
 - `mem.copy` and `mem.fill`, which no instruction does. The bulk legalisation makes one of a constant length a loop of word moves, and the helpers legalisation turns any other into a call of a helper, or a kept fill into a loop of kept stores, before selection (see [target](../ir/target.md)).
 - A call and a return, which the abi legalisation puts in piece form, so only `call.placed` and `ret.placed` reach the table.
 - `ptr.member` and `ptr.index`, which the address legalisation folds to a `ptr.add` of a byte offset, and a sparse `switch`, which the compare chain legalisation lowers to `eq` and `cbr` (see [target](../ir/target.md)). A dense `switch` reaches selection indexed, its cases 0 to its count less one over a register-wide selector, and branches through a jump table: `sltiu` and `beq` to the first target test the index against the count, or `lui`, `addi` and `bgeu` where the count does not fit the immediate, then `slli` scales it to the pointer, the table's address is formed as a local global's is (`lui` and `addi` under static, `auipc` and `addi` otherwise), and `ld` or `lw` loads the entry into `x7`, which `jalr x0` jumps through. `x7` is the register Zicfilp's software guarded branches name and no link register, so the `jalr` is never read as a return. The rules select what they leave: a store or load at a member's constant offset takes it as its displacement, and a multiply of an index by an element size that is a power of two is a shift.
-- `extract` and `insert`, since the target holds aggregate values in no register. Nothing takes them apart before selection yet, so selection refuses them (#178).
+- `extract` and `insert`, since the target holds aggregate values in no register. The aggregates legalisation takes them apart into their leaves before selection (see [target](../ir/target.md)).
 
 Some operations select only for the operands a base form covers.
 

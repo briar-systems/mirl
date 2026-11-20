@@ -40,7 +40,7 @@ The folder decides nothing by opcode name. The row decides everything but the ar
 
 ## What folds
 
-Every row that reads or writes memory, transfers control, computes an address from a pointer or has declared secrecy is unfoldable. These are `load`, `store`, `alloca`, `ptr.add`, `br`, `cbr`, `call`, `ret`, `ptrtoint`, `inttoptr`, `unreachable`, `fence`, `mem.copy`, `mem.fill` and every atomic opcode. Every other row folds, including the vector opcodes, the reductions and `declassify`.
+Every row that reads or writes memory, transfers control, computes an address from a pointer or has declared secrecy is unfoldable, and so is every row whose operands or results are aggregates, an inline assembly block or a target op. These are `load`, `store`, `alloca`, `ptr.add`, `ptr.member`, `ptr.index`, `func.addr`, `br`, `cbr`, `switch`, `call`, `call.placed`, `ret`, `ret.placed`, `ptrtoint`, `inttoptr`, `unreachable`, `fence`, `mem.copy`, `mem.fill`, `extract`, `insert`, `asm`, `target.op`, `target.op.memory`, `timing.read`, `timing.set`, `timing.restore`, `arg.incoming`, `arg.outgoing` and every atomic opcode. Every other row folds, including the vector opcodes, the reductions and `declassify`.
 
 ## Secrecy
 

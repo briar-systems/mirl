@@ -30,7 +30,7 @@ A body is built around one of three kinds of access, `Constraint.kind`:
 - `cas`, one compare and swap, a row that reads and writes memory in one access, as x86's `lock cmpxchg`, AArch64's LSE `cas` and RISC-V's Zacas `amocas`. The body runs again while the value the swap found is not the one it expected. A swap fails only when another store succeeded, so no guarantee of the core is needed, and the swap's register that gives the value found is one its row reads and writes.
 - `plain`, neither: a body held to its limit alone, and every straight sequence, which has no body. `mirl.machine.loop.row.SEQUENCE` is the constraint of a straight sequence.
 
-A set states a constraint for each kind it writes loops of, and each loop names its own, a `mirl.machine.loop.Constraint`:
+A set states a constraint for each kind it writes loops of, and each loop names its own, a `mirl.machine.loop.row.Constraint`:
 
 - `kind`, `llsc`, `cas` or `plain`,
 - `limit`, the most instructions a body holds, its jump out counted,

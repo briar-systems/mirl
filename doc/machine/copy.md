@@ -3,11 +3,11 @@
 `mirl.machine.copy` turns every `pseudo copy`, `parallel_copy`, `spill` and `reload` of a framed register machine function into the target's moves, and every `address` into the frame code's add of the slot's place to its base. It runs after the frame, where every operand is a location or a placed slot, and before block layout. It names no instruction: the set states its moves as data.
 
 ```
-index(a, ?table, ?locations, ?registers)          # res[Index, move.Error]
+index(a, ?table, ?locations, ctx)                 # res[Index, move.Error]
 lower(a, ?framed, ?request)                       # err[lower.Error]
 ```
 
-`index` is built once per target from the set's `Table`, the locations and the registers the selection gives. `lower` replaces the framed function with its copies lowered, or leaves it as it was when refused. `compile` calls it between the frame and the expansion of loops (see [loops](loop.md)), which comes before layout.
+`index` is built once per target from the set's `Table`, the locations and the build's context, which admits each row and whose view fixes the storage each move takes. `lower` replaces the framed function with its copies lowered, or leaves it as it was when refused. `compile` calls it between the frame and the expansion of loops (see [loops](loop.md)), which comes before layout.
 
 ## The set's moves
 
@@ -15,7 +15,7 @@ A set's `Table` lists its moves and its swaps. A `Move` names the class it write
 
 - A move is admitted when the selection admits its row's requirements. It moves a pair only where both locations' storage through the selection is exactly its bits, so a class whose width follows an extension states one move per width and exactly one fits. RISC-V's float registers state `fsgnj.s`, `fsgnj.d` and `fsgnj.q`, and f, d or q picks one.
 - The index groups the admitted moves by the pair of class keys and the swaps by class key, each list ordered by storage, so a pair's move is a binary search. A second admitted move of one pair and one storage is refused, and so is a move naming a class of no register file of the locations.
-- `mirl.target.register.riscv.isa.MOVES` is RISC-V's: `addi` by zero for a general register, the sign injection of a float register at its width, and `vmv1r.v` for a vector register, with `vmv2r.v`, `vmv4r.v` and `vmv8r.v` for a group of `vg2`, `vg4` and `vg8`. RISC-V has no exchange of two registers and no copy between classes, so it states neither, and a cycle of groups goes through a free group of the same size.
+- `mirl.target.register.riscv.move.MOVES` is RISC-V's: `addi` by zero for a general register, the sign injection of a float register at its width, and `vmv1r.v` for a vector register, with `vmv2r.v`, `vmv4r.v` and `vmv8r.v` for a group of `vg2`, `vg4` and `vg8`. RISC-V has no exchange of two registers and no copy between classes, so it states neither, and a cycle of groups goes through a free group of the same size.
 
 ## The lowering
 
