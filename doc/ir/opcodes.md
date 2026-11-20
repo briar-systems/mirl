@@ -156,6 +156,8 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 | `timing.restore` | `saved` | `state` a state value | none | propagates |
 | `arg.incoming` | none | `type` a type, `pointer` a type, `places` a place list | none | propagates |
 | `arg.outgoing` | none | `type` a type, `pointer` a type, `places` a place list | none | propagates |
+| `slot.begin` | `slot` | none | none | no results |
+| `slot.end` | `slot` | none | none | no results |
 
 ### `add`
 
@@ -2318,4 +2320,28 @@ Operand names are the names the text form gives them. A subject such as `lhs` is
 - secrecy: propagates
 - vector: none
 - made: by a pass of mirl only, so a module given to a schedule that holds it is refused
+
+### `slot.begin`
+
+- operands: `slot`
+- immediates: none
+- targets: 0
+- typing:
+  - `slot` is a pointer
+- results: none
+- effects: writes memory
+- secrecy: no results
+- vector: none
+
+### `slot.end`
+
+- operands: `slot`
+- immediates: none
+- targets: 0
+- typing:
+  - `slot` is a pointer
+- results: none
+- effects: writes memory
+- secrecy: no results
+- vector: none
 
