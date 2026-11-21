@@ -1,10 +1,10 @@
-# the start of an oracle program on aarch64 linux, never a C library. the
-# secret is the eight bytes at `secret`. under valgrind the client request
-# VALGRIND_MAKE_MEM_UNDEFINED marks them undefined, so memcheck reports any
-# branch or address they decide (ctgrind), and natively the request is a
-# sequence of rotates that leaves every register as it was. BINSEC's checkct
-# reads `secret` as the secret global. @probe is called once with the secret
-# and its result is dropped, so the exit status depends on nothing secret
+// the start of an oracle program on aarch64 linux, never a C library. the
+// secret is the eight bytes at `secret`. under valgrind the client request
+// VALGRIND_MAKE_MEM_UNDEFINED marks them undefined, so memcheck reports any
+// branch or address they decide (ctgrind), and natively the request is a
+// sequence of rotates that leaves every register as it was. BINSEC's checkct
+// reads `secret` as the secret global. @probe is called once with the secret
+// and its result is dropped, so the exit status depends on nothing secret
 	.section .data, "aw", @progbits
 	.p2align 3
 	.globl secret

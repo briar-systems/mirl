@@ -1,65 +1,35 @@
 # what the local constant-time suites share, sourced by test/ct/harness.sh and
-# test/ct/oracle.sh: the host, the built mirl, the masc and mink programs of
-# the pinned dep/masc and dep/mink, and a program built from one case.
+# test/ct/oracle.sh: the host, the mirl, masc and mink programs, the lane
+# target and a program built from one case.
 #
-# the masc and mink programs are built from the pinned dep/masc and dep/mink,
-# over the pinned dep/std and dep/mink, once per set of pins into
-# out/ct/tools/<pins>, with the compiler $MACH (mach by default), as
-# test/example.sh builds them. $MASC and $MINK name built ones instead.
+# mirl, masc and mink are taken from the path, the toolchain under test, so no
+# build or git checkout is needed. $MIRL, $MASC and $MINK name other programs.
 #
-# $LEVEL is the optimisation level every case compiles at, 0 by default, so
-# each suite runs over the optimiser too: LEVEL=2 bash test/ct/oracle.sh.
+# $OPTIMIZE set to 1 compiles every case with mirl's optimisation passes (-O),
+# off by default, so each suite runs over the optimiser too:
+# OPTIMIZE=1 bash test/ct/oracle.sh <run>.
 
 here=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$(CDPATH= cd -- "$here/../.." && pwd)
 
 case "$(uname -s)/$(uname -m)" in
-    Linux/x86_64)  host_dir=linux-x86_64; host_arch=x86_64 ;;
-    Linux/aarch64) host_dir=linux-aarch64; host_arch=aarch64 ;;
+    Linux/x86_64)  host_arch=x86_64 ;;
+    Linux/aarch64) host_arch=aarch64 ;;
     *) echo "the constant-time suites run on a linux x86-64 or aarch64 host" >&2; exit 2 ;;
 esac
-mirl=$repo/out/$host_dir/debug/bin/mirl
-[ -x "$mirl" ] || { echo "$mirl is not built, run: mach build . -a cli" >&2; exit 2; }
+mirl=${MIRL:-mirl}
+masc=${MASC:-masc}
+mink=${MINK:-mink}
+for tool in "$mirl" "$masc" "$mink"; do
+    command -v "$tool" >/dev/null || { echo "$tool is not on the path" >&2; exit 2; }
+done
 
-# a shadow project of the pinned dependency `$1` in `$2`: its tracked files at
-# the pin, with every dependency it declares taken from mirl's own dep/
-shadow() {
-    mkdir -p "$2" || return 1
-    git -C "$repo/dep/$1" archive HEAD | tar -x -C "$2" || return 1
-    awk -v dep="$repo/dep" '
-        /^\[dep\./ { name = substr($0, 6, length($0) - 6); print; print "path = \"" dep "/" name "\""; skip = 1; next }
-        /^\[/ { skip = 0 }
-        skip && /^(git|ref|range) *=/ { next }
-        { print }' "$repo/dep/$1/mach.toml" >"$2/mach.toml" || return 1
-    "${MACH:-mach}" dep pull "$2" >/dev/null
-}
-
-# build the artifact `$2` of the pinned dependency `$1` into the tools of these
-# pins, the program's path on stdout
-tool() {
-    local dir=$tools/$1
-    if [ ! -x "$dir/out/$host_dir/debug/bin/$3" ]; then
-        shadow "$1" "$dir" >&2 || { echo "the shadow of dep/$1 was not made" >&2; return 1; }
-        "${MACH:-mach}" build "$dir" -a "$2" >&2 || { echo "dep/$1 -a $2 does not build" >&2; return 1; }
-    fi
-    echo "$dir/out/$host_dir/debug/bin/$3"
-}
-
-pins=$(git -C "$repo" submodule status dep | awk '{ sub(/^[-+ U]/, "", $1); printf "%s", substr($1, 1, 12) }')
-tools=$repo/out/ct/tools/$pins
-masc=${MASC:-$(tool masc cli masc)} || exit 2
-mink=${MINK:-$(tool mink cli mink)} || exit 2
-
-# the linux target of architecture `$1` the suites build for, in the columns
-# of test/lanes.sh: its target, architecture, system, environment, baseline
-# and convention. x86-64's is its lane target, and aarch64's takes the
-# baseline armv8-a, not its lane's
+# the linux target of architecture `$1` the suites build for, its line of
+# test/lanes.sh: its target, architecture, system, environment, baseline and
+# convention
 . "$repo/test/lanes.sh"
 lane_of() {
-    case "$1" in
-        aarch64) echo "linux-aarch64 aarch64 linux gnu armv8-a aapcs64" ;;
-        *) awk -v arch="$1" '$2 == arch && $3 == "linux" { print; exit }' <<<"$lanes" ;;
-    esac
+    awk -v arch="$1" '$2 == arch && $3 == "linux" { print; exit }' <<<"$lanes"
 }
 
 # the number a case states on its line `# <word> <n>`, `$2` when it states none
@@ -85,7 +55,7 @@ program() {
     read -r target arch system env isa abi <<<"$lane"
     # the case is a body, so it is read under the library's own version statement
     { printf 'mirl "%s";\n' "$("$mirl" --version)"; cat "$src"; } >"$at.text.mirl"
-    if ! "$mirl" compile "$at.text.mirl" --level "${LEVEL:-0}" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
+    if ! "$mirl" compile "$at.text.mirl" $([ "${OPTIMIZE:-0}" = 1 ] && echo -O) --verify --emit obj -o "$at.o" 2>"$at.emit"; then
         echo "mirl compile refuses it: $(cat "$at.emit")"
         return 1
     fi

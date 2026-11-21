@@ -1,7 +1,7 @@
-# the host's side of the dudect driver on aarch64 linux, never a C library:
-# __ct_ticks() reads the virtual counter behind a barrier, so no earlier
-# instruction is still running, __ct_write(ptr, i64) writes the bytes to
-# standard output and __mirl_exit(i64) exits with the status
+// the host's side of the dudect driver on aarch64 linux, never a C library:
+// __ct_ticks() reads the virtual counter behind a barrier, so no earlier
+// instruction is still running, __ct_write(ptr, i64) writes the bytes to
+// standard output and __mirl_exit(i64) exits with the status
 	.section .text, "ax", @progbits
 	.p2align 2
 	.globl __ct_ticks

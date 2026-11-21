@@ -7,8 +7,7 @@
 # usage: bash test/ct/harness.sh <run>
 #
 # <run> names a fresh directory out/ct/harness/<run>, which must not exist.
-# mirl must be built: mach build . -a cli. git must be on the path, and the
-# masc and mink programs are built as test/ct/tools.sh says.
+# mirl, masc and mink are taken from the path, as test/ct/tools.sh says.
 #
 # each case is a test/ct/case/*.mirl body, a function probe(i64) i64
 # that requires constant time and takes its input as a secret, and its line
