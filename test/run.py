@@ -13,6 +13,9 @@
 # own, as `-t` spells them, as a case the walk of constant-time code must accept on each
 # architecture that runs it at emission.
 # a `# flags:` line adds its words to every compile of the file.
+# a `# refuse:` line states that every compile of the file is refused, its report, its lines
+# joined by spaces, holding the line's text, as a case the walk of constant-time code must
+# refuse on each target it names.
 # exit 0: nothing failed.
 import argparse, concurrent.futures, os, re, subprocess, sys
 
@@ -62,8 +65,14 @@ def one(cfg, version, path):
                 cmd += ['-t', t]
             p = subprocess.run(cmd, capture_output=True, text=True)
             done += 1
-            if p.returncode != 0:
-                said = [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip() and not l.startswith('warning')]
+            said = [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip() and not l.startswith('warning')]
+            refuse = h.get('refuse')
+            if refuse is not None:
+                if p.returncode == 0:
+                    fails.append(f'{rel} [{where}, {state}] compiled, where it must be refused: {refuse}')
+                elif refuse not in ' '.join(said):
+                    fails.append(f'{rel} [{where}, {state}] refused without `{refuse}`: ' + ' '.join(said[:3]))
+            elif p.returncode != 0:
                 fails.append(f'{rel} [{where}, {state}] exit {p.returncode}: ' + ' '.join(said[:3]))
     return done, fails
 
