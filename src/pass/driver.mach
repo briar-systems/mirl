@@ -19,6 +19,10 @@
 # functions the row's pass changed, as a function they did not reach is as the
 # rows before left it. an unchecked run verifies nothing, so a
 # caller that reads a module from text verifies it before handing it over.
+# a run asked for a report writes, once it has run, a line per function and
+# optimisation pass that changed it, in the order the passes ran: the pass's
+# name, the function's and, for a pass whose record counts what it does, the
+# count, as `vectorise loop_copy.copy_bytes 1`, each line written whole.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -33,6 +37,9 @@ use std.allocator;
 use std.chrono.time.Instant;
 use std.collections.slice.Slice;
 use std.collections.vector;
+use std.format;
+use io: std.io.writer;
+use std.types.view.View;
 
 use mirl.base.slice;
 use mirl.base.stats;
@@ -42,6 +49,7 @@ use mirl.ct.oblivious;
 use mirl.ir.function.Node;
 use mirl.ir.function.in_constant_time;
 use mirl.ir.id.Function;
+use mirl.ir.module;
 use mirl.ir.module.Module;
 use mirl.pass.analysis;
 use mirl.pass.cache;
@@ -63,6 +71,7 @@ use mirl.pass.record.LowerAll;
 use mirl.pass.record.Lowering;
 use mirl.pass.record.Pass;
 use mirl.pass.record.Run;
+use mirl.pass.record.Tally;
 use mirl.pass.record.Time;
 use mirl.pass.record.Unit;
 use mirl.pass.record.Visit;
@@ -97,6 +106,8 @@ use verify_table: mirl.verify.table;
 # widenings: the module's table of the selection each function stands on,
 #            which a function visit reads as its basis, none where every
 #            function stands on the run's
+# report:    where the report of what each optimisation pass did to each
+#            function is written once the run is done, none for no report
 pub rec Options {
     optimise:  Optimise;
     checked:   bool;
@@ -104,7 +115,24 @@ pub rec Options {
     stats:     opt[*Stats];
     warnings:  *vector.Vector[Warning];
     widenings: opt[*Widenings];
+    report:    opt[*io.Writer];
 }
+
+# one line of the report: an optimisation pass changed a function
+# ---
+# f:     the function
+# pass:  the pass's name
+# count: what its record's `counts` names, as many as it did
+# what:  its record's `counts`, nil for a pass that counts nothing
+rec Entry {
+    f:     Function;
+    pass:  str;
+    count: u64;
+    what:  str;
+}
+
+# no entry, the end of a function's list in the report
+val NONE: u32 = 0xffffffff;
 
 # a run in progress
 # ---
@@ -119,6 +147,8 @@ pub rec Options {
 # changed: a mark per function the running pass changed
 # whole:   whether the next verification walks every body, since no earlier
 #          one holds the bodies the pass did not mark
+# tally:   what the running pass counted, where the run is asked for a report
+# entries: the report's lines so far, in the order the passes ran
 pub rec Driver {
     m:       *Module;
     t:       *Target;
@@ -128,6 +158,8 @@ pub rec Driver {
     legal:   bool;
     changed: vector.Vector[bool];
     whole:   bool;
+    tally:   Tally;
+    entries: vector.Vector[Entry];
 }
 
 # a run over a module for a target and the selection it reads, with an empty
@@ -140,13 +172,95 @@ pub fun init(m: *Module, t: *Target, basis: opt[*Basis], options: Options) res[D
     if (sel basis.some) {
         if (basis.some.target != t) { ret res[Driver, Error].err{Error.foreign{}}; }
     }
-    ret res[Driver, Error].ok{Driver{m: m, t: t, basis: basis, cache: cache.init(m, t, basis, analysis.rows(), cache.NONE), options: options, legal: false, changed: vector.init[bool](m.a), whole: true}};
+    ret res[Driver, Error].ok{Driver{m: m, t: t, basis: basis, cache: cache.init(m, t, basis, analysis.rows(), cache.NONE), options: options, legal: false, changed: vector.init[bool](m.a), whole: true, tally: Tally{counts: vector.init[u64](m.a)}, entries: vector.init[Entry](m.a)}};
 }
 
 # give back the run's analyses
 pub fun dnit(d: *Driver) err[allocator.Error] {
     vector.dnit[bool](?d.changed);
+    vector.dnit[u64](?d.tally.counts);
+    vector.dnit[Entry](?d.entries);
     ret cache.dnit(?d.cache);
+}
+
+# whether the run keeps a report of pass `p`: an optimisation, in a run asked for one
+fun reporting(d: *Driver, p: *Pass) bool {
+    ret sel d.options.report.some && sel p.kind.optimise;
+}
+
+# clear what the running pass counted, one count per function of the module
+fun untallied(d: *Driver) err[allocator.Error] {
+    vector.truncate[u64](?d.tally.counts, 0);
+    ret slice.fill[u64](?d.tally.counts, d.m.functions.len, 0);
+}
+
+# a line of the report for each function pass `p` changed, with what it counted of it
+fun tallied(d: *Driver, p: *Pass) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < d.changed.len) {
+        if (d.changed.data[i]) {
+            var count: u64 = 0;
+            if (i < d.tally.counts.len) { count = d.tally.counts.data[i]; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Entry](?d.entries, Entry{f: (i::u32), pass: p.name, count: count, what: p.counts});
+            if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# write the report, a line per function and pass that changed it, the functions in their order and each one's passes
+# in the order they ran, every line written whole so the lines of runs side by side never mix
+fun report(d: *Driver, out: *io.Writer) err[Error] {
+    var line:  io.Memory;
+    var w:     io.Writer          = io.memory_growing(?line, d.m.a);
+    var first: vector.Vector[u32] = vector.init[u32](d.m.a);
+    var next:  vector.Vector[u32] = vector.init[u32](d.m.a);
+    var last:  vector.Vector[u32] = vector.init[u32](d.m.a);
+    fin {
+        io.memory_dnit(?line);
+        vector.dnit[u32](?first);
+        vector.dnit[u32](?next);
+        vector.dnit[u32](?last);
+    }
+    var err_room: err[allocator.Error] = slice.fill[u32](?first, d.m.functions.len, NONE);
+    if (!(sel err_room.err)) { err_room = slice.fill[u32](?last, d.m.functions.len, NONE); }
+    if (!(sel err_room.err)) { err_room = slice.fill[u32](?next, d.entries.len, NONE); }
+    if (sel err_room.err)    { ret err[Error].err{Error.alloc{err_room.err}}; }
+    var e: usize = 0;
+    for (e < d.entries.len) {
+        val f: usize = d.entries.data[e].f::usize;
+        if (f < first.len) {
+            if (first.data[f] == NONE) { first.data[f] = e::u32; }
+            or                         { next.data[last.data[f]] = e::u32; }
+            last.data[f] = e::u32;
+        }
+        e = e + 1;
+    }
+    var f: usize = 0;
+    for (f < first.len) {
+        var at: u32 = first.data[f];
+        for (at != NONE) {
+            val entry: Entry = d.entries.data[at];
+            val name:  View  = module.name_of(d.m, d.m.functions.data[f].data.name);
+            line.len = 0;
+            format.write_str(?w, entry.pass);
+            format.write_str(?w, " ");
+            io.write_all(?w, name.data, name.len);
+            if (entry.what != nil) {
+                format.write_str(?w, " ");
+                format.write_u64(?w, entry.count);
+            }
+            format.write_str(?w, "\n");
+            if (line.len > 0) {
+                val err_wrote: err[io.WriteError] = io.write_all(out, line.buf, line.len);
+                if (sel err_wrote.err) { ret err[Error].err{Error.report{err_wrote.err}}; }
+            }
+            at = next.data[at];
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
 }
 
 # clear the marks of the functions a pass changed before it runs, one per
@@ -284,8 +398,8 @@ fun basis_of(d: *Driver, f: Function) opt[*Basis] {
     ret widening.of(d.options.widenings.some, f);
 }
 
-# scope function `f` again in the module's table after a visit changed it, as
-# a visit may name an extension past the build's for it
+# scope function `f` in the module's table after a visit or a module run changed
+# or added it, as a pass may name an extension past the build's for it
 fun rescope(d: *Driver, name: str, f: Function) res[bool, Error] {
     if (sel d.options.widenings.none) { ret res[bool, Error].ok{false}; }
     val err_scoped: err[Unwidened] = widening.scope(d.options.widenings.some, d.m, f);
@@ -303,8 +417,9 @@ fun rescope(d: *Driver, name: str, f: Function) res[bool, Error] {
 }
 
 # call a module run once, marking each function it changed and each one it
-# added, and dropping the analyses of those it does not preserve. a refusal names
-# the pass and gives the module up
+# added, dropping the analyses of those it does not preserve and scoping each
+# in the module's table by the extensions it names. a refusal names the pass
+# and gives the module up
 fun whole_module(d: *Driver, c: *Context, name: str, preserves: cache.Set, call: Running) res[bool, Error] {
     var marks:      Changed                  = Changed{marks: Slice[bool]{data: d.changed.data, size: d.changed.len}};
     val res_run_of: res[bool, refusal.Error] = run_of(call, c, ?marks);
@@ -317,6 +432,8 @@ fun whole_module(d: *Driver, c: *Context, name: str, preserves: cache.Set, call:
         if (d.changed.data[i]) {
             val err_dropped: err[allocator.Error] = cache.drop(?d.cache, (i::u32), preserves);
             if (sel err_dropped.err) { ret lost(err_dropped.err); }
+            val res_scoped: res[bool, Error] = rescope(d, name, (i::u32));
+            if (sel res_scoped.err) { ret res_scoped; }
         }
         i = i + 1;
     }
@@ -360,7 +477,7 @@ fun ground(d: *Driver) Ground {
 # the context a pass of this time runs in, the cache held to the rows it needs
 fun context(d: *Driver, time: Time, needs: cache.Set) Context {
     cache.reader(?d.cache, needs);
-    ret Context{m: d.m, t: d.t, basis: d.basis, build: d.basis, cache: ?d.cache, time: time, floats: d.options.floats, warnings: d.options.warnings};
+    ret Context{m: d.m, t: d.t, basis: d.basis, build: d.basis, cache: ?d.cache, time: time, floats: d.options.floats, warnings: d.options.warnings, tally: nil};
 }
 
 # run one pass over the module, verifying it after when the run is checked
@@ -375,11 +492,23 @@ fun apply(d: *Driver, p: *Pass, over: Over) res[bool, Error] {
     var res_changed: res[bool, Error];
     val err_cleared: err[allocator.Error] = unmark(d);
     if (sel err_cleared.err) { ret lost(err_cleared.err); }
+    val counting: bool = reporting(d, p);
+    if (counting) {
+        val err_untallied: err[allocator.Error] = untallied(d);
+        if (sel err_untallied.err) { ret lost(err_untallied.err); }
+        c.tally = ?d.tally;
+    }
     val opt_from: opt[Instant] = stats.start(d.options.stats);
     if (sel p.scope.function) { res_changed = each_function(d, ?c, p.name, p.preserves, Visiting.pass{p.scope.function}, over); }
     or (sel p.scope.module)   { res_changed = whole_module(d, ?c, p.name, p.preserves, Running.pass{p.scope.module}); }
     or                        { ret refused(p.name, opt[Function].none{}, refusal.Error.reason{"the pass states no scope"}); }
     stats.stop(d.options.stats, stats.Stage.passes{}, opt_from);
+    if (sel res_changed.ok && res_changed.ok) {
+        if (counting) {
+            val err_tallied: err[allocator.Error] = tallied(d, p);
+            if (sel err_tallied.err) { ret lost(err_tallied.err); }
+        }
+    }
     ret checked(d, p.name, res_changed);
 }
 
@@ -484,8 +613,11 @@ fun run_plan(m: *Module, t: *Target, basis: opt[*Basis], rows: Slice[Row], steps
     }
     val res_started: res[Driver, Error] = init(m, t, basis, options);
     if (sel res_started.err) { ret err[Error].err{res_started.err}; }
-    var d:        Driver               = res_started.ok;
-    val err_ran:  err[Error]           = follow(?d, rows, steps, b);
+    var d:       Driver     = res_started.ok;
+    var err_ran: err[Error] = follow(?d, rows, steps, b);
+    if (sel options.report.some) {
+        if (!(sel err_ran.err)) { err_ran = report(?d, options.report.some); }
+    }
     val err_gone: err[allocator.Error] = dnit(?d);
     if (sel err_ran.err)  { ret err_ran; }
     if (sel err_gone.err) { ret err[Error].err{Error.alloc{err_gone.err}}; }

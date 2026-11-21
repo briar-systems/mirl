@@ -226,7 +226,9 @@ literals
   it so.
 
   a number of an integer type is its bits read unsigned, and a number of a
-  float type is the bits of its encoding, never a decimal value. `-` gives
+  float type is the bits of its encoding, never a decimal value, and a number
+  of a pointer type is a fixed address, its one 64-bit word, which the printer
+  writes in hex, as `0x4000_0000::ptr`. `-` gives
   the two's complement of those bits at the type's width. the printer writes
   an integer of at most 64 bits in decimal, negative when its top bit is set
   and it is wider than one bit, and any other number in hex. `zero` is every

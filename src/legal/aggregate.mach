@@ -48,6 +48,11 @@
 #   legalisation, and a member that is not large is read out of it. so every
 #   aggregate value valid ir holds is taken apart or held, whatever pass
 #   formed it, and none ahead of this one bounds what it forms.
+#   each slot is begun where its value is made and ended past the value's
+#   last access on every path (`spanned`), so the frame shares the slots of
+#   values not live at once. a slot whose address an edge passes or whose
+#   range cannot be closed on every path keeps no markers and lasts the whole
+#   function, as a constant's does.
 # - an `extract` of a scalar member is replaced by the leaf it reads, and
 #   the leaves held for an aggregate built of it hold that leaf, so the visit,
 #   which takes blocks in their order and not as they dominate one another,
@@ -231,6 +236,7 @@ rec Run {
 # head:   the last instruction made at the head of the entry block so far,
 #         `NO_INSTRUCTION` for none
 # ptr:    the pointer type of a stack slot
+# scoped: the slots of large values begun where they are made, ended by `scope`
 # failed: the first failure
 rec Work {
     site:   Site;
@@ -249,7 +255,17 @@ rec Work {
     before: Vector[u32];
     head:   Instruction;
     ptr:    Type;
+    scoped: Vector[Scoped];
     failed: opt[refusal.Error];
+}
+
+# a slot of a large value and the `slot.begin` made where it is first written
+# ---
+# home:  the slot's address, an alloca's result
+# begin: its marker
+rec Scoped {
+    home:  Value;
+    begin: Instruction;
 }
 
 fun lost(e: allocator.Error) refusal.Error {
@@ -1529,6 +1545,7 @@ fun loaded_home(w: *Work, i: Instruction) Value {
     if (res_align.ok < both) { both = res_align.ok; }
     val secret: bool = d.metadata.secret || b.values.data[x].secret;
     emit.begin(?w.site, i);
+    begun(w, home, i);
     moved_bytes(w, opt[Instruction].none{}, home, opt[Value].some{from}, res_size.ok, both, read, NO_FLAGS, secret);
     val err_done: err[refusal.Error] = emit.done(?w.site);
     if (sel err_done.err) { fail(w, err_done.err); }
@@ -1559,6 +1576,7 @@ fun selected_home(w: *Work, i: Instruction) Value {
     val home:   Value = slot(w, ty);
     if (sel w.failed.some) { ret home; }
     emit.begin(?w.site, i);
+    begun(w, home, i);
     var done: u64 = 0;
     for (done < res_size.ok && sel w.failed.none) {
         val at:          u64                      = moves.aligned_at(res_align.ok, done);
@@ -1615,6 +1633,7 @@ fun inserted_home(w: *Work, i: Instruction) Value {
     if (sel w.failed.some) { ret home; }
     val secret: bool = b.values.data[x].secret;
     emit.begin(?w.site, i);
+    begun(w, home, i);
     copy_value(w, ty, home, from, secret);
     if (large(w, mt)) { copy_value(w, mt, at_offset(w, home, off), source, secret); }
     or (aggregate(w, mt)) {
@@ -1823,6 +1842,7 @@ fun placed_home(w: *Work, x: Value) Value {
     val entry:  bool        = !(sel b.values.data[x].def.result);
     val origin: Instruction = after_def(w, x);
     emit.begin(?w.site, origin);
+    begun(w, home, origin);
     store_at(w, home, x, res_align.ok, NO_FLAGS);
     if (entry) { w.head = b.instructions.data[origin].prev; }
     val err_done: err[refusal.Error] = emit.done(?w.site);
@@ -1958,7 +1978,14 @@ fun enter_homes(w: *Work, k: Block, entered: *Vector[Entered]) err[refusal.Error
     }
     val err_slotted: err[refusal.Error] = failure_of(w);
     if (sel err_slotted.err) { ret err_slotted; }
-    emit.begin(?w.site, b.blocks.data[k].first);
+    val first: Instruction = b.blocks.data[k].first;
+    emit.begin(?w.site, first);
+    n = 0;
+    for (n < entered.len) {
+        begun(w, entered.data[n].home, first);
+        if (split) { begun(w, entered.data[n].staged, first); }
+        n = n + 1;
+    }
     n = 0;
     for (n < entered.len) {
         val e:  Entered = entered.data[n];
@@ -2610,6 +2637,338 @@ fun remove(w: *Work) err[refusal.Error] {
     ret refusal.edit(body.remove_dead(w.site.m, w.site.f, Slice[Instruction]{data: keep.data, size: keep.len}, Slice[Value]{data: w.params.data, size: w.params.len}));
 }
 
+# begin a large value's slot where the rewrite of origin stands, ahead of the
+# slot's first write. the marker holds no value, so it is not marked secret
+fun begun(w: *Work, home: Value, origin: Instruction) {
+    val was: bool     = body_of(w).instructions.data[origin].metadata.secret;
+    var ops: [1]Value = [1]Value{home};
+    emit.secret(?w.site, false);
+    val i: Instruction = emit.emit(?w.site, opcode_table.SLOT_BEGIN, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: nil, size: 0});
+    emit.secret(?w.site, was);
+    val res_pushed: res[usize, allocator.Error] = vector.push[Scoped](?w.scoped, Scoped{home: home, begin: i});
+    if (sel res_pushed.err) { fail(w, lost(res_pushed.err)); }
+}
+
+# what `scope` holds of the function while it ends one slot
+# ---
+# limit:    the instructions the body held when `scope` started, past which none is an access
+# access:   by instruction, whether it reads or writes the slot
+# seen:     by block, whether any of the flags below was set for it
+# live_in:  by block, whether the slot is accessed past its head before it is begun again
+# live_out: by block, the same past its end
+# begins:   by block, whether the slot's begin stands in it
+# headed:   by block, whether the slot ends at its head
+# last:     by block, its last access of the slot or its begin, `NO_INSTRUCTION` for none
+# accesses: the instructions `access` holds
+# touched:  the blocks `seen` holds
+# values:   the addresses into the slot still to follow
+# work:     the blocks whose predecessors are still to visit
+# ends:     the instructions an end goes before
+rec Span {
+    limit:    usize;
+    access:   *bool;
+    seen:     *bool;
+    live_in:  *bool;
+    live_out: *bool;
+    begins:   *bool;
+    headed:   *bool;
+    last:     *Instruction;
+    accesses: Vector[Instruction];
+    touched:  Vector[Block];
+    values:   Vector[Value];
+    work:     Vector[Block];
+    ends:     Vector[Instruction];
+}
+
+fun flags_of(w: *Work, n: usize) *bool {
+    val res_zallocate: res[*bool, allocator.Error] = allocator.zallocate[bool](w.keep, n + 1);
+    if (sel res_zallocate.err) {
+        fail(w, lost(res_zallocate.err));
+        ret nil;
+    }
+    ret res_zallocate.ok;
+}
+
+fun touch(w: *Work, sp: *Span, k: Block) {
+    if (sp.seen[k]) { ret; }
+    sp.seen[k] = true;
+    sp.last[k] = NO_INSTRUCTION;
+    val res_pushed: res[usize, allocator.Error] = vector.push[Block](?sp.touched, k);
+    if (sel res_pushed.err) { fail(w, lost(res_pushed.err)); }
+}
+
+fun accessed(w: *Work, sp: *Span, i: Instruction) {
+    if (sp.access[i]) { ret; }
+    sp.access[i] = true;
+    val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?sp.accesses, i);
+    if (sel res_pushed.err) { fail(w, lost(res_pushed.err)); }
+}
+
+# forget the slot the span last held
+fun cleared(sp: *Span) {
+    var n: usize = 0;
+    for (n < sp.accesses.len) {
+        sp.access[sp.accesses.data[n]] = false;
+        n                              = n + 1;
+    }
+    n = 0;
+    for (n < sp.touched.len) {
+        val k: Block = sp.touched.data[n];
+        sp.seen[k]     = false;
+        sp.live_in[k]  = false;
+        sp.live_out[k] = false;
+        sp.begins[k]   = false;
+        sp.headed[k]   = false;
+        n              = n + 1;
+    }
+    vector.clear[Instruction](?sp.accesses);
+    vector.clear[Block](?sp.touched);
+    vector.clear[Value](?sp.values);
+    vector.clear[Block](?sp.work);
+    vector.clear[Instruction](?sp.ends);
+}
+
+# mark every access of the slot at `home`, through the addresses formed from it
+# by `ptr.add`. false where an address goes anywhere else, a block argument or
+# a call among them, so its accesses cannot all be found. a whole load's users
+# are accesses too, since the abi legalisation may read the slot at them
+fun reached(w: *Work, sp: *Span, s: Scoped) bool {
+    val b:          *Body                       = body_of(w);
+    val res_pushed: res[usize, allocator.Error] = vector.push[Value](?sp.values, s.home);
+    if (sel res_pushed.err) {
+        fail(w, lost(res_pushed.err));
+        ret false;
+    }
+    for (sp.values.len > 0) {
+        val v: Value = sp.values.data[sp.values.len - 1];
+        vector.pop[Value](?sp.values);
+        val uses: *Growing[Instruction] = ?b.values.data[v].uses;
+        var u:    usize                 = 0;
+        for (u < uses.len) {
+            val i:    Instruction      = uses.data[u];
+            val d:    *InstructionData = ?b.instructions.data[i];
+            val code: Opcode           = d.opcode;
+            val at:   bool             = d.operands.len > 0 && d.operands.data[0] == v;
+            if (code == opcode_table.PTR_ADD) {
+                if (!at || d.operands.data[1] == v) { ret false; }
+                val res_past: res[usize, allocator.Error] = vector.push[Value](?sp.values, d.results.data[0]);
+                if (sel res_past.err) {
+                    fail(w, lost(res_past.err));
+                    ret false;
+                }
+            }
+            or (code == opcode_table.LOAD) {
+                if (!at) { ret false; }
+                accessed(w, sp, i);
+                val x: Value = d.results.data[0];
+                if (aggregate(w, type_of(w, x))) {
+                    val readers: *Growing[Instruction] = ?b.values.data[x].uses;
+                    var r:       usize                 = 0;
+                    for (r < readers.len) {
+                        accessed(w, sp, readers.data[r]);
+                        r = r + 1;
+                    }
+                }
+            }
+            or (code == opcode_table.STORE) {
+                if (!at || d.operands.len != 2 || d.operands.data[1] == v) { ret false; }
+                accessed(w, sp, i);
+            }
+            or (code == opcode_table.MEM_COPY) {
+                if (d.operands.len != 3 || d.operands.data[2] == v) { ret false; }
+                accessed(w, sp, i);
+            }
+            or (code == opcode_table.MEM_FILL) {
+                if (!at || d.operands.len != 3 || d.operands.data[1] == v || d.operands.data[2] == v) { ret false; }
+                accessed(w, sp, i);
+            }
+            or (code != opcode_table.SLOT_BEGIN || i != s.begin) { ret false; }
+            u = u + 1;
+        }
+    }
+    ret sel w.failed.none;
+}
+
+# the ends of one slot, from its begin to its last access on every path, into
+# the span's `ends` and `headed`. false where the slot keeps no markers
+#
+# the rule: the slot is live at a point where some path from it reaches an
+# access without passing its begin. it ends after its last access in a block
+# it is not live out of, and at the head of a block it is not live into that
+# a block it is live out of branches to, where every predecessor of that block
+# has it live out. the slot keeps no markers, lasting the whole function, where
+# it is live into the entry, accessed ahead of its begin in the begin's block,
+# accessed by a branch, or would end at the head of a block one of whose
+# predecessors does not have it live out. so every access lies between its
+# begin and an end on every path, a path that leaves where it is live passes
+# an end, and it is begun again only after one. a value's accesses all follow
+# where it is made, so a value made and used within a loop's trip begins and
+# ends each trip, and one whose slot an edge passes keeps no markers
+fun spanned(w: *Work, sp: *Span, s: Scoped) bool {
+    val b: *Body = body_of(w);
+    cleared(sp);
+    val at: Spot = b.instructions.data[s.begin].place;
+    if (!(sel at.placed))   { ret false; }
+    if (!reached(w, sp, s)) { ret false; }
+    touch(w, sp, at.placed);
+    var n: usize = 0;
+    for (n < sp.accesses.len) {
+        val where: Spot = b.instructions.data[sp.accesses.data[n]].place;
+        if (!(sel where.placed)) { ret false; }
+        touch(w, sp, where.placed);
+        n = n + 1;
+    }
+    n = 0;
+    for (n < sp.touched.len) {
+        val k:     Block       = sp.touched.data[n];
+        var begun: bool        = false;
+        var i:     Instruction = b.blocks.data[k].first;
+        for (i != NO_INSTRUCTION) {
+            if (i == s.begin) {
+                begun        = true;
+                sp.begins[k] = true;
+                sp.last[k]   = i;
+            }
+            or (i::usize < sp.limit && sp.access[i]) {
+                if (!begun) { sp.live_in[k] = true; }
+                sp.last[k] = i;
+            }
+            i = b.instructions.data[i].next;
+        }
+        if (sp.begins[k] && sp.live_in[k]) { ret false; }
+        if (sp.live_in[k]) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Block](?sp.work, k);
+            if (sel res_pushed.err) {
+                fail(w, lost(res_pushed.err));
+                ret false;
+            }
+        }
+        n = n + 1;
+    }
+    for (sp.work.len > 0) {
+        val k: Block = sp.work.data[sp.work.len - 1];
+        vector.pop[Block](?sp.work);
+        val preds: *vector.Vector[Instruction] = ?b.blocks.data[k].predecessors;
+        var p:     usize                       = 0;
+        for (p < preds.len) {
+            val from: Spot = b.instructions.data[preds.data[p]].place;
+            if (!(sel from.placed)) { ret false; }
+            val q: Block = from.placed;
+            touch(w, sp, q);
+            if (!sp.live_out[q]) {
+                sp.live_out[q] = true;
+                if (!sp.begins[q] && !sp.live_in[q]) {
+                    sp.live_in[q] = true;
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Block](?sp.work, q);
+                    if (sel res_pushed.err) {
+                        fail(w, lost(res_pushed.err));
+                        ret false;
+                    }
+                }
+            }
+            p = p + 1;
+        }
+    }
+    if (sp.seen[0] && sp.live_in[0]) { ret false; }
+    val count: usize = sp.touched.len;
+    n = 0;
+    for (n < count) {
+        val k:    Block       = sp.touched.data[n];
+        val term: Instruction = b.blocks.data[k].last;
+        val l:    Instruction = sp.last[k];
+        if (term == NO_INSTRUCTION) { ret false; }
+        val edges: usize = b.instructions.data[term].edges.len;
+        if (l == term && edges > 0) { ret false; }
+        if (!sp.live_out[k] && l != NO_INSTRUCTION && l != term) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?sp.ends, b.instructions.data[l].next);
+            if (sel res_pushed.err) {
+                fail(w, lost(res_pushed.err));
+                ret false;
+            }
+        }
+        var e: usize = 0;
+        for (sp.live_out[k] && e < edges) {
+            val to: Block = b.instructions.data[term].edges.data[e].block;
+            touch(w, sp, to);
+            if (!sp.live_in[to] && !sp.headed[to]) {
+                val preds: *vector.Vector[Instruction] = ?b.blocks.data[to].predecessors;
+                var p:     usize                       = 0;
+                for (p < preds.len) {
+                    val from: Spot = b.instructions.data[preds.data[p]].place;
+                    if (!(sel from.placed))        { ret false; }
+                    if (!sp.live_out[from.placed]) { ret false; }
+                    p = p + 1;
+                }
+                sp.headed[to] = true;
+                val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?sp.ends, b.blocks.data[to].first);
+                if (sel res_pushed.err) {
+                    fail(w, lost(res_pushed.err));
+                    ret false;
+                }
+            }
+            e = e + 1;
+        }
+        n = n + 1;
+    }
+    ret sel w.failed.none;
+}
+
+# an end of the slot at `home` just ahead of instruction `before`
+fun ended(w: *Work, home: Value, before: Instruction) err[refusal.Error] {
+    var ops: [1]Value = [1]Value{home};
+    emit.begin(?w.site, before);
+    emit.secret(?w.site, false);
+    emit.emit(?w.site, opcode_table.SLOT_END, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: nil, size: 0});
+    ret emit.done(?w.site);
+}
+
+# give the slot of each large value made this run a marked range, from where
+# the value is made to its last access on every path (`spanned`), so the frame
+# shares the slots of values that are not live at once. a slot that cannot be
+# given one loses its begin and lasts the whole function
+fun scope(w: *Work) err[refusal.Error] {
+    if (w.scoped.len == 0) { ret err[refusal.Error].ok{}; }
+    val b:  *Body = body_of(w);
+    var sp: Span;
+    sp.limit    = b.instructions.len;
+    sp.access   = flags_of(w, b.instructions.len);
+    sp.seen     = flags_of(w, b.blocks.len);
+    sp.live_in  = flags_of(w, b.blocks.len);
+    sp.live_out = flags_of(w, b.blocks.len);
+    sp.begins   = flags_of(w, b.blocks.len);
+    sp.headed   = flags_of(w, b.blocks.len);
+    val res_last: res[*Instruction, allocator.Error] = allocator.zallocate[Instruction](w.keep, b.blocks.len + 1);
+    if (sel res_last.err) { ret err[refusal.Error].err{lost(res_last.err)}; }
+    sp.last     = res_last.ok;
+    sp.accesses = vector.init[Instruction](w.keep);
+    sp.touched  = vector.init[Block](w.keep);
+    sp.values   = vector.init[Value](w.keep);
+    sp.work     = vector.init[Block](w.keep);
+    sp.ends     = vector.init[Instruction](w.keep);
+    val err_flags: err[refusal.Error] = failure_of(w);
+    if (sel err_flags.err) { ret err_flags; }
+    var n: usize = 0;
+    for (n < w.scoped.len) {
+        val s: Scoped = w.scoped.data[n];
+        if (spanned(w, ?sp, s)) {
+            var e: usize = 0;
+            for (e < sp.ends.len) {
+                val err_ended: err[refusal.Error] = ended(w, s.home, sp.ends.data[e]);
+                if (sel err_ended.err) { ret err_ended; }
+                e = e + 1;
+            }
+        }
+        or {
+            val err_failed: err[refusal.Error] = failure_of(w);
+            if (sel err_failed.err) { ret err_failed; }
+            val err_erased: err[refusal.Error] = refusal.edit(body.erase(w.site.m, w.site.f, s.begin));
+            if (sel err_erased.err) { ret err_erased; }
+        }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
 fun ahead(u: *Unit) res[bool, refusal.Error] {
     ret visit(u, false);
 }
@@ -2660,6 +3019,7 @@ fun visit(u: *Unit, late: bool) res[bool, refusal.Error] {
     w.state  = vector.init[u8](?keep);
     w.gone   = vector.init[Instruction](?keep);
     w.params = vector.init[Value](?keep);
+    w.scoped = vector.init[Scoped](?keep);
     w.before = vector.init[u32](?keep);
     w.head   = NO_INSTRUCTION;
     w.failed = opt[refusal.Error].none{};
@@ -2730,5 +3090,7 @@ fun visit(u: *Unit, late: bool) res[bool, refusal.Error] {
     if (sel err_edges.err) { ret res[bool, refusal.Error].err{err_edges.err}; }
     val err_removed: err[refusal.Error] = remove(?w);
     if (sel err_removed.err) { ret res[bool, refusal.Error].err{err_removed.err}; }
+    val err_scoped: err[refusal.Error] = scope(?w);
+    if (sel err_scoped.err) { ret res[bool, refusal.Error].err{err_scoped.err}; }
     ret res[bool, refusal.Error].ok{true};
 }

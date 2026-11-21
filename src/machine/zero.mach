@@ -1,0 +1,344 @@
+# the writing of a move of zero in the set's zeroing row once registers are allocated
+#
+# a move of the immediate zero into a register is rewritten as the set's
+# zeroing row of that register at both operands (`isa.Zeroing`), as x86's
+# `xor eax, eax`, where every location the zeroing row writes or leaves
+# unspecified beyond what the move does is dead after it: on every path from
+# it an instruction writes all of them before any instruction reads one of
+# them or a location sharing storage with one, or the path leaves the
+# function, past which no convention hands a value back in them. what an
+# instruction reads and writes is masc's footprint of its row and the
+# locations it states beyond its row. a write of some of them alone kills
+# none, an inline block or a loop counts as a read, and a pseudo, which
+# emits nothing, as neither. this runs after the frame, the copies and the
+# loops and before layout, so every location is assigned, nearly every
+# instruction is a row, and the block operands name every successor of a
+# block. a block that reads none of them and writes not all of them passes
+# the question to its successors, each block read once per move.
+#
+# nothing here names a set: the rows are the set's zeroings, read as data.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.machine.class.Physical;
+use mirl.machine.effects;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.isa.Zeroing;
+use mirl.machine.isa.Zeroings;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.vstate;
+
+use masc.core.footprint;
+use rf:         masc.core.register;
+use rows:       masc.core.row;
+use core_state: masc.core.state;
+
+# what the instructions a scan reads say of the locations
+# ---
+# LIVE:    one reads a location
+# DEAD:    one writes all of them first
+# THROUGH: none reads one or writes all of them
+val LIVE:    u8 = 0;
+val DEAD:    u8 = 1;
+val THROUGH: u8 = 2;
+
+# what the rewriting of one function holds
+# ---
+# f:      the function
+# ctx:    the context masc's footprints are asked under
+# file:   its register file
+# fp:     the footprint each instruction is asked into
+# beyond: the rows the zeroing row of the move asked last writes or leaves unspecified beyond what the move does
+# graph:  the graph of its blocks
+# seen:   by block, the move whose scan last read it, one more than its number
+# scan:   the number of the move now asked, one more than the last
+# stack:  the blocks the scan has still to read
+rec Zero {
+    f:      *Function;
+    ctx:    *core_state.Context;
+    file:   *rf.File;
+    fp:     *footprint.Footprint;
+    beyond: vector.Vector[u64];
+    graph:  Graph;
+    seen:   vector.Vector[u32];
+    scan:   u32;
+    stack:  vector.Vector[u32];
+}
+
+# a move of the immediate zero into a register a zeroing names
+# ---
+# zeroing: the zeroing, by its place among the set's
+# into:    the register the move writes
+rec Move {
+    zeroing: u32;
+    into:    Physical;
+}
+
+# the move of the immediate zero into a register instruction `d` is, by a zeroing of `zs`, none for none
+fun move_of(zs: Zeroings, d: *InstructionData) opt[Move] {
+    val op: Opcode = d.opcode;
+    if (!(sel op.row))        { ret opt[Move].none{}; }
+    if (d.operands.size != 2) { ret opt[Move].none{}; }
+    val into: Operand = d.operands.data[0];
+    val made: Operand = d.operands.data[1];
+    if (!(sel into.physical))          { ret opt[Move].none{}; }
+    if (!(sel into.physical.register)) { ret opt[Move].none{}; }
+    if (!(sel made.immediate))         { ret opt[Move].none{}; }
+    if (made.immediate != 0)           { ret opt[Move].none{}; }
+    var k: u32 = 0;
+    for (k < zs.len) {
+        if (zs.at[k].long == op.row) { ret opt[Move].some{Move{zeroing: k, into: into.physical}}; }
+        k = k + 1;
+    }
+    ret opt[Move].none{};
+}
+
+# rewrite every move of zero of function `f` whose zeroing row's further writes are dead after it
+# ---
+# a:   the allocator the rewriting takes and gives back
+# f:   the allocated, framed function, its copies lowered and loops expanded, not yet laid out
+# ctx: the context masc's footprints are asked under
+# zs:  the set's zeroings
+# ret: ok, or the allocator's refusal, the function then holding the moves rewritten so far
+pub fun zero(a: *allocator.Allocator, f: *Function, ctx: *core_state.Context, zs: Zeroings) err[allocator.Error] {
+    val file: *rf.File = function.file(f);
+    if (zs.len == 0 || file == nil) { ret err[allocator.Error].ok{}; }
+    var any: bool  = false;
+    var i:   usize = 0;
+    for (i < f.instructions.len && !any) {
+        val opt_move: opt[Move] = move_of(zs, ?f.instructions.data[i]);
+        any = sel opt_move.some;
+        i   = i + 1;
+    }
+    if (!any) { ret err[allocator.Error].ok{}; }
+    val res_fp: res[footprint.Footprint, allocator.Error] = footprint.init(a, file);
+    if (sel res_fp.err) { ret err[allocator.Error].err{res_fp.err}; }
+    var fp: footprint.Footprint = res_fp.ok;
+    fin { footprint.dnit(?fp); }
+    val res_graph: res[Graph, allocator.Error] = function.graph_of(f);
+    if (sel res_graph.err) { ret err[allocator.Error].err{res_graph.err}; }
+    var x:          Zero                 = Zero{f: f, ctx: ctx, file: file, fp: ?fp, beyond: vector.init[u64](a), graph: res_graph.ok, seen: vector.init[u32](a), scan: 0, stack: vector.init[u32](a)};
+    var err_failed: err[allocator.Error] = slice.fill[u32](?x.seen, f.blocks.len, 0);
+    var b:          usize                = 0;
+    for (b < f.blocks.len && sel err_failed.ok) {
+        val list: Slice[Instruction] = function.instructions(f, b::Block);
+        var k:    usize              = 0;
+        for (k < list.size && sel err_failed.ok) {
+            val at:       Instruction = list.data[k];
+            val opt_move: opt[Move]   = move_of(zs, function.data(f, at));
+            if (sel opt_move.some) {
+                val z:        *Zeroing                   = ?zs.at[opt_move.some.zeroing];
+                val res_dead: res[bool, allocator.Error] = dead_after(?x, z, opt_move.some.into, b::Block, k);
+                if (sel res_dead.err)               { err_failed = err[allocator.Error].err{res_dead.err}; }
+                or (sel res_dead.ok && res_dead.ok) { rewrite(f, at, z, opt_move.some.into); }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    keep(?err_failed, vector.dnit[u64](?x.beyond));
+    keep(?err_failed, graph.dnit(?x.graph));
+    keep(?err_failed, vector.dnit[u32](?x.seen));
+    keep(?err_failed, vector.dnit[u32](?x.stack));
+    ret err_failed;
+}
+
+# put zeroing row `z` of register `p`, which the move `at` writes, at both operands in its place
+fun rewrite(f: *Function, at: Instruction, z: *Zeroing, p: Physical) {
+    var ops: [2]Operand = [2]Operand{Operand.physical{p}, Operand.physical{p}};
+    function.replace(f, at, Opcode.row{z.short}, Slice[Operand]{data: ?ops[0], size: 2});
+}
+
+# masc's footprint of row `r` holding `given`, none where masc leaves it undecided
+fun asked(x: *Zero, r: *rows.Row, given: Slice[Operand], state: opt[vstate.State]) res[opt[*footprint.Footprint], allocator.Error] {
+    ret effects.alone(x.fp, x.ctx, r, given, vstate.configured(x.f.set, state));
+}
+
+# the rows a footprint writes or leaves unspecified, or-ed into `into`
+fun gather(into: *vector.Vector[u64], fp: *footprint.Footprint) {
+    var w: usize = 0;
+    for (w < into.len) {
+        into.data[w] = into.data[w] | fp.written.data[w] | fp.clobbers.data[w];
+        w            = w + 1;
+    }
+}
+
+# work out `x.beyond` for the move `at` into register `p`: what zeroing row `z` writes or leaves unspecified of `p` at
+# both operands, less what the move writes or leaves unspecified. false where masc leaves either undecided
+fun beyond_of(x: *Zero, z: *Zeroing, p: Physical, at: Instruction) res[bool, allocator.Error] {
+    val d:     *InstructionData = function.data(x.f, at);
+    val words: usize            = x.fp.written.len;
+    vector.clear[u64](?x.beyond);
+    val err_filled: err[allocator.Error] = slice.fill[u64](?x.beyond, words, 0);
+    if (sel err_filled.err) { ret res[bool, allocator.Error].err{err_filled.err}; }
+    var ops:       [2]Operand                                      = [2]Operand{Operand.physical{p}, Operand.physical{p}};
+    val res_short: res[opt[*footprint.Footprint], allocator.Error] = asked(x, z.short, Slice[Operand]{data: ?ops[0], size: 2}, d.state);
+    if (sel res_short.err)     { ret res[bool, allocator.Error].err{res_short.err}; }
+    if (sel res_short.ok.none) { ret res[bool, allocator.Error].ok{false}; }
+    gather(?x.beyond, res_short.ok.some);
+    val res_long: res[opt[*footprint.Footprint], allocator.Error] = asked(x, z.long, d.operands, d.state);
+    if (sel res_long.err)     { ret res[bool, allocator.Error].err{res_long.err}; }
+    if (sel res_long.ok.none) { ret res[bool, allocator.Error].ok{false}; }
+    val fp: *footprint.Footprint = res_long.ok.some;
+    var w:  usize                = 0;
+    for (w < words) {
+        x.beyond.data[w] = x.beyond.data[w] & ~(fp.written.data[w] | fp.clobbers.data[w]);
+        w                = w + 1;
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# whether register `reg` shares storage with a row of `x.beyond`
+fun touches(x: *Zero, reg: *rf.Register) bool {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        var bits: u64 = x.beyond.data[w];
+        var n:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                if (rf.overlap(x.file, reg, ?x.file.registers[(w::u32 * 64 + n)])) { ret true; }
+            }
+            bits = bits >> 1;
+            n    = n + 1;
+        }
+        w = w + 1;
+    }
+    ret false;
+}
+
+# whether a footprint reads a row sharing storage with one of `x.beyond`
+fun reads_beyond(x: *Zero, fp: *footprint.Footprint) bool {
+    var w: usize = 0;
+    for (w < fp.reads.len) {
+        var bits: u64 = fp.reads.data[w];
+        var n:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                if (touches(x, ?x.file.registers[(w::u32 * 64 + n)])) { ret true; }
+            }
+            bits = bits >> 1;
+            n    = n + 1;
+        }
+        w = w + 1;
+    }
+    ret false;
+}
+
+# whether a footprint leaves no bit of any row of `x.beyond` as it was
+fun kills_beyond(x: *Zero, fp: *footprint.Footprint) bool {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        var bits: u64 = x.beyond.data[w];
+        var n:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                if (!footprint.kills(fp, rf.id_of(?x.file.registers[(w::u32 * 64 + n)]))) { ret false; }
+            }
+            bits = bits >> 1;
+            n    = n + 1;
+        }
+        w = w + 1;
+    }
+    ret true;
+}
+
+# what instruction `at` says of `x.beyond`
+fun verdict(x: *Zero, at: Instruction) res[u8, allocator.Error] {
+    val d:  *InstructionData = function.data(x.f, at);
+    val op: Opcode           = d.opcode;
+    if (sel op.pseudo) { ret res[u8, allocator.Error].ok{THROUGH}; }
+    if (!(sel op.row)) { ret res[u8, allocator.Error].ok{LIVE}; }
+    var k: usize = 0;
+    for (k < d.implicit.size) {
+        val l: Physical = d.implicit.data[k].location;
+        if (!d.implicit.data[k].write) {
+            if (sel l.register) {
+                val opt_row_of: opt[*rf.Register] = rf.row_of(x.file, l.register);
+                if (sel opt_row_of.none)         { ret res[u8, allocator.Error].ok{LIVE}; }
+                if (touches(x, opt_row_of.some)) { ret res[u8, allocator.Error].ok{LIVE}; }
+            }
+        }
+        k = k + 1;
+    }
+    val res_asked: res[opt[*footprint.Footprint], allocator.Error] = asked(x, op.row, d.operands, d.state);
+    if (sel res_asked.err)                  { ret res[u8, allocator.Error].err{res_asked.err}; }
+    if (sel res_asked.ok.none)              { ret res[u8, allocator.Error].ok{LIVE}; }
+    if (reads_beyond(x, res_asked.ok.some)) { ret res[u8, allocator.Error].ok{LIVE}; }
+    if (kills_beyond(x, res_asked.ok.some)) { ret res[u8, allocator.Error].ok{DEAD}; }
+    ret res[u8, allocator.Error].ok{THROUGH};
+}
+
+# what the instructions of block `b` from position `from` on say of `x.beyond`
+fun block_verdict(x: *Zero, b: Block, from: usize) res[u8, allocator.Error] {
+    val list: Slice[Instruction] = function.instructions(x.f, b);
+    var k:    usize              = from;
+    for (k < list.size) {
+        val res_verdict: res[u8, allocator.Error] = verdict(x, list.data[k]);
+        if (sel res_verdict.err)       { ret res_verdict; }
+        if (res_verdict.ok != THROUGH) { ret res_verdict; }
+        k = k + 1;
+    }
+    ret res[u8, allocator.Error].ok{THROUGH};
+}
+
+# the successors of block `b` pushed for the scan to read
+fun push_successors(x: *Zero, b: Block) err[allocator.Error] {
+    val next: Slice[u32] = graph.successors(?x.graph, b);
+    var k:    usize      = 0;
+    for (k < next.size) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[u32](?x.stack, next.data[k]);
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether what zeroing row `z` writes beyond the move into `p` at position `k` of block `b` is dead after it
+fun dead_after(x: *Zero, z: *Zeroing, p: Physical, b: Block, k: usize) res[bool, allocator.Error] {
+    val list:       Slice[Instruction]         = function.instructions(x.f, b);
+    val res_beyond: res[bool, allocator.Error] = beyond_of(x, z, p, list.data[k]);
+    if (sel res_beyond.err) { ret res_beyond; }
+    if (!res_beyond.ok)     { ret res[bool, allocator.Error].ok{false}; }
+    val res_here: res[u8, allocator.Error] = block_verdict(x, b, k + 1);
+    if (sel res_here.err)       { ret res[bool, allocator.Error].err{res_here.err}; }
+    if (res_here.ok != THROUGH) { ret res[bool, allocator.Error].ok{res_here.ok == DEAD}; }
+    x.scan = x.scan + 1;
+    vector.clear[u32](?x.stack);
+    val err_pushed: err[allocator.Error] = push_successors(x, b);
+    if (sel err_pushed.err) { ret res[bool, allocator.Error].err{err_pushed.err}; }
+    for (x.stack.len > 0) {
+        val opt_popped: opt[u32] = vector.pop[u32](?x.stack);
+        if (sel opt_popped.none) { brk; }
+        val s: u32 = opt_popped.some;
+        if (x.seen.data[s] == x.scan) { cnt; }
+        x.seen.data[s] = x.scan;
+        val res_there: res[u8, allocator.Error] = block_verdict(x, s, 0);
+        if (sel res_there.err)    { ret res[bool, allocator.Error].err{res_there.err}; }
+        if (res_there.ok == LIVE) { ret res[bool, allocator.Error].ok{false}; }
+        if (res_there.ok == THROUGH) {
+            val err_more: err[allocator.Error] = push_successors(x, s);
+            if (sel err_more.err) { ret res[bool, allocator.Error].err{err_more.err}; }
+        }
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
