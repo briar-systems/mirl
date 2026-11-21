@@ -1,0 +1,583 @@
+# loop rotation: a loop that tests at its top tests once ahead of it, as a guard, and again at its bottom, so the
+# block every trip begins with is the body and not the test
+#
+# a loop is taken when it has one latch, its header is not the function's entry, the header ends in a `cbr` with one
+# edge to a block of the loop (the body's first block, which the header alone enters, by that one edge) and one to a
+# block outside it, and every other instruction of the header is plain and speculatable (no memory, no trap, not
+# volatile, not kept, so no slot, marker, call or inline assembly item), at most SIZE of them. every reader of a value
+# the header defines, its parameters and its results, a value binding record included, stands in the header, in a
+# block the body's first block dominates, or in one the outside target dominates, and in that last case every edge
+# into the outside target other than the header's leaves a block the body's first block dominates. the pass reads all
+# of this off the loops and the dominator tree before it changes anything, and a loop that fails any of it is left
+# exactly as it is.
+#
+# the header is copied as a new block, the guard, and every edge that entered the header from outside the loop enters
+# the guard instead, with its arguments: the guard's parameters take the entry values and its test reads them. the
+# guard's edge into the body gets a block of its own, the preheader, which only jumps on. the header stays where it
+# was as the loop's bottom test: the old latch still enters it with the next values, and its edge into the body gets a
+# block of its own as well, the new latch, which only jumps on. the body's first block gets a parameter for each value
+# of the header a reader past the test reads, the preheader passing the guard's copy and the latch the bottom test's
+# own, and those readers read the parameter. each of the two edges into the body passes values to its parameters, and
+# an edge of a `cbr` into a block another edge enters too has no place for them (`mirl.opt.bypass`), so each enters
+# through a block of its own. a value read past the outside target is passed the same way into a parameter of that
+# target: the guard passes its copy, the bottom test its own and every other edge the body's parameter.
+#
+# why it is right: every run of the header's code becomes exactly one run of a copy of it at the same point of the
+# trace, the guard on entry and the bottom test after each trip, with the same operands, so no instruction runs more
+# or fewer times or in another order, and the loop runs the trips it ran: none when the entry values fail the test.
+# the copied code reads no memory and cannot trap, so the copy changes nothing but the code's size, which SIZE bounds:
+# a `for` test joined by `&&` or `||` is cut into blocks of one compare each, so a header holds one compare and the few
+# offsets and widenings of its two sides, and eight admits every such test while a header past it is doing work a
+# guard would copy for nothing.
+#
+# what it gives the passes after it: a preheader the guard dominates and the one block that enters the loop, a single
+# latch that only jumps to the header, after the bottom test, and the body's first block as the loop's header, which
+# runs on every entry before anything else of the loop. licm moves a load or an operation that may trap only out of a loop's header, so it now reaches
+# the body. a loop whose body is its header already, and a loop entered at the function's entry, stay as they are,
+# and each header is taken once, so the pass ends.
+#
+# it runs after vectorisation and unrolling, which read a loop tested at its top (the vectoriser a header holding only
+# the compare, the unroller an exit block no edge from outside the loop enters), with loop invariant code motion as
+# its follow-up over the functions it changed. it costs each loop it takes the header's instructions and the uses of
+# their values, and a scan of the function's records where one of them has a record. it reads the loops and the
+# dominator tree. the guard branches on the value the header's first test branched on, and the bottom test on the
+# values every later test did, so the code branches on the same values in the same order and on no other: it keeps
+# constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.remap;
+use mirl.build.remap.Remap;
+use mirl.ir.body;
+use mirl.ir.body.Source;
+use mirl.ir.cfg.copy;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.edge;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.table;
+use mirl.ir.point;
+use mirl.ir.point.Reads;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.ValueData;
+use mirl.opt.instance.plain;
+use mirl.opt.instance.row_of;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.record.did;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it adds blocks and moves edges, so it keeps no analysis
+pub val ROTATE: Pass = Pass{name: "rotate", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_DOMINANCE | analysis.OF_LOOPS, preserves: cache.NONE, time: Time.keeps{}, counts: "loops rotated"};
+
+# the most instructions besides its branch a header the pass copies holds
+val SIZE: usize = 8;
+
+# where the readers of a header's value stand
+val IN_HEADER: u8 = 0;
+val IN_BODY:   u8 = 1;
+val PAST:      u8 = 2;
+val ELSEWHERE: u8 = 3;
+
+# one value of the header and what it becomes
+# ---
+# v:    the value
+# copy: its copy in the guard
+# body: the body's parameter for it, read where `in_body`
+# past: the outside target's parameter for it, read where `in_past`
+# in_body, in_past: a reader stands where the body's first block, or the outside target, dominates
+rec Carried {
+    v:       Value;
+    copy:    Value;
+    body:    Value;
+    past:    Value;
+    in_body: bool;
+    in_past: bool;
+}
+
+# one loop the pass takes
+# ---
+# head:    its header
+# inside:  the body's first block, the header's target in the loop
+# outside: the header's target outside the loop
+# count:   the blocks the function held before the edits, the ones the dominator tree knows
+# latch:   the block the bottom test's edge into the body enters through, once it is made
+rec Shape {
+    head:    Block;
+    inside:  Block;
+    outside: Block;
+    count:   usize;
+    latch:   Block;
+}
+
+# one run over a function
+# ---
+# c:       the run
+# f:       the function
+# b:       its body
+# scratch: storage for one loop's lists
+# seen:    per block, whether a loop it heads was looked at, so each header is taken once
+rec Run {
+    c:       *Context;
+    f:       Function;
+    b:       *Body;
+    scratch: *allocator.Allocator;
+    seen:    vector.Vector[bool];
+}
+
+fun refused[T](e: allocator.Error) res[T, refusal.Error] {
+    ret res[T, refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+fun broken[T](e: module.Error) res[T, refusal.Error] {
+    ret res[T, refusal.Error].err{refusal.Error.ir{e}};
+}
+
+# the block an instruction stands in, none where it stands in none
+fun block_of(x: *Run, i: Instruction) opt[Block] {
+    val place: Place = x.b.instructions.data[i].place;
+    if (sel place.placed) { ret opt[Block].some{place.placed}; }
+    ret opt[Block].none{};
+}
+
+# whether every instruction of the header but its branch may be copied, and they are at most SIZE
+fun copyable(x: *Run, head: Block, term: Instruction) res[bool, refusal.Error] {
+    var count: usize       = 0;
+    var i:     Instruction = x.b.blocks.data[head].first;
+    for (i != term) {
+        val d:          *InstructionData         = ?x.b.instructions.data[i];
+        val res_row_of: res[*Row, refusal.Error] = row_of(d);
+        if (sel res_row_of.err)                                              { ret res[bool, refusal.Error].err{res_row_of.err}; }
+        if (!plain(d, res_row_of.ok) || !res_row_of.ok.effects.speculatable) { ret res[bool, refusal.Error].ok{false}; }
+        count = count + 1;
+        if (count > SIZE) { ret res[bool, refusal.Error].ok{false}; }
+        i = d.next;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# where a reader in block `k` stands
+fun where(d: *Dominance, s: *Shape, k: Block) u8 {
+    if (k == s.head)                          { ret IN_HEADER; }
+    if (dominance.dominates(d, s.inside, k))  { ret IN_BODY; }
+    if (dominance.dominates(d, s.outside, k)) { ret PAST; }
+    ret ELSEWHERE;
+}
+
+# note a reader of `c` in block `k`, false where it stands where the pass cannot reach it
+fun note(d: *Dominance, s: *Shape, c: *Carried, k: Block) bool {
+    val at: u8 = where(d, s, k);
+    if (at == IN_BODY) { c.in_body = true; }
+    if (at == PAST)    { c.in_past = true; }
+    ret at != ELSEWHERE;
+}
+
+# the entry of `values` for value `v`, none where it is not one
+fun find(values: *vector.Vector[Carried], v: Value) opt[usize] {
+    var j: usize = 0;
+    for (j < values.len) {
+        if (values.data[j].v == v) { ret opt[usize].some{j}; }
+        j = j + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# note the readers of the header's values among the records of a run, false where one stands out of reach
+fun note_run(x: *Run, d: *Dominance, s: *Shape, values: *vector.Vector[Carried], run: point.Run, k: Block) bool {
+    var p: u32 = run.first;
+    for (p != 0) {
+        val pt:       point.Point = x.b.points.data[p - 1];
+        val opt_read: opt[Value]  = point.read(pt.reads);
+        if (sel opt_read.some) {
+            val opt_at: opt[usize] = find(values, opt_read.some);
+            if (sel opt_at.some && !note(d, s, ?values.data[opt_at.some], k)) { ret false; }
+        }
+        if (p == run.last) { brk; }
+        p = pt.next;
+    }
+    ret true;
+}
+
+# the header's values and where their readers stand, false where a reader stands out of reach
+fun gather(x: *Run, d: *Dominance, s: *Shape, values: *vector.Vector[Carried]) res[bool, refusal.Error] {
+    var j: usize = 0;
+    for (j < x.b.blocks.data[s.head].parameters.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Carried](values, Carried{v: x.b.blocks.data[s.head].parameters.data[j]});
+        if (sel res_pushed.err) { ret refused[bool](res_pushed.err); }
+        j = j + 1;
+    }
+    var i: Instruction = x.b.blocks.data[s.head].first;
+    for (i != NO_INSTRUCTION) {
+        var r: usize = 0;
+        for (r < x.b.instructions.data[i].results.len) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Carried](values, Carried{v: x.b.instructions.data[i].results.data[r]});
+            if (sel res_pushed.err) { ret refused[bool](res_pushed.err); }
+            r = r + 1;
+        }
+        i = x.b.instructions.data[i].next;
+    }
+    var records: bool = false;
+    j = 0;
+    for (j < values.len) {
+        val vd: *ValueData = ?x.b.values.data[values.data[j].v];
+        if (vd.bound.len != 0) { records = true; }
+        var u: usize = 0;
+        for (u < vd.uses.len) {
+            val opt_in: opt[Block] = block_of(x, vd.uses.data[u]);
+            if (sel opt_in.none)                           { ret res[bool, refusal.Error].ok{false}; }
+            if (!note(d, s, ?values.data[j], opt_in.some)) { ret res[bool, refusal.Error].ok{false}; }
+            u = u + 1;
+        }
+        j = j + 1;
+    }
+    if (records) {
+        var k: usize = 0;
+        for (k < x.b.blocks.len) {
+            if (!x.b.blocks.data[k].erased && k::u32 != s.head) {
+                if (!note_run(x, d, s, values, x.b.blocks.data[k].ending, k::u32)) { ret res[bool, refusal.Error].ok{false}; }
+                var at: Instruction = x.b.blocks.data[k].first;
+                for (at != NO_INSTRUCTION) {
+                    if (!note_run(x, d, s, values, x.b.instructions.data[at].points, k::u32)) { ret res[bool, refusal.Error].ok{false}; }
+                    at = x.b.instructions.data[at].next;
+                }
+            }
+            k = k + 1;
+        }
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# whether every edge into the outside target other than the header's leaves a block the body's first block dominates,
+# so the body's parameter is defined where it starts
+fun joins_body(x: *Run, d: *Dominance, s: *Shape) bool {
+    val preds: usize = x.b.blocks.data[s.outside].predecessors.len;
+    var p:     usize = 0;
+    for (p < preds) {
+        val opt_from: opt[Block] = block_of(x, x.b.blocks.data[s.outside].predecessors.data[p]);
+        if (sel opt_from.none)                                                           { ret false; }
+        if (opt_from.some != s.head && !dominance.dominates(d, s.inside, opt_from.some)) { ret false; }
+        p = p + 1;
+    }
+    ret true;
+}
+
+# the edges into the header from outside the loop, into `sources`
+fun entries(x: *Run, l: *Loops, n: u32, s: *Shape, sources: *vector.Vector[Source]) err[allocator.Error] {
+    val preds: usize = x.b.blocks.data[s.head].predecessors.len;
+    var p:     usize = 0;
+    for (p < preds) {
+        val i:        Instruction = x.b.blocks.data[s.head].predecessors.data[p];
+        val opt_from: opt[Block]  = block_of(x, i);
+        var taken:    bool        = false;
+        var q:        usize       = 0;
+        for (q < sources.len) {
+            if (sources.data[q].branch == i) { taken = true; }
+            q = q + 1;
+        }
+        var outside: bool = false;
+        if (sel opt_from.some) { outside = !loops.contains(l, n, opt_from.some); }
+        if (outside && !taken) {
+            var e: usize = 0;
+            for (e < x.b.instructions.data[i].edges.len) {
+                if (x.b.instructions.data[i].edges.data[e].block == s.head) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Source](sources, Source{branch: i, edge: e::u32});
+                    if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+                }
+                e = e + 1;
+            }
+        }
+        p = p + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the loop's shape where the pass takes it, none where it does not
+fun shape(x: *Run, l: *Loops, n: u32) res[opt[Shape], refusal.Error] {
+    val no:   res[opt[Shape], refusal.Error] = res[opt[Shape], refusal.Error].ok{opt[Shape].none{}};
+    val head: Block                          = loops.loop(l, n).header;
+    if (head == 0 || loops.latches(l, n).size != 1) { ret no; }
+    val term: Instruction = x.b.blocks.data[head].last;
+    if (term == NO_INSTRUCTION) { ret no; }
+    val d: *InstructionData = ?x.b.instructions.data[term];
+    if (d.opcode != table.CBR || d.edges.len != 2) { ret no; }
+    val first:   Block = d.edges.data[0].block;
+    val second:  Block = d.edges.data[1].block;
+    var inside:  Block = first;
+    var outside: Block = second;
+    if (!loops.contains(l, n, first)) {
+        inside  = second;
+        outside = first;
+    }
+    if (!loops.contains(l, n, inside) || loops.contains(l, n, outside))  { ret no; }
+    if (inside == head || x.b.blocks.data[inside].predecessors.len != 1) { ret no; }
+    val res_copyable: res[bool, refusal.Error] = copyable(x, head, term);
+    if (sel res_copyable.err) { ret res[opt[Shape], refusal.Error].err{res_copyable.err}; }
+    if (!res_copyable.ok)     { ret no; }
+    ret res[opt[Shape], refusal.Error].ok{opt[Shape].some{Shape{head: head, inside: inside, outside: outside, count: x.b.blocks.len, latch: NONE}}};
+}
+
+# the argument each edge into block `k` passes for carried value `c`: the value from the header or the latch, its copy
+# from the guard or the preheader, the body's parameter from any other
+fun incoming(x: *Run, k: Block, s: *Shape, guard: Block, pre: Block, c: *Carried) res[Slice[Value], refusal.Error] {
+    val preds:    usize                        = x.b.blocks.data[k].predecessors.len;
+    val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](x.scratch, preds + 1);
+    if (sel res_room.err) { ret refused[Slice[Value]](res_room.err); }
+    var p: usize = 0;
+    for (p < preds) {
+        val opt_from: opt[Block] = block_of(x, x.b.blocks.data[k].predecessors.data[p]);
+        if (sel opt_from.none) { ret broken[Slice[Value]](module.Error.instruction{x.b.blocks.data[k].predecessors.data[p]}); }
+        var given: Value = c.body;
+        if (opt_from.some == s.head || opt_from.some == s.latch) { given = c.v; }
+        if (opt_from.some == guard || opt_from.some == pre)      { given = c.copy; }
+        res_room.ok[p] = given;
+        p              = p + 1;
+    }
+    ret res[Slice[Value], refusal.Error].ok{Slice[Value]{data: res_room.ok, size: preds}};
+}
+
+# the value a reader in block `k` reads in place of carried value `c`
+fun stand_in(d: *Dominance, s: *Shape, c: *Carried, k: Block) Value {
+    if (where(d, s, k) == IN_BODY) { ret c.body; }
+    ret c.past;
+}
+
+# make the records of a run in block `k` that read a carried value read what stands in for it there
+fun reread(x: *Run, d: *Dominance, s: *Shape, values: *vector.Vector[Carried], run: point.Run, k: Block) err[refusal.Error] {
+    var p: u32 = run.first;
+    for (p != 0) {
+        val pt:    point.Point = x.b.points.data[p - 1];
+        val reads: Reads       = pt.reads;
+        if (sel reads.operand) {
+            val opt_at: opt[usize] = find(values, reads.operand.value);
+            if (sel opt_at.some) {
+                val to:          Value              = stand_in(d, s, ?values.data[opt_at.some], k);
+                val err_rebound: err[refusal.Error] = edit(body.rebind(x.c.m, x.f, p - 1, Reads.operand{point.Operand{value: to, expression: reads.operand.expression}}));
+                if (sel err_rebound.err) { ret err_rebound; }
+            }
+        }
+        if (p == run.last) { brk; }
+        p = pt.next;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# rotate loop `n` where the pass takes it, answering the body's first block, now its header
+fun rotate(x: *Run, l: *Loops, d: *Dominance, n: u32) res[opt[Block], refusal.Error] {
+    val no:        res[opt[Block], refusal.Error] = res[opt[Block], refusal.Error].ok{opt[Block].none{}};
+    val res_shape: res[opt[Shape], refusal.Error] = shape(x, l, n);
+    if (sel res_shape.err)     { ret res[opt[Block], refusal.Error].err{res_shape.err}; }
+    if (sel res_shape.ok.none) { ret no; }
+    var s:            Shape                    = res_shape.ok.some;
+    var values:       vector.Vector[Carried]   = vector.init[Carried](x.scratch);
+    val res_gathered: res[bool, refusal.Error] = gather(x, d, ?s, ?values);
+    if (sel res_gathered.err) { ret res[opt[Block], refusal.Error].err{res_gathered.err}; }
+    if (!res_gathered.ok)     { ret no; }
+    var past: bool  = false;
+    var j:    usize = 0;
+    for (j < values.len) {
+        if (values.data[j].in_past) { past = true; }
+        j = j + 1;
+    }
+    if (past && !joins_body(x, d, ?s)) { ret no; }
+    var sources:     vector.Vector[Source] = vector.init[Source](x.scratch);
+    val err_entered: err[allocator.Error]  = entries(x, l, n, ?s, ?sources);
+    if (sel err_entered.err) { ret refused[opt[Block]](err_entered.err); }
+    if (sources.len == 0)    { ret no; }
+
+    var r: Remap = remap.init(x.c.m.a);
+    fin { remap.dnit(?r); }
+    var region:     [1]Block   = [1]Block{s.head};
+    val err_copied: err[Error] = copy.region(x.c.m, x.f, x.f, Slice[Block]{data: ?region[0], size: 1}, ?r);
+    if (sel err_copied.err) { ret res[opt[Block], refusal.Error].err{refusal.Error.cfg{err_copied.err}}; }
+    val opt_guard: opt[Block] = remap.block(?r, s.head);
+    if (sel opt_guard.none) { ret broken[opt[Block]](module.Error.block{s.head}); }
+    val guard: Block = opt_guard.some;
+    j = 0;
+    for (j < values.len) {
+        val opt_copy: opt[Value] = remap.value(?r, values.data[j].v);
+        if (sel opt_copy.none) { ret broken[opt[Block]](module.Error.value{values.data[j].v}); }
+        values.data[j].copy = opt_copy.some;
+        j                   = j + 1;
+    }
+    val err_moved: err[refusal.Error] = edit(body.reroute(x.c.m, x.f, Slice[Source]{data: sources.data, size: sources.len}, guard));
+    if (sel err_moved.err) { ret res[opt[Block], refusal.Error].err{err_moved.err}; }
+    val test: Instruction = x.b.blocks.data[guard].last;
+    var into: u32         = 0;
+    if (x.b.instructions.data[test].edges.data[0].block != s.inside) { into = 1; }
+    val res_pre: res[Block, Error] = edge.split(x.c.m, x.f, test, into);
+    if (sel res_pre.err) { ret res[opt[Block], refusal.Error].err{refusal.Error.cfg{res_pre.err}}; }
+    val pre:   Block       = res_pre.ok;
+    val back:  Instruction = x.b.blocks.data[s.head].last;
+    var again: u32         = 0;
+    if (x.b.instructions.data[back].edges.data[0].block != s.inside) { again = 1; }
+    val res_latch: res[Block, Error] = edge.split(x.c.m, x.f, back, again);
+    if (sel res_latch.err) { ret res[opt[Block], refusal.Error].err{refusal.Error.cfg{res_latch.err}}; }
+    s.latch = res_latch.ok;
+
+    # the readers of each carried value, taken before any parameter adds a reader
+    var users: vector.Vector[vector.Vector[Instruction]] = vector.init[vector.Vector[Instruction]](x.scratch);
+    j = 0;
+    for (j < values.len) {
+        var list: vector.Vector[Instruction] = vector.init[Instruction](x.scratch);
+        val vd:   *ValueData                 = ?x.b.values.data[values.data[j].v];
+        var u:    usize                      = 0;
+        for (u < vd.uses.len) {
+            val i:      Instruction = vd.uses.data[u];
+            val opt_in: opt[Block]  = block_of(x, i);
+            var keep:   bool        = false;
+            if (sel opt_in.some) { keep = opt_in.some != s.head && opt_in.some::usize < s.count; }
+            if (keep) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?list, i);
+                if (sel res_pushed.err) { ret refused[opt[Block]](res_pushed.err); }
+            }
+            u = u + 1;
+        }
+        val res_pushed: res[usize, allocator.Error] = vector.push[vector.Vector[Instruction]](?users, list);
+        if (sel res_pushed.err) { ret refused[opt[Block]](res_pushed.err); }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < values.len) {
+        val c:  *Carried  = ?values.data[j];
+        val vd: ValueData = x.b.values.data[c.v];
+        if (c.in_body || c.in_past) {
+            val res_in: res[Slice[Value], refusal.Error] = incoming(x, s.inside, ?s, guard, pre, c);
+            if (sel res_in.err) { ret res[opt[Block], refusal.Error].err{res_in.err}; }
+            val res_param: res[Value, module.Error] = body.add_parameter(x.c.m, x.f, s.inside, Declaration{type: vd.type, secret: vd.secret}, res_in.ok);
+            if (sel res_param.err) { ret broken[opt[Block]](res_param.err); }
+            c.body = res_param.ok;
+        }
+        if (c.in_past) {
+            val res_in: res[Slice[Value], refusal.Error] = incoming(x, s.outside, ?s, guard, pre, c);
+            if (sel res_in.err) { ret res[opt[Block], refusal.Error].err{res_in.err}; }
+            val res_param: res[Value, module.Error] = body.add_parameter(x.c.m, x.f, s.outside, Declaration{type: vd.type, secret: vd.secret}, res_in.ok);
+            if (sel res_param.err) { ret broken[opt[Block]](res_param.err); }
+            c.past = res_param.ok;
+        }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < values.len) {
+        val c:    *Carried                    = ?values.data[j];
+        val list: *vector.Vector[Instruction] = ?users.data[j];
+        var u:    usize                       = 0;
+        for (u < list.len) {
+            val opt_in: opt[Block] = block_of(x, list.data[u]);
+            if (sel opt_in.none) { ret broken[opt[Block]](module.Error.instruction{list.data[u]}); }
+            val err_read: err[refusal.Error] = edit(body.substitute(x.c.m, x.f, list.data[u], c.v, stand_in(d, ?s, c, opt_in.some)));
+            if (sel err_read.err) { ret res[opt[Block], refusal.Error].err{err_read.err}; }
+            u = u + 1;
+        }
+        j = j + 1;
+    }
+    var k: usize = 0;
+    for (k < s.count) {
+        if (!x.b.blocks.data[k].erased && k::u32 != s.head) {
+            val err_ending: err[refusal.Error] = reread(x, d, ?s, ?values, x.b.blocks.data[k].ending, k::u32);
+            if (sel err_ending.err) { ret res[opt[Block], refusal.Error].err{err_ending.err}; }
+            var at: Instruction = x.b.blocks.data[k].first;
+            for (at != NO_INSTRUCTION) {
+                val err_points: err[refusal.Error] = reread(x, d, ?s, ?values, x.b.instructions.data[at].points, k::u32);
+                if (sel err_points.err) { ret res[opt[Block], refusal.Error].err{err_points.err}; }
+                at = x.b.instructions.data[at].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[opt[Block], refusal.Error].ok{opt[Block].some{s.inside}};
+}
+
+# grow the marks to the function's blocks
+fun cover(x: *Run) err[allocator.Error] {
+    for (x.seen.len < x.b.blocks.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[bool](?x.seen, false);
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# rotate one loop not looked at yet, innermost first, answering whether one rotated
+fun step(x: *Run) res[bool, refusal.Error] {
+    val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(x.c.cache, x.f);
+    if (sel res_loops_of.err) { ret res[bool, refusal.Error].err{res_loops_of.err}; }
+    val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(x.c.cache, x.f);
+    if (sel res_dominance_of.err) { ret res[bool, refusal.Error].err{res_dominance_of.err}; }
+    val l:         *Loops               = res_loops_of.ok;
+    val err_grown: err[allocator.Error] = cover(x);
+    if (sel err_grown.err) { ret refused[bool](err_grown.err); }
+    var n: u32 = loops.count(l);
+    for (n > 0) {
+        n = n - 1;
+        val head: Block = loops.loop(l, n).header;
+        if (!x.seen.data[head]) {
+            x.seen.data[head] = true;
+            val res_done: res[opt[Block], refusal.Error] = rotate(x, l, res_dominance_of.ok, n);
+            if (sel res_done.err) { ret res[bool, refusal.Error].err{res_done.err}; }
+            if (sel res_done.ok.some) {
+                val err_cover: err[allocator.Error] = cover(x);
+                if (sel err_cover.err) { ret refused[bool](err_cover.err); }
+                x.seen.data[res_done.ok.some] = true;
+                val err_dropped: err[allocator.Error] = cache.forget(x.c.cache, x.f);
+                if (sel err_dropped.err) { ret refused[bool](err_dropped.err); }
+                ret res[bool, refusal.Error].ok{true};
+            }
+        }
+    }
+    ret res[bool, refusal.Error].ok{false};
+}
+
+# rotate every loop of one function the pass takes
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var x: Run = Run{c: c, f: u.f, b: res_body.ok, scratch: ?scratch, seen: vector.init[bool](c.m.a)};
+    fin { vector.dnit[bool](?x.seen); }
+    var changed: bool = false;
+    for {
+        arena.reset(?ar);
+        val res_step: res[bool, refusal.Error] = step(?x);
+        if (sel res_step.err) { ret res_step; }
+        if (!res_step.ok)     { brk; }
+        did(c, u.f, 1);
+        changed = true;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

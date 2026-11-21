@@ -1,0 +1,323 @@
+# whether locations an instruction would leave changed are dead after it, once registers are allocated
+#
+# a stage after allocation that writes an instruction in another row, or drops
+# one, asks of the locations the change leaves holding another value, as the
+# flags x86's xor writes and its move does not: on every path from the
+# instruction an instruction writes all of them before any instruction reads
+# one of them or a location sharing storage with one, or the path leaves the
+# function, past which no convention hands a value back in them. what an
+# instruction reads and writes is masc's footprint of its row and the
+# locations it states beyond its row. a write of some of them alone kills
+# none, an inline block or a loop counts as a read, and a pseudo, which
+# emits nothing, as neither. the stages that ask run after the frame, the
+# copies and the loops and before layout, so every location is assigned,
+# nearly every instruction is a row, and the block operands name every
+# successor of a block. a block that reads none of them and writes not all of
+# them passes the question to its successors, each block read once per
+# question.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.machine.class.Physical;
+use mirl.machine.effects;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.vstate;
+
+use masc.core.footprint;
+use rf:         masc.core.register;
+use rows:       masc.core.row;
+use core_state: masc.core.state;
+
+# what the instructions a scan reads say of the locations
+# ---
+# LIVE:    one reads a location
+# DEAD:    one writes all of them first
+# THROUGH: none reads one or writes all of them
+val LIVE:    u8 = 0;
+val DEAD:    u8 = 1;
+val THROUGH: u8 = 2;
+
+# what the questions of one function hold
+# ---
+# f:       the function
+# ctx:     the context masc's footprints are asked under
+# file:    its register file
+# fp:      the footprint each instruction is asked into
+# beyond:  the rows the question asks of, which the asking stage sets
+# kept:    the rows the instructions held write or leave unspecified
+# defined: of those, the rows the last of them to touch each leaves defined
+# graph:   the graph of its blocks
+# seen:    by block, the question that last read it, one more than its number
+# scan:    the number of the question now asked, one more than the last
+# stack:   the blocks the scan has still to read
+pub rec Scan {
+    f:       *Function;
+    ctx:     *core_state.Context;
+    file:    *rf.File;
+    fp:      footprint.Footprint;
+    beyond:  vector.Vector[u64];
+    kept:    vector.Vector[u64];
+    defined: vector.Vector[u64];
+    graph:   Graph;
+    seen:    vector.Vector[u32];
+    scan:    u32;
+    stack:   vector.Vector[u32];
+}
+
+# a scan of function `f`, allocated with a register file, which `dnit` gives back
+# ---
+# ret: the scan, or the allocator's refusal
+pub fun init(a: *allocator.Allocator, f: *Function, ctx: *core_state.Context) res[Scan, allocator.Error] {
+    val file:   *rf.File                                  = function.file(f);
+    val res_fp: res[footprint.Footprint, allocator.Error] = footprint.init(a, file);
+    if (sel res_fp.err) { ret res[Scan, allocator.Error].err{res_fp.err}; }
+    val res_graph: res[Graph, allocator.Error] = function.graph_of(f);
+    if (sel res_graph.err) {
+        var fp: footprint.Footprint = res_fp.ok;
+        footprint.dnit(?fp);
+        ret res[Scan, allocator.Error].err{res_graph.err};
+    }
+    var x:          Scan                 = Scan{f: f, ctx: ctx, file: file, fp: res_fp.ok, beyond: vector.init[u64](a), kept: vector.init[u64](a), defined: vector.init[u64](a), graph: res_graph.ok, seen: vector.init[u32](a), scan: 0, stack: vector.init[u32](a)};
+    var err_failed: err[allocator.Error] = slice.fill[u32](?x.seen, f.blocks.len, 0);
+    keep(?err_failed, slice.fill[u64](?x.beyond, x.fp.written.len, 0));
+    keep(?err_failed, slice.fill[u64](?x.kept, x.fp.written.len, 0));
+    keep(?err_failed, slice.fill[u64](?x.defined, x.fp.written.len, 0));
+    if (sel err_failed.err) {
+        dnit(?x);
+        ret res[Scan, allocator.Error].err{err_failed.err};
+    }
+    ret res[Scan, allocator.Error].ok{x};
+}
+
+# give back what a scan holds
+pub fun dnit(x: *Scan) {
+    footprint.dnit(?x.fp);
+    vector.dnit[u64](?x.beyond);
+    vector.dnit[u64](?x.kept);
+    vector.dnit[u64](?x.defined);
+    graph.dnit(?x.graph);
+    vector.dnit[u32](?x.seen);
+    vector.dnit[u32](?x.stack);
+}
+
+# masc's footprint of row `r` holding `given`, none where masc leaves it undecided
+pub fun asked(x: *Scan, r: *rows.Row, given: Slice[Operand], state: opt[vstate.State]) res[opt[*footprint.Footprint], allocator.Error] {
+    ret effects.alone(?x.fp, x.ctx, r, given, vstate.configured(x.f.set, state));
+}
+
+# no rows asked of, and no instruction held
+pub fun clear(x: *Scan) {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        x.beyond.data[w]  = 0;
+        x.kept.data[w]    = 0;
+        x.defined.data[w] = 0;
+        w                 = w + 1;
+    }
+}
+
+# hold what the last footprint asked leaves after what was held before it, as one more instruction of the ones a
+# stage would change: the rows they write or leave unspecified, and of those the ones the last to touch each leaves
+# defined
+pub fun hold(x: *Scan) {
+    var w: usize = 0;
+    for (w < x.kept.len) {
+        val now: u64 = x.fp.written.data[w] | x.fp.clobbers.data[w];
+        x.kept.data[w]    = x.kept.data[w] | now;
+        x.defined.data[w] = (x.defined.data[w] & ~now) | (x.fp.written.data[w] & ~x.fp.clobbers.data[w]);
+        w                 = w + 1;
+    }
+}
+
+# ask also of the rows the instructions held by `hold` and the one the last footprint asked would leave unlike each
+# other, the last standing in for the held: a row one touches and the other does not, and a row the held leave
+# defined and the last leaves unspecified. a row both leave defined is taken as left the same, which the stage
+# asking states of its rows
+pub fun changed(x: *Scan) {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        val now: u64 = x.fp.written.data[w] | x.fp.clobbers.data[w];
+        x.beyond.data[w] = x.beyond.data[w] | (now ^ x.kept.data[w]) | (x.fp.clobbers.data[w] & x.defined.data[w]);
+        w                = w + 1;
+    }
+}
+
+# ask also of every row the instructions held by `hold` leave defined, as where they are dropped
+pub fun defined(x: *Scan) {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        x.beyond.data[w] = x.beyond.data[w] | x.defined.data[w];
+        w                = w + 1;
+    }
+}
+
+# ask no more of register `reg`
+pub fun remove(x: *Scan, reg: rf.Id) {
+    val opt_index_of: opt[u32] = rf.index_of(x.file, reg);
+    if (sel opt_index_of.none) { ret; }
+    val at: u32 = opt_index_of.some;
+    x.beyond.data[at / 64] = x.beyond.data[at / 64] & ~(1::u64 << (at % 64)::u64);
+}
+
+# whether register `reg` shares storage with a row of `x.beyond`
+fun touches(x: *Scan, reg: *rf.Register) bool {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        var bits: u64 = x.beyond.data[w];
+        var n:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                if (rf.overlap(x.file, reg, ?x.file.registers[(w::u32 * 64 + n)])) { ret true; }
+            }
+            bits = bits >> 1;
+            n    = n + 1;
+        }
+        w = w + 1;
+    }
+    ret false;
+}
+
+# whether a footprint reads a row sharing storage with one of `x.beyond`
+fun reads_beyond(x: *Scan, fp: *footprint.Footprint) bool {
+    var w: usize = 0;
+    for (w < fp.reads.len) {
+        var bits: u64 = fp.reads.data[w];
+        var n:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                if (touches(x, ?x.file.registers[(w::u32 * 64 + n)])) { ret true; }
+            }
+            bits = bits >> 1;
+            n    = n + 1;
+        }
+        w = w + 1;
+    }
+    ret false;
+}
+
+# whether a footprint leaves no bit of any row of `x.beyond` as it was
+fun kills_beyond(x: *Scan, fp: *footprint.Footprint) bool {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        var bits: u64 = x.beyond.data[w];
+        var n:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                if (!footprint.kills(fp, rf.id_of(?x.file.registers[(w::u32 * 64 + n)]))) { ret false; }
+            }
+            bits = bits >> 1;
+            n    = n + 1;
+        }
+        w = w + 1;
+    }
+    ret true;
+}
+
+# whether no row is asked of
+fun empty(x: *Scan) bool {
+    var w: usize = 0;
+    for (w < x.beyond.len) {
+        if (x.beyond.data[w] != 0) { ret false; }
+        w = w + 1;
+    }
+    ret true;
+}
+
+# what instruction `at` says of `x.beyond`
+fun verdict(x: *Scan, at: Instruction) res[u8, allocator.Error] {
+    val d:  *InstructionData = function.data(x.f, at);
+    val op: Opcode           = d.opcode;
+    if (sel op.pseudo) { ret res[u8, allocator.Error].ok{THROUGH}; }
+    if (!(sel op.row)) { ret res[u8, allocator.Error].ok{LIVE}; }
+    var k: usize = 0;
+    for (k < d.implicit.size) {
+        val l: Physical = d.implicit.data[k].location;
+        if (!d.implicit.data[k].write) {
+            if (sel l.register) {
+                val opt_row_of: opt[*rf.Register] = rf.row_of(x.file, l.register);
+                if (sel opt_row_of.none)         { ret res[u8, allocator.Error].ok{LIVE}; }
+                if (touches(x, opt_row_of.some)) { ret res[u8, allocator.Error].ok{LIVE}; }
+            }
+        }
+        k = k + 1;
+    }
+    val res_asked: res[opt[*footprint.Footprint], allocator.Error] = asked(x, op.row, d.operands, d.state);
+    if (sel res_asked.err)                  { ret res[u8, allocator.Error].err{res_asked.err}; }
+    if (sel res_asked.ok.none)              { ret res[u8, allocator.Error].ok{LIVE}; }
+    if (reads_beyond(x, res_asked.ok.some)) { ret res[u8, allocator.Error].ok{LIVE}; }
+    if (kills_beyond(x, res_asked.ok.some)) { ret res[u8, allocator.Error].ok{DEAD}; }
+    ret res[u8, allocator.Error].ok{THROUGH};
+}
+
+# what the instructions of block `b` from position `from` on say of `x.beyond`
+fun block_verdict(x: *Scan, b: Block, from: usize) res[u8, allocator.Error] {
+    val list: Slice[Instruction] = function.instructions(x.f, b);
+    var k:    usize              = from;
+    for (k < list.size) {
+        val res_verdict: res[u8, allocator.Error] = verdict(x, list.data[k]);
+        if (sel res_verdict.err)       { ret res_verdict; }
+        if (res_verdict.ok != THROUGH) { ret res_verdict; }
+        k = k + 1;
+    }
+    ret res[u8, allocator.Error].ok{THROUGH};
+}
+
+# the successors of block `b` pushed for the scan to read
+fun push_successors(x: *Scan, b: Block) err[allocator.Error] {
+    val next: Slice[u32] = graph.successors(?x.graph, b);
+    var k:    usize      = 0;
+    for (k < next.size) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[u32](?x.stack, next.data[k]);
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether every row of `x.beyond` is dead after position `k` of block `b`, the instruction there read by none of the
+# scan, true when none is asked of
+pub fun dead_after(x: *Scan, b: Block, k: usize) res[bool, allocator.Error] {
+    if (empty(x)) { ret res[bool, allocator.Error].ok{true}; }
+    val res_here: res[u8, allocator.Error] = block_verdict(x, b, k + 1);
+    if (sel res_here.err)       { ret res[bool, allocator.Error].err{res_here.err}; }
+    if (res_here.ok != THROUGH) { ret res[bool, allocator.Error].ok{res_here.ok == DEAD}; }
+    x.scan = x.scan + 1;
+    vector.clear[u32](?x.stack);
+    val err_pushed: err[allocator.Error] = push_successors(x, b);
+    if (sel err_pushed.err) { ret res[bool, allocator.Error].err{err_pushed.err}; }
+    for (x.stack.len > 0) {
+        val opt_popped: opt[u32] = vector.pop[u32](?x.stack);
+        if (sel opt_popped.none) { brk; }
+        val s: u32 = opt_popped.some;
+        if (x.seen.data[s] == x.scan) { cnt; }
+        x.seen.data[s] = x.scan;
+        val res_there: res[u8, allocator.Error] = block_verdict(x, s, 0);
+        if (sel res_there.err)    { ret res[bool, allocator.Error].err{res_there.err}; }
+        if (res_there.ok == LIVE) { ret res[bool, allocator.Error].ok{false}; }
+        if (res_there.ok == THROUGH) {
+            val err_more: err[allocator.Error] = push_successors(x, s);
+            if (sel err_more.err) { ret res[bool, allocator.Error].err{err_more.err}; }
+        }
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
