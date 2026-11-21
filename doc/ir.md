@@ -279,7 +279,7 @@ The reductions take one vector and give a scalar of its lane type. The integer r
 
 ### 6.7 Aggregates
 
-`extract` gives one member of a structure or union value or one element of an array value, by a constant index immediate, and `insert` gives the aggregate with that member replaced by a value of the member's type. A union's member starts at its first byte: `extract` of one reads the union's first bytes, as many as the member has, as the member, and `insert` of one writes the member's bytes over those, the bytes inside the member that no scalar of it holds (its padding) zero, and keeps the union's bytes past the member. They take an aggregate whole, so a target that holds aggregate values in no register has them taken apart before selection.
+`extract` gives one member of a structure or union value or one element of an array value, by a constant index immediate, and `insert` gives the aggregate with that member replaced by a value of the member's type. A union's member starts at its first byte: `extract` of one reads the union's first bytes, as many as the member has, as the member, and `insert` of one writes the member's bytes over those, the bytes inside the member that no scalar of it holds (its padding) zero, and keeps the union's bytes past the member. They take an aggregate whole, so a target that holds aggregate values in no register has them taken apart before selection. An aggregate value of any size, made and read anywhere the SSA rule admits, is valid: one of more scalars than the aggregates legalisation takes apart is held in a stack slot of its own there (see [ir/target.md](ir/target.md)), so no pass that forms or keeps an aggregate value bounds its size, and the verifier states no rule of it.
 
 ### 6.8 Calls and returns
 

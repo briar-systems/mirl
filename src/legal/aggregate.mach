@@ -33,6 +33,25 @@
 #   for a fill, a constant byte, is made of the same word moves where the
 #   same rule admits them, and stays whole otherwise. a volatile or kept one stays
 #   whole. so a small aggregate copied through memory is never a block move.
+# - a value of a type of more than MOST leaves is large, and is held in a
+#   stack slot of its own rather than taken apart. the slot is written only
+#   where the value is made: a load's bytes copied in, a select's word by
+#   word on its condition, an insert's the aggregate's with the member's
+#   written over them, a constant's zeroed and written at the head of the
+#   entry, a value the abi legalisation places stored whole, and a block
+#   parameter's copied in at the head of its block from the slot whose
+#   address each edge passes, through a second slot each where the block has
+#   more than one, so an edge passing one for another reads what the block
+#   was entered with. an `extract` of a large member is the address of its
+#   bytes in its aggregate's slot. a store copies the slot's bytes, an
+#   argument or a returned value is loaded whole from it for the abi
+#   legalisation, and a member that is not large is read out of it. so every
+#   aggregate value valid ir holds is taken apart or held, whatever pass
+#   formed it, and none ahead of this one bounds what it forms.
+# - an `extract` of a scalar member is replaced by the leaf it reads, and
+#   the leaves held for an aggregate built of it hold that leaf, so the visit,
+#   which takes blocks in their order and not as they dominate one another,
+#   never leaves a read of an extract it takes out.
 #
 # the pass runs twice in a register family's schedule. first ahead of the
 # abi legalisation: a value it places, at the entry, a call or a return, is
@@ -136,16 +155,23 @@ use target_record: mirl.target.record;
 pub val AGGREGATES:        Pass = Pass{name: "aggregates", kind: Kind.legalise{}, scope: Scope.function{ahead}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
 pub val PLACED_AGGREGATES: Pass = Pass{name: "placed aggregates", kind: Kind.legalise{}, scope: Scope.function{after}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
 
-# the most leaves one aggregate value is taken apart into
+# the most leaves one aggregate value is taken apart into, past which it is held in a slot of its own
 val MOST: usize = 1024;
 
-val LARGE:     str = "an aggregate value of more scalars than the pass takes apart, which belongs in memory";
 val UNSIZED:   str = "an aggregate value whose type has no layout on the target";
 val WHOLE:     str = "an instruction that reads or gives an aggregate value whole, which no rule takes apart";
+val SLOTTED:   str = "a large aggregate value read as leaves, which the pass holds in a slot";
 val UNION:     str = "a union constant other than zero, whose members overlap";
 val UNMATCHED: str = "an aggregate constant whose elements do not match its type";
 
 val UNTOUCHED: u32 = 0xffffffff;
+
+# what the work holds of a value: nothing, its leaves, the address of the slot
+# a large one is held in, or the leaf an `extract` of a scalar member stands for
+val UNHELD: u8 = 0;
+val LEAVES: u8 = 1;
+val HOME:   u8 = 2;
+val STANDS: u8 = 3;
 
 # leaves are addressed through memory that can be reinterpreted
 fun wanted(g: *Ground) bool {
@@ -167,11 +193,13 @@ rec Leaf {
 # ---
 # ty:    the type
 # start: where its run starts
-# count: how many leaves it has
+# count: how many leaves it has, none where it is large
+# large: it has more than MOST, so a value of it is held in a slot (`home_of`)
 rec Shaped {
     ty:    Type;
     start: usize;
     count: usize;
+    large: bool;
 }
 
 # the run of a member's leaves within its aggregate's
@@ -194,8 +222,8 @@ rec Run {
 # keep:   storage that lives until the visit ends
 # leaves: the leaves of every type shaped so far
 # shapes: the types shaped so far
-# held:   the leaves of each value taken apart, by its index
-# state:  by value index, 1 once its leaves are held
+# held:   by value index, what `state` says it holds of the value
+# state:  by value index, UNHELD, LEAVES, HOME or STANDS
 # gone:   instructions to take out once nothing else reads them
 # params: block parameters taken apart, taken out at the end
 # before: each block's parameter count before its own were taken apart,
@@ -277,55 +305,59 @@ fun integer(w: *Work, bits: u32) res[Type, refusal.Error] {
     ret res[Type, refusal.Error].ok{res_intern.ok};
 }
 
-fun push_leaf(w: *Work, start: usize, l: Leaf) err[refusal.Error] {
-    if (w.leaves.len - start >= MOST) { ret err[refusal.Error].err{refusal.Error.reason{LARGE}}; }
+# push a leaf of the run from start, false where the run already holds MOST
+fun push_leaf(w: *Work, start: usize, l: Leaf) res[bool, refusal.Error] {
+    if (w.leaves.len - start >= MOST) { ret res[bool, refusal.Error].ok{false}; }
     val res_pushed: res[usize, allocator.Error] = vector.push[Leaf](?w.leaves, l);
-    if (sel res_pushed.err) { ret err[refusal.Error].err{lost(res_pushed.err)}; }
-    ret err[refusal.Error].ok{};
+    if (sel res_pushed.err) { ret res[bool, refusal.Error].err{lost(res_pushed.err)}; }
+    ret res[bool, refusal.Error].ok{true};
 }
 
-# the leaves of a type at a byte offset, pushed in member order
-fun collect(w: *Work, start: usize, ty: Type, base: u64) err[refusal.Error] {
+# the leaves of a type at a byte offset, pushed in member order, false once the run would pass MOST
+fun collect(w: *Work, start: usize, ty: Type, base: u64) res[bool, refusal.Error] {
     val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
-    if (sel res_shape_of.err) { ret err[refusal.Error].err{res_shape_of.err}; }
+    if (sel res_shape_of.err) { ret res[bool, refusal.Error].err{res_shape_of.err}; }
     val shape: table.Shape = res_shape_of.ok;
     if (sel shape.structure) {
         var i: usize = 0;
         for (i < shape.structure.members.size) {
             val res_offset: res[u64, target_record.Error] = layout.offset(?w.layout, ty, table.DEFAULT_SPACE, i::u32);
-            if (sel res_offset.err) { ret err[refusal.Error].err{refusal.Error.reason{UNSIZED}}; }
-            val err_inner: err[refusal.Error] = collect(w, start, shape.structure.members.data[i], base + res_offset.ok);
-            if (sel err_inner.err) { ret err_inner; }
+            if (sel res_offset.err) { ret res[bool, refusal.Error].err{refusal.Error.reason{UNSIZED}}; }
+            val res_inner: res[bool, refusal.Error] = collect(w, start, shape.structure.members.data[i], base + res_offset.ok);
+            if (sel res_inner.err) { ret res_inner; }
+            if (!res_inner.ok)     { ret res_inner; }
             i = i + 1;
         }
-        ret err[refusal.Error].ok{};
+        ret res[bool, refusal.Error].ok{true};
     }
     if (sel shape.array) {
         val res_step: res[u64, target_record.Error] = layout.stride(?w.layout, ty, table.DEFAULT_SPACE);
-        if (sel res_step.err) { ret err[refusal.Error].err{refusal.Error.reason{UNSIZED}}; }
+        if (sel res_step.err) { ret res[bool, refusal.Error].err{refusal.Error.reason{UNSIZED}}; }
         var e: u64 = 0;
         for (e < shape.array.count) {
-            val err_inner: err[refusal.Error] = collect(w, start, shape.array.element, base + e * res_step.ok);
-            if (sel err_inner.err) { ret err_inner; }
+            val res_inner: res[bool, refusal.Error] = collect(w, start, shape.array.element, base + e * res_step.ok);
+            if (sel res_inner.err) { ret res_inner; }
+            if (!res_inner.ok)     { ret res_inner; }
             e = e + 1;
         }
-        ret err[refusal.Error].ok{};
+        ret res[bool, refusal.Error].ok{true};
     }
     val res_size: res[u64, refusal.Error] = size_of(w, ty);
-    if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
+    if (sel res_size.err) { ret res[bool, refusal.Error].err{res_size.err}; }
     if (sel shape.union) {
         val res_align: res[u64, refusal.Error] = align_of(w, ty);
-        if (sel res_align.err) { ret err[refusal.Error].err{res_align.err}; }
+        if (sel res_align.err) { ret res[bool, refusal.Error].err{res_align.err}; }
         var done: u64 = 0;
         for (done < res_size.ok) {
             val n:         u64                      = moves.step(res_size.ok - done, moves.aligned_at(res_align.ok, done), w.word);
             val res_chunk: res[Type, refusal.Error] = integer(w, (n * 8)::u32);
-            if (sel res_chunk.err) { ret err[refusal.Error].err{res_chunk.err}; }
-            val err_pushed: err[refusal.Error] = push_leaf(w, start, Leaf{offset: base + done, ty: res_chunk.ok, bits: (n * 8)::u32});
-            if (sel err_pushed.err) { ret err_pushed; }
+            if (sel res_chunk.err) { ret res[bool, refusal.Error].err{res_chunk.err}; }
+            val res_pushed: res[bool, refusal.Error] = push_leaf(w, start, Leaf{offset: base + done, ty: res_chunk.ok, bits: (n * 8)::u32});
+            if (sel res_pushed.err) { ret res_pushed; }
+            if (!res_pushed.ok)     { ret res_pushed; }
             done = done + n;
         }
-        ret err[refusal.Error].ok{};
+        ret res[bool, refusal.Error].ok{true};
     }
     var bits: u32 = (res_size.ok * 8)::u32;
     if (sel shape.integer) { bits = shape.integer.width; }
@@ -333,21 +365,25 @@ fun collect(w: *Work, start: usize, ty: Type, base: u64) err[refusal.Error] {
         val opt_row: opt[format.Row] = format.row(shape.float.format);
         if (sel opt_row.some) { bits = opt_row.some.width; }
     }
-    if (sel shape.function) { ret err[refusal.Error].err{refusal.Error.reason{WHOLE}}; }
+    if (sel shape.function) { ret res[bool, refusal.Error].err{refusal.Error.reason{WHOLE}}; }
     ret push_leaf(w, start, Leaf{offset: base, ty: ty, bits: bits});
 }
 
-# the leaves of a type, shaped once
+# the leaves of a type, shaped once, or that it is large
 fun shaped(w: *Work, ty: Type) res[Shaped, refusal.Error] {
     var i: usize = 0;
     for (i < w.shapes.len) {
         if (table.same(w.shapes.data[i].ty, ty)) { ret res[Shaped, refusal.Error].ok{w.shapes.data[i]}; }
         i = i + 1;
     }
-    val start:    usize              = w.leaves.len;
-    val err_made: err[refusal.Error] = collect(w, start, ty, 0);
-    if (sel err_made.err) { ret res[Shaped, refusal.Error].err{err_made.err}; }
-    val s:          Shaped                      = Shaped{ty: ty, start: start, count: w.leaves.len - start};
+    val start:    usize                    = w.leaves.len;
+    val res_made: res[bool, refusal.Error] = collect(w, start, ty, 0);
+    if (sel res_made.err) { ret res[Shaped, refusal.Error].err{res_made.err}; }
+    var s: Shaped = Shaped{ty: ty, start: start, count: w.leaves.len - start, large: false};
+    if (!res_made.ok) {
+        vector.truncate[Leaf](?w.leaves, start);
+        s = Shaped{ty: ty, start: start, count: 0, large: true};
+    }
     val res_pushed: res[usize, allocator.Error] = vector.push[Shaped](?w.shapes, s);
     if (sel res_pushed.err) { ret res[Shaped, refusal.Error].err{lost(res_pushed.err)}; }
     ret res[Shaped, refusal.Error].ok{s};
@@ -398,10 +434,10 @@ fun fresh(w: *Work, n: usize) Slice[Value] {
     ret Slice[Value]{data: res_zallocate.ok, size: n};
 }
 
-fun hold(w: *Work, x: Value, leaves: Slice[Value]) {
+fun hold(w: *Work, x: Value, leaves: Slice[Value], kind: u8) {
     for (w.held.len <= x::usize) {
         val res_held_pushed:  res[usize, allocator.Error] = vector.push[Slice[Value]](?w.held, Slice[Value]{data: nil, size: 0});
-        val res_state_pushed: res[usize, allocator.Error] = vector.push[u8](?w.state, 0);
+        val res_state_pushed: res[usize, allocator.Error] = vector.push[u8](?w.state, UNHELD);
         if (sel res_held_pushed.err) {
             fail(w, lost(res_held_pushed.err));
             ret;
@@ -412,11 +448,16 @@ fun hold(w: *Work, x: Value, leaves: Slice[Value]) {
         }
     }
     w.held.data[x]  = leaves;
-    w.state.data[x] = 1;
+    w.state.data[x] = kind;
+}
+
+fun held_as(w: *Work, x: Value) u8 {
+    if (x::usize >= w.state.len) { ret UNHELD; }
+    ret w.state.data[x];
 }
 
 fun holding(w: *Work, x: Value) bool {
-    ret x::usize < w.state.len && w.state.data[x] == 1;
+    ret held_as(w, x) == LEAVES;
 }
 
 fun block_of(b: *Body, i: Instruction) Block {
@@ -722,27 +763,39 @@ fun zero_constant(w: *Work, c: Constant) bool {
 
 # the leaves of an aggregate loaded at an instruction, loaded ahead of it
 fun loaded(w: *Work, i: Instruction, ty: Type) Slice[Value] {
-    val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
-    if (sel res_shaped.err) {
-        fail(w, res_shaped.err);
-        ret Slice[Value]{data: nil, size: 0};
-    }
     val b:     *Body            = body_of(w);
     val d:     *InstructionData = ?b.instructions.data[i];
     val base:  Value            = d.operands.data[0];
     val align: u64              = alignment_of(d);
     val f:     Flags            = d.metadata.flags;
-    val out:   Slice[Value]     = fresh(w, res_shaped.ok.count);
-    val k:     Block            = block_of(b, i);
     emit.begin(?w.site, i);
-    var n: usize = 0;
-    for (n < out.size) {
+    val out:      Slice[Value]       = read_leaves(w, base, ty, align, f);
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret out;
+}
+
+# the leaves of a value of a type read from memory at an address where the
+# rewrite stands, a scalar's one leaf the value itself
+fun read_leaves(w: *Work, base: Value, ty: Type, align: u64, f: Flags) Slice[Value] {
+    if (!aggregate(w, ty)) {
+        val one: Slice[Value] = fresh(w, 1);
+        if (sel w.failed.some) { ret one; }
+        one.data[0] = load_leaf(w, base, ty, align, f);
+        ret one;
+    }
+    val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
+    if (sel res_shaped.err) {
+        fail(w, res_shaped.err);
+        ret Slice[Value]{data: nil, size: 0};
+    }
+    val out: Slice[Value] = fresh(w, res_shaped.ok.count);
+    var n:   usize        = 0;
+    for (n < out.size && sel w.failed.none) {
         val l: Leaf = leaf(w, res_shaped.ok, n);
         out.data[n] = load_leaf(w, at_offset(w, base, l.offset), l.ty, moves.aligned_at(align, l.offset), f);
         n           = n + 1;
     }
-    val err_done: err[refusal.Error] = emit.done(?w.site);
-    if (sel err_done.err) { fail(w, err_done.err); }
     ret out;
 }
 
@@ -980,7 +1033,10 @@ fun union_inserted(w: *Work, i: Instruction, whole: Value, part: Value, index: u
     var by:   Slice[Value] = Slice[Value]{data: nil, size: 0};
     var one:  [1]Value     = [1]Value{part};
     if (aggregate(w, res_union_member.ok)) { by = leaves_of(w, part); }
-    or                                     { by = Slice[Value]{data: ?one[0], size: 1}; }
+    or {
+        one[0] = scalar_of(w, part);
+        by     = Slice[Value]{data: ?one[0], size: 1};
+    }
     val res_shaped:        res[Shaped, refusal.Error] = shaped(w, ty);
     val res_member_shaped: res[Shaped, refusal.Error] = shaped(w, res_union_member.ok);
     val res_extent:        res[u64, refusal.Error]    = size_of(w, res_union_member.ok);
@@ -1068,8 +1124,11 @@ fun inserted(w: *Work, i: Instruction) Slice[Value] {
     var by:   Slice[Value] = Slice[Value]{data: nil, size: 0};
     var one:  [1]Value     = [1]Value{part};
     if (aggregate(w, member)) { by = leaves_of(w, part); }
-    or                        { by = Slice[Value]{data: ?one[0], size: 1}; }
-    if (sel w.failed.some)    { ret from; }
+    or {
+        one[0] = scalar_of(w, part);
+        by     = Slice[Value]{data: ?one[0], size: 1};
+    }
+    if (sel w.failed.some) { ret from; }
     val out: Slice[Value] = fresh(w, from.size);
     var n:   usize        = 0;
     for (n < out.size) {
@@ -1086,6 +1145,7 @@ fun extracted(w: *Work, i: Instruction) Slice[Value] {
     val b:     *Body            = body_of(w);
     val d:     *InstructionData = ?b.instructions.data[i];
     val whole: Value            = d.operands.data[0];
+    if (large(w, type_of(w, whole)))    { ret extracted_from_home(w, i); }
     if (overlaid(w, type_of(w, whole))) { ret union_extracted(w, i, whole, member_of(d)); }
     var member:  Type                    = type_of(w, whole);
     val res_run: res[Run, refusal.Error] = member_run(w, type_of(w, whole), member_of(d), ?member);
@@ -1316,8 +1376,12 @@ fun leaves_of(w: *Work, x: Value) Slice[Value] {
     if (holding(w, x)) { ret w.held.data[x]; }
     var out: Slice[Value] = Slice[Value]{data: nil, size: 0};
     val ty:  Type         = type_of(w, x);
-    val b:   *Body        = body_of(w);
-    val def: Def          = b.values.data[x].def;
+    if (large(w, ty)) {
+        fail(w, refusal.Error.reason{SLOTTED});
+        ret out;
+    }
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[x].def;
     if (sel def.constant) {
         val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
         if (sel res_shaped.err) {
@@ -1343,8 +1407,450 @@ fun leaves_of(w: *Work, x: Value) Slice[Value] {
     }
     or                     { fail(w, refusal.Error.reason{WHOLE}); }
     if (sel w.failed.some) { ret out; }
-    hold(w, x, out);
+    hold(w, x, out, LEAVES);
     ret out;
+}
+
+# whether a value of a type is large, more leaves than MOST, and held in a
+# slot of its own rather than taken apart
+fun large(w: *Work, ty: Type) bool {
+    if (!aggregate(w, ty)) { ret false; }
+    val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
+    if (sel res_shaped.err) {
+        fail(w, res_shaped.err);
+        ret false;
+    }
+    ret res_shaped.ok.large;
+}
+
+# the type of member i of a structure or a union, or of element i of an array
+fun member_at(w: *Work, ty: Type, i: u32) res[Type, refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[Type, refusal.Error].err{res_shape_of.err}; }
+    val shape: table.Shape = res_shape_of.ok;
+    if (sel shape.structure) {
+        if (i::usize < shape.structure.members.size) { ret res[Type, refusal.Error].ok{shape.structure.members.data[i]}; }
+    }
+    if (sel shape.array) {
+        if (i::u64 < shape.array.count) { ret res[Type, refusal.Error].ok{shape.array.element}; }
+    }
+    if (sel shape.union) {
+        if (i::usize < shape.union.members.size) { ret res[Type, refusal.Error].ok{shape.union.members.data[i]}; }
+    }
+    ret res[Type, refusal.Error].err{refusal.Error.reason{WHOLE}};
+}
+
+# the byte offset of member i of an aggregate, zero for a union's
+fun member_offset(w: *Work, ty: Type, i: u32) res[u64, refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[u64, refusal.Error].err{res_shape_of.err}; }
+    val shape: table.Shape = res_shape_of.ok;
+    if (sel shape.union) { ret res[u64, refusal.Error].ok{0}; }
+    if (sel shape.array) {
+        val res_step: res[u64, target_record.Error] = layout.stride(?w.layout, ty, table.DEFAULT_SPACE);
+        if (sel res_step.err) { ret res[u64, refusal.Error].err{refusal.Error.reason{UNSIZED}}; }
+        ret res[u64, refusal.Error].ok{i::u64 * res_step.ok};
+    }
+    val res_offset: res[u64, target_record.Error] = layout.offset(?w.layout, ty, table.DEFAULT_SPACE, i);
+    if (sel res_offset.err) { ret res[u64, refusal.Error].err{refusal.Error.reason{UNSIZED}}; }
+    ret res[u64, refusal.Error].ok{res_offset.ok};
+}
+
+# copy the bytes of a value of a type from one slot to another where the rewrite stands
+fun copy_value(w: *Work, ty: Type, to: Value, from: Value, secret: bool) {
+    val res_size:  res[u64, refusal.Error] = size_of(w, ty);
+    val res_align: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_size.err) {
+        fail(w, res_size.err);
+        ret;
+    }
+    if (sel res_align.err) {
+        fail(w, res_align.err);
+        ret;
+    }
+    moved_bytes(w, opt[Instruction].none{}, to, opt[Value].some{from}, res_size.ok, res_align.ok, NO_FLAGS, NO_FLAGS, secret);
+}
+
+# the address of the slot a large value is held in, made once where the value
+# is made: a load's bytes copied into it, a select's chosen word by word, an
+# insert's the aggregate's with the member's written over them, a constant's
+# written at the head of the entry and a value the abi legalisation places
+# stored to it whole. an `extract` of a large member is the address of its
+# bytes in its aggregate's slot, and a block parameter's slot is made with the
+# parameter (`split_parameters`). a slot is written only where its value is
+# made, so every reader finds the bytes the value was made with
+fun home_of(w: *Work, x: Value) Value {
+    if (held_as(w, x) == HOME) { ret w.held.data[x].data[0]; }
+    val b:    *Body = body_of(w);
+    val def:  Def   = b.values.data[x].def;
+    var home: Value = 0;
+    if (sel def.constant) { home = constant_home(w, x, def.constant); }
+    or (placed(w, x))     { home = placed_home(w, x); }
+    or (sel def.result) {
+        val i:    Instruction = def.result.instruction;
+        val code: Opcode      = b.instructions.data[i].opcode;
+        if (code == opcode_table.LOAD)    { home = loaded_home(w, i); }
+        or (code == opcode_table.SELECT)  { home = selected_home(w, i); }
+        or (code == opcode_table.INSERT)  { home = inserted_home(w, i); }
+        or (code == opcode_table.EXTRACT) { home = extracted_home(w, i); }
+        or                                { fail(w, refusal.Error.reason{WHOLE}); }
+    }
+    or                     { fail(w, refusal.Error.reason{WHOLE}); }
+    if (sel w.failed.some) { ret home; }
+    val one: Slice[Value] = fresh(w, 1);
+    if (sel w.failed.some) { ret home; }
+    one.data[0] = home;
+    hold(w, x, one, HOME);
+    ret home;
+}
+
+# the slot of a large load, its bytes copied into it where the load stands,
+# read as the load reads them
+fun loaded_home(w: *Work, i: Instruction) Value {
+    val b:         *Body                   = body_of(w);
+    val x:         Value                   = b.instructions.data[i].results.data[0];
+    val ty:        Type                    = type_of(w, x);
+    val res_size:  res[u64, refusal.Error] = size_of(w, ty);
+    val res_align: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_size.err) {
+        fail(w, res_size.err);
+        ret 0;
+    }
+    if (sel res_align.err) {
+        fail(w, res_align.err);
+        ret 0;
+    }
+    val home: Value = slot(w, ty);
+    if (sel w.failed.some) { ret home; }
+    val d:    *InstructionData = ?b.instructions.data[i];
+    val from: Value            = d.operands.data[0];
+    val read: Flags            = d.metadata.flags;
+    var both: u64              = alignment_of(d);
+    if (res_align.ok < both) { both = res_align.ok; }
+    val secret: bool = d.metadata.secret || b.values.data[x].secret;
+    emit.begin(?w.site, i);
+    moved_bytes(w, opt[Instruction].none{}, home, opt[Value].some{from}, res_size.ok, both, read, NO_FLAGS, secret);
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret home;
+}
+
+# the slot of a large select, each word a select of the words of its two
+# operands' slots on its condition, so nothing branches
+fun selected_home(w: *Work, i: Instruction) Value {
+    val b:         *Body                   = body_of(w);
+    val x:         Value                   = b.instructions.data[i].results.data[0];
+    val cond:      Value                   = b.instructions.data[i].operands.data[0];
+    val a:         Value                   = b.instructions.data[i].operands.data[1];
+    val e:         Value                   = b.instructions.data[i].operands.data[2];
+    val ty:        Type                    = type_of(w, x);
+    val res_size:  res[u64, refusal.Error] = size_of(w, ty);
+    val res_align: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_size.err) {
+        fail(w, res_size.err);
+        ret 0;
+    }
+    if (sel res_align.err) {
+        fail(w, res_align.err);
+        ret 0;
+    }
+    val from_a: Value = home_of(w, a);
+    val from_e: Value = home_of(w, e);
+    val home:   Value = slot(w, ty);
+    if (sel w.failed.some) { ret home; }
+    emit.begin(?w.site, i);
+    var done: u64 = 0;
+    for (done < res_size.ok && sel w.failed.none) {
+        val at:          u64                      = moves.aligned_at(res_align.ok, done);
+        val n:           u64                      = moves.step(res_size.ok - done, at, w.word);
+        val res_integer: res[Type, refusal.Error] = integer(w, (n * 8)::u32);
+        if (sel res_integer.err) {
+            fail(w, res_integer.err);
+            ret home;
+        }
+        val word_a: Value = load_at(w, at_offset(w, from_a, done), res_integer.ok, at, NO_FLAGS);
+        val word_e: Value = load_at(w, at_offset(w, from_e, done), res_integer.ok, at, NO_FLAGS);
+        store_at(w, at_offset(w, home, done), emit.ternary(?w.site, opcode_table.SELECT, cond, word_a, word_e), at, NO_FLAGS);
+        done = done + n;
+    }
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret home;
+}
+
+# the slot of a large insert, the aggregate's bytes copied into it and the
+# member's written over its own: copied from its slot where it is large, its
+# leaves stored where it is an aggregate and itself where it is a scalar
+fun inserted_home(w: *Work, i: Instruction) Value {
+    val b:          *Body                    = body_of(w);
+    val x:          Value                    = b.instructions.data[i].results.data[0];
+    val whole:      Value                    = b.instructions.data[i].operands.data[0];
+    val part:       Value                    = b.instructions.data[i].operands.data[1];
+    val index:      u32                      = member_of(?b.instructions.data[i]);
+    val ty:         Type                     = type_of(w, x);
+    val res_member: res[Type, refusal.Error] = member_at(w, ty, index);
+    val res_offset: res[u64, refusal.Error]  = member_offset(w, ty, index);
+    val res_align:  res[u64, refusal.Error]  = align_of(w, ty);
+    if (sel res_member.err) {
+        fail(w, res_member.err);
+        ret 0;
+    }
+    if (sel res_offset.err) {
+        fail(w, res_offset.err);
+        ret 0;
+    }
+    if (sel res_align.err) {
+        fail(w, res_align.err);
+        ret 0;
+    }
+    val mt:     Type         = res_member.ok;
+    val off:    u64          = res_offset.ok;
+    val from:   Value        = home_of(w, whole);
+    var source: Value        = 0;
+    var parts:  Slice[Value] = Slice[Value]{data: nil, size: 0};
+    if (large(w, mt))     { source = home_of(w, part); }
+    or (aggregate(w, mt)) { parts = leaves_of(w, part); }
+    or                    { source = scalar_of(w, part); }
+    val home: Value = slot(w, ty);
+    if (sel w.failed.some) { ret home; }
+    val secret: bool = b.values.data[x].secret;
+    emit.begin(?w.site, i);
+    copy_value(w, ty, home, from, secret);
+    if (large(w, mt)) { copy_value(w, mt, at_offset(w, home, off), source, secret); }
+    or (aggregate(w, mt)) {
+        val res_shaped: res[Shaped, refusal.Error] = shaped(w, mt);
+        if (sel res_shaped.err) {
+            fail(w, res_shaped.err);
+            ret home;
+        }
+        var n: usize = 0;
+        for (n < parts.size) {
+            val l: Leaf = leaf(w, res_shaped.ok, n);
+            store_at(w, at_offset(w, home, off + l.offset), as_stored(w, parts.data[n]), moves.aligned_at(res_align.ok, off + l.offset), NO_FLAGS);
+            n = n + 1;
+        }
+    }
+    or { store_at(w, at_offset(w, home, off), as_stored(w, source), moves.aligned_at(res_align.ok, off), NO_FLAGS); }
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret home;
+}
+
+# the address of a large member's bytes in its aggregate's slot, which no
+# one writes after it is made
+fun extracted_home(w: *Work, i: Instruction) Value {
+    val b:          *Body                   = body_of(w);
+    val whole:      Value                   = b.instructions.data[i].operands.data[0];
+    val res_offset: res[u64, refusal.Error] = member_offset(w, type_of(w, whole), member_of(?b.instructions.data[i]));
+    if (sel res_offset.err) {
+        fail(w, res_offset.err);
+        ret 0;
+    }
+    val from: Value = home_of(w, whole);
+    if (sel w.failed.some) { ret from; }
+    emit.begin(?w.site, i);
+    val home:     Value              = at_offset(w, from, res_offset.ok);
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret home;
+}
+
+# the leaves of a member that is not large of a large aggregate, read from
+# its bytes in the aggregate's slot ahead of the extract
+fun extracted_from_home(w: *Work, i: Instruction) Slice[Value] {
+    val none:       Slice[Value]            = Slice[Value]{data: nil, size: 0};
+    val b:          *Body                   = body_of(w);
+    val whole:      Value                   = b.instructions.data[i].operands.data[0];
+    val mt:         Type                    = type_of(w, b.instructions.data[i].results.data[0]);
+    val res_offset: res[u64, refusal.Error] = member_offset(w, type_of(w, whole), member_of(?b.instructions.data[i]));
+    val res_align:  res[u64, refusal.Error] = align_of(w, type_of(w, whole));
+    if (sel res_offset.err) {
+        fail(w, res_offset.err);
+        ret none;
+    }
+    if (sel res_align.err) {
+        fail(w, res_align.err);
+        ret none;
+    }
+    val from: Value = home_of(w, whole);
+    if (sel w.failed.some) { ret none; }
+    emit.begin(?w.site, i);
+    val out:      Slice[Value]       = read_leaves(w, at_offset(w, from, res_offset.ok), mt, moves.aligned_at(res_align.ok, res_offset.ok), NO_FLAGS);
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret out;
+}
+
+# the slot of a large constant, zeroed and its members that are not zero
+# written over it, at the head of the entry block
+fun constant_home(w: *Work, x: Value, c: Constant) Value {
+    val ty:        Type                    = type_of(w, x);
+    val res_size:  res[u64, refusal.Error] = size_of(w, ty);
+    val res_align: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_size.err) {
+        fail(w, res_size.err);
+        ret 0;
+    }
+    if (sel res_align.err) {
+        fail(w, res_align.err);
+        ret 0;
+    }
+    val home: Value = slot(w, ty);
+    if (sel w.failed.some) { ret home; }
+    val b:      *Body       = body_of(w);
+    val origin: Instruction = after_def(w, x);
+    emit.begin(?w.site, origin);
+    moved_bytes(w, opt[Instruction].none{}, home, opt[Value].none{}, res_size.ok, res_align.ok, NO_FLAGS, NO_FLAGS, b.values.data[x].secret);
+    constant_into(w, home, 0, c, ty, res_align.ok);
+    w.head = b.instructions.data[origin].prev;
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret home;
+}
+
+# write a constant of a type at an offset into a zeroed slot of an alignment,
+# leaving its zero bytes as they are
+fun constant_into(w: *Work, home: Value, offset: u64, c: Constant, ty: Type, align: u64) {
+    if (zero_constant(w, c) || sel w.failed.some) { ret; }
+    if (!large(w, ty)) {
+        val leaves: Slice[Value] = read_constant(w, c, ty);
+        if (sel w.failed.some) { ret; }
+        if (!aggregate(w, ty)) {
+            store_at(w, at_offset(w, home, offset), as_stored(w, leaves.data[0]), moves.aligned_at(align, offset), NO_FLAGS);
+            ret;
+        }
+        val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
+        if (sel res_shaped.err) {
+            fail(w, res_shaped.err);
+            ret;
+        }
+        var n: usize = 0;
+        for (n < leaves.size) {
+            val l: Leaf = leaf(w, res_shaped.ok, n);
+            store_at(w, at_offset(w, home, offset + l.offset), as_stored(w, leaves.data[n]), moves.aligned_at(align, offset + l.offset), NO_FLAGS);
+            n = n + 1;
+        }
+        ret;
+    }
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(w.site.m, c);
+    if (sel res_constant_data.err) {
+        fail(w, refusal.Error.ir{res_constant_data.err});
+        ret;
+    }
+    val data:         ConstantData                    = res_constant_data.ok;
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) {
+        fail(w, res_shape_of.err);
+        ret;
+    }
+    val shape: table.Shape = res_shape_of.ok;
+    if (sel shape.union) {
+        fail(w, refusal.Error.reason{UNION});
+        ret;
+    }
+    if (sel data.bytes) {
+        var opt_element: opt[Type] = opt[Type].none{};
+        if (sel shape.array) {
+            if (data.bytes.data.size::u64 == shape.array.count) { opt_element = opt[Type].some{shape.array.element}; }
+        }
+        if (sel opt_element.none) {
+            fail(w, refusal.Error.reason{UNMATCHED});
+            ret;
+        }
+        var k: usize = 0;
+        for (k < data.bytes.data.size && sel w.failed.none) {
+            if (data.bytes.data.data[k] != 0) {
+                var word: [1]u64 = [1]u64{data.bytes.data.data[k]::u64};
+                val byte: Value  = constant_value(w, ConstantData.integer{ir_constant.Bits{type: opt_element.some, words: Slice[u64]{data: ?word[0], size: 1}}});
+                store_at(w, at_offset(w, home, offset + k::u64), byte, moves.aligned_at(align, offset + k::u64), NO_FLAGS);
+            }
+            k = k + 1;
+        }
+        ret;
+    }
+    if (!(sel data.aggregate)) {
+        fail(w, refusal.Error.reason{UNMATCHED});
+        ret;
+    }
+    var i: usize = 0;
+    for (i < data.aggregate.elements.size && sel w.failed.none) {
+        val res_member: res[Type, refusal.Error] = member_at(w, ty, i::u32);
+        val res_offset: res[u64, refusal.Error]  = member_offset(w, ty, i::u32);
+        if (sel res_member.err) {
+            fail(w, refusal.Error.reason{UNMATCHED});
+            ret;
+        }
+        if (sel res_offset.err) {
+            fail(w, res_offset.err);
+            ret;
+        }
+        constant_into(w, home, offset + res_offset.ok, data.aggregate.elements.data[i], res_member.ok, align);
+        i = i + 1;
+    }
+}
+
+# the leaves of a constant of a type that is not large, a scalar's one leaf
+# the constant itself
+fun read_constant(w: *Work, c: Constant, ty: Type) Slice[Value] {
+    var count: usize = 1;
+    if (aggregate(w, ty)) {
+        val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
+        if (sel res_shaped.err) {
+            fail(w, res_shaped.err);
+            ret Slice[Value]{data: nil, size: 0};
+        }
+        count = res_shaped.ok.count;
+    }
+    val out: Slice[Value] = fresh(w, count);
+    if (sel w.failed.some) { ret out; }
+    constant_leaves(w, c, ty, out, 0);
+    ret out;
+}
+
+# the slot of a large value the abi legalisation places, a parameter of the
+# entry or a call's result, stored to it whole just after it is made, a store
+# the first run leaves for the abi legalisation as any of a placed value
+fun placed_home(w: *Work, x: Value) Value {
+    val ty:        Type                    = type_of(w, x);
+    val res_align: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_align.err) {
+        fail(w, res_align.err);
+        ret 0;
+    }
+    val home: Value = slot(w, ty);
+    if (sel w.failed.some) { ret home; }
+    val b:      *Body       = body_of(w);
+    val entry:  bool        = !(sel b.values.data[x].def.result);
+    val origin: Instruction = after_def(w, x);
+    emit.begin(?w.site, origin);
+    store_at(w, home, x, res_align.ok, NO_FLAGS);
+    if (entry) { w.head = b.instructions.data[origin].prev; }
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { fail(w, err_done.err); }
+    ret home;
+}
+
+# the leaf a scalar stands for once the pass is done: an `extract` of a
+# scalar member of an aggregate is replaced by the leaf it reads, taken out
+# once, so the leaves held for an aggregate built of it never name the
+# extract, whichever of the two is visited first. any other scalar stands for
+# itself
+fun scalar_of(w: *Work, x: Value) Value {
+    if (held_as(w, x) == STANDS) { ret w.held.data[x].data[0]; }
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[x].def;
+    if (!(sel def.result)) { ret x; }
+    val i: Instruction = def.result.instruction;
+    if (b.instructions.data[i].opcode != opcode_table.EXTRACT)              { ret x; }
+    if (!aggregate(w, type_of(w, b.instructions.data[i].operands.data[0]))) { ret x; }
+    val parts: Slice[Value] = extracted(w, i);
+    if (sel w.failed.some) { ret x; }
+    if (parts.size != 1) {
+        fail(w, refusal.Error.reason{WHOLE});
+        ret x;
+    }
+    hold(w, x, parts, STANDS);
+    ret parts.data[0];
 }
 
 # take every aggregate parameter of a block other than the entry apart into one
@@ -1361,43 +1867,121 @@ fun split_parameters(w: *Work) err[refusal.Error] {
     k = 1;
     for (k < b.blocks.len) {
         if (!b.blocks.data[k].erased) {
-            val count: usize = b.blocks.data[k].parameters.len;
-            var p:     usize = 0;
+            val count:   usize           = b.blocks.data[k].parameters.len;
+            var entered: Vector[Entered] = vector.init[Entered](w.keep);
+            var p:       usize           = 0;
             for (p < count) {
-                val old: Value = b.blocks.data[k].parameters.data[p];
-                val ty:  Type  = type_of(w, old);
-                if (aggregate(w, ty)) {
+                val old:    Value = b.blocks.data[k].parameters.data[p];
+                val ty:     Type  = type_of(w, old);
+                val secret: bool  = b.values.data[old].secret;
+                if (large(w, ty)) {
+                    w.before.data[k] = count::u32;
+                    val res_address: res[Value, refusal.Error] = parameter_of(w, k::u32, w.ptr, false);
+                    if (sel res_address.err) { ret err[refusal.Error].err{res_address.err}; }
+                    val res_entered: res[usize, allocator.Error] = vector.push[Entered](?entered, Entered{old: old, address: res_address.ok, home: slot(w, ty), staged: 0});
+                    if (sel res_entered.err) { ret err[refusal.Error].err{lost(res_entered.err)}; }
+                    val res_listed: res[usize, allocator.Error] = vector.push[Value](?w.params, old);
+                    if (sel res_listed.err) { ret err[refusal.Error].err{lost(res_listed.err)}; }
+                }
+                or (aggregate(w, ty)) {
                     val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
                     if (sel res_shaped.err) { ret err[refusal.Error].err{res_shaped.err}; }
                     w.before.data[k] = count::u32;
-                    val preds:  usize        = b.blocks.data[k].predecessors.len;
-                    val made:   Slice[Value] = fresh(w, res_shaped.ok.count);
-                    val secret: bool         = b.values.data[old].secret;
-                    var j:      usize        = 0;
+                    val made: Slice[Value] = fresh(w, res_shaped.ok.count);
+                    var j:    usize        = 0;
                     for (j < made.size) {
-                        val ty_j:     Type         = leaf(w, res_shaped.ok, j).ty;
-                        val zero:     Value        = constant_value(w, ConstantData.zero{ty_j});
-                        val incoming: Slice[Value] = fresh(w, preds);
-                        var e:        usize        = 0;
-                        for (e < incoming.size) {
-                            incoming.data[e] = zero;
-                            e                = e + 1;
-                        }
-                        val err_unmade: err[refusal.Error] = failure_of(w);
-                        if (sel err_unmade.err) { ret err_unmade; }
-                        val res_added: res[Value, module.Error] = body.add_parameter(w.site.m, w.site.f, (k::u32), Declaration{type: ty_j, secret: secret, name: opt[View].none{}}, incoming);
-                        if (sel res_added.err) { ret err[refusal.Error].err{refusal.Error.ir{res_added.err}}; }
+                        val res_added: res[Value, refusal.Error] = parameter_of(w, k::u32, leaf(w, res_shaped.ok, j).ty, secret);
+                        if (sel res_added.err) { ret err[refusal.Error].err{res_added.err}; }
                         made.data[j] = res_added.ok;
                         j            = j + 1;
                     }
-                    hold(w, old, made);
+                    hold(w, old, made, LEAVES);
                     val res_listed: res[usize, allocator.Error] = vector.push[Value](?w.params, old);
                     if (sel res_listed.err) { ret err[refusal.Error].err{lost(res_listed.err)}; }
                 }
                 p = p + 1;
             }
+            if (entered.len > 0) {
+                val err_entered: err[refusal.Error] = enter_homes(w, k::u32, ?entered);
+                if (sel err_entered.err) { ret err_entered; }
+            }
         }
         k = k + 1;
+    }
+    ret failure_of(w);
+}
+
+# a parameter of a type added to block k, every edge passing zero for it
+# until its arguments are
+fun parameter_of(w: *Work, k: Block, ty: Type, secret: bool) res[Value, refusal.Error] {
+    val b:        *Body        = body_of(w);
+    val zero:     Value        = constant_value(w, ConstantData.zero{ty});
+    val incoming: Slice[Value] = fresh(w, b.blocks.data[k].predecessors.len);
+    var e:        usize        = 0;
+    for (e < incoming.size) {
+        incoming.data[e] = zero;
+        e                = e + 1;
+    }
+    val err_unmade: err[refusal.Error] = failure_of(w);
+    if (sel err_unmade.err) { ret res[Value, refusal.Error].err{err_unmade.err}; }
+    val res_added: res[Value, module.Error] = body.add_parameter(w.site.m, w.site.f, k, Declaration{type: ty, secret: secret, name: opt[View].none{}}, incoming);
+    if (sel res_added.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_added.err}}; }
+    ret res[Value, refusal.Error].ok{res_added.ok};
+}
+
+# a large parameter of a block taken apart into the address of its argument's
+# slot
+# ---
+# old:     the parameter
+# address: the parameter added for the address
+# home:    the slot the parameter's value is held in
+# staged:  the slot its bytes pass through where the block has more than one
+rec Entered {
+    old:     Value;
+    address: Value;
+    home:    Value;
+    staged:  Value;
+}
+
+# copy each large parameter's bytes into its own slot at the head of block k,
+# since the block is entered again before what its argument's slot holds may
+# change. where the block has more than one, every argument is first copied
+# into a slot of its own and then each into its home, so an edge passing one
+# parameter for another reads the bytes the block was entered with
+fun enter_homes(w: *Work, k: Block, entered: *Vector[Entered]) err[refusal.Error] {
+    val b:     *Body = body_of(w);
+    val split: bool  = entered.len > 1;
+    var n:     usize = 0;
+    for (n < entered.len && split) {
+        entered.data[n].staged = slot(w, type_of(w, entered.data[n].old));
+        n                      = n + 1;
+    }
+    val err_slotted: err[refusal.Error] = failure_of(w);
+    if (sel err_slotted.err) { ret err_slotted; }
+    emit.begin(?w.site, b.blocks.data[k].first);
+    n = 0;
+    for (n < entered.len) {
+        val e:  Entered = entered.data[n];
+        var to: Value   = e.home;
+        if (split) { to = e.staged; }
+        copy_value(w, type_of(w, e.old), to, e.address, b.values.data[e.old].secret);
+        n = n + 1;
+    }
+    n = 0;
+    for (n < entered.len && split) {
+        val e: Entered = entered.data[n];
+        copy_value(w, type_of(w, e.old), e.home, e.staged, b.values.data[e.old].secret);
+        n = n + 1;
+    }
+    val err_done: err[refusal.Error] = emit.done(?w.site);
+    if (sel err_done.err) { ret err_done; }
+    n = 0;
+    for (n < entered.len) {
+        val one: Slice[Value] = fresh(w, 1);
+        if (sel w.failed.some) { ret failure_of(w); }
+        one.data[0] = entered.data[n].home;
+        hold(w, entered.data[n].old, one, HOME);
+        n = n + 1;
     }
     ret failure_of(w);
 }
@@ -1431,7 +2015,12 @@ fun split_edges(w: *Work) err[refusal.Error] {
                     }
                     a = 0;
                     for (a < args.size) {
-                        if (aggregate(w, type_of(w, b.blocks.data[to].parameters.data[a]))) {
+                        val pty: Type = type_of(w, b.blocks.data[to].parameters.data[a]);
+                        if (large(w, pty)) {
+                            val res_home: res[usize, allocator.Error] = vector.push[Value](?list, home_of(w, args.data[a]));
+                            if (sel res_home.err) { ret err[refusal.Error].err{lost(res_home.err)}; }
+                        }
+                        or (aggregate(w, pty)) {
                             val parts: Slice[Value] = leaves_of(w, args.data[a]);
                             var j:     usize        = 0;
                             for (j < parts.size) {
@@ -1496,12 +2085,12 @@ fun moved(w: *Work, store: Instruction, x: Value) opt[Instruction] {
 }
 
 # a run of bytes moved, or filled with one byte, in the widest words each
-# alignment allows, the last store in the store's place. every word is loaded
+# alignment allows, the last store in origin's place where there is one. every word is loaded
 # before the first store, so a move between overlapping runs reads the bytes
 # as they were. each load states what the move's read states, the public flag
 # of `read`, each store what its write states, the public flag of `f`, and
 # both are secret with `secret`
-fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, byte: u8, read: Flags, f: Flags, secret: bool) {
+fun in_words(w: *Work, origin: opt[Instruction], to: Value, from: opt[Value], size: u64, align: u64, byte: u8, read: Flags, f: Flags, secret: bool) {
     emit.secret(?w.site, secret);
     var loads: Vector[Value] = vector.init[Value](w.keep);
     var done:  u64           = 0;
@@ -1543,7 +2132,9 @@ fun in_words(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u
             x = res_constant.ok;
         }
         val address: Value = at_offset(w, to, done);
-        if (done + n >= size) { emit.end(?w.site, origin); }
+        if (done + n >= size) {
+            if (sel origin.some) { emit.end(?w.site, origin.some); }
+        }
         store_at(w, address, x, at, f);
         done = done + n;
         k    = k + 1;
@@ -1561,10 +2152,24 @@ fun filled(byte: u8, n: u64) Wide {
     ret x;
 }
 
-# a run of bytes moved or zeroed as one bulk operation in the store's place,
-# stating what the move states, secret with `secret` and public with the
-# public flag of `f`
-fun in_bulk(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u64, align: u64, f: Flags, secret: bool) {
+# a run of bytes moved, or zeroed where from is none, in words where
+# mirl.legal.moves admits them or either side is volatile and as one bulk
+# operation otherwise, the last in origin's place where there is one. the bulk
+# operation states the write's flags, public only where the read is too
+fun moved_bytes(w: *Work, origin: opt[Instruction], to: Value, from: opt[Value], size: u64, align: u64, read: Flags, f: Flags, secret: bool) {
+    if (read.volatile || f.volatile || moves.in_words(w.caps, size, align, w.word)) {
+        in_words(w, origin, to, from, size, align, 0, read, f, secret);
+        ret;
+    }
+    var moving: Flags = f;
+    moving.public = f.public && read.public;
+    in_bulk(w, origin, to, from, size, align, moving, secret);
+}
+
+# a run of bytes moved or zeroed as one bulk operation, in origin's place where
+# there is one, stating what the move states, secret with `secret` and public
+# with the public flag of `f`
+fun in_bulk(w: *Work, origin: opt[Instruction], to: Value, from: opt[Value], size: u64, align: u64, f: Flags, secret: bool) {
     val length: Value        = length_of(w, to, size);
     var ops:    [3]Value     = [3]Value{to, 0, length};
     var imm:    [1]Immediate = [1]Immediate{Immediate.alignment{align}};
@@ -1586,7 +2191,7 @@ fun in_bulk(w: *Work, origin: Instruction, to: Value, from: opt[Value], size: u6
         }
         ops[1] = res_constant.ok;
     }
-    emit.end(?w.site, origin);
+    if (sel origin.some) { emit.end(?w.site, origin.some); }
     emit.flags(?w.site, Flags{volatile: false, kept: f.kept, bounded: false, public: f.public});
     emit.secret(?w.site, secret);
     emit.emit(?w.site, code, Slice[Value]{data: ?ops[0], size: 3}, Slice[Immediate]{data: ?imm[0], size: 1});
@@ -1627,26 +2232,37 @@ fun store(w: *Work, i: Instruction) err[refusal.Error] {
         if (zero || sel opt_from.some) {
             var opt_source: opt[Value] = opt[Value].none{};
             var both:       u64        = align;
-            var moving:     Flags      = f;
             var reading:    Flags      = f;
             var secret:     bool       = d.metadata.secret;
             if (sel opt_from.some) {
                 val l: *InstructionData = ?b.instructions.data[opt_from.some];
                 opt_source     = opt[Value].some{l.operands.data[0]};
-                moving.public  = f.public && l.metadata.flags.public;
                 reading.public = l.metadata.flags.public;
                 secret         = secret || l.metadata.secret;
                 val other: u64 = alignment_of(l);
                 if (other < both) { both = other; }
             }
             emit.begin(?w.site, i);
-            if (moves.in_words(w.caps, res_size.ok, both, w.word)) { in_words(w, i, to, opt_source, res_size.ok, both, 0, reading, f, secret); }
-            or                                                     { in_bulk(w, i, to, opt_source, res_size.ok, both, moving, secret); }
+            moved_bytes(w, opt[Instruction].some{i}, to, opt_source, res_size.ok, both, reading, f, secret);
             val err_done: err[refusal.Error] = emit.done(?w.site);
             if (sel err_done.err)  { ret err_done; }
             if (sel opt_from.some) { ret gone(w, opt_from.some); }
             ret failure_of(w);
         }
+    }
+    if (large(w, ty)) {
+        val home:      Value                   = home_of(w, x);
+        val res_align: res[u64, refusal.Error] = align_of(w, ty);
+        if (sel res_align.err) { ret err[refusal.Error].err{res_align.err}; }
+        val err_homed: err[refusal.Error] = failure_of(w);
+        if (sel err_homed.err) { ret err_homed; }
+        var both: u64 = align;
+        if (res_align.ok < both) { both = res_align.ok; }
+        emit.begin(?w.site, i);
+        moved_bytes(w, opt[Instruction].some{i}, to, opt[Value].some{home}, res_size.ok, both, NO_FLAGS, f, d.metadata.secret || b.values.data[x].secret);
+        val err_done: err[refusal.Error] = emit.done(?w.site);
+        if (sel err_done.err) { ret err_done; }
+        ret failure_of(w);
     }
     val parts:      Slice[Value]       = leaves_of(w, x);
     val err_unmade: err[refusal.Error] = failure_of(w);
@@ -1749,6 +2365,16 @@ fun handed(w: *Work, i: Instruction, x: Value) err[refusal.Error] {
     val ty:        Type                    = type_of(w, x);
     val res_align: res[u64, refusal.Error] = align_of(w, ty);
     if (sel res_align.err) { ret err[refusal.Error].err{res_align.err}; }
+    if (large(w, ty)) {
+        val home:      Value              = home_of(w, x);
+        val err_homed: err[refusal.Error] = failure_of(w);
+        if (sel err_homed.err) { ret err_homed; }
+        emit.operand(?w.site, i, x);
+        val loaded_whole: Value              = load_at(w, home, ty, res_align.ok, NO_FLAGS);
+        val err_done:     err[refusal.Error] = emit.done(?w.site);
+        if (sel err_done.err) { ret err_done; }
+        ret refusal.edit(body.substitute(w.site.m, w.site.f, i, x, loaded_whole));
+    }
     val parts:      Slice[Value]               = leaves_of(w, x);
     val res_shaped: res[Shaped, refusal.Error] = shaped(w, ty);
     if (sel res_shaped.err) { ret err[refusal.Error].err{res_shaped.err}; }
@@ -1818,7 +2444,7 @@ fun bulk(w: *Work, i: Instruction) err[refusal.Error] {
     val f: Flags = d.metadata.flags;
     val k: Block = block_of(b, i);
     emit.begin(?w.site, i);
-    in_words(w, i, to, opt_from, opt_size.some, align, byte, f, f, d.metadata.secret);
+    in_words(w, opt[Instruction].some{i}, to, opt_from, opt_size.some, align, byte, f, f, d.metadata.secret);
     val err_done: err[refusal.Error] = emit.done(?w.site);
     if (sel err_done.err) { ret err_done; }
     ret failure_of(w);
@@ -1848,11 +2474,10 @@ fun visit_one(w: *Work, i: Instruction) err[refusal.Error] {
     if (code == opcode_table.EXTRACT) {
         if (!gives) {
             val result:     Value              = b.instructions.data[i].results.data[0];
-            val parts:      Slice[Value]       = extracted(w, i);
+            val part:       Value              = scalar_of(w, result);
             val err_unmade: err[refusal.Error] = failure_of(w);
             if (sel err_unmade.err) { ret err_unmade; }
-            if (parts.size != 1)    { ret err[refusal.Error].err{refusal.Error.reason{WHOLE}}; }
-            val err_moved: err[refusal.Error] = refusal.edit(body.replace(w.site.m, w.site.f, result, parts.data[0], Records.follow{}));
+            val err_moved: err[refusal.Error] = refusal.edit(body.replace(w.site.m, w.site.f, result, part, Records.follow{}));
             if (sel err_moved.err) { ret err_moved; }
         }
         ret gone(w, i);

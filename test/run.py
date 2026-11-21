@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 # the two states of a build, as `mirl compile` spells them
-STATES = (('off', ['--level', '0']), ('on', ['--level', '2']))
+STATES = (('off', ['--no-optimize']), ('on', ['--optimize']))
 
 
 def header(path):
