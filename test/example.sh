@@ -18,7 +18,8 @@
 # lines of test/lanes.sh, the one list of them. an
 # example is built for each by a copy whose target statement spells that target's
 # tuple, under the library's version statement, so an example states nothing a lane target lays out
-# otherwise. for each example and each lane target the lane checks:
+# otherwise. for each example, each lane target and each state of the build,
+# unoptimised and optimised, the lane checks:
 #   - mirl compile writes its object
 #   - mirl compile writes its listing, which masc assembles again. a byte
 #     difference from mirl's object shows masc disassemble of both, diffed,
@@ -92,10 +93,11 @@ fail() { echo "FAIL $1: $2"; fails=$((fails + 1)); }
 
 # build and run the example `$1` at `$2` for the lane target `$3`, which masc
 # reads as `$4`, mink link links under the flags `$5` and `$6` runs, into
-# `$7`, its target statement `$8`
+# `$7`, its target statement `$8`, in the state `$9` under the mirl flag `${10}`
 example() {
-    local name=$1 src=$2 target=$3 masc_as=$4 link=$5 qemu=$6 dir=$7 line=$8
-    local at="$dir/$name"
+    local state=$9 flag=${10}
+    local name="$1 $state" src=$2 target=$3 masc_as=$4 link=$5 qemu=$6 dir=$7 line=$8
+    local at="$dir/$1.$state"
     local expect status
     expect=$(sed -n 's/^# exits \([0-9][0-9]*\):.*/\1/p' "$src")
     if [ -z "$expect" ]; then
@@ -104,11 +106,11 @@ example() {
     fi
     { printf 'mirl "%s";\n%s\n' "$version" "$line"; tail -n +2 "$src"; } >"$at.mirl"
     src=$at.mirl
-    if ! "$mirl" compile "$src" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
+    if ! "$mirl" compile "$src" "$flag" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
         fail "$target $name" "mirl compile refuses it: $(cat "$at.emit")"
         return
     fi
-    if ! "$mirl" compile "$src" --verify --emit asm -o "$at.s" 2>"$at.emit"; then
+    if ! "$mirl" compile "$src" "$flag" --verify --emit asm -o "$at.s" 2>"$at.emit"; then
         fail "$target $name" "mirl compile refuses its listing: $(cat "$at.emit")"
         return
     fi
@@ -155,7 +157,8 @@ while read -r -u 3 target arch system env isa abi; do
             fail "$target $name" "its first line is no target statement"
             continue
         fi
-        example "$name" "$src" "$target" "$masc_as" "$link" "$qemu" "$dir" "$line"
+        example "$name" "$src" "$target" "$masc_as" "$link" "$qemu" "$dir" "$line" off --no-optimize
+        example "$name" "$src" "$target" "$masc_as" "$link" "$qemu" "$dir" "$line" on --optimize
     done
 done 3<<<"$lanes"
 echo "$fails failed"
