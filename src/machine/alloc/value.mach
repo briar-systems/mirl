@@ -89,8 +89,11 @@ use mirl.machine.operand;
 use mirl.machine.operand.Instruction;
 use mirl.machine.operand.Operand;
 use mirl.machine.pseudo;
+use mirl.machine.storage;
+use mirl.machine.storage.Storage;
 
 use mo: masc.core.operand;
+use rf: masc.core.register;
 
 # no instruction, place or value
 pub val NONE: u32 = 0xffffffff;
@@ -108,6 +111,7 @@ pub val NONE: u32 = 0xffffffff;
 # l:         the form's liveness
 # events:    the form's reads and writes, by linear number
 # graph:     the form's blocks' edges
+# regs:      the registers of the selection, which fix each place's storage
 pub rec Given {
     f:         *Function;
     input:     *Function;
@@ -118,6 +122,7 @@ pub rec Given {
     l:         *Live;
     events:    live.Events;
     graph:     *Graph;
+    regs:      *rf.Available;
 }
 
 # why the map refused a form
@@ -368,16 +373,7 @@ fun kill_set(m: *Map, set: u32) {
     val count: u32 = rows(m);
     var at:    u32 = 0;
     for (at < count) {
-        if (m.head_at.data[at] != NONE) {
-            val alias: Slice[u32] = location.shares(m.g.at, at);
-            var hit:   bool       = false;
-            var k:     usize      = 0;
-            for (k < alias.size && !hit) {
-                if (live.clobbered(m.g.l, set, alias.data[k])) { hit = true; }
-                k = k + 1;
-            }
-            if (hit) { kill_at(m, at); }
-        }
+        if (m.head_at.data[at] != NONE && live.clobbered(m.g.l, set, at)) { kill_at(m, at); }
         at = at + 1;
     }
 }
@@ -401,15 +397,66 @@ fun collect(m: *Map, at: u32, tag: u32) err[Error] {
     ret err[Error].ok{};
 }
 
-# whether two places hold one value: a value written on every path here,
-# since one some path leaves unwritten holds everywhere there, and two places
-# holding it there hold any bits
+# the bits place `at` holds: a register's storage, a cell's, a slot's size,
+# none for a register whose storage no fixed and scaled part states
+fun capacity(m: *Map, at: u32) opt[Storage] {
+    if (at == NONE) { ret opt[Storage].none{}; }
+    if (at >= rows(m)) {
+        val sd: function.SlotData = m.g.f.slots.data[at - rows(m)];
+        ret opt[Storage].some{storage.fold(m.g.regs, Storage{fixed: sd.size * 8, per: sd.per * 8, scale: sd.scale})};
+    }
+    val p: class.Physical = location.physical(m.g.at, at);
+    if (sel p.cell) { ret opt[Storage].some{Storage{fixed: p.cell.class.width::u64, per: 0, scale: 0}}; }
+    val opt_row: opt[*rf.Register] = rf.row_of(m.g.regs.file, p.register);
+    if (sel opt_row.none) { ret opt[Storage].none{}; }
+    ret storage.of_register(m.g.regs, opt_row.some);
+}
+
+# the bits pair `p` carries: its value's width, or a register of its class
+fun need_of(m: *Map, p: Pair) opt[Storage] {
+    var need: Storage = Storage{fixed: function.width_of(m.g.input, p.value), per: 0, scale: 0};
+    if (need.fixed == 0 || p.sub != 0) {
+        val opt_class: opt[Storage] = storage.of_class(m.g.regs, function.class_of(m.g.input, p.value));
+        if (sel opt_class.none) { ret opt[Storage].none{}; }
+        need = opt_class.some;
+    }
+    ret opt[Storage].some{need};
+}
+
+# whether a copy between places `dst` and `src` moves pair `p`: both hold all
+# the bits of its part
+fun carries(m: *Map, dst: u32, src: u32, p: Pair) bool {
+    val opt_need: opt[Storage] = need_of(m, p);
+    if (sel opt_need.none) { ret false; }
+    val opt_dst: opt[Storage] = capacity(m, dst);
+    val opt_src: opt[Storage] = capacity(m, src);
+    if (sel opt_dst.none) { ret false; }
+    if (sel opt_src.none) { ret false; }
+    ret storage.covers(opt_dst.some, opt_need.some) && storage.covers(opt_src.some, opt_need.some);
+}
+
+# whether two places hold one value: a value written on every path here whose
+# bits cover all of one of the places, since a narrower value leaves upper bits
+# distinct
 fun same_value(m: *Map, x: u32, y: u32) bool {
-    if (x == y) { ret true; }
-    var k: u32 = m.head_at.data[x];
+    if (x == NONE || y == NONE) { ret false; }
+    if (x == y)                 { ret true; }
+    val opt_x: opt[Storage] = capacity(m, x);
+    val opt_y: opt[Storage] = capacity(m, y);
+    if (sel opt_x.none) { ret false; }
+    if (sel opt_y.none) { ret false; }
+    val x_cap: Storage = opt_x.some;
+    val y_cap: Storage = opt_y.some;
+    var k:     u32     = m.head_at.data[x];
     for (k != NONE) {
         val p: Pair = m.cur.data[k];
-        if (bit_of(m.sure.data, p.value) && has(m, y, p.value, p.sub)) { ret true; }
+        if (bit_of(m.sure.data, p.value) && has(m, y, p.value, p.sub)) {
+            val opt_need: opt[Storage] = need_of(m, p);
+            if (sel opt_need.some) {
+                val need: Storage = opt_need.some;
+                if (storage.covers(need, x_cap) || storage.covers(need, y_cap)) { ret true; }
+            }
+        }
         k = m.next_at.data[k];
     }
     ret false;
@@ -506,7 +553,7 @@ fun copy_step(m: *Map, i: Instruction, d: *InstructionData, dst: Holder, src: Ho
     var t: usize = 0;
     for (t < m.temp.len) {
         val p: Pair = m.temp.data[t];
-        if (p.value != value) {
+        if (p.value != value && carries(m, dst.place, src.place, p)) {
             val err_added: err[Error] = add(m, p.at, p.value, p.sub);
             if (sel err_added.err) { ret err_added; }
         }
@@ -537,8 +584,21 @@ fun parallel_step(m: *Map, i: Instruction, d: *InstructionData) err[Error] {
         holder(m, d.operands.data[j], ?dst);
         holder(m, d.operands.data[j + half], ?src);
         if (moves(m, i, dst, src)) {
-            val err_held: err[Error] = collect(m, src.place, j);
+            val start:    usize      = m.temp.len;
+            val err_held: err[Error] = collect(m, src.place, dst.place);
             if (sel err_held.err) { ret err_held; }
+            var t:    usize = start;
+            var kept: usize = start;
+            for (t < m.temp.len) {
+                val p: Pair = m.temp.data[t];
+                if (carries(m, dst.place, src.place, p)) {
+                    m.temp.data[kept]    = p;
+                    m.temp.data[kept].at = j;
+                    kept                 = kept + 1;
+                }
+                t = t + 1;
+            }
+            m.temp.len = kept;
         }
         j = j + 1;
     }
