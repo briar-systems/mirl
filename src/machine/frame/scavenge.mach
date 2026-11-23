@@ -1,0 +1,958 @@
+# the scavenging of a scratch register where none is free
+#
+# a move of the frame code at an offset it reaches only through a scratch
+# takes the registers its caller shows free. where too few are, registers of
+# a class holding the stack pointer's values the move names none of are each
+# saved to one of the frame's emergency slots before it, offered as its
+# scratches beside the free ones, and restored after it. an emergency slot
+# lies at a fixed offset the frame code reaches with no scratch, so its own
+# save and restore take none. the saves serve any other instruction that
+# takes a scratch register the same way, as the configuration state's
+# establishing instruction.
+#
+# an emergency slot has a kind, the registers of a class alike in kind,
+# width and arity to one of its own (`class.alike`), and holds one of them.
+# a register borrowed through a slot of the stack pointer's kind is saved and
+# restored with no scratch. one of another kind, as a vector register of a
+# kind that scales, is saved and restored by the frame code under the free
+# scratches and, where too few are, registers of the stack pointer's kind
+# scavenged through its slots past those already holding one, so its own
+# save nests the stack pointer's kind inside it and never the reverse.
+#
+# a frame reserves emergency slots only where it could need them: of the
+# stack pointer's kind, for each add, load or store of a slot the frame code
+# makes, the fewest scratches it takes less the registers liveness of the
+# allocated function shows free across it, and for each instruction stating
+# a configuration state the scratches its establishing instruction takes
+# less those free before it, the most of any. a parallel copy counts the
+# registers free across it less the most its own cycles may hold at once:
+# the lowering breaks a cycle by saving a pair's value in a free location
+# until that pair's move, and a pair is saved at most once, only when
+# another pair writes what it reads. a copy between two slots goes through a
+# free location, and where none is free borrows a register through
+# an emergency slot, its own loads and stores scavenging past it: between
+# two slots of fixed size a register of the stack pointer's kind, so it
+# counts that register and their scratches, and between two slots of scaled
+# size the first allowed register of another kind that holds the value, so
+# it counts one slot of that register's kind where no candidate of it is
+# free and, of the stack pointer's kind, the scratches its moves and its own
+# save and restore take.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.NO_EXTENT;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Segment;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class;
+use mirl.machine.class.Physical;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Access;
+use mirl.machine.frame.code.Add;
+use mirl.machine.frame.code.Admitted;
+use mirl.machine.frame.code.Emit;
+use mirl.machine.frame.code.Step;
+use mirl.machine.frame.lay;
+use mirl.machine.frame.lay.Bank;
+use mirl.machine.frame.lay.Plan;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Emergency;
+use mirl.machine.frame.record.Layout;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.frame.record.Place;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.function.SlotData;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.pseudo;
+use mirl.target.abi.convention.Registers;
+use mirl.target.abi.convention.held;
+
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+
+# what the reservation reads beside the plan
+# ---
+# allowed:    the locations the allocator was allowed to assign
+# pool:       the allowed registers of a class holding the stack pointer's
+#             values, in the order allowed
+# configured: the scratch registers the instruction establishing a
+#             configuration state takes, 0 for a set with none
+pub rec Need {
+    allowed:    Slice[Physical];
+    pool:       Slice[rf.Id];
+    configured: u32;
+}
+
+# why the emergency slots a frame needs were not counted
+# ---
+# alloc:     the allocator refused storage
+# live:      liveness of the allocated function was refused
+# unlocated: a register allowed or saved that the locations refused, and why
+pub tag Error: u8 {
+    alloc:     allocator.Error;
+    live:      live.Error;
+    unlocated: location.Unlocated;
+}
+
+# the allocator's refusal `e` stands for, its own or a step's it carries, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc) { ret opt[allocator.Error].some{e.alloc}; }
+    if (sel e.live)  { ret live.starved(e.live); }
+    ret opt[allocator.Error].none{};
+}
+
+fun made(e: allocator.Error) code.Error {
+    ret code.Error.made{function.Error.alloc{e}};
+}
+
+fun stood(r: err[code.Error]) bool {
+    ret sel r.ok;
+}
+
+# whether two registers share storage, a register the locations refuse
+# sharing none but with itself
+fun overlaps(at: *Locations, a: rf.Id, b: rf.Id) bool {
+    if (a == b) { ret true; }
+    val res_locate: res[u32, location.Unlocated] = location.locate(at, Physical.register{a});
+    if (sel res_locate.err) { ret false; }
+    val res_locate_register: res[u32, location.Unlocated] = location.locate(at, Physical.register{b});
+    if (sel res_locate_register.err) { ret false; }
+    val alias: Slice[u32] = location.shares(at, res_locate.ok);
+    var i:     usize      = 0;
+    for (i < alias.size) {
+        if (alias.data[i] == res_locate_register.ok) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether a register shares storage with none of some others
+# ---
+# at:     the locations of the target
+# r:      the register
+# others: the others
+# ret:    whether it shares storage with none
+pub fun apart(at: *Locations, r: rf.Id, others: Slice[rf.Id]) bool {
+    var i: usize = 0;
+    for (i < others.size) {
+        if (overlaps(at, r, others.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun push(v: *vector.Vector[rf.Id], r: rf.Id) err[allocator.Error] {
+    if (r == rf.NONE) { ret err[allocator.Error].ok{}; }
+    val res_pushed: res[usize, allocator.Error] = vector.push[rf.Id](v, r);
+    if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+# the registers a move names, added to a list
+fun names(s: Step, out: *vector.Vector[rf.Id]) err[allocator.Error] {
+    var a: rf.Id = rf.NONE;
+    var b: rf.Id = rf.NONE;
+    var c: rf.Id = rf.NONE;
+    if (sel s.add) {
+        a = s.add.dest;
+        b = s.add.src;
+    }
+    or (sel s.mask) {
+        a = s.mask.dest;
+        b = s.mask.src;
+    }
+    or (sel s.sub) {
+        a = s.sub.dest;
+        b = s.sub.a;
+        c = s.sub.b;
+    }
+    or (sel s.store) {
+        a = s.store.register;
+        b = s.store.base;
+    }
+    or (sel s.load) {
+        a = s.load.register;
+        b = s.load.base;
+    }
+    or (sel s.store_pair) {
+        a = s.store_pair.lower;
+        b = s.store_pair.upper;
+        c = s.store_pair.base;
+    }
+    or (sel s.load_pair) {
+        a = s.load_pair.lower;
+        b = s.load_pair.upper;
+        c = s.load_pair.base;
+    }
+    or (sel s.push)    { a = s.push.register; }
+    or (sel s.pop)     { a = s.pop.register; }
+    or (sel s.release) { a = s.release.stack; }
+    or (sel s.probe)   { a = s.probe.stack; }
+    val err_out_pushed: err[allocator.Error] = push(out, a);
+    if (sel err_out_pushed.err) { ret err_out_pushed; }
+    val err_b_pushed: err[allocator.Error] = push(out, b);
+    if (sel err_b_pushed.err) { ret err_b_pushed; }
+    ret push(out, c);
+}
+
+# up to n registers of a pool, in its order, sharing storage with none of
+# some others and none another taken, added to a list
+# ---
+# at:     the locations of the target
+# pool:   the registers that may be taken
+# n:      the most taken
+# others: the registers none taken may share storage with
+# out:    the list the taken ones are added to
+# ret:    ok, or the allocator's refusal
+fun pick(at: *Locations, pool: Slice[rf.Id], n: usize, others: Slice[rf.Id], out: *vector.Vector[rf.Id]) err[allocator.Error] {
+    val from: usize = out.len;
+    var i:    usize = 0;
+    for (i < pool.size && out.len - from < n) {
+        val r:    rf.Id = pool.data[i];
+        var free: bool  = apart(at, r, others);
+        var j:    usize = from;
+        for (free && j < out.len) {
+            free = !overlaps(at, r, out.data[j]);
+            j    = j + 1;
+        }
+        if (free) {
+            val err_pushed: err[allocator.Error] = push(out, r);
+            if (sel err_pushed.err) { ret err_pushed; }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether two registers are of one kind, an emergency slot holding either
+fun kin(file: *rf.File, a: rf.Id, b: rf.Id) bool {
+    ret class.alike(file, a, rf.class_of(b));
+}
+
+# how many of some registers are of a register's kind
+# ---
+# file: the register file
+# regs: the registers, as those borrowed through emergency slots
+# r:    the register
+# ret:  how many share its kind
+pub fun holding(file: *rf.File, regs: Slice[rf.Id], r: rf.Id) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < regs.size) {
+        if (kin(file, r, regs.data[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# how many emergency slots of a frame hold a register of some kind
+# ---
+# l:    the frame's layout
+# file: the register file
+# r:    a register of the kind
+# ret:  how many of its slots hold one
+pub fun room(l: *Layout, file: *rf.File, r: rf.Id) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < l.reserved.len) {
+        if (kin(file, l.reserved.data[i].like, r)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the emergency slot of a register's kind past k others of it, none past
+# the last
+fun nth(l: *Layout, file: *rf.File, r: rf.Id, k: usize) opt[Emergency] {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < l.reserved.len) {
+        val spot: Emergency = l.reserved.data[i];
+        if (kin(file, spot.like, r)) {
+            if (n == k) { ret opt[Emergency].some{spot}; }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret opt[Emergency].none{};
+}
+
+# the save of a register to an emergency slot or its restore
+fun spot_step(l: *Layout, r: rf.Id, spot: Emergency, restore: bool) res[Step, code.Error] {
+    val pl: Place = l.slots.data[spot.slot];
+    if (!(sel pl.at)) { ret res[Step, code.Error].err{code.Error.reach{spot.size}}; }
+    val step: Access = Access{register: r, base: record.base_of(l, pl.at), at: pl.at.offset, size: spot.size};
+    if (restore) { ret res[Step, code.Error].ok{Step.load{step}}; }
+    ret res[Step, code.Error].ok{Step.store{step}};
+}
+
+# registers of the stack pointer's kind saved to the frame's emergency slots
+# of their kind, one each in order past a first, or restored from them. a save
+# or restore moves the register a move borrows, never the move's value, so it
+# carries neither the secret mark nor the statement of the move it serves
+# ---
+# e:       where it appends, its scratches unread
+# l:       the frame's layout, holding at least as many emergency slots of
+#          each register's kind past the first as registers of it
+# regs:    the registers
+# first:   the emergency slots of their kind already holding registers
+#          saved, those they take lying past them
+# restore: whether they are restored, else saved
+# ret:     ok, or why the frame code made nothing
+pub fun preserve(e: *Emit, l: *Layout, regs: Slice[rf.Id], first: usize, restore: bool) err[code.Error] {
+    val file: *rf.File = function.file(e.f);
+    var i:    usize    = 0;
+    for (i < regs.size) {
+        val r:       rf.Id          = regs.data[i];
+        val opt_nth: opt[Emergency] = nth(l, file, r, first + holding(file, Slice[rf.Id]{data: regs.data, size: i}, r));
+        if (sel opt_nth.none) { ret err[code.Error].err{code.Error.unreserved{r}}; }
+        val res_step: res[Step, code.Error] = spot_step(l, r, opt_nth.some, restore);
+        if (sel res_step.err) { ret err[code.Error].err{res_step.err}; }
+        var borrowed: Metadata = e.metadata;
+        borrowed.secret       = false;
+        borrowed.flags.public = false;
+        borrowed.extent       = NO_EXTENT;
+        var plain:    Emit            = Emit{admitted: e.admitted, f: e.f, block: e.block, metadata: borrowed, stack: e.stack, scratches: code.NO_SCRATCH, scratch: opt[rf.Id].none{}};
+        val err_done: err[code.Error] = code.make(?plain, res_step.ok);
+        if (sel err_done.err) { ret err_done; }
+        i = i + 1;
+    }
+    ret err[code.Error].ok{};
+}
+
+# a move made between the save and restore of the registers it is offered
+# beside its own scratches
+fun around(e: *Emit, s: Step, l: *Layout, regs: Slice[rf.Id], first: usize, offered: Slice[rf.Id]) err[code.Error] {
+    val err_saved: err[code.Error] = preserve(e, l, regs, first, false);
+    if (sel err_saved.err) { ret err_saved; }
+    var inner:    Emit            = Emit{admitted: e.admitted, f: e.f, block: e.block, metadata: e.metadata, stack: e.stack, scratches: offered, scratch: opt[rf.Id].none{}};
+    val err_done: err[code.Error] = code.make(?inner, s);
+    if (sel err_done.err) { ret err_done; }
+    ret preserve(e, l, regs, first, true);
+}
+
+# whether a move made around some saved registers is made whole, tried in a
+# function of its own
+fun stands_around(e: *Emit, s: Step, l: *Layout, regs: Slice[rf.Id], first: usize, offered: Slice[rf.Id]) bool {
+    var probe: Function = function.init(e.f.a, e.f.set, e.f.checked);
+    fin { function.dnit(?probe); }
+    val res_block: res[Block, function.Error] = function.block(?probe);
+    if (sel res_block.err) { ret false; }
+    var pe: Emit = Emit{admitted: e.admitted, f: ?probe, block: res_block.ok, metadata: e.metadata, stack: e.stack, scratches: e.scratches, scratch: opt[rf.Id].none{}};
+    ret stood(around(?pe, s, l, regs, first, offered));
+}
+
+# make one move of the frame code under the scratches the emit offers, and
+# where it makes none under them, under them and the fewest registers of a
+# pool it scavenges through the frame's emergency slots of the stack
+# pointer's kind
+# ---
+# e:    where it appends, with the bound frame code and the free scratches
+# s:    the move
+# l:    the frame's layout, whose emergency slots bound the registers
+#       scavenged
+# held: the registers a caller already holds in emergency slots around this
+#       move, those scavenged taking slots of their kind past them
+# at:   the locations of the target
+# pool: the registers it may scavenge, of a class holding the stack
+#       pointer's values, in the order it prefers them
+# ret:  ok, or why the code made nothing under the scratches offered alone
+pub fun make(e: *Emit, s: Step, l: *Layout, held: Slice[rf.Id], at: *Locations, pool: Slice[rf.Id]) err[code.Error] {
+    val err_plain: err[code.Error] = code.make(e, s);
+    if (sel err_plain.ok) { ret err_plain; }
+    val file:  *rf.File = function.file(e.f);
+    val first: usize    = holding(file, held, e.stack);
+    val most:  usize    = room(l, file, e.stack);
+    if (first >= most) { ret err_plain; }
+    var n: usize = most - first;
+    if (e.admitted.most::usize < n) { n = e.admitted.most::usize; }
+    if (n == 0)                     { ret err_plain; }
+    var others:  vector.Vector[rf.Id] = vector.init[rf.Id](e.f.a);
+    var taken:   vector.Vector[rf.Id] = vector.init[rf.Id](e.f.a);
+    var offered: vector.Vector[rf.Id] = vector.init[rf.Id](e.f.a);
+    fin {
+        vector.dnit[rf.Id](?others);
+        vector.dnit[rf.Id](?taken);
+        vector.dnit[rf.Id](?offered);
+    }
+    val err_named: err[allocator.Error] = names(s, ?others);
+    if (sel err_named.err) { ret err[code.Error].err{made(err_named.err)}; }
+    val err_based: err[allocator.Error] = push(?others, e.stack);
+    if (sel err_based.err) { ret err[code.Error].err{made(err_based.err)}; }
+    var i: usize = 0;
+    for (i < e.scratches.size) {
+        val err_other: err[allocator.Error] = push(?others, e.scratches.data[i]);
+        if (sel err_other.err) { ret err[code.Error].err{made(err_other.err)}; }
+        val err_free: err[allocator.Error] = push(?offered, e.scratches.data[i]);
+        if (sel err_free.err) { ret err[code.Error].err{made(err_free.err)}; }
+        i = i + 1;
+    }
+    val err_picked: err[allocator.Error] = pick(at, pool, n, Slice[rf.Id]{data: others.data, size: others.len}, ?taken);
+    if (sel err_picked.err) { ret err[code.Error].err{made(err_picked.err)}; }
+    var k: usize = 0;
+    for (k < taken.len) {
+        val err_one: err[allocator.Error] = push(?offered, taken.data[k]);
+        if (sel err_one.err) { ret err[code.Error].err{made(err_one.err)}; }
+        val regs:  Slice[rf.Id] = Slice[rf.Id]{data: taken.data, size: k + 1};
+        val offer: Slice[rf.Id] = Slice[rf.Id]{data: offered.data, size: offered.len};
+        if (stands_around(e, s, l, regs, first, offer)) { ret around(e, s, l, regs, first, offer); }
+        k = k + 1;
+    }
+    ret err_plain;
+}
+
+# a register borrowed through the frame's emergency slot of its kind past
+# those its kind already holds, saved there or restored from there by the
+# frame code under the scratches the emit offers and, where it reaches the
+# slot only through more, registers of the stack pointer's kind scavenged
+# through their own slots past those held and the one the register takes
+# when it is of that kind
+# ---
+# e:       where it appends, with the bound frame code and the free scratches
+# l:       the frame's layout
+# r:       the register
+# held:    the registers already borrowed, r not among them
+# restore: whether it is restored, else saved
+# at:      the locations of the target
+# pool:    the registers of the stack pointer's kind it may scavenge
+# ret:     ok, or why the frame code made nothing
+pub fun lend(e: *Emit, l: *Layout, r: rf.Id, held: Slice[rf.Id], restore: bool, at: *Locations, pool: Slice[rf.Id]) err[code.Error] {
+    val file:    *rf.File       = function.file(e.f);
+    val opt_nth: opt[Emergency] = nth(l, file, r, holding(file, held, r));
+    if (sel opt_nth.none) { ret err[code.Error].err{code.Error.unreserved{r}}; }
+    val res_step: res[Step, code.Error] = spot_step(l, r, opt_nth.some, restore);
+    if (sel res_step.err)       { ret err[code.Error].err{res_step.err}; }
+    if (!kin(file, e.stack, r)) { ret make(e, res_step.ok, l, held, at, pool); }
+    var past: vector.Vector[rf.Id] = vector.init[rf.Id](e.f.a);
+    fin { vector.dnit[rf.Id](?past); }
+    var i: usize = 0;
+    for (i < held.size) {
+        val err_one: err[allocator.Error] = push(?past, held.data[i]);
+        if (sel err_one.err) { ret err[code.Error].err{made(err_one.err)}; }
+        i = i + 1;
+    }
+    val err_own: err[allocator.Error] = push(?past, r);
+    if (sel err_own.err) { ret err[code.Error].err{made(err_own.err)}; }
+    ret make(e, res_step.ok, l, Slice[rf.Id]{data: past.data, size: past.len}, at, pool);
+}
+
+# whether a pool holds k registers sharing storage with none a move names
+# nor the stack pointer, to offer the move as its scratches
+fun supplied(n: *Counter, s: Step, k: u32) bool {
+    var others: vector.Vector[rf.Id] = vector.init[rf.Id](n.f.a);
+    var taken:  vector.Vector[rf.Id] = vector.init[rf.Id](n.f.a);
+    fin {
+        vector.dnit[rf.Id](?others);
+        vector.dnit[rf.Id](?taken);
+    }
+    val err_named: err[allocator.Error] = names(s, ?others);
+    if (sel err_named.err) { ret false; }
+    val err_based: err[allocator.Error] = push(?others, n.p.layout.stack);
+    if (sel err_based.err) { ret false; }
+    val err_picked: err[allocator.Error] = pick(n.at, n.pool, k::usize, Slice[rf.Id]{data: others.data, size: others.len}, ?taken);
+    if (sel err_picked.err) { ret false; }
+    ret taken.len == k::usize;
+}
+
+# what reserving reads, shared by every instruction it counts
+# ---
+# f:       the allocated function
+# p:       the plan laid out for it
+# c:       the bound frame code
+# at:      the locations of the target
+# pool:    the allowed registers of a class holding the stack pointer's values
+# allowed: the locations the allocator was allowed to assign
+rec Counter {
+    f:       *Function;
+    p:       *Plan;
+    c:       *Admitted;
+    at:      *Locations;
+    pool:    Slice[rf.Id];
+    allowed: Slice[Physical];
+}
+
+# what one pair of a copy takes
+# ---
+# scratches: of the stack pointer's kind, the most one move of it takes, and
+#            a register of that kind it borrows
+# lent:      a register of another kind it borrows through an emergency slot
+#            of that kind, masc's no register for none
+rec Want {
+    scratches: u32;
+    lent:      rf.Id;
+}
+
+# a register of another kind than the stack pointer's a copy borrows
+# ---
+# at:   the copy
+# like: the register
+rec Lend {
+    at:   u32;
+    like: rf.Id;
+}
+
+val NO_WANT: Want = Want{scratches: 0, lent: rf.NONE};
+
+# the fewest scratches a move takes, as the frame code states for it, 0 for
+# one it makes under none, refuses under any count, or that the pool holds
+# too few registers apart from it to offer
+fun fewest(n: *Counter, s: Step) u32 {
+    val k: u32 = code.fewest(n.c, n.p.layout.stack, s);
+    if (k == 0 || supplied(n, s, k)) { ret k; }
+    ret 0;
+}
+
+# the address of a slot of the function, none for one dropped
+fun slot_place(n: *Counter, slot: u32) opt[record.Address] {
+    val pl: Place = n.p.layout.slots.data[slot];
+    if (sel pl.at) { ret opt[record.Address].some{pl.at}; }
+    ret opt[record.Address].none{};
+}
+
+# the registers a copy between two slots of fixed size takes where no
+# location is free to go through: one of the pool that moves the slot's
+# bytes whole or in parts, borrowed through an emergency slot, and the
+# scratches the frame code takes to load it from one slot and store it to
+# the other, 0 where no register of the pool moves them
+fun slots_need(n: *Counter, to: u32, from: u32) u32 {
+    val s: SlotData = n.f.slots.data[from];
+    if (s.per != 0 || s.size == 0) { ret 0; }
+    var align: u64 = s.align;
+    if (n.f.slots.data[to].align < align) { align = n.f.slots.data[to].align; }
+    val opt_slot_place: opt[record.Address] = slot_place(n, from);
+    if (sel opt_slot_place.none) { ret 0; }
+    val opt_to_slot: opt[record.Address] = slot_place(n, to);
+    if (sel opt_to_slot.none) { ret 0; }
+    var i: usize = 0;
+    for (i < n.pool.size) {
+        val r:    rf.Id = n.pool.data[i];
+        val part: u64   = code.widest(n.c, r, s.size, align);
+        if (part > 0) {
+            val size: Offset = record.bytes(part::i64);
+            val load: u32    = fewest(n, Step.load{Access{register: r, base: record.base_of(?n.p.layout, opt_slot_place.some), at: opt_slot_place.some.offset, size: size}});
+            var most: u32    = fewest(n, Step.store{Access{register: r, base: record.base_of(?n.p.layout, opt_to_slot.some), at: opt_to_slot.some.offset, size: size}});
+            if (load > most) { most = load; }
+            ret most + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the first allowed register of a kind other than the stack pointer's the
+# frame code both loads and stores whole at a size, none for none
+fun borrower(n: *Counter, size: Offset) rf.Id {
+    val file: *rf.File = n.at.file;
+    var i:    usize    = 0;
+    for (i < n.allowed.size) {
+        val q: Physical = n.allowed.data[i];
+        if (sel q.register) {
+            val r: rf.Id = q.register;
+            if (!kin(file, n.p.layout.stack, r)) {
+                val opt_into: opt[*code.Width] = code.width_of(n.c, r, size, false);
+                val opt_back: opt[*code.Width] = code.width_of(n.c, r, size, true);
+                if (sel opt_into.some && sel opt_back.some) { ret r; }
+            }
+        }
+        i = i + 1;
+    }
+    ret rf.NONE;
+}
+
+# what a copy between two slots of one scaled size takes where no location
+# is free to go through: the first allowed register of another kind that
+# holds the value, borrowed through an emergency slot of its kind, and of
+# the stack pointer's kind the scratches the frame code takes to load it
+# from one slot, store it to the other, and save and restore it at the
+# emergency slot the plan holds for its kind
+fun scaled_need(n: *Counter, to: u32, from: u32) Want {
+    val s: SlotData = n.f.slots.data[from];
+    val t: SlotData = n.f.slots.data[to];
+    if (s.size != 0 || t.size != 0 || t.per != s.per || t.scale != s.scale) { ret NO_WANT; }
+    val opt_slot_place: opt[record.Address] = slot_place(n, from);
+    if (sel opt_slot_place.none) { ret NO_WANT; }
+    val opt_to_slot: opt[record.Address] = slot_place(n, to);
+    if (sel opt_to_slot.none) { ret NO_WANT; }
+    val size: Offset = record.size_of(s);
+    val r:    rf.Id  = borrower(n, size);
+    if (r == rf.NONE) { ret NO_WANT; }
+    var most:  u32 = fewest(n, Step.load{Access{register: r, base: record.base_of(?n.p.layout, opt_slot_place.some), at: opt_slot_place.some.offset, size: size}});
+    val store: u32 = fewest(n, Step.store{Access{register: r, base: record.base_of(?n.p.layout, opt_to_slot.some), at: opt_to_slot.some.offset, size: size}});
+    if (store > most) { most = store; }
+    val opt_spot: opt[Emergency] = nth(?n.p.layout, n.at.file, r, 0);
+    if (sel opt_spot.some) {
+        val res_saved: res[Step, code.Error] = spot_step(?n.p.layout, r, opt_spot.some, false);
+        if (sel res_saved.ok) {
+            val k: u32 = fewest(n, res_saved.ok);
+            if (k > most) { most = k; }
+        }
+        val res_back: res[Step, code.Error] = spot_step(?n.p.layout, r, opt_spot.some, true);
+        if (sel res_back.ok) {
+            val k: u32 = fewest(n, res_back.ok);
+            if (k > most) { most = k; }
+        }
+    }
+    ret Want{scratches: most, lent: r};
+}
+
+# what the frame code takes for one pair of a copy, a register stored to a
+# slot or loaded from it, and what a copy between two slots borrows, nothing
+# for any other pair
+fun pair_need(n: *Counter, to: Operand, from: Operand) Want {
+    var store: bool  = false;
+    var reg:   rf.Id = rf.NONE;
+    var slot:  u32   = 0;
+    if (sel to.slot) {
+        if (sel from.slot) {
+            if (n.f.slots.data[from.slot].per != 0) { ret scaled_need(n, to.slot, from.slot); }
+            ret Want{scratches: slots_need(n, to.slot, from.slot), lent: rf.NONE};
+        }
+        if (!(sel from.physical)) { ret NO_WANT; }
+        val p: Physical = from.physical;
+        if (!(sel p.register)) { ret NO_WANT; }
+        store = true;
+        reg   = p.register;
+        slot  = to.slot;
+    }
+    or (sel from.slot) {
+        if (!(sel to.physical)) { ret NO_WANT; }
+        val p: Physical = to.physical;
+        if (!(sel p.register)) { ret NO_WANT; }
+        reg  = p.register;
+        slot = from.slot;
+    }
+    or { ret NO_WANT; }
+    val opt_slot_place: opt[record.Address] = slot_place(n, slot);
+    if (sel opt_slot_place.none) { ret NO_WANT; }
+    val step: Access = Access{register: reg, base: record.base_of(?n.p.layout, opt_slot_place.some), at: opt_slot_place.some.offset, size: record.size_of(n.f.slots.data[slot])};
+    if (store) { ret Want{scratches: fewest(n, Step.store{step}), lent: rf.NONE}; }
+    ret Want{scratches: fewest(n, Step.load{step}), lent: rf.NONE};
+}
+
+# whether an instruction is a copy, its destinations then its sources
+fun is_copy(op: Opcode) bool {
+    if (!(sel op.pseudo)) { ret false; }
+    val p: pseudo.Pseudo = op.pseudo;
+    ret p == pseudo.COPY || p == pseudo.PARALLEL_COPY || p == pseudo.SPILL || p == pseudo.RELOAD;
+}
+
+# the scratches the frame code takes for an instruction's slot accesses and
+# addresses, the most of any one, each register of another kind a copy of
+# it borrows added to those lent
+fun frame_need(n: *Counter, d: *InstructionData, at: u32, lends: *vector.Vector[Lend]) res[u32, allocator.Error] {
+    val op: Opcode = d.opcode;
+    if (sel op.pseudo && op.pseudo == pseudo.ADDRESS) {
+        if (d.operands.size != 3) { ret res[u32, allocator.Error].ok{0}; }
+        val o: Operand = d.operands.data[0];
+        val q: Operand = d.operands.data[1];
+        val t: Operand = d.operands.data[2];
+        if (!(sel o.physical))  { ret res[u32, allocator.Error].ok{0}; }
+        if (!(sel q.slot))      { ret res[u32, allocator.Error].ok{0}; }
+        if (!(sel t.immediate)) { ret res[u32, allocator.Error].ok{0}; }
+        val p: Physical = o.physical;
+        if (!(sel p.register)) { ret res[u32, allocator.Error].ok{0}; }
+        val opt_slot_place: opt[record.Address] = slot_place(n, q.slot);
+        if (sel opt_slot_place.none) { ret res[u32, allocator.Error].ok{0}; }
+        ret res[u32, allocator.Error].ok{fewest(n, Step.add{Add{dest: p.register, src: record.base_of(?n.p.layout, opt_slot_place.some), by: record.past(opt_slot_place.some.offset, t.immediate)}})};
+    }
+    if (!is_copy(op)) { ret res[u32, allocator.Error].ok{0}; }
+    val pairs: usize = d.operands.size / 2;
+    var most:  u32   = 0;
+    var k:     usize = 0;
+    for (k < pairs) {
+        val got: Want = pair_need(n, d.operands.data[k], d.operands.data[k + pairs]);
+        if (got.scratches > most) { most = got.scratches; }
+        if (got.lent != rf.NONE) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Lend](lends, Lend{at: at, like: got.lent});
+            if (sel res_pushed.err) { ret res[u32, allocator.Error].err{res_pushed.err}; }
+        }
+        k = k + 1;
+    }
+    ret res[u32, allocator.Error].ok{most};
+}
+
+fun listed_in(s: Slice[rf.Id], r: rf.Id) bool {
+    var i: usize = 0;
+    for (i < s.size) {
+        if (s.data[i] == r) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun saved_by(l: *Layout, r: rf.Id) bool {
+    var i: usize = 0;
+    for (i < l.saves.len) {
+        if (l.saves.data[i].register == r) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# how many of some candidates hold no value across an instruction, counted
+# up to `want`, none for an instruction liveness places nowhere
+fun free_at(l: *Live, at: *Locations, cands: Slice[u32], i: Instruction, want: u32) u32 {
+    val opt_slot: opt[u32] = live.use_slot(l, i);
+    if (sel opt_slot.none) { ret 0; }
+    var span:  [1]Segment = [1]Segment{Segment{from: opt_slot.some, to: opt_slot.some + 2}};
+    var count: u32        = 0;
+    var k:     usize      = 0;
+    for (k < cands.size && count < want) {
+        val opt_blocked: opt[u32] = live.blocked_over(l, at, cands.data[k], Slice[Segment]{data: ?span[0], size: 1}, Slice[u32]{data: nil, size: 0});
+        if (sel opt_blocked.none) { count = count + 1; }
+        k = k + 1;
+    }
+    ret count;
+}
+
+# the allowed registers of a register's kind a call clobbers or the frame
+# saves, by location, into a list emptied first
+fun candidates(l: *Layout, at: *Locations, regs: *Registers, allowed: Slice[Physical], like: rf.Id, out: *vector.Vector[u32]) err[Error] {
+    vector.clear[u32](out);
+    var i: usize = 0;
+    for (i < allowed.size) {
+        val q: Physical = allowed.data[i];
+        if (sel q.register) {
+            val reg: rf.Id = q.register;
+            if (kin(at.file, like, reg) && (listed_in(regs.clobbered, reg) || saved_by(l, reg))) {
+                val res_locate: res[u32, location.Unlocated] = location.locate(at, Physical.register{reg});
+                if (sel res_locate.err) { ret err[Error].err{Error.unlocated{res_locate.err}}; }
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](out, res_locate.ok);
+                if (sel res_pushed.err) { ret err[Error].err{Error.alloc{res_pushed.err}}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun banked(out: *vector.Vector[Bank], file: *rf.File, like: rf.Id) bool {
+    var i: usize = 0;
+    for (i < out.len) {
+        if (kin(file, out.data[i].like, like)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the liveness of an allocated function, which its function does not change
+# as its frame is laid out again, made the first time a count reads it
+# ---
+# made: whether it is
+# live: the liveness, once made
+pub rec After {
+    made: bool;
+    live: Live;
+}
+
+# no liveness made yet
+pub fun after() After {
+    var x: After;
+    ret x;
+}
+
+# give back what an after holds
+pub fun after_dnit(x: *After) {
+    if (x.made) { live.dnit(?x.live); }
+    x.made = false;
+}
+
+# the liveness an after holds, made of the allocated function the first time
+fun liveness(x: *After, a: *allocator.Allocator, f: *Function, ctx: *core_state.Context, at: *Locations) res[*Live, live.Error] {
+    if (!x.made) {
+        val res_computed: res[Live, live.Error] = live.compute(a, f, ctx, at, live.unclobbered());
+        if (sel res_computed.err) { ret res[*Live, live.Error].err{res_computed.err}; }
+        x.live = res_computed.ok;
+        x.made = true;
+    }
+    ret res[*Live, live.Error].ok{?x.live};
+}
+
+# the emergency slots a frame could need, by kind. of the stack pointer's
+# kind: at each instruction, the scratches its slot accesses, addresses and
+# established state take less the candidates the copy lowering and the
+# configuration offer free there, the allowed registers of a class that
+# holds the stack pointer's values a call clobbers or the frame saves, the
+# most at any. of another kind: one where a copy between two slots of scaled
+# size borrows a register of it and no candidate of its kind is free across
+# the copy. a parallel copy is counted as having those free less one for each
+# of its pairs the lowering may save to break a cycle (`cyclic`)
+# ---
+# a:     the allocator the count takes
+# f:     the allocated function the plan was laid out for
+# p:     the plan
+# c:     the target's frame code bound to the build's selection
+# r:     the convention and locations
+# n:     the allowed locations, the pool and the configuration's scratches
+# after: the liveness of the allocated function, made here the first time
+#        any count reads it
+# out:   the banks, emptied first, the stack pointer's kind first, a kind
+#        needing none left out
+# ret:   ok, or why the count was refused
+pub fun needed(a: *allocator.Allocator, f: *Function, p: *Plan, c: *Admitted, r: lay.Request, n: Need, after: *After, out: *vector.Vector[Bank]) err[Error] {
+    vector.clear[Bank](out);
+    val stack: rf.Id = p.layout.stack;
+    if (stack == rf.NONE) { ret err[Error].ok{}; }
+    var counter: Counter             = Counter{f: f, p: p, c: c, at: r.at, pool: n.pool, allowed: n.allowed};
+    var demand:  vector.Vector[u32]  = vector.init[u32](a);
+    var lends:   vector.Vector[Lend] = vector.init[Lend](a);
+    fin {
+        vector.dnit[u32](?demand);
+        vector.dnit[Lend](?lends);
+    }
+    var any: bool  = false;
+    var i:   usize = 0;
+    for (i < f.instructions.len) {
+        val d:              *InstructionData          = ?f.instructions.data[i];
+        val res_frame_need: res[u32, allocator.Error] = frame_need(?counter, d, i::u32, ?lends);
+        if (sel res_frame_need.err) { ret err[Error].err{Error.alloc{res_frame_need.err}}; }
+        var want: u32 = res_frame_need.ok;
+        if (sel d.state.some && n.configured > want) { want = n.configured; }
+        val res_pushed: res[usize, allocator.Error] = vector.push[u32](?demand, want);
+        if (sel res_pushed.err) { ret err[Error].err{Error.alloc{res_pushed.err}}; }
+        if (want > 0)           { any = true; }
+        i = i + 1;
+    }
+    if (!any && lends.len == 0) { ret err[Error].ok{}; }
+    val regs:      *Registers             = held(r.convention);
+    val res_known: res[*Live, live.Error] = liveness(after, a, f, regs.context, r.at);
+    if (sel res_known.err) { ret err[Error].err{Error.live{res_known.err}}; }
+    val l:     *Live              = res_known.ok;
+    var cands: vector.Vector[u32] = vector.init[u32](a);
+    fin { vector.dnit[u32](?cands); }
+    val err_listed: err[Error] = candidates(?p.layout, r.at, regs, n.allowed, stack, ?cands);
+    if (sel err_listed.err) { ret err_listed; }
+    var most: u32 = 0;
+    i = 0;
+    for (i < demand.len) {
+        val want: u32 = demand.data[i];
+        if (want > most) {
+            val held: u32 = cyclic(f, r.at, i::u32);
+            var free: u32 = free_at(l, r.at, Slice[u32]{data: cands.data, size: cands.len}, (i::u32), want + held);
+            if (free > held)        { free = free - held; }
+            or                      { free = 0; }
+            if (want - free > most) { most = want - free; }
+        }
+        i = i + 1;
+    }
+    if (most > 0) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Bank](out, Bank{like: stack, count: most});
+        if (sel res_pushed.err) { ret err[Error].err{Error.alloc{res_pushed.err}}; }
+    }
+    i = 0;
+    for (i < lends.len) {
+        val one: Lend = lends.data[i];
+        if (!banked(out, r.at.file, one.like)) {
+            val held:     u32        = cyclic(f, r.at, one.at);
+            val err_kind: err[Error] = candidates(?p.layout, r.at, regs, n.allowed, one.like, ?cands);
+            if (sel err_kind.err) { ret err_kind; }
+            if (free_at(l, r.at, Slice[u32]{data: cands.data, size: cands.len}, one.at, 1 + held) <= held) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Bank](out, Bank{like: one.like, count: 1});
+                if (sel res_pushed.err) { ret err[Error].err{Error.alloc{res_pushed.err}}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether a location shares storage with a register a parallel copy of `n`
+# pairs writes
+fun written_by(at: *Locations, d: *InstructionData, n: usize, loc: u32) bool {
+    val alias: Slice[u32] = location.shares(at, loc);
+    var j:     usize      = 0;
+    for (j < n) {
+        val o: Operand = d.operands.data[j];
+        if (sel o.physical) {
+            val res_to: res[u32, location.Unlocated] = location.locate(at, o.physical);
+            if (sel res_to.ok) {
+                var k: usize = 0;
+                for (k < alias.size) {
+                    if (alias.data[k] == res_to.ok) { ret true; }
+                    k = k + 1;
+                }
+            }
+        }
+        j = j + 1;
+    }
+    ret false;
+}
+
+# the most free locations a parallel copy's lowering may hold at once to
+# break its cycles: its pairs reading a register some pair writes, or reading
+# a slot or a member, which this does not follow, each saved at most once.
+# none for any other instruction
+fun cyclic(f: *Function, at: *Locations, i: u32) u32 {
+    val d:  *InstructionData = ?f.instructions.data[i];
+    val op: Opcode           = d.opcode;
+    if (!(sel op.pseudo))                  { ret 0; }
+    if (op.pseudo != pseudo.PARALLEL_COPY) { ret 0; }
+    val n:     usize = d.operands.size / 2;
+    var count: u32   = 0;
+    var k:     usize = 0;
+    for (k < n) {
+        val o: Operand = d.operands.data[n + k];
+        if (sel o.physical) {
+            val res_from: res[u32, location.Unlocated] = location.locate(at, o.physical);
+            if (sel res_from.ok) {
+                if (written_by(at, d, n, res_from.ok)) { count = count + 1; }
+            }
+            or { count = count + 1; }
+        }
+        or (!(sel o.immediate) && !(sel o.symbol)) { count = count + 1; }
+        k = k + 1;
+    }
+    ret count;
+}
+
+# fold the emergency slots a frame needs into those it reserves, each kind
+# the most of either
+# ---
+# reserve: the banks reserved, grown in place
+# need:    the banks needed
+# file:    the register file
+# ret:     whether any bank grew, or the allocator's refusal
+pub fun merge(reserve: *vector.Vector[Bank], need: Slice[Bank], file: *rf.File) res[bool, Error] {
+    var grew: bool  = false;
+    var i:    usize = 0;
+    for (i < need.size) {
+        val want:  Bank  = need.data[i];
+        var found: bool  = false;
+        var j:     usize = 0;
+        for (!found && j < reserve.len) {
+            if (kin(file, reserve.data[j].like, want.like)) {
+                found = true;
+                if (want.count > reserve.data[j].count) {
+                    reserve.data[j].count = want.count;
+                    grew                  = true;
+                }
+            }
+            j = j + 1;
+        }
+        if (!found && want.count > 0) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Bank](reserve, want);
+            if (sel res_pushed.err) { ret res[bool, Error].err{Error.alloc{res_pushed.err}}; }
+            grew = true;
+        }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{grew};
+}

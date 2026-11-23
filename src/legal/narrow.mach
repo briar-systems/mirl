@@ -1,0 +1,1333 @@
+# narrow integer arithmetic widened to the widths a target computes at
+#
+# a target declares the integer widths its arithmetic runs at, and an
+# operation at any other width is rewritten to run at the narrowest declared
+# width above it: its operands are extended, a constant one to the constant
+# extended, the same opcode runs at the wide width, and the result is
+# truncated back. a comparison has no result to
+# truncate, since its result is a condition.
+#
+# a high multiply has no wide form of its own: its operands are extended as it
+# reads them, multiplied at the wide width, which is at least twice the narrow
+# one, and shifted down by the narrow width, so the low bits left are the high
+# half of the exact narrow product.
+#
+# a condition is a width like any other here. it stays one bit where it is
+# read as a condition, by a branch or a select, which this pass does not
+# rewrite, and an operation on it is widened like one on eight bits, its
+# operand extended beside the condition and its result truncated back to one
+# bit for every reader. the one exception is an operation the algebra table
+# states is exact on single bits, which the target declares it selects on
+# them as they stand, and which the pass leaves.
+#
+# how an operand is extended is a fact of the operation, read from the algebra
+# table and the folder's comparison table: an operation that reads its operands
+# as signed extends them with their sign, one that reads them as unsigned
+# extends with zeros, and one whose low bits do not depend on the bits above
+# them (a sum, a product, a shift left) takes either, which here is the sign.
+# a shift count is always read as unsigned. the result at the narrow width is
+# then exact, and so are the rules that hold at it:
+#
+# - a shift by the narrow width or more gives zero or the sign fill at the wide
+#   width too, since the count is not truncated, so the truncated result is the
+#   same. a shift right of one bit with its sign fills from bit 0.
+# - a division by zero traps at the wide width exactly when it does at the
+#   narrow one. the least value divided by minus one does not trap at the wide
+#   width, so an opcode whose row states that trap has its dividend replaced,
+#   when the narrow dividend is the least value and the divisor minus one, by
+#   the least value of the wide width, which traps there. the row states the
+#   operand positions, and the replacement is two selects, so the pass adds no
+#   branch and no operation on a condition. a checked division has its traps
+#   tested before it, so it needs no replacement and its wide division stays
+#   checked.
+#
+# the counts, the byte swap and the overflow forms read the bits an extension
+# adds, so each is corrected from what the algebra table states of it:
+#
+# - a population count reads its operand extended with zeros, which add no one
+#   bit.
+# - a leading zero count reads it extended with zeros and takes away the width
+#   difference, so a zero operand gives the narrow width.
+# - a trailing zero count reads it with every bit above the narrow width set,
+#   so a zero operand gives the narrow width.
+# - a byte swap swaps at the wide width and shifts right by the width
+#   difference, which brings the narrow bytes back down.
+# - an overflow form reads its operands signed or unsigned as the table states,
+#   computes exactly at the wide width, and overflows at the narrow one when
+#   the narrow result extended back the same way is not the wide one. a sum and
+#   a difference are exact one bit wider and a product twice as wide, so a
+#   product of a width whose double the target does not compute at runs at the
+#   double width, which the wide integer splitting takes.
+#
+# the pass adds no branch and reads no value to decide anything, so it keeps
+# constant time, and every instruction it makes reads as the one it replaces,
+# which carries the secrecy over: a result is secret exactly when it was.
+#
+# an operand the operation reads only the narrow bits of, as a sum's, a
+# difference's, a product's, a bitwise operation's, a negation's or the value
+# a shift left moves, reads the wide value an earlier widened operation
+# truncated, since its low bits are the narrow value, so no truncation and
+# extension stand between two such operations.
+#
+# what it leaves for another pass: a vector of narrow integers and a width above
+# the widest the target computes at, which the wide integer splitting takes.
+#
+# a width the target holds only under a condition the build does not meet, as
+# spir-v's 8 bits without Int8, is carried: a vector of it is widened lane by
+# lane like a scalar, and then every value of the width, the function's
+# signature, its parameters, results, constants and stack slots included,
+# becomes the narrowest arithmetic width above it. a carrier holds the bits of
+# the width and leaves the bits above undefined, so an extension of it, a
+# conversion to a float and a minimum or maximum reduction first make it exact
+# at the width with a mask or a pair of shifts, a conversion from a float is
+# held to the width's bounds, and a truncation between two carried widths is
+# the value itself. memory other than a carried slot and a member of an
+# aggregate keep the width: a load or extract reads it and extends it, and a
+# store or insert truncates to it. a reinterpretation through a carried width
+# regroups the bits by shifts at the carriers, lane 0 lowest, so it needs no
+# value of the width. no branch is added and each value made reads as the
+# instruction it stands for.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.build.builder.Builder;
+use mirl.build.failure;
+use mirl.fold.algebra;
+use mirl.fold.record;
+use mirl.fold.table;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.constant.Aggregate;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.constant.Spec;
+use mirl.ir.function;
+use mirl.ir.function.Body;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.row.Traps;
+use mirl.ir.opcode.rule.Division;
+use mirl.ir.opcode.rule.Trap;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.format;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Def;
+use mirl.ir.value.ValueData;
+use mirl.legal.emit;
+use mirl.opt.number;
+use mirl.pass.analysis;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use target_basis: mirl.target.basis;
+use mirl.target.capability;
+use mirl.target.capability.Bitwise;
+use mirl.target.capability.Capabilities;
+use mirl.target.capability.Carried;
+use mirl.target.capability.Set;
+
+# the pass: it adds and removes instructions and never touches the graph
+pub val NARROW: Pass = Pass{name: "narrow", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: widens_something};
+
+# how an operand is extended to the wide width
+# ---
+# zero: with zeros, the operand read as unsigned
+# sign: with copies of its sign bit, the operand read as signed or any
+tag Extend: u8 {
+    zero;
+    sign;
+}
+
+# the extension of an operand read as signed when true and as unsigned otherwise
+fun signs(signed: bool) opt[Extend] {
+    if (signed) { ret opt[Extend].some{Extend.sign{}}; }
+    ret opt[Extend].some{Extend.zero{}};
+}
+
+# whether an operation is exact only at twice the width it reads: a high half
+# and a product whose overflow is read
+fun doubles(code: Opcode) bool {
+    val a: algebra.Op = algebra.op(code);
+    ret sel a.high || sel a.checked_product;
+}
+
+# how an opcode extends the operand at a position, none when it is not widened
+fun extension(code: Opcode, position: u32) opt[Extend] {
+    val a: algebra.Op = algebra.op(code);
+    if (sel a.shift_left || sel a.shift_right_s) {
+        if (position == 0) { ret opt[Extend].some{Extend.sign{}}; }
+        ret opt[Extend].some{Extend.zero{}};
+    }
+    if (sel a.shift_right_u || sel a.quotient_u || sel a.remainder_u)                                 { ret opt[Extend].some{Extend.zero{}}; }
+    if (sel a.sum || sel a.difference || sel a.product || sel a.both || sel a.either || sel a.differ) { ret opt[Extend].some{Extend.sign{}}; }
+    if (sel a.negate || sel a.complement || sel a.quotient_s || sel a.remainder_s)                    { ret opt[Extend].some{Extend.sign{}}; }
+    if (sel a.population || sel a.leading_zeros || sel a.trailing_zeros || sel a.swap)                { ret opt[Extend].some{Extend.zero{}}; }
+    if (sel a.checked_sum)                                                                            { ret signs(a.checked_sum); }
+    if (sel a.checked_difference)                                                                     { ret signs(a.checked_difference); }
+    if (sel a.checked_product)                                                                        { ret signs(a.checked_product); }
+    if (sel a.high) {
+        var signed: bool = a.high.rhs;
+        if (position == 0) { signed = a.high.lhs; }
+        if (signed)        { ret opt[Extend].some{Extend.sign{}}; }
+        ret opt[Extend].some{Extend.zero{}};
+    }
+    if (sel a.compare) {
+        val opt_comparison: opt[table.Comparison] = table.comparison(code);
+        if (sel opt_comparison.none)    { ret opt[Extend].none{}; }
+        if (opt_comparison.some.signed) { ret opt[Extend].some{Extend.sign{}}; }
+        ret opt[Extend].some{Extend.zero{}};
+    }
+    ret opt[Extend].none{};
+}
+
+# whether the narrow result of an opcode reads only the narrow bits of the
+# operand at a position, so the operand may be any wide value whose low bits
+# are the narrow one
+fun low_bits(code: Opcode, position: u32) bool {
+    val a: algebra.Op = algebra.op(code);
+    if (sel a.shift_left) { ret position == 0; }
+    ret sel a.sum || sel a.difference || sel a.product || sel a.both || sel a.either || sel a.differ || sel a.negate || sel a.complement;
+}
+
+# the wide value of type `to` a narrow value was truncated from, which an
+# earlier widened operation leaves, none for any other value
+fun cut_from(w: *Work, v: Value, to: Type) opt[Value] {
+    val d: *ValueData = ?w.b.values.data[v];
+    if (!(sel d.def.result)) { ret opt[Value].none{}; }
+    val i: *InstructionData = ?w.b.instructions.data[d.def.result.instruction];
+    if (i.opcode != opcode_table.TRUNC) { ret opt[Value].none{}; }
+    val x: Value = i.operands.data[0];
+    if (!type_table.same(w.b.values.data[x].type, to)) { ret opt[Value].none{}; }
+    ret opt[Value].some{x};
+}
+
+# whether the pass rewrites an opcode when its integer operands are narrow
+pub fun widens(code: Opcode) bool {
+    val opt_how: opt[Extend] = extension(code, 0);
+    ret sel opt_how.some;
+}
+
+# the widths an opcode runs at natively: a product's and a high half's are the
+# multiply's and a quotient's or remainder's the division's where the target
+# lists them, and every other operation's the arithmetic's
+fun native(caps: *Capabilities, code: Opcode) Set {
+    val a: algebra.Op = algebra.op(code);
+    if ((sel a.product || sel a.high) && sel caps.arithmetic.multiply.widths) { ret caps.arithmetic.multiply; }
+
+    val divides: bool = sel a.quotient_s || sel a.quotient_u || sel a.remainder_s || sel a.remainder_u;
+    if (divides && sel caps.arithmetic.division.widths.widths) { ret caps.arithmetic.division.widths; }
+
+    ret caps.widths.alu;
+}
+
+# the width an opcode at a width is done at instead, none where the build
+# holds the width as a value of its own
+fun promoted(w: *Work, code: Opcode, width: u32) opt[u32] {
+    if (held(w, width)) { ret opt[u32].none{}; }
+    ret runs_at(w.caps, code, width);
+}
+
+# the width the pass makes an opcode at a width run at on a target, at least
+# twice the width for one exact only at twice it, none where the target
+# computes it at the width itself or at no wider one
+pub fun runs_at(caps: *Capabilities, code: Opcode, width: u32) opt[u32] {
+    val widths: Set = native(caps, code);
+    if (capability.computes_in(widths, width)) { ret opt[u32].none{}; }
+    val opt_wider: opt[u32] = capability.wider_in(widths, width);
+    if (sel opt_wider.none)                          { ret opt_wider; }
+    if (doubles(code) && opt_wider.some < 2 * width) { ret opt[u32].some{at_least(2 * width)}; }
+    ret opt_wider;
+}
+
+# whether a set of widths widens any integer width
+fun widens_in(widths: Set) bool {
+    var i: usize = 0;
+    for (i < $length_of(type_table.Widths)) {
+        val opt_wider_in: opt[u32] = capability.wider_in(widths, type_table.WIDTHS[i]);
+        if (!capability.computes_in(widths, type_table.WIDTHS[i]) && sel opt_wider_in.some) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the single bit operation an opcode is, none when the algebra table does not
+# state it exact on single bits
+fun bitwise(code: Opcode) opt[Bitwise] {
+    if (!algebra.single_bit(code)) { ret opt[Bitwise].none{}; }
+    val a: algebra.Op = algebra.op(code);
+    if (sel a.both)   { ret opt[Bitwise].some{Bitwise.both{}}; }
+    if (sel a.either) { ret opt[Bitwise].some{Bitwise.either{}}; }
+    if (sel a.differ) { ret opt[Bitwise].some{Bitwise.differ{}}; }
+    ret opt[Bitwise].some{Bitwise.compare{}};
+}
+
+# whether the target selects an opcode on operands of a width as it stands
+fun kept(caps: *Capabilities, code: Opcode, width: u32) bool {
+    val opt_bitwise: opt[Bitwise] = bitwise(code);
+    ret sel opt_bitwise.some && capability.selects_bits(caps, opt_bitwise.some, width);
+}
+
+# whether a target has an integer width its arithmetic is widened from
+fun widens_something(g: *Ground) bool {
+    val c: *Capabilities = ?g.t.caps;
+    ret widens_in(c.widths.alu) || widens_in(c.arithmetic.multiply) || widens_in(c.arithmetic.division.widths);
+}
+
+# one visit
+# ---
+# m:        the module
+# caps:     the target's declarations
+# f:        the function
+# b:        its body
+# scratch:  storage for one instruction at a time, reset between them
+# rows:     the widths the target holds only under a condition
+# carriers: for each of them, the width the build carries it at, zero where
+#           the build holds it
+rec Work {
+    m:        *Module;
+    caps:     *Capabilities;
+    f:        Function;
+    b:        *Body;
+    scratch:  *allocator.Allocator;
+    rows:     Slice[Carried];
+    carriers: *u32;
+}
+
+# a constant of an integer type in the function, or of a vector of them
+# holding it in every lane
+fun constant(w: *Work, ty: Type, width: u32, x: Wide) res[Value, refusal.Error] {
+    val res_lane: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, ty);
+    if (sel res_lane.err) { ret res[Value, refusal.Error].err{res_lane.err}; }
+    if (sel res_lane.ok.some) {
+        if (res_lane.ok.some.lanes != 0) { ret splat(w, res_lane.ok.some, ty, width, x); }
+    }
+    val n:        usize                      = word.words_for(width)::usize;
+    val res_room: res[*u64, allocator.Error] = allocator.zallocate[u64](w.scratch, n);
+    if (sel res_room.err) { ret res[Value, refusal.Error].err{refusal.Error.alloc{res_room.err}}; }
+    var k: usize = 0;
+    for (k < n) {
+        res_room.ok[k] = x[k];
+        k              = k + 1;
+    }
+    val res_made: res[Constant, module.Error] = module.add_constant(w.m, ConstantData.integer{Bits{type: ty, words: Slice[u64]{data: res_room.ok, size: n}}});
+    if (sel res_made.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    val res_constant: res[Value, module.Error] = body.constant(w.m, w.f, res_made.ok);
+    if (sel res_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_constant.err}}; }
+    ret res[Value, refusal.Error].ok{res_constant.ok};
+}
+
+fun make(bld: *Builder, code: Opcode, operands: Slice[Value], immediates: Slice[Immediate]) Value {
+    ret builder.value(bld, Request{opcode: code, operands: operands, immediates: immediates, targets: Slice[Branch]{data: nil, size: 0}});
+}
+
+fun make_plain(bld: *Builder, code: Opcode, operands: Slice[Value]) Value {
+    ret make(bld, code, operands, Slice[Immediate]{data: nil, size: 0});
+}
+
+fun resize(bld: *Builder, code: Opcode, v: Value, to: Type) Value {
+    var ops: [1]Value     = [1]Value{v};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{to}};
+    ret make(bld, code, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+fun extend(bld: *Builder, how: Extend, v: Value, to: Type) Value {
+    if (sel how.zero) { ret resize(bld, opcode_table.EXT_U, v, to); }
+    ret resize(bld, opcode_table.EXT_S, v, to);
+}
+
+# operand `v` of `narrow` bits extended as `how` says to type `to` of `width` bits: a constant integer is the constant
+# extended, so a constant operand stays one, and any other value an extension
+fun widened(w: *Work, bld: *Builder, how: Extend, v: Value, narrow: u32, width: u32, to: Type) res[Value, refusal.Error] {
+    val opt_known: opt[u64] = emit.known_in(w.m, w.b, v);
+    if (sel opt_known.none)         { ret res[Value, refusal.Error].ok{extend(bld, how, v, to)}; }
+    if (narrow >= 64 || width > 64) { ret res[Value, refusal.Error].ok{extend(bld, how, v, to)}; }
+    val low: u64 = (1u64 << narrow::u64) - 1;
+    var x:   u64 = opt_known.some & low;
+    if (sel how.sign && ((x >> (narrow - 1)::u64) & 1) != 0) { x = x | ~low; }
+    if (width < 64)                                          { x = x & ((1u64 << width::u64) - 1); }
+    ret constant(w, to, width, word.small(x));
+}
+
+fun compare(bld: *Builder, a: Value, b: Value) Value {
+    var ops: [2]Value = [2]Value{a, b};
+    ret make_plain(bld, opcode_table.EQ, Slice[Value]{data: ?ops[0], size: 2});
+}
+
+fun inequal(bld: *Builder, a: Value, b: Value) Value {
+    var ops: [2]Value = [2]Value{a, b};
+    ret make_plain(bld, opcode_table.NE, Slice[Value]{data: ?ops[0], size: 2});
+}
+
+# the dividend a wide division reads in place of the extended one, which is the
+# least value of the wide width when the narrow division would overflow, so the
+# division traps at the wide width exactly when it would at the narrow one. the
+# two tests are two selects, since an and of them would be an operation on
+# conditions the target may not select
+fun dividend(w: *Work, bld: *Builder, wide: [2]Value, at: Division, to: Type, narrow: u32, width: u32) res[Value, refusal.Error] {
+    val least:     Wide                      = word.mask(word.sext(word.least(narrow), narrow), width);
+    val res_above: res[Value, refusal.Error] = constant(w, to, width, least);
+    if (sel res_above.err) { ret res_above; }
+    val res_ones: res[Value, refusal.Error] = constant(w, to, width, word.ones(width));
+    if (sel res_ones.err) { ret res_ones; }
+    val res_floor: res[Value, refusal.Error] = constant(w, to, width, word.least(width));
+    if (sel res_floor.err) { ret res_floor; }
+    val x:     Value    = wide[at.dividend];
+    val y:     Value    = wide[at.divisor];
+    var inner: [3]Value = [3]Value{compare(bld, y, res_ones.ok), res_floor.ok, x};
+    var outer: [3]Value = [3]Value{compare(bld, x, res_above.ok), make_plain(bld, opcode_table.SELECT, Slice[Value]{data: ?inner[0], size: 3}), x};
+    ret res[Value, refusal.Error].ok{make_plain(bld, opcode_table.SELECT, Slice[Value]{data: ?outer[0], size: 3})};
+}
+
+# widen one placed instruction to a type of the width the target computes at,
+# and take it out
+fun widen(w: *Work, i: Instruction, narrow: u32, width: u32, to: Type) err[refusal.Error] {
+    val d:      *InstructionData = ?w.b.instructions.data[i];
+    val code:   Opcode           = d.opcode;
+    val count:  usize            = d.operands.len;
+    val old:    Value            = d.results.data[0];
+    var second: Value            = old;
+    if (d.results.len > 1) { second = d.results.data[1]; }
+    val ty:    Type       = w.b.values.data[old].type;
+    val tests: bool       = d.metadata.flags.checked;
+    val alg:   algebra.Op = algebra.op(code);
+    val high:  bool       = sel alg.high;
+    var given: [2]Value;
+    var n:     usize      = 0;
+    for (n < count) {
+        given[n] = d.operands.data[n];
+        n        = n + 1;
+    }
+    val opt_code_at: opt[*Row] = opcode_table.at(code);
+    if (sel opt_code_at.none) { ret err[refusal.Error].err{refusal.Error.reason{"an instruction whose opcode has no row"}}; }
+    val row: *Row = opt_code_at.some;
+
+    var bld: Builder = builder.make(w.m);
+    builder.enter(?bld, w.f);
+    builder.derive(?bld, i);
+    builder.before(?bld, i);
+    var wide: [2]Value;
+    n = 0;
+    for (n < count) {
+        val opt_how: opt[Extend] = extension(code, n::u32);
+        if (!(sel opt_how.some)) { ret err[refusal.Error].err{refusal.Error.reason{"an operand of a widened operation that has no extension"}}; }
+        val opt_cut: opt[Value] = cut_from(w, given[n], to);
+        if (sel opt_cut.some) {
+            if (low_bits(code, n::u32)) {
+                wide[n] = opt_cut.some;
+                n       = n + 1;
+                cnt;
+            }
+        }
+        val res_wide: res[Value, refusal.Error] = widened(w, ?bld, opt_how.some, given[n], narrow, width, to);
+        if (sel res_wide.err) { ret err[refusal.Error].err{res_wide.err}; }
+        wide[n] = res_wide.ok;
+        n       = n + 1;
+    }
+    n = 0;
+    for (n < $length_of(Traps) && !tests) {
+        val t: Trap = row.effects.traps[n];
+        if (sel t.overflow) {
+            val res_read: res[Value, refusal.Error] = dividend(w, ?bld, wide, t.overflow, to, narrow, width);
+            if (sel res_read.err) { ret err[refusal.Error].err{res_read.err}; }
+            wide[t.overflow.dividend] = res_read.ok;
+        }
+        n = n + 1;
+    }
+    if (tests) { builder.flags(?bld, emit.CHECKED); }
+    var result:   Value;
+    var opt_flag: opt[Value] = opt[Value].none{};
+    if (high) {
+        val res_constant: res[Value, refusal.Error] = constant(w, to, width, word.small(narrow::u64));
+        if (sel res_constant.err) { ret err[refusal.Error].err{res_constant.err}; }
+        var down: [2]Value = [2]Value{make_plain(?bld, opcode_table.MUL, Slice[Value]{data: ?wide[0], size: count}), res_constant.ok};
+        result = make_plain(?bld, opcode_table.SHR_U, Slice[Value]{data: ?down[0], size: 2});
+    }
+    or (sel alg.leading_zeros) {
+        val res_constant: res[Value, refusal.Error] = constant(w, to, width, word.small((width - narrow)::u64));
+        if (sel res_constant.err) { ret err[refusal.Error].err{res_constant.err}; }
+        var less: [2]Value = [2]Value{make_plain(?bld, code, Slice[Value]{data: ?wide[0], size: 1}), res_constant.ok};
+        result = make_plain(?bld, opcode_table.SUB, Slice[Value]{data: ?less[0], size: 2});
+    }
+    or (sel alg.trailing_zeros) {
+        val res_above: res[Value, refusal.Error] = constant(w, to, width, word.and_at(word.ones(width), word.not_at(word.ones(narrow), width), width));
+        if (sel res_above.err) { ret err[refusal.Error].err{res_above.err}; }
+        var set: [2]Value = [2]Value{wide[0], res_above.ok};
+        var one: [1]Value = [1]Value{make_plain(?bld, opcode_table.OR, Slice[Value]{data: ?set[0], size: 2})};
+        result = make_plain(?bld, code, Slice[Value]{data: ?one[0], size: 1});
+    }
+    or (sel alg.swap) {
+        val res_constant: res[Value, refusal.Error] = constant(w, to, width, word.small((width - narrow)::u64));
+        if (sel res_constant.err) { ret err[refusal.Error].err{res_constant.err}; }
+        var down: [2]Value = [2]Value{make_plain(?bld, code, Slice[Value]{data: ?wide[0], size: 1}), res_constant.ok};
+        result = make_plain(?bld, opcode_table.SHR_U, Slice[Value]{data: ?down[0], size: 2});
+    }
+    or (sel alg.checked_sum || sel alg.checked_difference || sel alg.checked_product) {
+        var plain:  Opcode = opcode_table.ADD;
+        var signed: bool   = false;
+        if (sel alg.checked_sum) { signed = alg.checked_sum; }
+        if (sel alg.checked_difference) {
+            plain  = opcode_table.SUB;
+            signed = alg.checked_difference;
+        }
+        if (sel alg.checked_product) {
+            plain  = opcode_table.MUL;
+            signed = alg.checked_product;
+        }
+        val exact: Value = make_plain(?bld, plain, Slice[Value]{data: ?wide[0], size: count});
+        result = resize(?bld, opcode_table.TRUNC, exact, ty);
+        var how: Extend = Extend.zero{};
+        if (signed) { how = Extend.sign{}; }
+        opt_flag = opt[Value].some{inequal(?bld, extend(?bld, how, result, to), exact)};
+    }
+    or { result = make_plain(?bld, code, Slice[Value]{data: ?wide[0], size: count}); }
+    builder.flags(?bld, NO_FLAGS);
+    if (!builder.failed(?bld)) {
+        if (!type_table.same(w.b.values.data[result].type, ty)) { result = resize(?bld, opcode_table.TRUNC, result, ty); }
+    }
+    val err_built: err[failure.Error] = builder.done(?bld);
+    if (sel err_built.err) { ret err[refusal.Error].err{refusal.Error.build{err_built.err}}; }
+
+    val err_edit: err[refusal.Error] = refusal.edit(body.replace(w.m, w.f, old, result, Records.follow{}));
+    if (sel err_edit.err) { ret err_edit; }
+    if (sel opt_flag.some) {
+        val err_edit: err[refusal.Error] = refusal.edit(body.replace(w.m, w.f, second, opt_flag.some, Records.follow{}));
+        if (sel err_edit.err) { ret err_edit; }
+    }
+    ret refusal.edit(body.erase(w.m, w.f, i));
+}
+
+# the narrowest integer width of the ir that is at least a number of bits
+fun at_least(bits: u32) u32 {
+    var i: usize = 0;
+    for (i < $length_of(type_table.Widths)) {
+        if (type_table.WIDTHS[i] >= bits) { ret type_table.WIDTHS[i]; }
+        i = i + 1;
+    }
+    ret type_table.WIDTHS[$length_of(type_table.Widths) - 1];
+}
+
+# widen an instruction if it is narrow arithmetic
+fun consider(w: *Work, i: Instruction) res[bool, refusal.Error] {
+    val d: *InstructionData = ?w.b.instructions.data[i];
+    if (!(sel d.place.placed) || d.results.len == 0 || d.results.len > 2 || d.operands.len == 0) { ret res[bool, refusal.Error].ok{false}; }
+    if (!widens(d.opcode))                                                                       { ret res[bool, refusal.Error].ok{false}; }
+    val res_lane: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, w.b.values.data[d.operands.data[0]].type);
+    if (sel res_lane.err)     { ret res[bool, refusal.Error].err{res_lane.err}; }
+    if (sel res_lane.ok.none) { ret res[bool, refusal.Error].ok{false}; }
+    val narrow: u32 = res_lane.ok.some.bits;
+    val lanes:  u32 = res_lane.ok.some.lanes;
+    # a vector is widened here only where the build carries its lanes, and is
+    # otherwise the vector legalisation's
+    if (lanes != 0) {
+        val opt_carried: opt[u32] = carrier(w, narrow);
+        if (sel opt_carried.none) { ret res[bool, refusal.Error].ok{false}; }
+    }
+    val opt_promoted: opt[u32] = promoted(w, d.opcode, narrow);
+    if (sel opt_promoted.none)          { ret res[bool, refusal.Error].ok{false}; }
+    if (kept(w.caps, d.opcode, narrow)) { ret res[bool, refusal.Error].ok{false}; }
+    val width:  u32                      = opt_promoted.some;
+    val res_to: res[Type, refusal.Error] = integer_type(w, width, lanes);
+    if (sel res_to.err) { ret res[bool, refusal.Error].err{res_to.err}; }
+    val err_widen: err[refusal.Error] = widen(w, i, narrow, width, res_to.ok);
+    if (sel err_widen.err) { ret res[bool, refusal.Error].err{err_widen.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# widen every narrow operation of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+
+    var w: Work = Work{m: c.m, caps: ?c.t.caps, f: u.f, b: res_body.ok, scratch: ?scratch, rows: Slice[Carried]{data: nil, size: 0}, carriers: nil};
+    if (sel c.t.caps.widths.carried.rows) {
+        val rows:         Slice[Carried]             = c.t.caps.widths.carried.rows;
+        val res_carriers: res[*u32, allocator.Error] = allocator.zallocate[u32](c.m.a, rows.size);
+        if (sel res_carriers.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_carriers.err}}; }
+        w.rows     = rows;
+        w.carriers = res_carriers.ok;
+    }
+    fin {
+        if (w.carriers != nil) { allocator.deallocate[u32](c.m.a, w.carriers, w.rows.size); }
+    }
+    var carrying: bool  = false;
+    var r:        usize = 0;
+    for (r < w.rows.size) {
+        val res_met: res[bool, target_basis.Error] = target_basis.meets(c.basis, w.rows.data[r].condition);
+        if (sel res_met.err) { ret res[bool, refusal.Error].err{refusal.Error.condition{res_met.err}}; }
+        if (!res_met.ok) {
+            val opt_up: opt[u32] = capability.wider_in(w.caps.widths.alu, w.rows.data[r].width);
+            if (sel opt_up.some) {
+                w.carriers[r] = opt_up.some;
+                carrying      = true;
+            }
+        }
+        r = r + 1;
+    }
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < w.b.blocks.len) {
+        if (!w.b.blocks.data[k].erased) {
+            var p: Instruction = w.b.blocks.data[k].first;
+            for (p != NO_INSTRUCTION) {
+                arena.reset(?ar);
+                val i: Instruction = p;
+                p = w.b.instructions.data[i].next;
+                val res_done: res[bool, refusal.Error] = consider(?w, i);
+                if (sel res_done.err) { ret res[bool, refusal.Error].err{res_done.err}; }
+                if (res_done.ok)      { changed = true; }
+            }
+        }
+        k = k + 1;
+    }
+    if (carrying) {
+        arena.reset(?ar);
+        val res_carried: res[bool, refusal.Error] = carry(?w);
+        if (sel res_carried.err) { ret res_carried; }
+        if (res_carried.ok)      { changed = true; }
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# whether the build holds a width the target holds only under a condition
+fun held(w: *Work, width: u32) bool {
+    var i: usize = 0;
+    for (i < w.rows.size) {
+        if (w.rows.data[i].width == width) { ret w.carriers[i] == 0; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the width the build carries an integer width at, none where it holds it
+fun carrier(w: *Work, width: u32) opt[u32] {
+    var i: usize = 0;
+    for (i < w.rows.size) {
+        if (w.rows.data[i].width == width && w.carriers[i] != 0) { ret opt[u32].some{w.carriers[i]}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun typing(e: type_table.Error) refusal.Error {
+    ret refusal.Error.ir{module.Error.types{e}};
+}
+
+# an integer type of a width, or a vector of that many lanes of it where
+# lanes is not zero
+fun integer_type(w: *Work, width: u32, lanes: u32) res[Type, refusal.Error] {
+    val res_scalar: res[Type, type_table.Error] = type_table.intern(?w.m.types, type_table.Shape.integer{type_table.Integer{width: width}});
+    if (sel res_scalar.err) { ret res[Type, refusal.Error].err{typing(res_scalar.err)}; }
+    if (lanes == 0)         { ret res[Type, refusal.Error].ok{res_scalar.ok}; }
+    val res_vector: res[Type, type_table.Error] = type_table.intern(?w.m.types, type_table.Shape.vector{type_table.Vector{lanes: lanes, element: res_scalar.ok}});
+    if (sel res_vector.err) { ret res[Type, refusal.Error].err{typing(res_vector.err)}; }
+    ret res[Type, refusal.Error].ok{res_vector.ok};
+}
+
+# a constant of a vector of integers holding x in every lane
+fun splat(w: *Work, lane: emit.Lane, ty: Type, width: u32, x: Wide) res[Value, refusal.Error] {
+    val n:         usize                      = word.words_for(width)::usize;
+    val res_words: res[*u64, allocator.Error] = allocator.zallocate[u64](w.scratch, n);
+    if (sel res_words.err) { ret res[Value, refusal.Error].err{refusal.Error.alloc{res_words.err}}; }
+    var k: usize = 0;
+    for (k < n) {
+        res_words.ok[k] = x[k];
+        k               = k + 1;
+    }
+    val count:     usize                       = lane.lanes::usize;
+    val res_lanes: res[*Bits, allocator.Error] = allocator.zallocate[Bits](w.scratch, count);
+    if (sel res_lanes.err) { ret res[Value, refusal.Error].err{refusal.Error.alloc{res_lanes.err}}; }
+    k = 0;
+    for (k < count) {
+        res_lanes.ok[k] = Bits{type: lane.lane, words: Slice[u64]{data: res_words.ok, size: n}};
+        k               = k + 1;
+    }
+    ret number.place(w.m, w.f, w.scratch, record.Value{type: ty, lanes: Slice[Bits]{data: res_lanes.ok, size: count}});
+}
+
+# the type a value of a type is carried as, none where the build holds it as
+# it is: an integer of a carried width as an integer of its carrier, a vector
+# of them lane by lane, and a function type in its parameters and results
+fun carried_type(w: *Work, ty: Type) res[opt[Type], refusal.Error] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?w.m.types, ty);
+    if (sel res_shape.err) { ret res[opt[Type], refusal.Error].err{typing(res_shape.err)}; }
+    val sh: type_table.Shape = res_shape.ok;
+    if (sel sh.function) { ret carried_signature(w, sh.function); }
+    var width: u32 = 0;
+    var lanes: u32 = 0;
+    if (sel sh.integer) { width = sh.integer.width; }
+    or (sel sh.vector) {
+        val res_lane: res[type_table.Shape, type_table.Error] = type_table.shape(?w.m.types, sh.vector.element);
+        if (sel res_lane.err)           { ret res[opt[Type], refusal.Error].err{typing(res_lane.err)}; }
+        if (!(sel res_lane.ok.integer)) { ret res[opt[Type], refusal.Error].ok{opt[Type].none{}}; }
+        width = res_lane.ok.integer.width;
+        lanes = sh.vector.lanes;
+    }
+    or { ret res[opt[Type], refusal.Error].ok{opt[Type].none{}}; }
+    val opt_up: opt[u32] = carrier(w, width);
+    if (sel opt_up.none) { ret res[opt[Type], refusal.Error].ok{opt[Type].none{}}; }
+    val res_to: res[Type, refusal.Error] = integer_type(w, opt_up.some, lanes);
+    if (sel res_to.err) { ret res[opt[Type], refusal.Error].err{res_to.err}; }
+    ret res[opt[Type], refusal.Error].ok{opt[Type].some{res_to.ok}};
+}
+
+# a list of types with each carried type in its place, into `out`, and
+# whether any was
+fun carried_list(w: *Work, list: Slice[Type], out: *Type) res[bool, refusal.Error] {
+    var any: bool  = false;
+    var i:   usize = 0;
+    for (i < list.size) {
+        out[i] = list.data[i];
+        val res_carried: res[opt[Type], refusal.Error] = carried_type(w, list.data[i]);
+        if (sel res_carried.err) { ret res[bool, refusal.Error].err{res_carried.err}; }
+        if (sel res_carried.ok.some) {
+            out[i] = res_carried.ok.some;
+            any    = true;
+        }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{any};
+}
+
+# a function type with its carried parameters and results in their carriers,
+# none where it has none
+fun carried_signature(w: *Work, fs: type_table.Function) res[opt[Type], refusal.Error] {
+    val res_params: res[*Type, allocator.Error] = allocator.zallocate[Type](w.scratch, fs.params.size + 1);
+    if (sel res_params.err) { ret res[opt[Type], refusal.Error].err{refusal.Error.alloc{res_params.err}}; }
+    val res_results: res[*Type, allocator.Error] = allocator.zallocate[Type](w.scratch, fs.results.size + 1);
+    if (sel res_results.err) { ret res[opt[Type], refusal.Error].err{refusal.Error.alloc{res_results.err}}; }
+    val res_in: res[bool, refusal.Error] = carried_list(w, fs.params, res_params.ok);
+    if (sel res_in.err) { ret res[opt[Type], refusal.Error].err{res_in.err}; }
+    val res_out: res[bool, refusal.Error] = carried_list(w, fs.results, res_results.ok);
+    if (sel res_out.err)           { ret res[opt[Type], refusal.Error].err{res_out.err}; }
+    if (!res_in.ok && !res_out.ok) { ret res[opt[Type], refusal.Error].ok{opt[Type].none{}}; }
+    var shape: type_table.Function = fs;
+    shape.params  = Slice[Type]{data: res_params.ok, size: fs.params.size};
+    shape.results = Slice[Type]{data: res_results.ok, size: fs.results.size};
+    val res_made: res[Type, type_table.Error] = type_table.intern(?w.m.types, type_table.Shape.function{shape});
+    if (sel res_made.err) { ret res[opt[Type], refusal.Error].err{typing(res_made.err)}; }
+    ret res[opt[Type], refusal.Error].ok{opt[Type].some{res_made.ok}};
+}
+
+# the types an instruction read and gave before its function was carried:
+# its first and second operands' and its first result's, each zero where it
+# has none
+rec Before {
+    first:  Type;
+    second: Type;
+    result: Type;
+}
+
+# the lane width of an integer type or a vector of them, zero for any other
+fun lane_bits(w: *Work, ty: Type) res[u32, refusal.Error] {
+    val res_lane: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, ty);
+    if (sel res_lane.err)     { ret res[u32, refusal.Error].err{res_lane.err}; }
+    if (sel res_lane.ok.none) { ret res[u32, refusal.Error].ok{0}; }
+    ret res[u32, refusal.Error].ok{res_lane.ok.some.bits};
+}
+
+# a carried value made exact at its own width: its bits above the width
+# zero, or copies of its sign bit, so an operation that reads them reads the
+# value. a carrier holds a value's bits at its own width and leaves the bits
+# above undefined, since wrapping needs nothing more
+fun exact(w: *Work, bld: *Builder, x: Value, narrow: u32, how: Extend) res[Value, refusal.Error] {
+    val ty:        Type                    = w.b.values.data[x].type;
+    val res_width: res[u32, refusal.Error] = lane_bits(w, ty);
+    if (sel res_width.err) { ret res_width; }
+    val width: u32 = res_width.ok;
+    if (sel how.zero) {
+        val res_mask: res[Value, refusal.Error] = constant(w, ty, width, word.ones(narrow));
+        if (sel res_mask.err) { ret res_mask; }
+        var ops: [2]Value = [2]Value{x, res_mask.ok};
+        ret res[Value, refusal.Error].ok{make_plain(bld, opcode_table.AND, Slice[Value]{data: ?ops[0], size: 2})};
+    }
+    val res_by: res[Value, refusal.Error] = constant(w, ty, width, word.small((width - narrow)::u64));
+    if (sel res_by.err) { ret res_by; }
+    builder.flags(bld, emit.BOUNDED);
+    var up:   [2]Value = [2]Value{x, res_by.ok};
+    var down: [2]Value = [2]Value{make_plain(bld, opcode_table.SHL, Slice[Value]{data: ?up[0], size: 2}), res_by.ok};
+    val r:    Value    = make_plain(bld, opcode_table.SHR_S, Slice[Value]{data: ?down[0], size: 2});
+    builder.flags(bld, NO_FLAGS);
+    ret res[Value, refusal.Error].ok{r};
+}
+
+# a carried float-to-integer conversion's result held to the bounds of its
+# own width, which a conversion at the carrier's width saturates past
+fun bounded(w: *Work, bld: *Builder, x: Value, narrow: u32, signed: bool) res[Value, refusal.Error] {
+    val ty:        Type                    = w.b.values.data[x].type;
+    val res_width: res[u32, refusal.Error] = lane_bits(w, ty);
+    if (sel res_width.err) { ret res_width; }
+    val width: u32 = res_width.ok;
+    if (!signed) {
+        val res_top: res[Value, refusal.Error] = constant(w, ty, width, word.ones(narrow));
+        if (sel res_top.err) { ret res_top; }
+        var above: [2]Value = [2]Value{x, res_top.ok};
+        var pick:  [3]Value = [3]Value{make_plain(bld, opcode_table.GT_U, Slice[Value]{data: ?above[0], size: 2}), res_top.ok, x};
+        ret res[Value, refusal.Error].ok{make_plain(bld, opcode_table.SELECT, Slice[Value]{data: ?pick[0], size: 3})};
+    }
+    val res_top: res[Value, refusal.Error] = constant(w, ty, width, word.ones(narrow - 1));
+    if (sel res_top.err) { ret res_top; }
+    val res_floor: res[Value, refusal.Error] = constant(w, ty, width, word.mask(word.sext(word.least(narrow), narrow), width));
+    if (sel res_floor.err) { ret res_floor; }
+    var above:  [2]Value = [2]Value{x, res_top.ok};
+    var high:   [3]Value = [3]Value{make_plain(bld, opcode_table.GT_S, Slice[Value]{data: ?above[0], size: 2}), res_top.ok, x};
+    val capped: Value    = make_plain(bld, opcode_table.SELECT, Slice[Value]{data: ?high[0], size: 3});
+    var below:  [2]Value = [2]Value{capped, res_floor.ok};
+    var low:    [3]Value = [3]Value{make_plain(bld, opcode_table.LT_S, Slice[Value]{data: ?below[0], size: 2}), res_floor.ok, capped};
+    ret res[Value, refusal.Error].ok{make_plain(bld, opcode_table.SELECT, Slice[Value]{data: ?low[0], size: 3})};
+}
+
+# whether an address is a slot the build carries: a stack slot of an integer
+# or vector type it carries, which is then a slot of its carrier
+fun carried_slot(w: *Work, address: Value) res[bool, refusal.Error] {
+    val def: Def = w.b.values.data[address].def;
+    if (!(sel def.result)) { ret res[bool, refusal.Error].ok{false}; }
+    val d: *InstructionData = ?w.b.instructions.data[def.result.instruction];
+    if (d.opcode != opcode_table.ALLOCA || d.immediates.len == 0) { ret res[bool, refusal.Error].ok{false}; }
+    val slot: Immediate = d.immediates.data[0];
+    if (!(sel slot.ty)) { ret res[bool, refusal.Error].ok{false}; }
+    val res_carried: res[opt[Type], refusal.Error] = carried_type(w, slot.ty);
+    if (sel res_carried.err) { ret res[bool, refusal.Error].err{res_carried.err}; }
+    ret res[bool, refusal.Error].ok{sel res_carried.ok.some};
+}
+
+# the copy of an instruction's operands and immediates a rewrite reads, since
+# making instructions may move the body's lists
+rec Taken {
+    code:     Opcode;
+    operands: [3]Value;
+    count:    usize;
+    imm:      [3]Immediate;
+    imms:     usize;
+    result:   Value;
+    results:  usize;
+    flags:    Flags;
+}
+
+fun taken(d: *InstructionData) Taken {
+    var t: Taken;
+    t.code  = d.opcode;
+    t.count = d.operands.len;
+    if (t.count > 3) { t.count = 3; }
+    var k: usize = 0;
+    for (k < t.count) {
+        t.operands[k] = d.operands.data[k];
+        k             = k + 1;
+    }
+    t.imms = d.immediates.len;
+    if (t.imms > 3) { t.imms = 3; }
+    k = 0;
+    for (k < t.imms) {
+        t.imm[k] = d.immediates.data[k];
+        k        = k + 1;
+    }
+    t.results = d.results.len;
+    if (t.results > 0) { t.result = d.results.data[0]; }
+    t.flags = d.metadata.flags;
+    ret t;
+}
+
+# the type of an instruction's first immediate, none where it holds none
+fun first_type(t: *Taken) opt[Type] {
+    if (t.imms == 0) { ret opt[Type].none{}; }
+    val imm: Immediate = t.imm[0];
+    if (sel imm.ty) { ret opt[Type].some{imm.ty}; }
+    ret opt[Type].none{};
+}
+
+# what one instruction becomes where the build carries a width it reads or
+# gives, made ahead of it: none where it stays as it is, its operands and
+# results carried in place
+# ---
+# keep:   it stays
+# stands: its result is this value, which takes its uses
+# gone:   it is replaced by what was made, and has no result
+tag Carry: u8 {
+    keep;
+    stands: Value;
+    gone;
+}
+
+# what one instruction becomes once its function is carried, made ahead of it
+# ---
+# w:      the visit
+# before: the types it read and gave before the function was carried
+# bld:    the builder, at the instruction
+# t:      the copy of the instruction, its operands and immediates rewritten
+#         in place where it is made again
+# ret:    how it is replaced, or why it could not be
+fun carry_one(w: *Work, before: Before, bld: *Builder, t: *Taken) res[Carry, refusal.Error] {
+    val keep: res[Carry, refusal.Error] = res[Carry, refusal.Error].ok{Carry.keep{}};
+    val code: Opcode                    = t.code;
+    if (code == opcode_table.LOAD || code == opcode_table.EXTRACT) {
+        if (t.results == 0) { ret keep; }
+        val narrow:    Type                          = before.result;
+        val res_carry: res[opt[Type], refusal.Error] = carried_type(w, narrow);
+        if (sel res_carry.err)     { ret res[Carry, refusal.Error].err{res_carry.err}; }
+        if (sel res_carry.ok.none) { ret keep; }
+        if (code == opcode_table.LOAD) {
+            val res_slot: res[bool, refusal.Error] = carried_slot(w, t.operands[0]);
+            if (sel res_slot.err) { ret res[Carry, refusal.Error].err{res_slot.err}; }
+            if (res_slot.ok)      { ret keep; }
+            t.imm[0] = Immediate.ty{narrow};
+        }
+        # memory and an aggregate keep the width, read then carried
+        builder.flags(bld, t.flags);
+        val got: Value = make(bld, code, Slice[Value]{data: ?t.operands[0], size: t.count}, Slice[Immediate]{data: ?t.imm[0], size: t.imms});
+        builder.flags(bld, NO_FLAGS);
+        ret res[Carry, refusal.Error].ok{Carry.stands{resize(bld, opcode_table.EXT_U, got, res_carry.ok.some)}};
+    }
+    if (code == opcode_table.STORE || code == opcode_table.INSERT) {
+        if (t.count < 2) { ret keep; }
+        val narrow:    Type                          = before.second;
+        val res_carry: res[opt[Type], refusal.Error] = carried_type(w, narrow);
+        if (sel res_carry.err)     { ret res[Carry, refusal.Error].err{res_carry.err}; }
+        if (sel res_carry.ok.none) { ret keep; }
+        if (code == opcode_table.STORE) {
+            val res_slot: res[bool, refusal.Error] = carried_slot(w, t.operands[0]);
+            if (sel res_slot.err) { ret res[Carry, refusal.Error].err{res_slot.err}; }
+            if (res_slot.ok)      { ret keep; }
+        }
+        t.operands[1] = resize(bld, opcode_table.TRUNC, t.operands[1], narrow);
+        builder.flags(bld, t.flags);
+        val i: Instruction = builder.emit(bld, Request{opcode: code, operands: Slice[Value]{data: ?t.operands[0], size: t.count}, immediates: Slice[Immediate]{data: ?t.imm[0], size: t.imms}, targets: Slice[Branch]{data: nil, size: 0}});
+        builder.flags(bld, NO_FLAGS);
+        if (code == opcode_table.STORE) { ret res[Carry, refusal.Error].ok{Carry.gone{}}; }
+        ret res[Carry, refusal.Error].ok{Carry.stands{builder.result(bld, i, 0)}};
+    }
+    if (t.count == 0 || t.results == 0) { ret keep; }
+    val x:        Value                         = t.operands[0];
+    val from:     Type                          = before.first;
+    val res_from: res[opt[Type], refusal.Error] = carried_type(w, from);
+    if (sel res_from.err) { ret res[Carry, refusal.Error].err{res_from.err}; }
+    val res_bits: res[u32, refusal.Error] = lane_bits(w, from);
+    if (sel res_bits.err) { ret res[Carry, refusal.Error].err{res_bits.err}; }
+    val narrow: u32 = res_bits.ok;
+    if (code == opcode_table.EXT_U || code == opcode_table.EXT_S || code == opcode_table.TRUNC) {
+        val opt_to: opt[Type] = first_type(t);
+        if (sel opt_to.none) { ret keep; }
+        val res_to: res[opt[Type], refusal.Error] = carried_type(w, opt_to.some);
+        if (sel res_to.err) { ret res[Carry, refusal.Error].err{res_to.err}; }
+        if (code == opcode_table.TRUNC) {
+            if (sel res_to.ok.none) { ret keep; }
+            val into: Type = res_to.ok.some;
+            if (type_table.same(w.b.values.data[x].type, into)) { ret res[Carry, refusal.Error].ok{Carry.stands{x}}; }
+            val res_into: res[u32, refusal.Error] = lane_bits(w, into);
+            if (sel res_into.err) { ret res[Carry, refusal.Error].err{res_into.err}; }
+            # a held width narrower than the carrier it is cut to
+            if (narrow < res_into.ok) { ret res[Carry, refusal.Error].ok{Carry.stands{resize(bld, opcode_table.EXT_U, x, into)}}; }
+            ret keep;
+        }
+        if (sel res_from.ok.none) { ret keep; }
+        var how: Extend = Extend.zero{};
+        if (code == opcode_table.EXT_S) { how = Extend.sign{}; }
+        val res_exact: res[Value, refusal.Error] = exact(w, bld, x, narrow, how);
+        if (sel res_exact.err) { ret res[Carry, refusal.Error].err{res_exact.err}; }
+        var into: Type = opt_to.some;
+        if (sel res_to.ok.some)                                        { into = res_to.ok.some; }
+        if (type_table.same(w.b.values.data[res_exact.ok].type, into)) { ret res[Carry, refusal.Error].ok{Carry.stands{res_exact.ok}}; }
+        val res_wide: res[u32, refusal.Error] = lane_bits(w, w.b.values.data[res_exact.ok].type);
+        if (sel res_wide.err) { ret res[Carry, refusal.Error].err{res_wide.err}; }
+        val res_into: res[u32, refusal.Error] = lane_bits(w, into);
+        if (sel res_into.err) { ret res[Carry, refusal.Error].err{res_into.err}; }
+        # a held width narrower than the carrier takes its low bits, already exact
+        if (res_into.ok < res_wide.ok) { ret res[Carry, refusal.Error].ok{Carry.stands{resize(bld, opcode_table.TRUNC, res_exact.ok, into)}}; }
+        ret res[Carry, refusal.Error].ok{Carry.stands{resize(bld, code, res_exact.ok, into)}};
+    }
+    if (code == opcode_table.ITOF_U || code == opcode_table.ITOF_S) {
+        if (sel res_from.ok.none) { ret keep; }
+        val opt_to: opt[Type] = first_type(t);
+        if (sel opt_to.none) { ret keep; }
+        var how: Extend = Extend.zero{};
+        if (code == opcode_table.ITOF_S) { how = Extend.sign{}; }
+        val res_exact: res[Value, refusal.Error] = exact(w, bld, x, narrow, how);
+        if (sel res_exact.err) { ret res[Carry, refusal.Error].err{res_exact.err}; }
+        ret res[Carry, refusal.Error].ok{Carry.stands{resize(bld, code, res_exact.ok, opt_to.some)}};
+    }
+    if (code == opcode_table.FTOI_U || code == opcode_table.FTOI_S) {
+        val opt_to: opt[Type] = first_type(t);
+        if (sel opt_to.none) { ret keep; }
+        val res_to: res[opt[Type], refusal.Error] = carried_type(w, opt_to.some);
+        if (sel res_to.err)     { ret res[Carry, refusal.Error].err{res_to.err}; }
+        if (sel res_to.ok.none) { ret keep; }
+        val res_bits_to: res[u32, refusal.Error] = lane_bits(w, opt_to.some);
+        if (sel res_bits_to.err) { ret res[Carry, refusal.Error].err{res_bits_to.err}; }
+        val whole:       Value                     = resize(bld, code, x, res_to.ok.some);
+        val res_bounded: res[Value, refusal.Error] = bounded(w, bld, whole, res_bits_to.ok, code == opcode_table.FTOI_S);
+        if (sel res_bounded.err) { ret res[Carry, refusal.Error].err{res_bounded.err}; }
+        ret res[Carry, refusal.Error].ok{Carry.stands{res_bounded.ok}};
+    }
+    val signed:   bool = code == opcode_table.REDUCE_SMIN || code == opcode_table.REDUCE_SMAX;
+    val unsigned: bool = code == opcode_table.REDUCE_UMIN || code == opcode_table.REDUCE_UMAX;
+    if (signed || unsigned) {
+        if (sel res_from.ok.none) { ret keep; }
+        var how: Extend = Extend.zero{};
+        if (signed) { how = Extend.sign{}; }
+        val res_exact: res[Value, refusal.Error] = exact(w, bld, x, narrow, how);
+        if (sel res_exact.err) { ret res[Carry, refusal.Error].err{res_exact.err}; }
+        var ops: [1]Value = [1]Value{res_exact.ok};
+        ret res[Carry, refusal.Error].ok{Carry.stands{make(bld, code, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?t.imm[0], size: t.imms})}};
+    }
+    if (code == opcode_table.BITCAST) {
+        val res_to: res[opt[Type], refusal.Error] = carried_type(w, before.result);
+        if (sel res_to.err)                             { ret res[Carry, refusal.Error].err{res_to.err}; }
+        if (sel res_from.ok.none && sel res_to.ok.none) { ret keep; }
+        val res_regrouped: res[Value, refusal.Error] = regrouped(w, bld, x, from, before.result);
+        if (sel res_regrouped.err) { ret res[Carry, refusal.Error].err{res_regrouped.err}; }
+        ret res[Carry, refusal.Error].ok{Carry.stands{res_regrouped.ok}};
+    }
+    ret keep;
+}
+
+# the integer lanes a reinterpretation reads or gives: a float or a vector of
+# floats as the integers of its lanes' widths, which a reinterpretation of its
+# own reaches, since no float here is carried
+fun integers_of(w: *Work, ty: Type) res[Type, refusal.Error] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?w.m.types, ty);
+    if (sel res_shape.err) { ret res[Type, refusal.Error].err{typing(res_shape.err)}; }
+    var lane:  Type = ty;
+    var lanes: u32  = 0;
+    if (sel res_shape.ok.vector) {
+        lane  = res_shape.ok.vector.element;
+        lanes = res_shape.ok.vector.lanes;
+    }
+    val res_lane: res[type_table.Shape, type_table.Error] = type_table.shape(?w.m.types, lane);
+    if (sel res_lane.err)         { ret res[Type, refusal.Error].err{typing(res_lane.err)}; }
+    if (!(sel res_lane.ok.float)) { ret res[Type, refusal.Error].ok{ty}; }
+    val opt_row: opt[format.Row] = format.row(res_lane.ok.float.format);
+    if (sel opt_row.none) { ret res[Type, refusal.Error].err{refusal.Error.reason{"a reinterpreted float of a format with no row"}}; }
+    ret integer_type(w, opt_row.some.width, lanes);
+}
+
+# a reinterpretation through a width the build carries, which holds no value
+# of the width to reinterpret: the bits regrouped by shifts at the carriers,
+# lane 0 lowest, as spir-v's OpBitcast places a vector's components. a lane
+# of the result gathers the lanes of the operand it spans, each made exact at
+# its width and shifted to its place, or takes its part of the one lane of
+# the operand that spans it, shifted down. a lane of a carried width is left
+# with the bits above it undefined, as every carrier is, so a reinterpretation
+# between two integers of one carried width is the value itself. a float side
+# is reached through the integers of its lanes, which hold no carried width
+# ---
+# x:    the operand, carried
+# from: its type before the function was carried
+# to:   the result's type before the function was carried
+fun regrouped(w: *Work, bld: *Builder, x: Value, from: Type, to: Type) res[Value, refusal.Error] {
+    val res_from: res[Type, refusal.Error] = integers_of(w, from);
+    if (sel res_from.err) { ret res_from; }
+    val res_to: res[Type, refusal.Error] = integers_of(w, to);
+    if (sel res_to.err) { ret res_to; }
+    val res_source: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, res_from.ok);
+    if (sel res_source.err) { ret res[Value, refusal.Error].err{res_source.err}; }
+    val res_target: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, res_to.ok);
+    if (sel res_target.err)     { ret res[Value, refusal.Error].err{res_target.err}; }
+    if (sel res_source.ok.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a carried reinterpretation of no integer"}}; }
+    if (sel res_target.ok.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a carried reinterpretation of no integer"}}; }
+    val source:  emit.Lane = res_source.ok.some;
+    val target:  emit.Lane = res_target.ok.some;
+    var operand: Value     = x;
+    if (!type_table.same(res_from.ok, from)) { operand = resize(bld, opcode_table.BITCAST, x, res_from.ok); }
+    var into:        Type                          = res_to.ok;
+    val res_carried: res[opt[Type], refusal.Error] = carried_type(w, res_to.ok);
+    if (sel res_carried.err)     { ret res[Value, refusal.Error].err{res_carried.err}; }
+    if (sel res_carried.ok.some) { into = res_carried.ok.some; }
+    val res_held: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, w.b.values.data[operand].type);
+    if (sel res_held.err)     { ret res[Value, refusal.Error].err{res_held.err}; }
+    if (sel res_held.ok.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a carried reinterpretation of no integer"}}; }
+    val res_into: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, into);
+    if (sel res_into.err)     { ret res[Value, refusal.Error].err{res_into.err}; }
+    if (sel res_into.ok.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a carried reinterpretation of no integer"}}; }
+    val held_lane: Type = res_held.ok.some.lane;
+    val held_bits: u32  = res_held.ok.some.bits;
+    val into_lane: Type = res_into.ok.some.lane;
+    val into_bits: u32  = res_into.ok.some.bits;
+    var count:     u32  = target.lanes;
+    if (count == 0) { count = 1; }
+    var result: Value = 0;
+    if (target.lanes != 0) {
+        val res_zero: res[Value, refusal.Error] = constant(w, into, into_bits, word.zero());
+        if (sel res_zero.err) { ret res_zero; }
+        result = res_zero.ok;
+    }
+    var j: u32 = 0;
+    for (j < count) {
+        var part: Value = 0;
+        if (source.bits < target.bits) {
+            val each:    u32                       = target.bits / source.bits;
+            val res_acc: res[Value, refusal.Error] = constant(w, into_lane, into_bits, word.zero());
+            if (sel res_acc.err) { ret res_acc; }
+            part = res_acc.ok;
+            var i: u32 = 0;
+            for (i < each) {
+                val one:      Value                     = lane(bld, operand, source.lanes, j * each + i);
+                val res_mask: res[Value, refusal.Error] = constant(w, held_lane, held_bits, word.ones(source.bits));
+                if (sel res_mask.err) { ret res_mask; }
+                var ops:     [2]Value                  = [2]Value{one, res_mask.ok};
+                val exactly: Value                     = make_plain(bld, opcode_table.AND, Slice[Value]{data: ?ops[0], size: 2});
+                val placed:  Value                     = moved(bld, exactly, held_bits, into_lane, into_bits);
+                val res_by:  res[Value, refusal.Error] = constant(w, into_lane, into_bits, word.small((i * source.bits)::u64));
+                if (sel res_by.err) { ret res_by; }
+                builder.flags(bld, emit.BOUNDED);
+                var up:      [2]Value = [2]Value{placed, res_by.ok};
+                val shifted: Value    = make_plain(bld, opcode_table.SHL, Slice[Value]{data: ?up[0], size: 2});
+                builder.flags(bld, NO_FLAGS);
+                var join: [2]Value = [2]Value{part, shifted};
+                part = make_plain(bld, opcode_table.OR, Slice[Value]{data: ?join[0], size: 2});
+                i    = i + 1;
+            }
+        }
+        or {
+            val each:   u32                       = source.bits / target.bits;
+            val one:    Value                     = lane(bld, operand, source.lanes, j / each);
+            val res_by: res[Value, refusal.Error] = constant(w, held_lane, held_bits, word.small(((j % each) * target.bits)::u64));
+            if (sel res_by.err) { ret res_by; }
+            builder.flags(bld, emit.BOUNDED);
+            var down:    [2]Value = [2]Value{one, res_by.ok};
+            val shifted: Value    = make_plain(bld, opcode_table.SHR_U, Slice[Value]{data: ?down[0], size: 2});
+            builder.flags(bld, NO_FLAGS);
+            part = moved(bld, shifted, held_bits, into_lane, into_bits);
+        }
+        if (target.lanes == 0) { result = part; }
+        or {
+            var ops: [2]Value     = [2]Value{result, part};
+            var imm: [1]Immediate = [1]Immediate{Immediate.lane{j}};
+            result = make(bld, opcode_table.VINSERT, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 1});
+        }
+        j = j + 1;
+    }
+    if (!type_table.same(into, to) && sel res_carried.ok.none) { result = resize(bld, opcode_table.BITCAST, result, to); }
+    ret res[Value, refusal.Error].ok{result};
+}
+
+# lane i of a value of a number of lanes, the value itself where it has none
+fun lane(bld: *Builder, x: Value, lanes: u32, i: u32) Value {
+    if (lanes == 0) { ret x; }
+    var ops: [1]Value     = [1]Value{x};
+    var imm: [1]Immediate = [1]Immediate{Immediate.lane{i}};
+    ret make(bld, opcode_table.VEXTRACT, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+# a scalar integer of one width at another, cut or extended with zeros
+fun moved(bld: *Builder, x: Value, from: u32, to: Type, bits: u32) Value {
+    if (from > bits) { ret resize(bld, opcode_table.TRUNC, x, to); }
+    if (from < bits) { ret resize(bld, opcode_table.EXT_U, x, to); }
+    ret x;
+}
+
+# every immediate type of a placed instruction carried in its place
+fun carry_immediates(w: *Work, i: Instruction) res[bool, refusal.Error] {
+    val d:       *InstructionData = ?w.b.instructions.data[i];
+    var changed: bool             = false;
+    var j:       usize            = 0;
+    for (j < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[j];
+        if (sel imm.ty) {
+            val res_carried: res[opt[Type], refusal.Error] = carried_type(w, imm.ty);
+            if (sel res_carried.err) { ret res[bool, refusal.Error].err{res_carried.err}; }
+            if (sel res_carried.ok.some) {
+                w.b.instructions.data[i].immediates.data[j] = Immediate.ty{res_carried.ok.some};
+                changed                                     = true;
+            }
+        }
+        j = j + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# the constant a carried constant stands as: its bits in the carrier, lane by
+# lane for a vector
+fun carried_constant(w: *Work, c: Constant, to: Type) res[Constant, refusal.Error] {
+    val res_data: res[ConstantData, module.Error] = module.constant_data(w.m, c);
+    if (sel res_data.err) { ret res[Constant, refusal.Error].err{refusal.Error.ir{res_data.err}}; }
+    val data: ConstantData = res_data.ok;
+    var made: ConstantData = ConstantData.zero{to};
+    if (sel data.integer) { made = ConstantData.integer{Bits{type: to, words: data.integer.words}}; }
+    or (sel data.spec) {
+        made = ConstantData.spec{Spec{id: data.spec.id, default: Bits{type: to, words: data.spec.default.words}}};
+    }
+    or (sel data.aggregate) {
+        val res_lane: res[opt[emit.Lane], refusal.Error] = emit.lane_of(w.m, to);
+        if (sel res_lane.err)     { ret res[Constant, refusal.Error].err{res_lane.err}; }
+        if (sel res_lane.ok.none) { ret res[Constant, refusal.Error].err{refusal.Error.reason{"a carried aggregate constant that is no vector"}}; }
+        val n:         usize                           = data.aggregate.elements.size;
+        val res_lanes: res[*Constant, allocator.Error] = allocator.zallocate[Constant](w.scratch, n + 1);
+        if (sel res_lanes.err) { ret res[Constant, refusal.Error].err{refusal.Error.alloc{res_lanes.err}}; }
+        var k: usize = 0;
+        for (k < n) {
+            val res_one: res[Constant, refusal.Error] = carried_constant(w, data.aggregate.elements.data[k], res_lane.ok.some.lane);
+            if (sel res_one.err) { ret res_one; }
+            res_lanes.ok[k] = res_one.ok;
+            k               = k + 1;
+        }
+        made = ConstantData.aggregate{Aggregate{type: to, elements: Slice[Constant]{data: res_lanes.ok, size: n}}};
+    }
+    or (!(sel data.zero)) { ret res[Constant, refusal.Error].err{refusal.Error.reason{"a carried constant that is no integer"}}; }
+    val res_made: res[Constant, module.Error] = module.add_constant(w.m, made);
+    if (sel res_made.err) { ret res[Constant, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    ret res[Constant, refusal.Error].ok{res_made.ok};
+}
+
+# carry every value of a width the build does not hold in its carrier: the
+# function's signature, its values, slots and constants of the width, and
+# each instruction that keeps the width, in memory or an aggregate, or reads
+# the bits above it
+fun carry(w: *Work) res[bool, refusal.Error] {
+    val b:             *Body                         = w.b;
+    var changed:       bool                          = false;
+    val node:          *function.Node                = ?w.m.functions.data[w.f];
+    val res_signature: res[opt[Type], refusal.Error] = carried_type(w, node.data.signature);
+    if (sel res_signature.err) { ret res[bool, refusal.Error].err{res_signature.err}; }
+    if (sel res_signature.ok.some) {
+        node.data.signature = res_signature.ok.some;
+        changed             = true;
+    }
+
+    var s: vector.Vector[Type] = vector.init[Type](w.m.a);
+    fin { vector.dnit[Type](?s); }
+    val count: usize = b.values.len;
+    var v:     usize = 0;
+    for (v < count) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Type](?s, b.values.data[v].type);
+        if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        v = v + 1;
+    }
+    v = 0;
+    for (v < count) {
+        if (!(sel b.values.data[v].def.removed)) {
+            val res_carried: res[opt[Type], refusal.Error] = carried_type(w, b.values.data[v].type);
+            if (sel res_carried.err) { ret res[bool, refusal.Error].err{res_carried.err}; }
+            if (sel res_carried.ok.some) {
+                b.values.data[v].type = res_carried.ok.some;
+                changed               = true;
+            }
+        }
+        v = v + 1;
+    }
+    if (!changed) { ret res[bool, refusal.Error].ok{false}; }
+
+    val start:      usize                         = b.instructions.len;
+    val res_before: res[*Before, allocator.Error] = allocator.zallocate[Before](w.m.a, start + 1);
+    if (sel res_before.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_before.err}}; }
+    fin { allocator.deallocate[Before](w.m.a, res_before.ok, start + 1); }
+    var n: usize = 0;
+    for (n < start) {
+        val d: *InstructionData = ?b.instructions.data[n];
+        if (d.operands.len > 0) { res_before.ok[n].first = s.data[d.operands.data[0]]; }
+        if (d.operands.len > 1) { res_before.ok[n].second = s.data[d.operands.data[1]]; }
+        if (d.results.len > 0)  { res_before.ok[n].result = s.data[d.results.data[0]]; }
+        n = n + 1;
+    }
+
+    # a constant value carried stands for the carrier's constant of its bits
+    v = 0;
+    for (v < count) {
+        val def:     Def  = b.values.data[v].def;
+        val retyped: bool = !type_table.same(b.values.data[v].type, s.data[v]);
+        if (sel def.constant) {
+            if (retyped) {
+                val res_made: res[Constant, refusal.Error] = carried_constant(w, def.constant, b.values.data[v].type);
+                if (sel res_made.err) { ret res[bool, refusal.Error].err{res_made.err}; }
+                var old:       u32         = def.constant;
+                var made:      u32         = res_made.ok;
+                var there:     opt[Value]  = opt[Value].none{};
+                val opt_there: opt[*Value] = map.get[u32, Value](?b.constants, ?made);
+                if (sel opt_there.some) { there = opt[Value].some{@opt_there.some}; }
+                map.remove[u32, Value](?b.constants, ?old);
+                if (sel there.some) {
+                    val err_moved: err[refusal.Error] = refusal.edit(body.replace(w.m, w.f, (v::u32), there.some, Records.follow{}));
+                    if (sel err_moved.err) { ret res[bool, refusal.Error].err{err_moved.err}; }
+                }
+                or {
+                    b.values.data[v].def = Def.constant{res_made.ok};
+                    val res_kept: res[bool, allocator.Error] = map.insert[u32, Value](?b.constants, made, (v::u32));
+                    if (sel res_kept.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_kept.err}}; }
+                }
+            }
+        }
+        v = v + 1;
+    }
+
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var p: Instruction = b.blocks.data[k].first;
+            for (p != NO_INSTRUCTION) {
+                val i: Instruction = p;
+                p = b.instructions.data[i].next;
+                if (i::usize < start && sel b.instructions.data[i].place.placed) {
+                    var t:   Taken   = taken(?b.instructions.data[i]);
+                    var bld: Builder = builder.make(w.m);
+                    builder.enter(?bld, w.f);
+                    builder.derive(?bld, i);
+                    builder.before(?bld, i);
+                    val res_one: res[Carry, refusal.Error] = carry_one(w, res_before.ok[i], ?bld, ?t);
+                    if (sel res_one.err) { ret res[bool, refusal.Error].err{res_one.err}; }
+                    val err_built: err[failure.Error] = builder.done(?bld);
+                    if (sel err_built.err) { ret res[bool, refusal.Error].err{refusal.Error.build{err_built.err}}; }
+                    val one: Carry = res_one.ok;
+                    if (sel one.stands) {
+                        val err_moved: err[refusal.Error] = refusal.edit(body.replace(w.m, w.f, t.result, one.stands, Records.follow{}));
+                        if (sel err_moved.err) { ret res[bool, refusal.Error].err{err_moved.err}; }
+                    }
+                    if (!(sel one.keep)) {
+                        val err_gone: err[refusal.Error] = refusal.edit(body.erase(w.m, w.f, i));
+                        if (sel err_gone.err) { ret res[bool, refusal.Error].err{err_gone.err}; }
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    # what stays has its immediate types carried, the slots' last, since the
+    # rewrite reads which slots are carried from them
+    n = 0;
+    for (n < start) {
+        if (sel b.instructions.data[n].place.placed) {
+            val res_retyped: res[bool, refusal.Error] = carry_immediates(w, (n::u32));
+            if (sel res_retyped.err) { ret res_retyped; }
+        }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}

@@ -1,0 +1,973 @@
+# the rules over the shape of each body: what it names, how its blocks end, and its edges
+#
+# an erased block is never walked, and an instruction is walked only where a
+# live block lists it, so an erased or detached instruction is skipped. the
+# reference rule refuses a walked instruction that names any of them or reads
+# a value one of them defines.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use me:         masc.core.effect;
+use mo:         masc.core.operand;
+use mrow:       masc.core.row;
+use core_state: masc.core.state;
+
+use mirl.base.slice;
+use ia: mirl.ir.assembly;
+use mirl.ir.block.BlockData;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.List;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.native.Op;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.table;
+use mirl.ir.pool.Growing;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Def;
+use target_basis: mirl.target.basis;
+use mirl.target.capability.Catalog;
+use mirl.target.capability.Kinded;
+use mirl.target.capability.Known;
+use mirl.target.capability.OpSet;
+use mirl.target.capability.Ops;
+use mirl.target.capability.Standing;
+use mirl.target.capability.handle_of;
+use mirl.target.capability.known;
+use mirl.target.capability.op_row;
+use mirl.target.capability.op_set;
+use mirl.target.capability.row_reads;
+use mirl.target.capability.row_writes;
+use mirl.target.capability.structure_words;
+use mirl.target.capability.supplies;
+use mirl.target.layout;
+use mirl.target.record;
+use mirl.target.record.Target;
+use mirl.verify.failure.Error;
+use mirl.verify.failure.Run;
+use mirl.verify.failure.Where;
+use mirl.verify.failure.at_instruction;
+use mirl.verify.failure.broken;
+use mirl.verify.failure.exhausted;
+use mirl.verify.failure.finding;
+use mirl.verify.failure.in_block;
+use mirl.verify.failure.in_function;
+use mirl.verify.failure.walks;
+
+# a block the body gave out and has not erased
+pub fun live(b: *Body, k: Block) bool {
+    ret k::usize < b.blocks.len && !b.blocks.data[k].erased;
+}
+
+# a value the body gave out whose definition stands in it: a constant, a
+# parameter its live block lists, or a result of an instruction placed in a
+# live block, never one whose definition was removed or dropped from its block
+pub fun defined(b: *Body, v: Value) bool {
+    if (v::usize >= b.values.len) { ret false; }
+    val def: Def = b.values.data[v].def;
+    if (sel def.constant) { ret true; }
+    if (sel def.parameter) {
+        val k: Block = def.parameter.block;
+        if (!live(b, k)) { ret false; }
+        val params: *vector.Vector[Value] = ?b.blocks.data[k].parameters;
+        ret def.parameter.index::usize < params.len && params.data[def.parameter.index] == v;
+    }
+    if (!(sel def.result)) { ret false; }
+    val maker: Instruction = def.result.instruction;
+    if (maker::usize >= b.instructions.len) { ret false; }
+    val at: Place = b.instructions.data[maker].place;
+    if (!(sel at.placed)) { ret false; }
+    ret live(b, at.placed);
+}
+
+# count, for every instruction of body `b`, how many times the live blocks
+# list it, in one pass over the blocks, a list stopping at an instruction the
+# body does not hold or one it lists a second time
+fun listed(b: *Body, counts: *vector.Vector[u32]) err[allocator.Error] {
+    vector.truncate[u32](counts, 0);
+    val err_filled: err[allocator.Error] = slice.fill[u32](counts, b.instructions.len, 0);
+    if (sel err_filled.err) { ret err_filled; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        val d:    *BlockData  = ?b.blocks.data[k];
+        var inst: Instruction = d.first;
+        for (!d.erased && inst != NO_INSTRUCTION && inst::usize < b.instructions.len && counts.data[inst] < 2) {
+            counts.data[inst] = counts.data[inst] + 1;
+            inst              = b.instructions.data[inst].next;
+        }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether the entry at position p of a value's use list names instruction i
+fun entered(b: *Body, v: Value, p: u32, i: Instruction) bool {
+    val uses: *Growing[Instruction] = ?b.values.data[v].uses;
+    ret p::usize < uses.len && uses.data[p] == i;
+}
+
+# the reference rule on instruction `i` listed in block `k`: placed there and
+# listed once, of a known opcode, naming only values and blocks the body holds
+fun named(m: *Module, f: Function, b: *Body, counts: *vector.Vector[u32], k: Block, i: Instruction) err[Error] {
+    val d:  *InstructionData = ?b.instructions.data[i];
+    val at: Place            = d.place;
+    if (!(sel at.placed && at.placed == k)) { ret broken(at_instruction(m, f, k, i), "a block lists an instruction placed elsewhere or nowhere"); }
+    if (counts.data[i] != 1)                { ret broken(at_instruction(m, f, k, i), "a block lists an instruction more than once"); }
+    val opt_opcode_at: opt[*opcode_row.Row] = table.at(d.opcode);
+    if (sel opt_opcode_at.none) { ret broken(at_instruction(m, f, k, i), "an opcode that names no row"); }
+    var o: usize = 0;
+    for (o < d.operands.len) {
+        if (!defined(b, d.operands.data[o]))                       { ret broken(at_instruction(m, f, k, i), "an operand the body does not define"); }
+        if (!entered(b, d.operands.data[o], d.entries.data[o], i)) { ret broken(at_instruction(m, f, k, i), "an operand whose use entry names another instruction"); }
+        o = o + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val edge: *Edge = ?d.edges.data[e];
+        if (!live(b, edge.block)) { ret broken(at_instruction(m, f, k, i), "an edge into a block the body does not hold"); }
+        val preds: *vector.Vector[Instruction] = ?b.blocks.data[edge.block].predecessors;
+        if (edge.rank::usize >= preds.len || preds.data[edge.rank] != i) { ret broken(at_instruction(m, f, k, i), "an edge whose predecessor entry names another instruction"); }
+        var j: usize = 0;
+        for (j < edge.arguments.len) {
+            if (!defined(b, edge.arguments.data[j]))                          { ret broken(at_instruction(m, f, k, i), "an argument the body does not define"); }
+            if (!entered(b, edge.arguments.data[j], edge.entries.data[j], i)) { ret broken(at_instruction(m, f, k, i), "an argument whose use entry names another instruction"); }
+            j = j + 1;
+        }
+        e = e + 1;
+    }
+    var n: usize = 0;
+    for (n < d.results.len) {
+        val v: Value = d.results.data[n];
+        if (v::usize >= b.values.len) { ret broken(at_instruction(m, f, k, i), "a result the body does not hold"); }
+        val def: Def = b.values.data[v].def;
+        if (!(sel def.result))                                           { ret broken(at_instruction(m, f, k, i), "a result defined by something else"); }
+        if (def.result.instruction != i || def.result.index::usize != n) { ret broken(at_instruction(m, f, k, i), "a result defined by something else"); }
+        n = n + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the reference rule over one function's body, `counts` its scratch for `listed`
+fun references_of(m: *Module, f: Function, counts: *vector.Vector[u32]) err[Error] {
+    val b: *Body = ?m.functions.data[f].body;
+    if (b.blocks.len != 0 && b.blocks.data[0].erased) { ret broken(in_function(m, f), "an erased entry block"); }
+    val err_counted: err[allocator.Error] = listed(b, counts);
+    if (sel err_counted.err) { ret exhausted(err_counted.err); }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        val id: Block      = (k::u32);
+        val d:  *BlockData = ?b.blocks.data[k];
+        if (!d.erased) {
+            var p: usize = 0;
+            for (p < d.parameters.len) {
+                val v: Value = d.parameters.data[p];
+                if (v::usize >= b.values.len) { ret broken(in_block(m, f, id), "a parameter the body does not hold"); }
+                val def: Def = b.values.data[v].def;
+                if (!(sel def.parameter))                                         { ret broken(in_block(m, f, id), "a parameter defined by something else"); }
+                if (def.parameter.block != id || def.parameter.index::usize != p) { ret broken(in_block(m, f, id), "a parameter defined by something else"); }
+                p = p + 1;
+            }
+            var prev: Instruction = NO_INSTRUCTION;
+            var inst: Instruction = d.first;
+            for (inst != NO_INSTRUCTION) {
+                if (inst::usize >= b.instructions.len) { ret broken(in_block(m, f, id), "a block lists an instruction the body does not hold"); }
+                val err_named: err[Error] = named(m, f, b, counts, id, inst);
+                if (sel err_named.err)                      { ret err_named; }
+                if (b.instructions.data[inst].prev != prev) { ret broken(at_instruction(m, f, id, inst), "an instruction whose link back names another than the one before it"); }
+                prev = inst;
+                inst = b.instructions.data[inst].next;
+            }
+            if (prev != d.last) { ret broken(in_block(m, f, id), "a block whose last instruction is not the end of its list"); }
+        }
+        k = k + 1;
+    }
+    var i: usize = 0;
+    for (i < b.instructions.len) {
+        val at: Place = b.instructions.data[i].place;
+        if (sel at.placed) {
+            val inst: Instruction = (i::u32);
+            if (!live(b, at.placed)) { ret broken(in_function(m, f), "an instruction placed in a block the body does not hold"); }
+            if (counts.data[i] != 1) { ret broken(at_instruction(m, f, at.placed, inst), "an instruction placed in a block that does not list it"); }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# every id a walked block or instruction names is one the body holds and has not removed
+pub fun references(run: *Run) err[Error] {
+    var counts: vector.Vector[u32] = vector.init[u32](run.m.a);
+    fin { vector.dnit[u32](?counts); }
+    var f: usize = 0;
+    for (f < run.m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val err_references_of: err[Error] = references_of(run.m, (f::u32), ?counts);
+        if (sel err_references_of.err) { ret err_references_of; }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether an instruction's opcode is a terminator
+fun ends(d: *InstructionData) bool {
+    val opt_opcode_at: opt[*opcode_row.Row] = table.at(d.opcode);
+    ret sel opt_opcode_at.some && opt_opcode_at.some.terminator;
+}
+
+# every live block ends in exactly one terminator, with none before it
+pub fun terminators(run: *Run) err[Error] {
+    val m: *Module = run.m;
+    var f: usize   = 0;
+    for (f < m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val fn: Function = (f::u32);
+        val b:  *Body    = ?m.functions.data[f].body;
+        var k:  usize    = 0;
+        for (k < b.blocks.len) {
+            val id: Block      = (k::u32);
+            val d:  *BlockData = ?b.blocks.data[k];
+            if (!d.erased) {
+                if (d.first == NO_INSTRUCTION) { ret broken(in_block(m, fn, id), "a block with no terminator"); }
+                var inst: Instruction = d.first;
+                for (inst != NO_INSTRUCTION) {
+                    val last: bool = inst == d.last;
+                    val term: bool = ends(?b.instructions.data[inst]);
+                    if (term && !last) { ret broken(at_instruction(m, fn, id, inst), "a terminator before the end of its block"); }
+                    if (!term && last) { ret broken(at_instruction(m, fn, id, inst), "a block that does not end in a terminator"); }
+                    inst = b.instructions.data[inst].next;
+                }
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether the values passed are the parameters' types, one each
+fun agree(b: *Body, args: *List[Value], params: *vector.Vector[Value]) bool {
+    if (args.len != params.len) { ret false; }
+    var j: usize = 0;
+    for (j < args.len) {
+        if (!type_table.same(b.values.data[args.data[j]].type, b.values.data[params.data[j]].type)) { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# the edge rule over one function's body
+fun edges_of(m: *Module, f: Function) err[Error] {
+    val b: *Body = ?m.functions.data[f].body;
+    if (b.blocks.len == 0) { ret err[Error].ok{}; }
+    val res_sig: res[type_table.Function, type_table.Error] = type_table.signature(?m.types, m.functions.data[f].data.signature);
+    if (sel res_sig.err) { ret broken(in_function(m, f), "a signature that is not a function type"); }
+    val entry:  *vector.Vector[Value]  = ?b.blocks.data[0].parameters;
+    val params: Slice[type_table.Type] = res_sig.ok.params;
+    if (sel b.entry.placed) {
+        if (b.entry.placed.len != entry.len) { ret broken(in_block(m, f, 0), "entry parameters that are not one per place"); }
+    }
+    or {
+        var same: bool  = entry.len == params.size;
+        var p:    usize = 0;
+        for (same && p < params.size) {
+            same = type_table.same(b.values.data[entry.data[p]].type, params.data[p]);
+            p    = p + 1;
+        }
+        if (!same) { ret broken(in_block(m, f, 0), "entry parameters that are not the signature's parameters"); }
+    }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        val id: Block      = (k::u32);
+        val d:  *BlockData = ?b.blocks.data[k];
+        if (!d.erased) {
+            var i: Instruction = d.first;
+            for (i != NO_INSTRUCTION) {
+                val inst: Instruction      = i;
+                val data: *InstructionData = ?b.instructions.data[inst];
+                var e:    usize            = 0;
+                for (e < data.edges.len) {
+                    val edge: *Edge = ?data.edges.data[e];
+                    if (edge.block == 0)                                                   { ret broken(at_instruction(m, f, id, inst), "an edge into the entry block, which only the call enters"); }
+                    if (!agree(b, ?edge.arguments, ?b.blocks.data[edge.block].parameters)) { ret broken(at_instruction(m, f, id, inst), "an edge whose arguments are not its target's parameters"); }
+                    e = e + 1;
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# every edge passes one argument of each parameter's type and leads to a block
+# other than the entry, and the entry's parameters are the signature's, or one
+# per place once they are placed
+pub fun edges(run: *Run) err[Error] {
+    var f: usize = 0;
+    for (f < run.m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val err_edges_of: err[Error] = edges_of(run.m, (f::u32));
+        if (sel err_edges_of.err) { ret err_edges_of; }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether every pointer an instruction reads or gives is an address under the
+# build's addressing model, as a physical pointer is where the build states a
+# model its row holds an address of (spir-v's PhysicalStorageBuffer under
+# PhysicalStorageBuffer64), which a number may be formed of or read from
+fun addressed(run: *Run, b: *Body, d: *InstructionData) bool {
+    var k: usize = 0;
+    for (k < d.operands.len + d.results.len) {
+        var v: Value = 0;
+        if (k < d.operands.len) { v = d.operands.data[k]; }
+        or                      { v = d.results.data[k - d.operands.len]; }
+        val ty:        Type                                    = b.values.data[v].type;
+        val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?run.m.types, ty);
+        if (sel res_shape.err) { ret false; }
+        val sh: type_table.Shape = res_shape.ok;
+        if (sel sh.pointer) {
+            val res_size: res[u64, record.Error] = layout.size(?run.layout, ty, sh.pointer.space);
+            if (sel res_size.err) { ret false; }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# past legalisation on a target whose addressing is logical, no instruction
+# forms or reads an address as a number, since a logical address has none,
+# but where every pointer it reads or gives is an address the build's model
+# holds (`addressed`), read per build since the model is the selection's
+pub fun addressing(run: *Run) err[Error] {
+    if (!(sel run.stage.legal))                    { ret err[Error].ok{}; }
+    if (!(sel run.target.caps.addressing.logical)) { ret err[Error].ok{}; }
+    val m: *Module = run.m;
+    var f: usize   = 0;
+    for (f < m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val fn: Function = (f::u32);
+        val b:  *Body    = ?m.functions.data[f].body;
+        var k:  usize    = 0;
+        for (k < b.blocks.len) {
+            val id: Block      = (k::u32);
+            val d:  *BlockData = ?b.blocks.data[k];
+            if (!d.erased) {
+                var i: Instruction = d.first;
+                for (i != NO_INSTRUCTION) {
+                    val inst:        Instruction          = i;
+                    val opt_data_at: opt[*opcode_row.Row] = table.at(b.instructions.data[inst].opcode);
+                    if (sel opt_data_at.some && sel opt_data_at.some.forms.arithmetic && !addressed(run, b, ?b.instructions.data[inst])) { ret broken(at_instruction(m, fn, id, inst), "an address formed or read as a number under logical addressing"); }
+                    i = b.instructions.data[i].next;
+                }
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# in a module given to a schedule, no instruction is of an opcode only a pass of mirl makes
+pub fun made(run: *Run) err[Error] {
+    if (!(sel run.stage.given)) { ret err[Error].ok{}; }
+    val m: *Module = run.m;
+    var f: usize   = 0;
+    for (f < m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val fn: Function = (f::u32);
+        val b:  *Body    = ?m.functions.data[f].body;
+        var k:  usize    = 0;
+        for (k < b.blocks.len) {
+            val id: Block      = (k::u32);
+            val d:  *BlockData = ?b.blocks.data[k];
+            if (!d.erased) {
+                var i: Instruction = d.first;
+                for (i != NO_INSTRUCTION) {
+                    val inst:        Instruction          = i;
+                    val opt_data_at: opt[*opcode_row.Row] = table.at(b.instructions.data[inst].opcode);
+                    if (sel opt_data_at.some && table.pass_only(opt_data_at.some)) { ret broken(at_instruction(m, fn, id, inst), "an opcode only a pass of mirl makes, in a module given to a schedule"); }
+                    i = b.instructions.data[i].next;
+                }
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether a constant holds the address of a function, at any depth
+fun names_function(m: *Module, c: Constant) bool {
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, c);
+    if (sel res_constant_data.err) { ret false; }
+    val d: ConstantData = res_constant_data.ok;
+    if (sel d.address) { ret sel d.address.symbol.function; }
+    if (sel d.aggregate) {
+        var i: usize = 0;
+        for (i < d.aggregate.elements.size) {
+            if (names_function(m, d.aggregate.elements.data[i])) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
+}
+
+# whether a constant holds an address of an integer type at any depth, a number only the link fixes
+fun links_number(m: *Module, c: Constant) bool {
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, c);
+    if (sel res_constant_data.err) { ret false; }
+    val d: ConstantData = res_constant_data.ok;
+    if (sel d.address) {
+        val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?m.types, d.address.type);
+        if (sel res_shape.err) { ret false; }
+        ret sel res_shape.ok.integer;
+    }
+    if (sel d.aggregate) {
+        var i: usize = 0;
+        for (i < d.aggregate.elements.size) {
+            if (links_number(m, d.aggregate.elements.data[i])) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
+}
+
+# whether a value is a constant an instruction may not read: one holding the address of a function, or a number
+# only the link fixes, which a global's initial value alone holds
+fun unread_constant(m: *Module, b: *Body, v: Value) bool {
+    if (!defined(b, v)) { ret false; }
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.constant)) { ret false; }
+    ret links_number(m, def.constant);
+}
+
+# whether a value is a constant holding the address of a function
+fun function_constant(m: *Module, b: *Body, v: Value) bool {
+    if (!defined(b, v)) { ret false; }
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.constant)) { ret false; }
+    ret names_function(m, def.constant);
+}
+
+# whether an operand is a call's callee naming the function it calls, the
+# address of that function with no offset
+fun names_callee(m: *Module, r: *opcode_row.Row, d: *InstructionData, k: usize, b: *Body) bool {
+    if (k >= $length_of(opcode_row.Operands) || !(sel r.operands[k].role.callee)) { ret false; }
+    val def: Def = b.values.data[d.operands.data[k]].def;
+    if (!(sel def.constant)) { ret false; }
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+    if (sel res_constant_data.err) { ret false; }
+    val c: ConstantData = res_constant_data.ok;
+    if (!(sel c.address)) { ret false; }
+    ret sel c.address.symbol.function && c.address.offset == 0;
+}
+
+val LINKED: str = "an address of an integer type in code, a number the link fixes that only a global's initial value holds";
+
+# the rule an instruction keeps on functions: it takes no function's address
+# on a target whose code has none, each function immediate names a function
+# of the module, and no operand or edge argument is a constant
+# holding a function's address except a callee naming the function it calls,
+# nor an address of an integer type
+fun functions_of(m: *Module, t: *Target, fn: Function, k: Block, inst: Instruction) err[Error] {
+    val b:             *Body                = ?m.functions.data[fn].body;
+    val d:             *InstructionData     = ?b.instructions.data[inst];
+    val opt_opcode_at: opt[*opcode_row.Row] = table.at(d.opcode);
+    if (sel opt_opcode_at.none) { ret err[Error].ok{}; }
+    val row: *opcode_row.Row = opt_opcode_at.some;
+    if (sel row.forms.function && sel t.caps.functions.none) { ret broken(at_instruction(m, fn, k, inst), "a function's address on a target whose code has none"); }
+    var j: usize = 0;
+    for (j < d.immediates.len) {
+        val imm: opcode_row.Immediate = d.immediates.data[j];
+        if (sel imm.function) {
+            if (imm.function::usize >= m.functions.len) { ret broken(at_instruction(m, fn, k, inst), "a function immediate naming no function of the module"); }
+        }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < d.operands.len) {
+        if (function_constant(m, b, d.operands.data[j]) && !names_callee(m, row, d, j, b)) { ret broken(at_instruction(m, fn, k, inst), "a constant naming a function's address in code, which only func.addr names"); }
+        if (unread_constant(m, b, d.operands.data[j]))                                     { ret broken(at_instruction(m, fn, k, inst), LINKED); }
+        j = j + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val args: Slice[Value] = Slice[Value]{data: d.edges.data[e].arguments.data, size: d.edges.data[e].arguments.len};
+        j = 0;
+        for (j < args.size) {
+            if (function_constant(m, b, args.data[j])) { ret broken(at_instruction(m, fn, k, inst), "a constant naming a function's address in code, which only func.addr names"); }
+            if (unread_constant(m, b, args.data[j]))   { ret broken(at_instruction(m, fn, k, inst), LINKED); }
+            j = j + 1;
+        }
+        e = e + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# code names a function's address only through func.addr, on a target whose
+# code has them, and a call names the function it calls as its callee
+pub fun functions(run: *Run) err[Error] {
+    val m: *Module = run.m;
+    var f: usize   = 0;
+    for (f < m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val fn: Function = (f::u32);
+        val b:  *Body    = ?m.functions.data[f].body;
+        var k:  usize    = 0;
+        for (k < b.blocks.len) {
+            val d: *BlockData = ?b.blocks.data[k];
+            if (!d.erased) {
+                var i: Instruction = d.first;
+                for (i != NO_INSTRUCTION) {
+                    val err_found: err[Error] = functions_of(m, run.target, fn, (k::u32), i);
+                    if (sel err_found.err) { ret err_found; }
+                    i = b.instructions.data[i].next;
+                }
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether value `v` is a constant an immediate operand of a block binds: an
+# integer, or an address where a symbol may stand for it
+fun immediate_constant(m: *Module, b: *Body, v: Value, symbolic: bool) bool {
+    if (!defined(b, v)) { ret false; }
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.constant)) { ret false; }
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+    if (sel res_constant_data.err) { ret false; }
+    val c: ConstantData = res_constant_data.ok;
+    if (sel c.integer || sel c.zero) { ret true; }
+    ret symbolic && sel c.address;
+}
+
+# the rule an inline assembly item keeps on what it binds
+fun assembly_of(m: *Module, fn: Function, k: Block, inst: Instruction) err[Error] {
+    val b: *Body            = ?m.functions.data[fn].body;
+    val d: *InstructionData = ?b.instructions.data[inst];
+    if (d.opcode != table.ASM || d.immediates.len == 0) { ret err[Error].ok{}; }
+    val imm: opcode_row.Immediate = d.immediates.data[0];
+    if (!(sel imm.assembly)) { ret err[Error].ok{}; }
+    val blk: *ia.Assembly = imm.assembly;
+    var at:  usize        = 0;
+    var j:   usize        = 0;
+    for (j < blk.operands.size && at < d.operands.len) {
+        val c:      *ia.Operand  = ?blk.operands.data[j];
+        val placed: ia.Placement = c.placement;
+        if (sel placed.stated) {
+            if (sel placed.stated.immediate) {
+                if (!immediate_constant(m, b, d.operands.data[at], placed.stated.immediate.symbolic)) { ret broken(at_instruction(m, fn, k, inst), "an immediate an inline assembly block binds that is not an integer constant, or an address one where a symbol may stand for it"); }
+            }
+        }
+        if (ia.takes(c)) { at = at + 1; }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# every immediate an inline assembly block binds is a constant
+pub fun assembly(run: *Run) err[Error] {
+    val m: *Module = run.m;
+    var f: usize   = 0;
+    for (f < m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val fn: Function = (f::u32);
+        val b:  *Body    = ?m.functions.data[f].body;
+        var k:  usize    = 0;
+        for (k < b.blocks.len) {
+            val d: *BlockData = ?b.blocks.data[k];
+            if (!d.erased) {
+                var i: Instruction = d.first;
+                for (i != NO_INSTRUCTION) {
+                    val err_found: err[Error] = assembly_of(m, fn, (k::u32), i);
+                    if (sel err_found.err) { ret err_found; }
+                    i = b.instructions.data[i].next;
+                }
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# where a target op stands, naming its set and its op
+fun at_op(m: *Module, fn: Function, k: Block, inst: Instruction, o: *Op) Where {
+    var w: Where = at_instruction(m, fn, k, inst);
+    w.set = o.set;
+    w.op  = o.name;
+    ret w;
+}
+
+# whether an operand of a row's own takes a value: a register or an id, or an
+# integer constant for an immediate, an enumerant or a number written inline,
+# and nothing for any other shape
+fun bindable(s: mo.Shape) bool {
+    if (sel s.register || sel s.id || sel s.immediate || sel s.enumerant) { ret true; }
+    if (sel s.literal)                                                    { ret s.literal.content == mo.NUMBER && s.literal.width_of == 0; }
+    ret false;
+}
+
+# whether an operand of a row's own is one the instruction gives a constant for
+fun constant_shape(s: mo.Shape) bool {
+    ret sel s.immediate || sel s.enumerant || sel s.literal;
+}
+
+# the bits of an integer constant value, none for any other value
+fun constant_word(m: *Module, b: *Body, v: Value) opt[u64] {
+    if (!defined(b, v)) { ret opt[u64].none{}; }
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.constant)) { ret opt[u64].none{}; }
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+    if (sel res_constant_data.err) { ret opt[u64].none{}; }
+    val c: ConstantData = res_constant_data.ok;
+    if (sel c.zero) { ret opt[u64].some{0}; }
+    if (sel c.integer) {
+        if (c.integer.words.size > 0) { ret opt[u64].some{c.integer.words.data[0]}; }
+    }
+    ret opt[u64].none{};
+}
+
+# whether a type is the handle kind an op's set names for the id operand
+# masc's row states a kind of, true where the row states none. a pointer kind
+# is a pointer of any space, since the ir's pointers carry no pointee
+fun handled(m: *Module, s: *OpSet, x: *mo.Operand, ty: Type) bool {
+    if (!(sel x.shape.id))                 { ret true; }
+    if (x.shape.id.handle == mo.NO_HANDLE) { ret true; }
+    val opt_kind: opt[Kinded] = handle_of(s, x.shape.id.handle);
+    if (sel opt_kind.none) { ret false; }
+    if (sel opt_kind.some.pointer) {
+        val res_space: res[u32, type_table.Error] = type_table.space(?m.types, ty);
+        ret sel res_space.ok;
+    }
+    if (!(sel opt_kind.some.handle)) { ret false; }
+    val res_handle_kind: res[View, type_table.Error] = type_table.handle_kind(?m.types, ty);
+    if (sel res_handle_kind.err) { ret false; }
+    ret slice.same_view(res_handle_kind.ok, View{data: opt_kind.some.handle, len: str_len(opt_kind.some.handle)});
+}
+
+# a target op's operands as its row's own operands take them, the params of
+# an enumerant's members among them
+# ---
+# m:     the module
+# b:     the body the op is in
+# d:     the op
+# taken: how many of its operands are taken
+rec Binding {
+    m:     *Module;
+    b:     *Body;
+    d:     *InstructionData;
+    taken: usize;
+}
+
+# take the values one read operand of a row binds, and after an enumerant
+# the params of the members its value names, none when they bind, or why not
+fun take(g: *Binding, x: *mo.Operand) opt[str] {
+    if (!bindable(x.shape)) { ret opt[str].some{"a target op whose op's row has an operand of a shape no value binds"}; }
+    val left:  usize = g.d.operands.len - g.taken;
+    var count: usize = 1;
+    if (x.quantity == mo.VARIADIC)              { count = left; }
+    if (x.quantity == mo.OPTIONAL && left == 0) { count = 0; }
+    if (count > left)                           { ret opt[str].some{"a target op passing fewer operands than its op's row takes"}; }
+    var n: usize = 0;
+    for (n < count) {
+        val v: Value = g.d.operands.data[g.taken];
+        g.taken = g.taken + 1;
+        if (constant_shape(x.shape) && !immediate_constant(g.m, g.b, v, false)) { ret opt[str].some{"a target op passing a value where its op's row takes an integer constant"}; }
+        if (sel x.shape.enumerant) {
+            val opt_why: opt[str] = take_params(g, x.shape.enumerant, v);
+            if (sel opt_why.some) { ret opt_why; }
+        }
+        n = n + 1;
+    }
+    ret opt[str].none{};
+}
+
+# take the params of the members an enumerant's value names, its member's or
+# a mask's in ascending bit order, as masc reads them
+fun take_params(g: *Binding, e: mo.Enumeration, v: Value) opt[str] {
+    val opt_word: opt[u64] = constant_word(g.m, g.b, v);
+    if (sel opt_word.none)                                                 { ret opt[str].none{}; }
+    if (opt_word.some > 0xFFFF_FFFF || !mo.member(?e, opt_word.some::u32)) { ret opt[str].some{"a target op passing an enumerant its op's row does not name"}; }
+    val value: u32 = opt_word.some::u32;
+    val count: u32 = mo.param_count(?e, value);
+    var k:     u32 = 0;
+    for (k < count) {
+        val p: *mo.Operand = mo.param(?e, value, k);
+        if (p == nil) { ret opt[str].some{"a target op passing an enumerant its op's row does not name"}; }
+        val opt_why: opt[str] = take(g, p);
+        if (sel opt_why.some) { ret opt_why; }
+        k = k + 1;
+    }
+    ret opt[str].none{};
+}
+
+# a set of extensions functions name past the build's, opened once
+# ---
+# names:   the names of the function that opened it
+# widened: the build's selection widened by them, and its context
+rec Opened {
+    names:   Slice[View];
+    widened: target_basis.Widened;
+}
+
+# the contexts the op rule checks target ops under in one walk
+# ---
+# a:      the allocator each opened set comes from
+# t:      the target
+# build:  the context the build's selection opened, none where no build is open
+# opened: each distinct set of extensions a function names past the build's
+# ctx:    the context of the function walked, none before its first target op
+#         reads it
+# read:   whether `ctx` has been read for the function walked
+rec Scopes {
+    a:      *allocator.Allocator;
+    t:      *Target;
+    build:  opt[*core_state.Context];
+    opened: vector.Vector[*Opened];
+    ctx:    opt[*core_state.Context];
+    read:   bool;
+}
+
+# whether two lists of extension names, each naming any name once, name the
+# same extensions in any order
+fun same_names(x: Slice[View], y: Slice[View]) bool {
+    if (x.size != y.size) { ret false; }
+    var i: usize = 0;
+    for (i < x.size) {
+        var held: bool  = false;
+        var j:    usize = 0;
+        for (j < y.size && !held) {
+            held = slice.same_view(x.data[i], y.data[j]);
+            j    = j + 1;
+        }
+        if (!held) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# give back every set a walk opened
+fun scopes_dnit(sc: *Scopes) {
+    var i: usize = 0;
+    for (i < sc.opened.len) {
+        target_basis.narrow(?sc.opened.data[i].widened);
+        allocator.deallocate[Opened](sc.a, sc.opened.data[i], 1);
+        i = i + 1;
+    }
+    vector.dnit[*Opened](?sc.opened);
+}
+
+# the context a function's target ops are checked under: the build's, or
+# the one its extensions past the build's open, each distinct set opened once
+# in a walk. none where no build is open
+# ---
+# at:  where the target op that reads it stands, which a refusal names
+# ret: the context, or the allocator's refusal, or why the set was not
+#      opened: a name the instruction set does not know, named, or as
+#      `target_basis.widen_context` refuses
+fun scope_of(sc: *Scopes, m: *Module, fn: Function, at: Where) res[opt[*core_state.Context], Error] {
+    if (sc.read) { ret res[opt[*core_state.Context], Error].ok{sc.ctx}; }
+    val names: Slice[View]         = m.functions.data[fn].data.extensions;
+    var build: *core_state.Context = nil;
+    if (sel sc.build.some) { build = sc.build.some; }
+    if (build == nil || names.size == 0) {
+        sc.ctx  = sc.build;
+        sc.read = true;
+        ret res[opt[*core_state.Context], Error].ok{sc.ctx};
+    }
+    var i: usize = 0;
+    for (i < sc.opened.len) {
+        if (same_names(sc.opened.data[i].names, names)) {
+            sc.ctx  = opt[*core_state.Context].some{?sc.opened.data[i].widened.context};
+            sc.read = true;
+            ret res[opt[*core_state.Context], Error].ok{sc.ctx};
+        }
+        i = i + 1;
+    }
+    val res_made: res[*Opened, allocator.Error] = allocator.allocate[Opened](sc.a, 1);
+    if (sel res_made.err) { ret res[opt[*core_state.Context], Error].err{Error.alloc{res_made.err}}; }
+    val o:           *Opened                 = res_made.ok;
+    val err_widened: err[target_basis.Error] = target_basis.widen_context(?o.widened, sc.a, sc.t, build, names);
+    if (sel err_widened.err) {
+        allocator.deallocate[Opened](sc.a, o, 1);
+        val e: target_basis.Error = err_widened.err;
+        if (sel e.alloc) { ret res[opt[*core_state.Context], Error].err{Error.alloc{e.alloc}}; }
+        var where: Where = at;
+        if (sel e.named) { where.extension = e.named; }
+        ret res[opt[*core_state.Context], Error].err{Error.refused{finding(where, target_basis.fact(e))}};
+    }
+    o.names = names;
+    val res_pushed: res[usize, allocator.Error] = vector.push[*Opened](?sc.opened, o);
+    if (sel res_pushed.err) {
+        target_basis.narrow(?o.widened);
+        allocator.deallocate[Opened](sc.a, o, 1);
+        ret res[opt[*core_state.Context], Error].err{Error.alloc{res_pushed.err}};
+    }
+    sc.ctx  = opt[*core_state.Context].some{?o.widened.context};
+    sc.read = true;
+    ret res[opt[*core_state.Context], Error].ok{sc.ctx};
+}
+
+# the rule a target op keeps against its op's row: the set and the op are in
+# its target's catalog and the op is no part of the module's structure, its operands and
+# results are the ones the row's own operands bind, each a handle of the kind
+# the set names for the handle byte its row states, where it states one, its
+# memory covers what the row accesses, and the build, where one is open, admits the
+# row's requirement under the selection the function's own extensions widen it to
+fun op_of(run: *Run, sc: *Scopes, fn: Function, k: Block, inst: Instruction) err[Error] {
+    val m: *Module          = run.m;
+    val b: *Body            = ?m.functions.data[fn].body;
+    val d: *InstructionData = ?b.instructions.data[inst];
+    if (!table.target_op(d.opcode) || d.immediates.len == 0) { ret err[Error].ok{}; }
+    val imm: opcode_row.Immediate = d.immediates.data[0];
+    if (!(sel imm.op)) { ret err[Error].ok{}; }
+    val o:    *Op   = imm.op;
+    var at:   Where = at_op(m, fn, k, inst, o);
+    val held: Ops   = run.target.caps.ops;
+    if (sel held.none)       { ret broken(at, "a target op on a target whose catalog holds no instruction set"); }
+    if (!(sel held.catalog)) { ret err[Error].ok{}; }
+    val c:       *Catalog    = held.catalog;
+    val opt_set: opt[*OpSet] = op_set(c, o.set);
+    if (sel opt_set.none) { ret broken(at, "a target op naming an instruction set its target's catalog does not hold"); }
+    val s:         *OpSet      = opt_set.some;
+    val opt_known: opt[*Known] = known(s, o.name);
+    var standing:  Standing    = Standing.unstated{};
+    if (sel opt_known.some) { standing = opt_known.some.standing; }
+    if (sel standing.structure) {
+        val words: str = structure_words(standing.structure);
+        at.form = View{data: words, len: str_len(words)};
+        ret broken(at, "a target op naming an op that is part of the module's structure, never an instruction of a body");
+    }
+    val opt_found: opt[*mrow.Row] = op_row(c, s, o.name);
+    if (sel opt_found.none) { ret broken(at, "a target op naming an op its instruction set does not hold"); }
+    val r: *mrow.Row = opt_found.some;
+    if (sel s.form.own) {
+        if (r.effect.control.transfer != me.NONE) { ret broken(at, "a target op naming an op that transfers control, which the ir's control flow states"); }
+    }
+    if ((row_reads(r) && !o.reads) || (row_writes(r) && !o.writes)) { ret broken(at, "a target op not declaring memory its op's row accesses"); }
+
+    var g:       Binding = Binding{m: m, b: b, d: d, taken: 0};
+    var defined: usize   = 0;
+    if (r.effect.values.defines != 0 && o.results.size > 0) {
+        defined = 1;
+        if (!handled(m, s, ?r.operands.at[r.effect.values.defines::u32 - 1], o.results.data[0])) { ret broken(at, "a target op whose result is not the handle kind its op's catalog names"); }
+    }
+    var given: usize = defined;
+    var j:     u32   = supplies(s, r);
+    for (j < r.operands.len) {
+        val x:     *mo.Operand = ?r.operands.at[j];
+        val start: usize       = g.taken;
+        if (!bindable(x.shape)) { ret broken(at, "a target op whose op's row has an operand of a shape no value binds"); }
+        if ((x.role & mo.READ) != 0) {
+            val opt_why: opt[str] = take(?g, x);
+            if (sel opt_why.some) { ret broken(at, opt_why.some); }
+            if (g.taken > start) {
+                val ty: Type = b.values.data[d.operands.data[start]].type;
+                if (!handled(m, s, x, ty)) { ret broken(at, "a target op passing a value that is not the handle kind its op's catalog names for the operand"); }
+            }
+        }
+        if ((x.role & mo.WRITE) != 0) {
+            if (given >= o.results.size) { ret broken(at, "a target op stating fewer results than its op's row gives"); }
+            if ((x.role & mo.READ) != 0 && g.taken == start + 1) {
+                val ty: Type = b.values.data[d.operands.data[start]].type;
+                if (!type_table.same(ty, o.results.data[given])) { ret broken(at, "a target op whose operand its op's row reads and writes is not of the type of the result it gives"); }
+            }
+            if (!handled(m, s, x, o.results.data[given])) { ret broken(at, "a target op whose result is not the handle kind its op's catalog names"); }
+            given = given + 1;
+        }
+        j = j + 1;
+    }
+    if (g.taken != d.operands.len) { ret broken(at, "a target op passing more operands than its op's row takes"); }
+    if (given != o.results.size)   { ret broken(at, "a target op stating more results than its op's row gives"); }
+
+    val res_ctx: res[opt[*core_state.Context], Error] = scope_of(sc, m, fn, at);
+    if (sel res_ctx.err)                                                        { ret err[Error].err{res_ctx.err}; }
+    if (sel res_ctx.ok.some && !core_state.admits(res_ctx.ok.some, r.requires)) { ret broken(at, "a target op whose op's row requires what the function's selection does not hold"); }
+    ret err[Error].ok{};
+}
+
+# every target op is an op of its target's catalog, binding what the op's row
+# binds and declaring the memory the row states, and admitted by the build's
+# selection widened by its function's own extensions
+pub fun ops(run: *Run) err[Error] {
+    val m:  *Module = run.m;
+    var sc: Scopes  = Scopes{a: m.a, t: run.target, build: run.layout.ctx, opened: vector.init[*Opened](m.a), ctx: opt[*core_state.Context].none{}, read: false};
+    fin { scopes_dnit(?sc); }
+    var f: usize = 0;
+    for (f < m.functions.len) {
+        if (!walks(run, f)) {
+            f = f + 1;
+            cnt;
+        }
+        val fn: Function = (f::u32);
+        val b:  *Body    = ?m.functions.data[f].body;
+        sc.ctx  = opt[*core_state.Context].none{};
+        sc.read = false;
+        var k: usize = 0;
+        for (k < b.blocks.len) {
+            val d: *BlockData = ?b.blocks.data[k];
+            if (!d.erased) {
+                var i: Instruction = d.first;
+                for (i != NO_INSTRUCTION) {
+                    val err_found: err[Error] = op_of(run, ?sc, fn, (k::u32), i);
+                    if (sel err_found.err) { ret err_found; }
+                    i = b.instructions.data[i].next;
+                }
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}

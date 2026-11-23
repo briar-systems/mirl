@@ -1,0 +1,375 @@
+# scalar replacement of aggregates: a stack slot whose accesses each cover one of the parts they cut it into becomes
+# one slot per part, which promotion then takes out of memory one by one
+#
+# the parts are the slots analysis's (`mirl.pass.analysis.slots`): the runs between the first and one past the last
+# byte of every access a slot's accesses make. a slot is split when its address never escapes, no secret offset moves
+# it, no kept or volatile access touches it, the layout states its size, its accesses cut it into more than one part or
+# into one part short of the whole slot, and every access
+# of it is a load or a store at a constant offset covering exactly one part with no frame extent stated. a fill or a
+# copy of it, or an access across parts, as a load of a whole structure written member by member, leaves it whole, as
+# does a union whose members overlap in part, since their accesses then cross each other's parts.
+#
+# each part an access reaches becomes a slot of the type of the first access of it, aligned as the part's offset in
+# the slot allows, stating as public the bytes of the part its slot stated public, or nothing where its slot stated
+# nothing, and binding the variables its slot binds with the part's bits as the piece it holds, ahead of the slot it
+# comes from. each access takes the part's slot as its address, each marker of where the slot's storage begins or ends
+# (`slot.begin`, `slot.end`) is made again at its point for every part's slot and taken out, so each part's storage
+# lasts exactly where its slot's did, and dead code removal takes the old slot and the address arithmetic that reached
+# it.
+#
+# no branch, address, offset or callee is made from a value, every access keeps its secrecy, a kept or volatile access
+# is never touched (rule 3), and a secret byte of a part stays secret in the part's slot, so it keeps constant time.
+#
+# cost: one scan of the body's accesses, each address traced back through its moves, and one rewrite of each access.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.function.Body;
+use mirl.ir.global;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.table;
+use mirl.ir.point.Bits;
+use mirl.ir.type.table.Type;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.pass.analysis;
+use mirl.pass.analysis.slots;
+use mirl.pass.analysis.slots.Slots;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.target.basis;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+
+# the pass: it adds and rewrites instructions within their blocks, never an edge
+pub val SPLIT: Pass = Pass{name: "split", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_SLOTS, preserves: analysis.FLOW, time: Time.keeps{}};
+
+# one access of a slot that may be split
+# ---
+# ins:  the load or store
+# slot: the slot's alloca
+# part: the part it covers
+# ty:   the type it loads or stores
+rec Access {
+    ins:  Instruction;
+    slot: Instruction;
+    part: u32;
+    ty:   Type;
+}
+
+# a split in progress
+# ---
+# m, b:     the module and the body
+# s:        its slots
+# l:        the target's layout
+# held:     per instruction, whether it is an alloca whose slot may still be split
+# accesses: every access of a slot that may be split, in body order
+rec Work {
+    m:        *Module;
+    b:        *Body;
+    s:        *Slots;
+    l:        *Layout;
+    held:     vector.Vector[bool];
+    accesses: vector.Vector[Access];
+}
+
+# whether a slot is one the pass considers at all
+fun candidate(w: *Work, i: Instruction) bool {
+    val d: *InstructionData = ?w.b.instructions.data[i];
+    if (d.opcode != table.ALLOCA)                                              { ret false; }
+    if (slots.escaped(w.s, i) || slots.moved(w.s, i) || slots.touched(w.s, i)) { ret false; }
+    val opt_size: opt[u64] = slots.slot_size(w.l, w.b, i);
+    if (sel opt_size.none) { ret false; }
+    val cuts: Slice[u64] = slots.cuts(w.s, i);
+    if (cuts.size >= 3) { ret true; }
+    ret cuts.size == 2 && (cuts.data[0] != 0 || cuts.data[1] != opt_size.some);
+}
+
+# the part of slot `slot` the bytes from `at`, `len` of them, are exactly, none where they are no one part
+fun part_of(w: *Work, slot: Instruction, at: u64, len: u64) opt[u32] {
+    val cuts: Slice[u64] = slots.cuts(w.s, slot);
+    var k:    usize      = 0;
+    for (k + 1 < cuts.size) {
+        if (cuts.data[k] == at) {
+            if (cuts.data[k + 1] == at + len) { ret opt[u32].some{k::u32}; }
+            ret opt[u32].none{};
+        }
+        k = k + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# note access `i` of the type `ty` through address `v`, or leave its slot whole where it covers no one part
+fun note(w: *Work, i: Instruction, v: Value, ty: Type) err[refusal.Error] {
+    val opt_slot: opt[Instruction] = slots.slot_of(w.b, v);
+    if (sel opt_slot.none) { ret err[refusal.Error].ok{}; }
+    val slot: Instruction = opt_slot.some;
+    if (!w.held.data[slot]) { ret err[refusal.Error].ok{}; }
+    val d: *InstructionData = ?w.b.instructions.data[i];
+    if (metadata.states_extent(?d.metadata) || d.metadata.flags.volatile || d.metadata.flags.kept) {
+        w.held.data[slot] = false;
+        ret err[refusal.Error].ok{};
+    }
+    val opt_at:   opt[u64] = slots.offset_in(w.m, w.l, w.b, v);
+    val opt_len:  opt[u64] = slots.bytes_of(w.l, ty);
+    var opt_part: opt[u32] = opt[u32].none{};
+    if (sel opt_at.some) {
+        if (sel opt_len.some) { opt_part = part_of(w, slot, opt_at.some, opt_len.some); }
+    }
+    if (sel opt_part.none) {
+        w.held.data[slot] = false;
+        ret err[refusal.Error].ok{};
+    }
+    val res_pushed: res[usize, allocator.Error] = vector.push[Access](?w.accesses, Access{ins: i, slot: slot, part: opt_part.some, ty: ty});
+    if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+# leave whole the slot an address of a fill or copy reaches
+fun whole(w: *Work, v: Value) {
+    val opt_slot: opt[Instruction] = slots.slot_of(w.b, v);
+    if (sel opt_slot.some) { w.held.data[opt_slot.some] = false; }
+}
+
+# every access of a slot that may be split
+fun scan(w: *Work) err[refusal.Error] {
+    val b: *Body = w.b;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d: *InstructionData = ?b.instructions.data[i];
+                if (d.opcode == table.LOAD && d.operands.len == 1 && d.results.len == 1) {
+                    val err_noted: err[refusal.Error] = note(w, i, d.operands.data[0], b.values.data[d.results.data[0]].type);
+                    if (sel err_noted.err) { ret err_noted; }
+                }
+                or (d.opcode == table.STORE && d.operands.len == 2) {
+                    val err_noted: err[refusal.Error] = note(w, i, d.operands.data[0], b.values.data[d.operands.data[1]].type);
+                    if (sel err_noted.err) { ret err_noted; }
+                }
+                or (d.opcode == table.MEM_FILL || d.opcode == table.MEM_COPY) {
+                    var n: usize = 0;
+                    for (n < d.operands.len) {
+                        whole(w, d.operands.data[n]);
+                        n = n + 1;
+                    }
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the public ranges of the bytes from `at`, `len` of them, of the slot alloca `d` makes, from the part's first byte
+fun public_part(w: *Work, d: *InstructionData, at: u64, len: u64) res[metadata.Publics, refusal.Error] {
+    val id: metadata.Publics = d.metadata.publics;
+    if (id == metadata.NO_PUBLICS) { ret res[metadata.Publics, refusal.Error].ok{metadata.NO_PUBLICS}; }
+    val ranges: Slice[global.Range]         = w.m.publics.data[id::usize];
+    var out:    vector.Vector[global.Range] = vector.init[global.Range](w.m.a);
+    fin { vector.dnit[global.Range](?out); }
+    var k: usize = 0;
+    for (k < ranges.size) {
+        val r:    global.Range = ranges.data[k];
+        var from: u64          = r.offset;
+        var to:   u64          = r.offset + r.length;
+        if (from < at)     { from = at; }
+        if (to > at + len) { to = at + len; }
+        if (from < to) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[global.Range](?out, global.Range{offset: from - at, length: to - from});
+            if (sel res_pushed.err) { ret res[metadata.Publics, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        k = k + 1;
+    }
+    val res_listed: res[metadata.Publics, module.Error] = module.publics(w.m, Slice[global.Range]{data: out.data, size: out.len});
+    if (sel res_listed.err) { ret res[metadata.Publics, refusal.Error].err{refusal.Error.ir{res_listed.err}}; }
+    ret res[metadata.Publics, refusal.Error].ok{res_listed.ok};
+}
+
+# the bits of the variables a slot binds that its part from byte `at`, `len` bytes of it, holds, where the slot holds
+# the bits `whole` of them
+fun held_piece(whole: Bits, at: u64, len: u64) Bits {
+    ret Bits{offset: whole.offset + (at * 8)::u32, size: (len * 8)::u32};
+}
+
+# the alignment a part at byte `at` of a slot aligned to `align` keeps
+fun aligned(align: u64, at: u64) u64 {
+    if (at == 0) { ret align; }
+    val low: u64 = at & (0 - at);
+    if (low < align) { ret low; }
+    ret align;
+}
+
+# split slot `slot` into one slot per part its accesses reach, each access taking its part's slot
+fun split_slot(w: *Work, site: *Site, f: u32, slot: Instruction) err[refusal.Error] {
+    val cuts:  Slice[u64]           = slots.cuts(w.s, slot);
+    val parts: usize                = cuts.size - 1;
+    var made:  vector.Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?made); }
+    var n: usize = 0;
+    for (n < parts) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?made, 0xffffffff);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        n = n + 1;
+    }
+    var a: usize = 0;
+    for (a < w.accesses.len) {
+        val x: Access = w.accesses.data[a];
+        if (x.slot == slot) {
+            if (made.data[x.part] == 0xffffffff) {
+                val d:     *InstructionData = ?w.b.instructions.data[slot];
+                val at:    u64              = cuts.data[x.part];
+                val len:   u64              = cuts.data[x.part + 1] - at;
+                var align: u64              = 1;
+                if (d.immediates.len > 2) {
+                    val imm: Immediate = d.immediates.data[2];
+                    if (sel imm.alignment) { align = imm.alignment; }
+                }
+                val res_public: res[metadata.Publics, refusal.Error] = public_part(w, d, at, len);
+                if (sel res_public.err) { ret err[refusal.Error].err{res_public.err}; }
+                val bindings: metadata.Bindings = d.metadata.bindings;
+                val piece:    Bits              = held_piece(d.metadata.piece, at, len);
+                emit.begin(site, slot);
+                var imm:      [3]Immediate       = [3]Immediate{Immediate.ty{x.ty}, d.immediates.data[1], Immediate.alignment{aligned(align, at)}};
+                val i:        Instruction        = emit.emit(site, table.ALLOCA, Slice[Value]{data: nil, size: 0}, Slice[Immediate]{data: ?imm[0], size: 3});
+                val v:        Value              = emit.result(site, i, 0);
+                val err_done: err[refusal.Error] = emit.done(site);
+                if (sel err_done.err) { ret err_done; }
+                var md: Metadata = w.b.instructions.data[i].metadata;
+                md.publics  = res_public.ok;
+                md.bindings = bindings;
+                md.piece    = piece;
+                val err_stated: err[refusal.Error] = refusal.edit(body.set_metadata(w.m, f, i, md));
+                if (sel err_stated.err) { ret err_stated; }
+                made.data[x.part] = v;
+            }
+            val old:       Value              = w.b.instructions.data[x.ins].operands.data[0];
+            val err_moved: err[refusal.Error] = refusal.edit(body.substitute(w.m, f, x.ins, old, made.data[x.part]));
+            if (sel err_moved.err) { ret err_moved; }
+        }
+        a = a + 1;
+    }
+    ret remark(w, site, f, slot, ?made);
+}
+
+# each marker of slot `slot` made again ahead of it for every part's slot `made` holds, a part no access reaches
+# holding none, and taken out
+fun remark(w: *Work, site: *Site, f: u32, slot: Instruction, made: *vector.Vector[Value]) err[refusal.Error] {
+    var marks: vector.Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin { vector.dnit[Instruction](?marks); }
+    val pointer: Value = w.b.instructions.data[slot].results.data[0];
+    var n:       usize = 0;
+    for (n < w.b.values.data[pointer].uses.len) {
+        val at: Instruction = w.b.values.data[pointer].uses.data[n];
+        if (table.marks(w.b.instructions.data[at].opcode)) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?marks, at);
+            if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < marks.len) {
+        val at:   Instruction = marks.data[n];
+        val code: u32         = w.b.instructions.data[at].opcode;
+        emit.begin(site, at);
+        var p: usize = 0;
+        for (p < made.len) {
+            if (made.data[p] != 0xffffffff) {
+                var ops: [1]Value = [1]Value{made.data[p]};
+                emit.emit(site, code, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: nil, size: 0});
+            }
+            p = p + 1;
+        }
+        val err_done: err[refusal.Error] = emit.done(site);
+        if (sel err_done.err) { ret err_done; }
+        val err_gone: err[refusal.Error] = refusal.edit(body.erase(w.m, f, at));
+        if (sel err_gone.err) { ret err_gone; }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# split the slots of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:            *Body                      = res_body.ok;
+    var any:          bool                       = false;
+    var i:            usize                      = 0;
+    val res_slots_of: res[*Slots, refusal.Error] = analysis.slots_of(c.cache, u.f);
+    if (sel res_slots_of.err) { ret res[bool, refusal.Error].err{res_slots_of.err}; }
+    var l: Layout = layout.of(c.t, ?c.m.types, basis.context_of(c.basis));
+    var w: Work   = Work{m: c.m, b: b, s: res_slots_of.ok, l: ?l, held: vector.init[bool](c.m.a), accesses: vector.init[Access](c.m.a)};
+    fin {
+        vector.dnit[bool](?w.held);
+        vector.dnit[Access](?w.accesses);
+    }
+    for (i < b.instructions.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[bool](?w.held, false);
+        if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < b.instructions.len) {
+        if (sel b.instructions.data[i].place.placed) {
+            if (candidate(?w, i::u32)) {
+                w.held.data[i] = true;
+                any            = true;
+            }
+        }
+        i = i + 1;
+    }
+    if (!any) { ret res[bool, refusal.Error].ok{false}; }
+    val err_scanned: err[refusal.Error] = scan(?w);
+    if (sel err_scanned.err) { ret res[bool, refusal.Error].err{err_scanned.err}; }
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var site: Site = emit.init(c.m, u.f, b, ?scratch);
+    fin { emit.dnit(?site); }
+
+    var changed: bool  = false;
+    val count:   usize = w.held.len;
+    i = 0;
+    for (i < count) {
+        if (w.held.data[i]) {
+            val err_split: err[refusal.Error] = split_slot(?w, ?site, u.f, i::u32);
+            if (sel err_split.err) { ret res[bool, refusal.Error].err{err_split.err}; }
+            changed = true;
+        }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

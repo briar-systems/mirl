@@ -1,0 +1,1235 @@
+# the value map: the copies, spills and reloads of an allocated virtual form
+# whose destination already holds what they move, which an optimised
+# compilation leaves out. the allocation checker proves what is left out by a
+# rule of its own (`mirl.machine.alloc.contents`)
+#
+# the map follows the form under its assignment and holds, at each point,
+# the values of the input each location and each frame slot holds: a value
+# of the input is one of its virtual registers, and a place holds it, and the
+# part of it a group's register covers, when the last write of that place's
+# storage put it there and nothing wrote the value since. an instruction the
+# input has writes its values: each place of a virtual register it writes
+# then holds that register's value of the input and nothing else, every
+# other place holding the value before holds it no longer, and every place
+# sharing storage with one it writes, by an operand, its footprint or a
+# clobber, holds nothing. a copy, a spill or a reload the allocator inserted
+# moves what its source holds to its destination, and so does a copy of the
+# input between two virtual registers of one class, which besides gives its
+# destination its own value. a slot address the allocator inserted to make a
+# value again holds that value only when the input forms that very frame
+# address, slot and displacement, at every write of it (`remade.of`), and
+# since that address is one value through the function the other places
+# holding it keep it, unless some path reaches the write with the value
+# unwritten: those places held it only as storage nothing wrote holds any
+# value, and hold it no longer. a read of a virtual register is proved when
+# its place holds its value of the input, or when no write of that value
+# reaches it, a read of storage nothing wrote, as a copy into one member of a
+# tuple reads the others.
+#
+# a copy may be dropped from the form when its destination already holds a
+# value its source holds and every path to it writes that value, so the two
+# places hold the same bits, or when it moves a place to itself. the copies
+# are found with none dropped, and since a dropped copy writes nothing, its
+# destination then holding what it held and what its source holds, dropping
+# them all leaves each one's places holding one value. a copy that
+# declassifies is never dropped, and neither is a parallel copy or a copy
+# naming a register, whose width the map does not follow.
+#
+# the map at a block's start is the meet of its predecessors' maps at their
+# ends: a place holds a value there when it holds it at the end of every
+# predecessor that writes the value. the blocks are walked in linear order
+# until no block's map changes, and since the maps only lose what they hold
+# once every predecessor is seen, the copies found in the last walk are
+# those whose places hold one value. the pairs held are chained by place and
+# by value, so a write touches only the pairs of the places and values it
+# names.
+#
+# one working map runs through every block. a map at a block's start or end
+# is a tree of its pairs by place, and of its defined and sure sets by word,
+# shared with the maps it was made from and never changed once made. a
+# block's map at its end is the one at its start with the places and words
+# it touched made anew, the working map is moved to the next block's start
+# by the places and words where the two trees differ, and meeting two maps
+# descends only where their trees differ, giving back the old tree where the
+# meet leaves it as it was, so a change is a new root. a block costs its
+# writes and what changes, not the pairs it carries, and the walks are
+# bounded by the loop nesting as any forward dataflow.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Event;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Site;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.alloc.remade;
+use mirl.machine.class;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.pseudo;
+use mirl.machine.storage;
+use mirl.machine.storage.Storage;
+
+use mo: masc.core.operand;
+use rf: masc.core.register;
+
+# no instruction, place or value
+pub val NONE: u32 = 0xffffffff;
+
+# what the map is built from
+# ---
+# f:         the virtual form
+# input:     the function the form is of
+# origin:    each virtual register of the form's register of the input,
+#            whose value it carries
+# sources:   each instruction of the form's instruction of the input, NONE
+#            for one the allocator inserted
+# at:        the locations of the target
+# locations: each virtual register's location, NONE for one with none
+# l:         the form's liveness
+# events:    the form's reads and writes, by linear number
+# graph:     the form's blocks' edges
+# regs:      the registers of the selection, which fix each place's storage
+pub rec Given {
+    f:         *Function;
+    input:     *Function;
+    origin:    Slice[u32];
+    sources:   Slice[u32];
+    at:        *Locations;
+    locations: Slice[u32];
+    l:         *Live;
+    events:    live.Events;
+    graph:     *Graph;
+    regs:      *rf.Available;
+}
+
+# why the map refused a form
+# ---
+# alloc:   the allocator refused storage
+# missing: a read of a virtual register whose place does not hold its value
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    missing: Site;
+}
+
+# the allocator's refusal `e` stands for, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc) { ret opt[allocator.Error].some{e.alloc}; }
+    ret opt[allocator.Error].none{};
+}
+
+# a place holding part `sub` of a value
+rec Pair {
+    at:    u32;
+    value: u32;
+    sub:   u32;
+}
+
+# the children of a node of a tree, and the bits of an index each height reads
+val FAN:  u32 = 16;
+val BITS: u32 = 4;
+
+# a map at a point, by its trees: the pairs it holds by place, and the values
+# written on some path there and on every path there, by word
+rec State {
+    pairs: u32;
+    defs:  u32;
+    sures: u32;
+}
+
+# where a copy's operand is: its place, NONE for one the map does not follow,
+# and its virtual register, NONE for none
+rec Holder {
+    place:   u32;
+    virtual: u32;
+}
+
+# the map as it walks
+# ---
+# remade:    per value of the input, the frame address every write of it forms (`remade.of`), the slot remade.NONE
+#            for none
+# nodes:     node n's children from n * FAN. a node is FAN children, nodes below it or, at the lowest height, groups,
+#            and node 0 is a tree that holds nothing at any height
+# gfirst:    per pair group, its first pair in held. a pair group is the pairs of one place sorted, group 0 holding none
+# gcount:    per pair group, its pairs
+# held:      the pairs of every pair group
+# bits:      per word group, its bits, one word of a set of values, word group 0 holding none
+# pheight:   the heights of a tree of places, a place's group that many children below its root
+# wheight:   the heights of a tree of words
+# now:       the trees of the working map as last loaded or settled
+# known:     per block, whether a map reaches its start
+# starts:    per block, its map at its start
+# epoch:     the mark of the places and words the block walked touches
+# pmark:     per place, the epoch it was last touched in
+# tplaces:   the places the block touched, the first tplace of it
+# wmark:     per word, the epoch it was last touched in
+# twords:    the words the block touched, the first tword of it
+# scratch:   a group being made
+# cur:       the working map's pairs, those taken out dead
+# dead:      per pair, whether it was taken out
+# next_at:   per pair, the next of its place's chain
+# prev_at:   per pair, the one before in its place's chain
+# next_val:  per pair, the next of its value's chain
+# prev_val:  per pair, the one before in its value's chain
+# head_at:   per place, its chain's first pair
+# head_val:  per value, its chain's first pair
+# defined:   the working map's values written on some path, by bit
+# sure:      the working map's values written on every path, by bit
+# temp:      the pairs a copy moves
+# redefined: the values a parallel copy writes
+rec Map {
+    a:         *allocator.Allocator;
+    g:         *Given;
+    places:    u32;
+    words:     u32;
+    found:     *vector.Vector[bool];
+    changed:   bool;
+    remade:    vector.Vector[remade.At];
+    nodes:     vector.Vector[u32];
+    gfirst:    vector.Vector[u32];
+    gcount:    vector.Vector[u32];
+    held:      vector.Vector[Pair];
+    bits:      vector.Vector[u64];
+    pheight:   u32;
+    wheight:   u32;
+    now:       State;
+    known:     vector.Vector[bool];
+    starts:    vector.Vector[State];
+    epoch:     u32;
+    pmark:     vector.Vector[u32];
+    tplaces:   vector.Vector[u32];
+    tplace:    usize;
+    wmark:     vector.Vector[u32];
+    twords:    vector.Vector[u32];
+    tword:     usize;
+    scratch:   vector.Vector[Pair];
+    cur:       vector.Vector[Pair];
+    dead:      vector.Vector[bool];
+    next_at:   vector.Vector[u32];
+    prev_at:   vector.Vector[u32];
+    next_val:  vector.Vector[u32];
+    prev_val:  vector.Vector[u32];
+    head_at:   vector.Vector[u32];
+    head_val:  vector.Vector[u32];
+    defined:   vector.Vector[u64];
+    sure:      vector.Vector[u64];
+    temp:      vector.Vector[Pair];
+    redefined: vector.Vector[u32];
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+# a push's refusal as the allocator's, ok where it took
+fun pushed_all(r: res[usize, allocator.Error]) err[allocator.Error] {
+    if (sel r.err) { ret err[allocator.Error].err{r.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+fun pushed(r: res[usize, allocator.Error]) err[Error] {
+    if (sel r.err) { ret alloc_err(r.err); }
+    ret err[Error].ok{};
+}
+
+fun by_pair(x: *Pair, y: *Pair) i64 {
+    if (x.at != y.at) {
+        if (x.at < y.at) { ret -1; }
+        ret 1;
+    }
+    if (x.value != y.value) {
+        if (x.value < y.value) { ret -1; }
+        ret 1;
+    }
+    if (x.sub < y.sub) { ret -1; }
+    if (x.sub > y.sub) { ret 1; }
+    ret 0;
+}
+
+fun is_defined(m: *Map, v: u32) bool {
+    ret ((m.defined.data[(v / 64)::usize] >> (v % 64)::u64) & 1) != 0;
+}
+
+# a place the block walked changed
+fun touch_place(m: *Map, at: u32) {
+    if (m.pmark.data[at] == m.epoch) { ret; }
+    m.pmark.data[at]         = m.epoch;
+    m.tplaces.data[m.tplace] = at;
+    m.tplace                 = m.tplace + 1;
+}
+
+fun define(m: *Map, v: u32) {
+    val k: usize = (v / 64)::usize;
+    if (m.wmark.data[k] != m.epoch) {
+        m.wmark.data[k]        = m.epoch;
+        m.twords.data[m.tword] = k::u32;
+        m.tword                = m.tword + 1;
+    }
+    m.defined.data[k] = m.defined.data[k] | ((1::u64) << (v % 64)::u64);
+    m.sure.data[k]    = m.sure.data[k] | ((1::u64) << (v % 64)::u64);
+}
+
+fun rows(m: *Map) u32 {
+    ret location.count(m.g.at);
+}
+
+fun has(m: *Map, at: u32, value: u32, sub: u32) bool {
+    var k: u32 = m.head_at.data[at];
+    for (k != NONE) {
+        val p: Pair = m.cur.data[k];
+        if (p.value == value && p.sub == sub) { ret true; }
+        k = m.next_at.data[k];
+    }
+    ret false;
+}
+
+# a pair onto the map, first in its place's and its value's chains
+fun push_pair(m: *Map, p: Pair) err[Error] {
+    val k:          u32                         = m.cur.len::u32;
+    var err_failed: err[allocator.Error]        = err[allocator.Error].ok{};
+    val res_pair:   res[usize, allocator.Error] = vector.push[Pair](?m.cur, p);
+    if (sel res_pair.err) { keep(?err_failed, err[allocator.Error].err{res_pair.err}); }
+    val res_dead: res[usize, allocator.Error] = vector.push[bool](?m.dead, false);
+    if (sel res_dead.err) { keep(?err_failed, err[allocator.Error].err{res_dead.err}); }
+    val res_na: res[usize, allocator.Error] = vector.push[u32](?m.next_at, m.head_at.data[p.at]);
+    if (sel res_na.err) { keep(?err_failed, err[allocator.Error].err{res_na.err}); }
+    val res_pa: res[usize, allocator.Error] = vector.push[u32](?m.prev_at, NONE);
+    if (sel res_pa.err) { keep(?err_failed, err[allocator.Error].err{res_pa.err}); }
+    val res_nv: res[usize, allocator.Error] = vector.push[u32](?m.next_val, m.head_val.data[p.value]);
+    if (sel res_nv.err) { keep(?err_failed, err[allocator.Error].err{res_nv.err}); }
+    val res_pv: res[usize, allocator.Error] = vector.push[u32](?m.prev_val, NONE);
+    if (sel res_pv.err)                   { keep(?err_failed, err[allocator.Error].err{res_pv.err}); }
+    if (sel err_failed.err)               { ret alloc_err(err_failed.err); }
+    if (m.head_at.data[p.at] != NONE)     { m.prev_at.data[m.head_at.data[p.at]] = k; }
+    if (m.head_val.data[p.value] != NONE) { m.prev_val.data[m.head_val.data[p.value]] = k; }
+    m.head_at.data[p.at]     = k;
+    m.head_val.data[p.value] = k;
+    touch_place(m, p.at);
+    ret err[Error].ok{};
+}
+
+fun add(m: *Map, at: u32, value: u32, sub: u32) err[Error] {
+    if (at == NONE || has(m, at, value, sub)) { ret err[Error].ok{}; }
+    ret push_pair(m, Pair{at: at, value: value, sub: sub});
+}
+
+# pair `k` taken out of both its chains, its entry left dead
+fun remove_at(m: *Map, k: u32) {
+    val p: Pair = m.cur.data[k];
+    if (m.prev_at.data[k] != NONE)  { m.next_at.data[m.prev_at.data[k]] = m.next_at.data[k]; }
+    or                              { m.head_at.data[p.at] = m.next_at.data[k]; }
+    if (m.next_at.data[k] != NONE)  { m.prev_at.data[m.next_at.data[k]] = m.prev_at.data[k]; }
+    if (m.prev_val.data[k] != NONE) { m.next_val.data[m.prev_val.data[k]] = m.next_val.data[k]; }
+    or                              { m.head_val.data[p.value] = m.next_val.data[k]; }
+    if (m.next_val.data[k] != NONE) { m.prev_val.data[m.next_val.data[k]] = m.prev_val.data[k]; }
+    m.dead.data[k] = true;
+    touch_place(m, p.at);
+}
+
+# a place holds nothing
+fun kill_at(m: *Map, at: u32) {
+    for (m.head_at.data[at] != NONE) { remove_at(m, m.head_at.data[at]); }
+}
+
+# a place written: every place sharing its storage holds nothing
+fun kill_place(m: *Map, at: u32) {
+    if (at == NONE) { ret; }
+    if (at >= rows(m)) {
+        kill_at(m, at);
+        ret;
+    }
+    val alias: Slice[u32] = location.shares(m.g.at, at);
+    var k:     usize      = 0;
+    for (k < alias.size) {
+        kill_at(m, alias.data[k]);
+        k = k + 1;
+    }
+}
+
+# every place a clobber set holds storage of holds nothing
+fun kill_set(m: *Map, set: u32) {
+    val count: u32 = rows(m);
+    var at:    u32 = 0;
+    for (at < count) {
+        if (m.head_at.data[at] != NONE && live.clobbered(m.g.l, set, at)) { kill_at(m, at); }
+        at = at + 1;
+    }
+}
+
+# a value written anew: no place holds its old value
+fun redefine(m: *Map, v: u32) {
+    define(m, v);
+    for (m.head_val.data[v] != NONE) { remove_at(m, m.head_val.data[v]); }
+}
+
+# what a place holds, onto the temporary list, each pair's place `tag`
+fun collect(m: *Map, at: u32, tag: u32) err[Error] {
+    if (at == NONE) { ret err[Error].ok{}; }
+    var k: u32 = m.head_at.data[at];
+    for (k != NONE) {
+        val p:          Pair       = m.cur.data[k];
+        val err_pushed: err[Error] = pushed(vector.push[Pair](?m.temp, Pair{at: tag, value: p.value, sub: p.sub}));
+        if (sel err_pushed.err) { ret err_pushed; }
+        k = m.next_at.data[k];
+    }
+    ret err[Error].ok{};
+}
+
+# the bits place `at` holds: a register's storage, a cell's, a slot's size,
+# none for a register whose storage no fixed and scaled part states
+fun capacity(m: *Map, at: u32) opt[Storage] {
+    if (at == NONE) { ret opt[Storage].none{}; }
+    if (at >= rows(m)) {
+        val sd: function.SlotData = m.g.f.slots.data[at - rows(m)];
+        ret opt[Storage].some{storage.fold(m.g.regs, Storage{fixed: sd.size * 8, per: sd.per * 8, scale: sd.scale})};
+    }
+    val p: class.Physical = location.physical(m.g.at, at);
+    if (sel p.cell) { ret opt[Storage].some{Storage{fixed: p.cell.class.width::u64, per: 0, scale: 0}}; }
+    val opt_row: opt[*rf.Register] = rf.row_of(m.g.regs.file, p.register);
+    if (sel opt_row.none) { ret opt[Storage].none{}; }
+    ret storage.of_register(m.g.regs, opt_row.some);
+}
+
+# the bits pair `p` carries: its value's width, or a register of its class
+fun need_of(m: *Map, p: Pair) opt[Storage] {
+    var need: Storage = Storage{fixed: function.width_of(m.g.input, p.value), per: 0, scale: 0};
+    if (need.fixed == 0 || p.sub != 0) {
+        val opt_class: opt[Storage] = storage.of_class(m.g.regs, function.class_of(m.g.input, p.value));
+        if (sel opt_class.none) { ret opt[Storage].none{}; }
+        need = opt_class.some;
+    }
+    ret opt[Storage].some{need};
+}
+
+# whether a copy between places `dst` and `src` moves pair `p`: both hold all
+# the bits of its part
+fun carries(m: *Map, dst: u32, src: u32, p: Pair) bool {
+    val opt_need: opt[Storage] = need_of(m, p);
+    if (sel opt_need.none) { ret false; }
+    val opt_dst: opt[Storage] = capacity(m, dst);
+    val opt_src: opt[Storage] = capacity(m, src);
+    if (sel opt_dst.none) { ret false; }
+    if (sel opt_src.none) { ret false; }
+    ret storage.covers(opt_dst.some, opt_need.some) && storage.covers(opt_src.some, opt_need.some);
+}
+
+# whether two places hold one value: a value written on every path here whose
+# bits cover all of one of the places, since a narrower value leaves upper bits
+# distinct
+fun same_value(m: *Map, x: u32, y: u32) bool {
+    if (x == NONE || y == NONE) { ret false; }
+    if (x == y)                 { ret true; }
+    val opt_x: opt[Storage] = capacity(m, x);
+    val opt_y: opt[Storage] = capacity(m, y);
+    if (sel opt_x.none) { ret false; }
+    if (sel opt_y.none) { ret false; }
+    val x_cap: Storage = opt_x.some;
+    val y_cap: Storage = opt_y.some;
+    var k:     u32     = m.head_at.data[x];
+    for (k != NONE) {
+        val p: Pair = m.cur.data[k];
+        if (bit_of(m.sure.data, p.value) && has(m, y, p.value, p.sub)) {
+            val opt_need: opt[Storage] = need_of(m, p);
+            if (sel opt_need.some) {
+                val need: Storage = opt_need.some;
+                if (storage.covers(need, x_cap) || storage.covers(need, y_cap)) { ret true; }
+            }
+        }
+        k = m.next_at.data[k];
+    }
+    ret false;
+}
+
+fun origin(m: *Map, v: u32) u32 {
+    ret m.g.origin.data[v];
+}
+
+fun original(m: *Map, i: Instruction) bool {
+    ret m.g.sources.data[i] != NONE;
+}
+
+fun span(m: *Map, v: u32) u32 {
+    ret live.span(m.g.l, v);
+}
+
+# the place of a virtual register's part `sub`, NONE for none
+fun place_of(m: *Map, v: u32, sub: u32) u32 {
+    val loc: u32 = m.g.locations.data[v];
+    if (loc == NONE) { ret NONE; }
+    val at: u32 = location.past(m.g.at, loc, sub);
+    if (at == location.NONE) { ret NONE; }
+    ret at;
+}
+
+# a read of virtual register `v` at operand `k` of instruction `i`
+fun check_read(m: *Map, i: Instruction, k: u32, v: u32) err[Error] {
+    val value: u32 = origin(m, v);
+    if (!is_defined(m, value)) { ret err[Error].ok{}; }
+    var g: u32 = 0;
+    for (g < span(m, v)) {
+        val at: u32 = place_of(m, v, g);
+        if (at == NONE || !has(m, at, value, g)) { ret err[Error].err{Error.missing{Site{instruction: i, operand: k}}}; }
+        g = g + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# where an operand of a copy is, none for one of another kind
+fun holder(m: *Map, o: Operand, out: *Holder) bool {
+    if (sel o.virtual) {
+        if (span(m, o.virtual) != 1) { ret false; }
+        @out = Holder{place: place_of(m, o.virtual, 0), virtual: o.virtual};
+        ret true;
+    }
+    if (sel o.physical) {
+        var at:          u32                          = NONE;
+        val res_located: res[u32, location.Unlocated] = location.locate(m.g.at, o.physical);
+        if (sel res_located.ok) { at = res_located.ok; }
+        @out = Holder{place: at, virtual: NONE};
+        ret true;
+    }
+    if (sel o.slot) {
+        @out = Holder{place: rows(m) + o.slot, virtual: NONE};
+        ret true;
+    }
+    ret false;
+}
+
+# whether a copy of the input or one inserted moves what its source holds:
+# one inserted moves it, one of the input between virtual registers of one class does
+fun moves(m: *Map, i: Instruction, dst: Holder, src: Holder) bool {
+    if (dst.place == NONE || src.place == NONE)     { ret false; }
+    if (!original(m, i))                            { ret true; }
+    if (dst.virtual == NONE || src.virtual == NONE) { ret false; }
+    ret class.same(function.class_of(m.g.f, dst.virtual), function.class_of(m.g.f, src.virtual));
+}
+
+# whether a copy may be dropped when its places hold one value
+fun droppable(m: *Map, i: Instruction, d: *InstructionData, dst: Holder, src: Holder) bool {
+    if (d.declassifies || !moves(m, i, dst, src))   { ret false; }
+    if (dst.virtual == NONE || src.virtual == NONE) { ret true; }
+    ret function.secret_of(m.g.f, dst.virtual) == function.secret_of(m.g.f, src.virtual);
+}
+
+# a copy, spill or reload of two operands
+fun copy_step(m: *Map, i: Instruction, d: *InstructionData, dst: Holder, src: Holder) err[Error] {
+    if (src.virtual != NONE) {
+        val err_read: err[Error] = check_read(m, i, 1, src.virtual);
+        if (sel err_read.err) { ret err_read; }
+    }
+    val own:   bool = original(m, i) && dst.virtual != NONE;
+    var value: u32  = NONE;
+    if (own) { value = origin(m, dst.virtual); }
+    vector.clear[Pair](?m.temp);
+    if (droppable(m, i, d, dst, src) && same_value(m, dst.place, src.place)) { m.found.data[i] = true; }
+    if (moves(m, i, dst, src)) {
+        val err_held: err[Error] = collect(m, src.place, dst.place);
+        if (sel err_held.err) { ret err_held; }
+    }
+    kill_place(m, dst.place);
+    if (own) { redefine(m, value); }
+    var t: usize = 0;
+    for (t < m.temp.len) {
+        val p: Pair = m.temp.data[t];
+        if (p.value != value && carries(m, dst.place, src.place, p)) {
+            val err_added: err[Error] = add(m, p.at, p.value, p.sub);
+            if (sel err_added.err) { ret err_added; }
+        }
+        t = t + 1;
+    }
+    if (own) { ret add(m, dst.place, value, 0); }
+    ret err[Error].ok{};
+}
+
+# a parallel copy: its destinations, then its sources, each pair at once
+fun parallel_step(m: *Map, i: Instruction, d: *InstructionData) err[Error] {
+    val half: u32 = (d.operands.size / 2)::u32;
+    var dst:  Holder;
+    var src:  Holder;
+    var j:    u32 = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j + half], ?src);
+        if (src.virtual != NONE) {
+            val err_read: err[Error] = check_read(m, i, j + half, src.virtual);
+            if (sel err_read.err) { ret err_read; }
+        }
+        j = j + 1;
+    }
+    vector.clear[Pair](?m.temp);
+    vector.clear[u32](?m.redefined);
+    j = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j], ?dst);
+        holder(m, d.operands.data[j + half], ?src);
+        if (moves(m, i, dst, src)) {
+            val start:    usize      = m.temp.len;
+            val err_held: err[Error] = collect(m, src.place, dst.place);
+            if (sel err_held.err) { ret err_held; }
+            var t:    usize = start;
+            var kept: usize = start;
+            for (t < m.temp.len) {
+                val p: Pair = m.temp.data[t];
+                if (carries(m, dst.place, src.place, p)) {
+                    m.temp.data[kept]    = p;
+                    m.temp.data[kept].at = j;
+                    kept                 = kept + 1;
+                }
+                t = t + 1;
+            }
+            m.temp.len = kept;
+        }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j], ?dst);
+        if (dst.virtual != NONE) {
+            val value: u32 = origin(m, dst.virtual);
+            redefine(m, value);
+            val err_pushed: err[Error] = pushed(vector.push[u32](?m.redefined, value));
+            if (sel err_pushed.err) { ret err_pushed; }
+        }
+        kill_place(m, dst.place);
+        j = j + 1;
+    }
+    var t: usize = 0;
+    for (t < m.temp.len) {
+        val p:    Pair  = m.temp.data[t];
+        var gone: bool  = false;
+        var r:    usize = 0;
+        for (r < m.redefined.len) {
+            if (m.redefined.data[r] == p.value) { gone = true; }
+            r = r + 1;
+        }
+        if (!gone) {
+            holder(m, d.operands.data[p.at], ?dst);
+            val err_added: err[Error] = add(m, dst.place, p.value, p.sub);
+            if (sel err_added.err) { ret err_added; }
+        }
+        t = t + 1;
+    }
+    j = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j], ?dst);
+        if (dst.virtual != NONE) {
+            val err_added: err[Error] = add(m, dst.place, origin(m, dst.virtual), 0);
+            if (sel err_added.err) { ret err_added; }
+        }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# a slot address the allocator inserted to make a value again
+fun remake_step(m: *Map, d: *InstructionData) err[Error] {
+    val dest: Operand = d.operands.data[0];
+    if (!(sel dest.virtual)) { ret err[Error].ok{}; }
+    val value: u32       = origin(m, dest.virtual);
+    val at:    u32       = place_of(m, dest.virtual, 0);
+    val made:  remade.At = remade.addressed(d);
+    # a place holds the value unwritten on some path only vacuously, so a first write there takes it back
+    if (bit_of(m.sure.data, value)) { define(m, value); }
+    or                              { redefine(m, value); }
+    kill_place(m, at);
+    val held: remade.At = m.remade.data[value];
+    if (made.slot != remade.NONE && held.slot == made.slot && held.disp == made.disp) { ret add(m, at, value, 0); }
+    ret err[Error].ok{};
+}
+
+fun is_virtual(m: *Map, value: u32) bool {
+    ret value != NONE && value < m.g.l.virtuals;
+}
+
+# an instruction by its reads and writes as liveness gathers them
+fun generic(m: *Map, i: Instruction, n: u32) err[Error] {
+    val start: u32          = m.g.events.first.data[n];
+    val ev:    Slice[Event] = Slice[Event]{data: ?m.g.events.events.data[start], size: (m.g.events.first.data[n + 1] - start)::usize};
+    var j:     usize        = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set == NONE && !e.write && is_virtual(m, e.value)) {
+            val err_read: err[Error] = check_read(m, i, e.operand, e.value);
+            if (sel err_read.err) { ret err_read; }
+        }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set == NONE && e.write && is_virtual(m, e.value)) { redefine(m, origin(m, e.value)); }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set != NONE) { kill_set(m, e.set); }
+        or (e.write && is_virtual(m, e.value)) {
+            var g: u32 = 0;
+            for (g < span(m, e.value)) {
+                kill_place(m, place_of(m, e.value, g));
+                g = g + 1;
+            }
+        }
+        or (e.write && e.value != NONE) { kill_place(m, m.g.events.touched.data[e.value - m.g.l.virtuals]); }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set == NONE && e.write && is_virtual(m, e.value)) {
+            var g: u32 = 0;
+            for (g < span(m, e.value)) {
+                val err_added: err[Error] = add(m, place_of(m, e.value, g), origin(m, e.value), g);
+                if (sel err_added.err) { ret err_added; }
+                g = g + 1;
+            }
+        }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether every operand of a copy is a place the map follows
+fun copyable(m: *Map, d: *InstructionData) bool {
+    var h: Holder;
+    var k: usize = 0;
+    for (k < d.operands.size) {
+        if (!holder(m, d.operands.data[k], ?h)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+fun step(m: *Map, i: Instruction, n: u32) err[Error] {
+    val d:  *InstructionData = function.data(m.g.f, i);
+    val op: Opcode           = d.opcode;
+    if (sel op.pseudo) {
+        val p: pseudo.Pseudo = op.pseudo;
+        if ((p == pseudo.COPY || p == pseudo.SPILL || p == pseudo.RELOAD) && d.operands.size == 2 && copyable(m, d)) {
+            var dst: Holder;
+            var src: Holder;
+            holder(m, d.operands.data[0], ?dst);
+            holder(m, d.operands.data[1], ?src);
+            ret copy_step(m, i, d, dst, src);
+        }
+        if (p == pseudo.PARALLEL_COPY && copyable(m, d))                    { ret parallel_step(m, i, d); }
+        if (p == pseudo.ADDRESS && !original(m, i) && d.operands.size == 3) { ret remake_step(m, d); }
+    }
+    ret generic(m, i, n);
+}
+
+# the heights of a tree numbering `count` places or words
+fun heights(count: usize) u32 {
+    var h:     u32   = 1;
+    var reach: usize = FAN::usize;
+    for (reach < count) {
+        reach = reach * FAN::usize;
+        h     = h + 1;
+    }
+    ret h;
+}
+
+fun child(m: *Map, n: u32, k: u32) u32 {
+    ret m.nodes.data[(n * FAN + k)::usize];
+}
+
+# the child of a node at height `h` an index leads to, the lowest height 0
+fun digit(i: u32, h: u32) u32 {
+    ret (i >> (h * BITS)) & (FAN - 1);
+}
+
+# the node of children `kids`, node 0 where every one is 0
+fun noded(m: *Map, kids: *u32) res[u32, Error] {
+    var bare: bool = true;
+    var k:    u32  = 0;
+    for (k < FAN) {
+        if (kids[k] != 0) { bare = false; }
+        k = k + 1;
+    }
+    if (bare) { ret res[u32, Error].ok{0}; }
+    val n:        u32                  = (m.nodes.len / FAN::usize)::u32;
+    val err_kept: err[allocator.Error] = pushed_all(vector.extend[u32](?m.nodes, Slice[u32]{data: kids, size: FAN::usize}));
+    if (sel err_kept.err) { ret res[u32, Error].err{Error.alloc{err_kept.err}}; }
+    ret res[u32, Error].ok{n};
+}
+
+# the group at index `i` of a tree `height` tall
+fun get(m: *Map, root: u32, height: u32, i: u32) u32 {
+    var n: u32 = root;
+    var h: u32 = height;
+    for (h > 0 && n != 0) {
+        h = h - 1;
+        n = child(m, n, digit(i, h));
+    }
+    ret n;
+}
+
+# tree `n`, `h` tall, with group `g` at index `i`
+fun set(m: *Map, n: u32, h: u32, i: u32, g: u32) res[u32, Error] {
+    var kids: [16]u32;
+    var k:    u32 = 0;
+    for (k < FAN) {
+        kids[k] = child(m, n, k);
+        k       = k + 1;
+    }
+    val d: u32 = digit(i, h - 1);
+    if (h == 1) { kids[d] = g; }
+    or {
+        val res_below: res[u32, Error] = set(m, kids[d], h - 1, i, g);
+        if (sel res_below.err) { ret res_below; }
+        kids[d] = res_below.ok;
+    }
+    ret noded(m, ?kids[0]);
+}
+
+fun group_of(m: *Map, g: u32) Slice[Pair] {
+    ret Slice[Pair]{data: ?m.held.data[m.gfirst.data[g]::usize], size: m.gcount.data[g]::usize};
+}
+
+# whether pair group `g` holds the pairs of `list`
+fun same_group(m: *Map, g: u32, list: *vector.Vector[Pair]) bool {
+    val have: Slice[Pair] = group_of(m, g);
+    if (have.size != list.len) { ret false; }
+    var i: usize = 0;
+    for (i < have.size) {
+        if (by_pair(?have.data[i], ?list.data[i]) != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a pair group of the sorted pairs of `list`, group 0 for none
+fun grouped(m: *Map, list: *vector.Vector[Pair]) res[u32, Error] {
+    if (list.len == 0) { ret res[u32, Error].ok{0}; }
+    val g:          u32                  = m.gfirst.len::u32;
+    var err_failed: err[allocator.Error] = pushed_all(vector.push[u32](?m.gfirst, m.held.len::u32));
+    keep(?err_failed, pushed_all(vector.push[u32](?m.gcount, list.len::u32)));
+    keep(?err_failed, pushed_all(vector.extend[Pair](?m.held, Slice[Pair]{data: list.data, size: list.len})));
+    if (sel err_failed.err) { ret res[u32, Error].err{Error.alloc{err_failed.err}}; }
+    ret res[u32, Error].ok{g};
+}
+
+# a word group of bits `w`, group 0 for none
+fun worded(m: *Map, w: u64) res[u32, Error] {
+    if (w == 0) { ret res[u32, Error].ok{0}; }
+    val g:          u32                         = m.bits.len::u32;
+    val res_pushed: res[usize, allocator.Error] = vector.push[u64](?m.bits, w);
+    if (sel res_pushed.err) { ret res[u32, Error].err{Error.alloc{res_pushed.err}}; }
+    ret res[u32, Error].ok{g};
+}
+
+# whether a tree of words holds value `v`
+fun word_bit(m: *Map, root: u32, v: u32) bool {
+    val g: u32 = get(m, root, m.wheight, v / 64);
+    ret ((m.bits.data[g::usize] >> (v % 64)::u64) & 1) != 0;
+}
+
+# pair groups `x`, of a successor's map at its start, and `y`, of the working
+# map at its block's end, met: a pair both hold stays, one only `x` holds
+# where the block's end writes its value on no path, and one only `y` holds
+# where the successor's defined set `defs` does not hold its value. `x` or
+# `y` itself where the meet holds what it holds
+fun meet_group(m: *Map, x: u32, y: u32, defs: u32) res[u32, Error] {
+    if (x == y) { ret res[u32, Error].ok{x}; }
+    vector.clear[Pair](?m.scratch);
+    val gx: Slice[Pair] = group_of(m, x);
+    val gy: Slice[Pair] = group_of(m, y);
+    var i:  usize       = 0;
+    var j:  usize       = 0;
+    for (i < gx.size || j < gy.size) {
+        var c: i64 = 0;
+        if (i >= gx.size) { c = 1; }
+        or (j >= gy.size) { c = -1; }
+        or                { c = by_pair(?gx.data[i], ?gy.data[j]); }
+        var take:    Pair = Pair{at: 0, value: 0, sub: 0};
+        var keep_it: bool = false;
+        if (c == 0) {
+            take    = gx.data[i];
+            keep_it = true;
+            i       = i + 1;
+            j       = j + 1;
+        }
+        or (c < 0) {
+            take    = gx.data[i];
+            keep_it = !is_defined(m, take.value);
+            i       = i + 1;
+        }
+        or {
+            take    = gy.data[j];
+            keep_it = !word_bit(m, defs, take.value);
+            j       = j + 1;
+        }
+        if (keep_it) {
+            val err_pushed: err[Error] = pushed(vector.push[Pair](?m.scratch, take));
+            if (sel err_pushed.err) { ret res[u32, Error].err{err_pushed.err}; }
+        }
+    }
+    if (same_group(m, x, ?m.scratch)) { ret res[u32, Error].ok{x}; }
+    if (same_group(m, y, ?m.scratch)) { ret res[u32, Error].ok{y}; }
+    ret grouped(m, ?m.scratch);
+}
+
+# trees of places `x` and `y`, `h` tall, met as `meet_group` meets their groups
+fun meet_pairs(m: *Map, x: u32, y: u32, h: u32, defs: u32) res[u32, Error] {
+    if (x == y) { ret res[u32, Error].ok{x}; }
+    var kids:   [16]u32;
+    var same_x: bool = true;
+    var same_y: bool = true;
+    var k:      u32  = 0;
+    for (k < FAN) {
+        val cx:      u32             = child(m, x, k);
+        val cy:      u32             = child(m, y, k);
+        var res_met: res[u32, Error] = res[u32, Error].ok{0};
+        if (h == 1)          { res_met = meet_group(m, cx, cy, defs); }
+        or                   { res_met = meet_pairs(m, cx, cy, h - 1, defs); }
+        if (sel res_met.err) { ret res_met; }
+        kids[k] = res_met.ok;
+        if (kids[k] != cx) { same_x = false; }
+        if (kids[k] != cy) { same_y = false; }
+        k = k + 1;
+    }
+    if (same_x) { ret res[u32, Error].ok{x}; }
+    if (same_y) { ret res[u32, Error].ok{y}; }
+    ret noded(m, ?kids[0]);
+}
+
+# trees of words `x` and `y`, `h` tall, met by word, the bits both hold where
+# `both`, else those either holds. `x` or `y` itself where the meet holds what it holds
+fun meet_words(m: *Map, x: u32, y: u32, h: u32, both: bool) res[u32, Error] {
+    if (x == y) { ret res[u32, Error].ok{x}; }
+    var kids:   [16]u32;
+    var same_x: bool = true;
+    var same_y: bool = true;
+    var k:      u32  = 0;
+    for (k < FAN) {
+        val cx:      u32             = child(m, x, k);
+        val cy:      u32             = child(m, y, k);
+        var res_met: res[u32, Error] = res[u32, Error].ok{cx};
+        if (h == 1) {
+            val wx: u64 = m.bits.data[cx::usize];
+            val wy: u64 = m.bits.data[cy::usize];
+            var w:  u64 = wx | wy;
+            if (both)    { w = wx & wy; }
+            if (w == wx) { res_met = res[u32, Error].ok{cx}; }
+            or (w == wy) { res_met = res[u32, Error].ok{cy}; }
+            or           { res_met = worded(m, w); }
+        }
+        or                   { res_met = meet_words(m, cx, cy, h - 1, both); }
+        if (sel res_met.err) { ret res_met; }
+        kids[k] = res_met.ok;
+        if (kids[k] != cx) { same_x = false; }
+        if (kids[k] != cy) { same_y = false; }
+        k = k + 1;
+    }
+    if (same_x) { ret res[u32, Error].ok{x}; }
+    if (same_y) { ret res[u32, Error].ok{y}; }
+    ret noded(m, ?kids[0]);
+}
+
+# the working map's pairs, those of tree `x`, made those of tree `y` at each
+# place the two differ, both `h` tall, `base` the index the nodes above lead to
+fun load_pairs(m: *Map, x: u32, y: u32, h: u32, base: u32) err[Error] {
+    if (x == y) { ret err[Error].ok{}; }
+    var k: u32 = 0;
+    for (k < FAN) {
+        val cx: u32 = child(m, x, k);
+        val cy: u32 = child(m, y, k);
+        val at: u32 = base * FAN + k;
+        k = k + 1;
+        if (cx == cy) { cnt; }
+        if (h > 1) {
+            val err_below: err[Error] = load_pairs(m, cx, cy, h - 1, at);
+            if (sel err_below.err) { ret err_below; }
+            cnt;
+        }
+        kill_at(m, at);
+        var i: usize = 0;
+        for (i < m.gcount.data[cy::usize]::usize) {
+            val err_pushed: err[Error] = push_pair(m, m.held.data[m.gfirst.data[cy::usize]::usize + i]);
+            if (sel err_pushed.err) { ret err_pushed; }
+            i = i + 1;
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# the working set `words`, that of tree `x`, made that of tree `y` at each
+# word the two differ, both `h` tall, `base` the index the nodes above lead to
+fun load_words(m: *Map, words: *vector.Vector[u64], x: u32, y: u32, h: u32, base: u32) {
+    if (x == y) { ret; }
+    var k: u32 = 0;
+    for (k < FAN) {
+        val cx: u32 = child(m, x, k);
+        val cy: u32 = child(m, y, k);
+        val at: u32 = base * FAN + k;
+        k = k + 1;
+        if (cx == cy) { cnt; }
+        if (h > 1)    { load_words(m, words, cx, cy, h - 1, at); }
+        or            { words.data[at::usize] = m.bits.data[cy::usize]; }
+    }
+}
+
+# the working map made block `b`'s map at its start, from the map it holds
+fun load(m: *Map, b: u32) err[Error] {
+    val to:         State      = m.starts.data[b];
+    val err_loaded: err[Error] = load_pairs(m, m.now.pairs, to.pairs, m.pheight, 0);
+    if (sel err_loaded.err) { ret err_loaded; }
+    load_words(m, ?m.defined, m.now.defs, to.defs, m.wheight, 0);
+    load_words(m, ?m.sure, m.now.sures, to.sures, m.wheight, 0);
+    m.now = to;
+    begin(m);
+    ret err[Error].ok{};
+}
+
+# nothing touched yet
+fun begin(m: *Map) {
+    m.epoch  = m.epoch + 1;
+    m.tplace = 0;
+    m.tword  = 0;
+}
+
+# the working map's trees at its block's end: those at its start with each
+# place and word it touched made anew
+fun settle(m: *Map) err[Error] {
+    var now: State = m.now;
+    var i:   usize = 0;
+    for (i < m.tplace) {
+        val at: u32 = m.tplaces.data[i];
+        vector.clear[Pair](?m.scratch);
+        var k: u32 = m.head_at.data[at];
+        for (k != NONE) {
+            val err_pushed: err[Error] = pushed(vector.push[Pair](?m.scratch, m.cur.data[k]));
+            if (sel err_pushed.err) { ret err_pushed; }
+            k = m.next_at.data[k];
+        }
+        sort.sort_by[Pair](m.scratch.data, m.scratch.len, by_pair);
+        val res_group: res[u32, Error] = grouped(m, ?m.scratch);
+        if (sel res_group.err) { ret err[Error].err{res_group.err}; }
+        val res_set: res[u32, Error] = set(m, now.pairs, m.pheight, at, res_group.ok);
+        if (sel res_set.err) { ret err[Error].err{res_set.err}; }
+        now.pairs = res_set.ok;
+        i         = i + 1;
+    }
+    i = 0;
+    for (i < m.tword) {
+        val w:        u32             = m.twords.data[i];
+        val res_defs: res[u32, Error] = worded(m, m.defined.data[w::usize]);
+        if (sel res_defs.err) { ret err[Error].err{res_defs.err}; }
+        val res_d: res[u32, Error] = set(m, now.defs, m.wheight, w, res_defs.ok);
+        if (sel res_d.err) { ret err[Error].err{res_d.err}; }
+        now.defs = res_d.ok;
+        val res_sures: res[u32, Error] = worded(m, m.sure.data[w::usize]);
+        if (sel res_sures.err) { ret err[Error].err{res_sures.err}; }
+        val res_s: res[u32, Error] = set(m, now.sures, m.wheight, w, res_sures.ok);
+        if (sel res_s.err) { ret err[Error].err{res_s.err}; }
+        now.sures = res_s.ok;
+        i         = i + 1;
+    }
+    m.now = now;
+    begin(m);
+    ret err[Error].ok{};
+}
+
+fun bit_of(words: *u64, v: u32) bool {
+    ret ((words[(v / 64)::usize] >> (v % 64)::u64) & 1) != 0;
+}
+
+# the working map at its block's end met with successor `s`'s map at its
+# start: its pairs as `meet_pairs` meets them, the values written on some
+# path joined and those written on every path met
+fun merge(m: *Map, s: u32) err[Error] {
+    if (!m.known.data[s]) {
+        m.known.data[s]  = true;
+        m.starts.data[s] = m.now;
+        m.changed        = true;
+        ret err[Error].ok{};
+    }
+    val was:       State           = m.starts.data[s];
+    val res_pairs: res[u32, Error] = meet_pairs(m, was.pairs, m.now.pairs, m.pheight, was.defs);
+    if (sel res_pairs.err) { ret err[Error].err{res_pairs.err}; }
+    val res_defs: res[u32, Error] = meet_words(m, was.defs, m.now.defs, m.wheight, false);
+    if (sel res_defs.err) { ret err[Error].err{res_defs.err}; }
+    val res_sures: res[u32, Error] = meet_words(m, was.sures, m.now.sures, m.wheight, true);
+    if (sel res_sures.err)                                                                 { ret err[Error].err{res_sures.err}; }
+    if (res_pairs.ok == was.pairs && res_defs.ok == was.defs && res_sures.ok == was.sures) { ret err[Error].ok{}; }
+    m.starts.data[s] = State{pairs: res_pairs.ok, defs: res_defs.ok, sures: res_sures.ok};
+    m.changed        = true;
+    ret err[Error].ok{};
+}
+
+# one walk of every block a map reaches, in linear order
+fun walk(m: *Map) err[Error] {
+    m.changed = false;
+    var c: usize = 0;
+    for (c < m.found.len) {
+        m.found.data[c] = false;
+        c               = c + 1;
+    }
+    val l: *Live = m.g.l;
+    var o: usize = 0;
+    for (o < l.order.len) {
+        val b: u32 = l.order.data[o];
+        o = o + 1;
+        if (!m.known.data[b]) { cnt; }
+        val err_loaded: err[Error] = load(m, b);
+        if (sel err_loaded.err) { ret err_loaded; }
+        val list:  Slice[Instruction] = function.instructions(m.g.f, b);
+        val first: u32                = l.starts.data[b] / 2;
+        var j:     usize              = 0;
+        for (j < list.size) {
+            val err_stepped: err[Error] = step(m, list.data[j], first + j::u32);
+            if (sel err_stepped.err) { ret err_stepped; }
+            j = j + 1;
+        }
+        val err_settled: err[Error] = settle(m);
+        if (sel err_settled.err) { ret err_settled; }
+        val next: Slice[u32] = graph.successors(m.g.graph, b);
+        var k:    usize      = 0;
+        for (k < next.size) {
+            val err_merged: err[Error] = merge(m, next.data[k]);
+            if (sel err_merged.err) { ret err_merged; }
+            k = k + 1;
+        }
+    }
+    ret err[Error].ok{};
+}
+
+fun map_init(a: *allocator.Allocator, g: *Given, found: *vector.Vector[bool]) Map {
+    ret Map{
+        a:         a,
+        g:         g,
+        places:    location.count(g.at) + g.f.slots.len::u32,
+        words:     ((g.input.virtuals.len + 63) / 64)::u32,
+        found:     found,
+        changed:   false,
+        remade:    vector.init[remade.At](a),
+        nodes:     vector.init[u32](a),
+        gfirst:    vector.init[u32](a),
+        gcount:    vector.init[u32](a),
+        held:      vector.init[Pair](a),
+        bits:      vector.init[u64](a),
+        pheight:   1,
+        wheight:   1,
+        now:       State{pairs: 0, defs: 0, sures: 0},
+        known:     vector.init[bool](a),
+        starts:    vector.init[State](a),
+        epoch:     1,
+        pmark:     vector.init[u32](a),
+        tplaces:   vector.init[u32](a),
+        tplace:    0,
+        wmark:     vector.init[u32](a),
+        twords:    vector.init[u32](a),
+        tword:     0,
+        scratch:   vector.init[Pair](a),
+        cur:       vector.init[Pair](a),
+        dead:      vector.init[bool](a),
+        next_at:   vector.init[u32](a),
+        prev_at:   vector.init[u32](a),
+        next_val:  vector.init[u32](a),
+        prev_val:  vector.init[u32](a),
+        head_at:   vector.init[u32](a),
+        head_val:  vector.init[u32](a),
+        defined:   vector.init[u64](a),
+        sure:      vector.init[u64](a),
+        temp:      vector.init[Pair](a),
+        redefined: vector.init[u32](a),
+    };
+}
+
+fun map_dnit(m: *Map) {
+    vector.dnit[remade.At](?m.remade);
+    vector.dnit[u32](?m.nodes);
+    vector.dnit[u32](?m.gfirst);
+    vector.dnit[u32](?m.gcount);
+    vector.dnit[Pair](?m.held);
+    vector.dnit[u64](?m.bits);
+    vector.dnit[bool](?m.known);
+    vector.dnit[State](?m.starts);
+    vector.dnit[u32](?m.pmark);
+    vector.dnit[u32](?m.tplaces);
+    vector.dnit[u32](?m.wmark);
+    vector.dnit[u32](?m.twords);
+    vector.dnit[Pair](?m.scratch);
+    vector.dnit[Pair](?m.cur);
+    vector.dnit[bool](?m.dead);
+    vector.dnit[u32](?m.next_at);
+    vector.dnit[u32](?m.prev_at);
+    vector.dnit[u32](?m.next_val);
+    vector.dnit[u32](?m.prev_val);
+    vector.dnit[u32](?m.head_at);
+    vector.dnit[u32](?m.head_val);
+    vector.dnit[u64](?m.defined);
+    vector.dnit[u64](?m.sure);
+    vector.dnit[Pair](?m.temp);
+    vector.dnit[u32](?m.redefined);
+}
+
+fun run(m: *Map) err[Error] {
+    val blocks:     usize                = m.g.f.blocks.len;
+    val values:     usize                = m.g.input.virtuals.len;
+    var err_failed: err[allocator.Error] = remade.of(m.g.input, ?m.remade);
+    keep(?err_failed, slice.fill[u64](?m.defined, m.words::usize, 0));
+    keep(?err_failed, slice.fill[u64](?m.sure, m.words::usize, 0));
+    keep(?err_failed, slice.fill[u32](?m.head_at, m.places::usize, NONE));
+    keep(?err_failed, slice.fill[u32](?m.head_val, values, NONE));
+    keep(?err_failed, slice.fill[bool](?m.known, blocks, false));
+    keep(?err_failed, slice.fill[State](?m.starts, blocks, State{pairs: 0, defs: 0, sures: 0}));
+    keep(?err_failed, slice.fill[u32](?m.pmark, m.places::usize, 0));
+    keep(?err_failed, slice.fill[u32](?m.tplaces, m.places::usize, 0));
+    keep(?err_failed, slice.fill[u32](?m.wmark, m.words::usize, 0));
+    keep(?err_failed, slice.fill[u32](?m.twords, m.words::usize, 0));
+    keep(?err_failed, slice.fill[u32](?m.nodes, FAN::usize, 0));
+    keep(?err_failed, slice.fill[u32](?m.gfirst, 1, 0));
+    keep(?err_failed, slice.fill[u32](?m.gcount, 1, 0));
+    keep(?err_failed, slice.fill[u64](?m.bits, 1, 0));
+    if (sel err_failed.err) { ret alloc_err(err_failed.err); }
+    m.pheight = heights(m.places::usize);
+    m.wheight = heights(m.words::usize);
+    if (blocks == 0) { ret err[Error].ok{}; }
+    val entry: u32 = graph.entry(m.g.graph);
+    m.known.data[entry] = true;
+    for {
+        val err_walked: err[Error] = walk(m);
+        if (sel err_walked.err) { ret err_walked; }
+        if (m.changed)          { cnt; }
+        ret err[Error].ok{};
+    }
+}
+
+# the copies of a form that may be dropped, each one whose places hold one
+# value where it stands, found with no copy dropped. leaving a copy out only
+# adds to what its destination holds, so all of them may be dropped at once
+# ---
+# a:     the allocator the search takes
+# g:     the form, its input, its assignment and its liveness
+# found: by instruction of the form, filled with whether it may be dropped
+# ret:   ok, or why the map refused the form
+pub fun removable(a: *allocator.Allocator, g: *Given, found: *vector.Vector[bool]) err[Error] {
+    val err_filled: err[allocator.Error] = slice.fill[bool](found, g.f.instructions.len, false);
+    if (sel err_filled.err) { ret alloc_err(err_filled.err); }
+    var m: Map = map_init(a, g, found);
+    fin { map_dnit(?m); }
+    ret run(?m);
+}

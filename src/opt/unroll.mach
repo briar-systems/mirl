@@ -1,0 +1,412 @@
+# loop unrolling: a small innermost loop is copied once, so each trip around the copied loop runs its body twice
+#
+# the loop's blocks are copied (`mirl.ir.cfg.copy.region`). every back edge of the loop then enters the copy's
+# header and every back edge of the copy enters the loop's header, so a trip runs the loop's body and then the
+# copy's. each copy keeps every exit test of its own, so the loop leaves after exactly the trips it left after
+# before, whatever its trip count: none, one, or one past the copies. a value of the loop that code after it reads is
+# read there through a new parameter of the block the loop leaves to, which each exit edge passes its own copy of,
+# and a debug record after the loop that read it reads the parameter.
+#
+# the rule by which a loop is left alone: it holds another loop, it holds more than SIZE instructions, a slot
+# (`alloca`) or an inline assembly item (whose text may define a label once), its exits leave to more than one block
+# or to one that code outside the loop enters too, a value of it is read after it while it has no exit, or its
+# header is the function's entry. a loop with no exit is copied as any other.
+#
+# it costs each loop it copies its instructions and the uses of its values. it reads the function's loops (and
+# through them its graph and dominator tree). it changes which branches the code takes and how long a trip runs, so
+# it breaks constant time and every function that requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.remap;
+use mirl.build.remap.Remap;
+use mirl.ir.body;
+use mirl.ir.cfg.copy;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Edge;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.opcode.table;
+use mirl.ir.point;
+use mirl.ir.point.Reads;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.ValueData;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it adds blocks and moves edges, so it keeps no analysis
+pub val UNROLL: Pass = Pass{name: "unroll", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_LOOPS, preserves: cache.NONE, time: Time.breaks{}};
+
+# the most instructions a loop it copies holds
+val SIZE: usize = 32;
+
+# one run over a function
+# ---
+# c:       the run
+# f:       the function
+# scratch: storage for one loop's lists
+# inside:  a mark for each block of the loop being copied, then of its copy too
+rec Run {
+    c:       *Context;
+    f:       Function;
+    scratch: *allocator.Allocator;
+    inside:  vector.Vector[bool];
+}
+
+fun body_of(x: *Run) *Body {
+    ret ?x.c.m.functions.data[x.f].body;
+}
+
+fun refused[T](e: allocator.Error) res[T, refusal.Error] {
+    ret res[T, refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+# mark the blocks of a list inside, every other outside
+fun mark(x: *Run, blocks: Slice[u32]) err[allocator.Error] {
+    val b: *Body = body_of(x);
+    vector.truncate[bool](?x.inside, 0);
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[bool](?x.inside, false);
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < blocks.size) {
+        x.inside.data[blocks.data[k]] = true;
+        k                             = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether instruction `i` stands in a block marked inside
+fun within(x: *Run, i: Instruction) bool {
+    val place: Place = body_of(x).instructions.data[i].place;
+    if (!(sel place.placed)) { ret false; }
+    ret place.placed::usize < x.inside.len && x.inside.data[place.placed];
+}
+
+# the block every exit of the loop leaves to, NO_BLOCK where it has none, none where it leaves to more than one or
+# to one that code outside the loop enters too
+fun exit_of(x: *Run, l: *Loops, n: u32) opt[u32] {
+    val b:     *Body       = body_of(x);
+    val exits: Slice[Edge] = loops.exits(l, n);
+    var to:    u32         = graph.NONE;
+    var k:     usize       = 0;
+    for (k < exits.size) {
+        val target: u32 = exits.data[k].to;
+        if (to != graph.NONE && target != to) { ret opt[u32].none{}; }
+        to = target;
+        k  = k + 1;
+    }
+    if (to == graph.NONE) { ret opt[u32].some{to}; }
+    k = 0;
+    for (k < b.blocks.data[to].predecessors.len) {
+        if (!within(x, b.blocks.data[to].predecessors.data[k])) { ret opt[u32].none{}; }
+        k = k + 1;
+    }
+    ret opt[u32].some{to};
+}
+
+# whether a loop is one the pass copies: no slot, no inline assembly item and at most SIZE instructions
+fun small(x: *Run, blocks: Slice[u32]) bool {
+    val b:     *Body = body_of(x);
+    var count: usize = 0;
+    var k:     usize = 0;
+    for (k < blocks.size) {
+        var i: Instruction = b.blocks.data[blocks.data[k]].first;
+        for (i != NO_INSTRUCTION) {
+            val op: u32 = b.instructions.data[i].opcode;
+            if (op == table.ALLOCA || op == table.ASM) { ret false; }
+            count = count + 1;
+            if (count > SIZE) { ret false; }
+            i = b.instructions.data[i].next;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether value `v` is read by an instruction outside the blocks marked inside
+fun escapes(x: *Run, v: Value) bool {
+    val b: *Body = body_of(x);
+    var u: usize = 0;
+    for (u < b.values.data[v].uses.len) {
+        if (!within(x, b.values.data[v].uses.data[u])) { ret true; }
+        u = u + 1;
+    }
+    ret false;
+}
+
+# the values of the loop's blocks code outside them reads, into `out`
+fun escaping(x: *Run, blocks: Slice[u32], out: *vector.Vector[Value]) err[allocator.Error] {
+    val b: *Body = body_of(x);
+    var k: usize = 0;
+    for (k < blocks.size) {
+        val bk: Block = blocks.data[k];
+        var p:  usize = 0;
+        for (p < b.blocks.data[bk].parameters.len) {
+            val v: Value = b.blocks.data[bk].parameters.data[p];
+            if (escapes(x, v)) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Value](out, v);
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+            }
+            p = p + 1;
+        }
+        var i: Instruction = b.blocks.data[bk].first;
+        for (i != NO_INSTRUCTION) {
+            var r: usize = 0;
+            for (r < b.instructions.data[i].results.len) {
+                val v: Value = b.instructions.data[i].results.data[r];
+                if (escapes(x, v)) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Value](out, v);
+                    if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+                }
+                r = r + 1;
+            }
+            i = b.instructions.data[i].next;
+        }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# move every edge of instruction `i` into block `from` to block `to`, passing what it passed
+fun redirect(x: *Run, i: Instruction, from: Block, to: Block) err[refusal.Error] {
+    val b: *Body = body_of(x);
+    var e: usize = 0;
+    for (e < b.instructions.data[i].edges.len) {
+        if (b.instructions.data[i].edges.data[e].block == from) {
+            val n:        usize                        = b.instructions.data[i].edges.data[e].arguments.len;
+            val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](x.scratch, n + 1);
+            if (sel res_room.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_room.err}}; }
+            var a: usize = 0;
+            for (a < n) {
+                res_room.ok[a] = b.instructions.data[i].edges.data[e].arguments.data[a];
+                a              = a + 1;
+            }
+            val err_moved: err[refusal.Error] = edit(body.retarget(x.c.m, x.f, i, e::u32, to, Slice[Value]{data: res_room.ok, size: n}));
+            if (sel err_moved.err) { ret err_moved; }
+        }
+        e = e + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# make the records of a run outside the loop that read an escaping value read its parameter
+fun reread(x: *Run, run: point.Run, from: Slice[Value], to: Slice[Value]) err[refusal.Error] {
+    val b: *Body = body_of(x);
+    var p: u32   = run.first;
+    for (p != 0) {
+        val pt:    point.Point = b.points.data[p - 1];
+        val reads: Reads       = pt.reads;
+        if (sel reads.operand) {
+            var j: usize = 0;
+            for (j < from.size) {
+                if (from.data[j] == reads.operand.value) {
+                    val err_rebound: err[refusal.Error] = edit(body.rebind(x.c.m, x.f, p - 1, Reads.operand{point.Operand{value: to.data[j], expression: reads.operand.expression}}));
+                    if (sel err_rebound.err) { ret err_rebound; }
+                }
+                j = j + 1;
+            }
+        }
+        if (p == run.last) { brk; }
+        p = pt.next;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# mark the copy of each of the loop's blocks inside as well
+fun mark_copies(x: *Run, blocks: Slice[u32], r: *Remap) err[allocator.Error] {
+    val b: *Body = body_of(x);
+    for (x.inside.len < b.blocks.len) {
+        val res_grown: res[usize, allocator.Error] = vector.push[bool](?x.inside, false);
+        if (sel res_grown.err) { ret err[allocator.Error].err{res_grown.err}; }
+    }
+    var k: usize = 0;
+    for (k < blocks.size) {
+        val opt_copy: opt[Block] = remap.block(r, blocks.data[k]);
+        if (sel opt_copy.some) { x.inside.data[opt_copy.some] = true; }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether block `k` is one of the copies, which the copy appends from block `first` on
+fun is_copy(k: Block, first: usize) bool {
+    ret k::usize >= first;
+}
+
+# make the loop's value `v` read after it through a new parameter of the exit block, each exit edge passing the
+# value or its copy, answering the parameter
+fun route(x: *Run, exit: Block, first: usize, v: Value, twin: Value) res[Value, refusal.Error] {
+    val b:        *Body                        = body_of(x);
+    val preds:    usize                        = b.blocks.data[exit].predecessors.len;
+    val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](x.scratch, preds + 1);
+    if (sel res_room.err) { ret refused[Value](res_room.err); }
+    var p: usize = 0;
+    for (p < preds) {
+        val place: Place = b.instructions.data[b.blocks.data[exit].predecessors.data[p]].place;
+        var given: Value = v;
+        if (sel place.placed && is_copy(place.placed, first)) { given = twin; }
+        res_room.ok[p] = given;
+        p              = p + 1;
+    }
+    val vd:        *ValueData               = ?b.values.data[v];
+    val res_param: res[Value, module.Error] = body.add_parameter(x.c.m, x.f, exit, Declaration{type: vd.type, secret: vd.secret}, Slice[Value]{data: res_room.ok, size: preds});
+    if (sel res_param.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_param.err}}; }
+    ret res[Value, refusal.Error].ok{res_param.ok};
+}
+
+# move every reader of `v` outside the loop and its copy to `param`, its instructions and its records
+fun reroute(x: *Run, v: Value, param: Value) err[refusal.Error] {
+    var users: vector.Vector[Instruction] = vector.init[Instruction](x.scratch);
+    var b:     *Body                      = body_of(x);
+    var u:     usize                      = 0;
+    for (u < b.values.data[v].uses.len) {
+        val i: Instruction = b.values.data[v].uses.data[u];
+        if (!within(x, i)) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?users, i);
+            if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        u = u + 1;
+    }
+    u = 0;
+    for (u < users.len) {
+        val err_moved: err[refusal.Error] = edit(body.substitute(x.c.m, x.f, users.data[u], v, param));
+        if (sel err_moved.err) { ret err_moved; }
+        u = u + 1;
+    }
+    var from: [1]Value = [1]Value{v};
+    var to:   [1]Value = [1]Value{param};
+    b = body_of(x);
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased && !(k < x.inside.len && x.inside.data[k])) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val err_points: err[refusal.Error] = reread(x, body_of(x).instructions.data[i].points, Slice[Value]{data: ?from[0], size: 1}, Slice[Value]{data: ?to[0], size: 1});
+                if (sel err_points.err) { ret err_points; }
+                i = body_of(x).instructions.data[i].next;
+            }
+            val err_ending: err[refusal.Error] = reread(x, body_of(x).blocks.data[k].ending, Slice[Value]{data: ?from[0], size: 1}, Slice[Value]{data: ?to[0], size: 1});
+            if (sel err_ending.err) { ret err_ending; }
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether loop `n` holds another loop
+fun outer(l: *Loops, n: u32) bool {
+    var k: u32 = 0;
+    for (k < loops.count(l)) {
+        if (loops.loop(l, k).parent == n) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# copy loop `n` once where the pass takes it, answering whether it did
+fun unroll(x: *Run, l: *Loops, n: u32) res[bool, refusal.Error] {
+    val head:   Block      = loops.loop(l, n).header;
+    val blocks: Slice[u32] = loops.body(l, n);
+    if (head == 0 || outer(l, n) || !small(x, blocks)) { ret res[bool, refusal.Error].ok{false}; }
+    val err_marked: err[allocator.Error] = mark(x, blocks);
+    if (sel err_marked.err) { ret refused[bool](err_marked.err); }
+    val opt_exit: opt[u32] = exit_of(x, l, n);
+    if (sel opt_exit.none) { ret res[bool, refusal.Error].ok{false}; }
+    val exit:       u32                  = opt_exit.some;
+    var out:        vector.Vector[Value] = vector.init[Value](x.scratch);
+    val err_listed: err[allocator.Error] = escaping(x, blocks, ?out);
+    if (sel err_listed.err)                { ret refused[bool](err_listed.err); }
+    if (out.len > 0 && exit == graph.NONE) { ret res[bool, refusal.Error].ok{false}; }
+
+    val first: usize = body_of(x).blocks.len;
+    var r:     Remap = remap.init(x.c.m.a);
+    fin { remap.dnit(?r); }
+    val err_copied: err[Error] = copy.region(x.c.m, x.f, x.f, Slice[Block]{data: blocks.data, size: blocks.size}, ?r);
+    if (sel err_copied.err) { ret res[bool, refusal.Error].err{refusal.Error.cfg{err_copied.err}}; }
+    val opt_twin: opt[Block] = remap.block(?r, head);
+    if (sel opt_twin.none) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.block{head}}}; }
+    val twin:    Block      = opt_twin.some;
+    val latches: Slice[u32] = loops.latches(l, n);
+    var k:       usize      = 0;
+    for (k < latches.size) {
+        val opt_copy: opt[Block] = remap.block(?r, latches.data[k]);
+        if (sel opt_copy.none) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.block{latches.data[k]}}}; }
+        val err_back: err[refusal.Error] = redirect(x, body_of(x).blocks.data[opt_copy.some].last, twin, head);
+        if (sel err_back.err) { ret res[bool, refusal.Error].err{err_back.err}; }
+        val err_on: err[refusal.Error] = redirect(x, body_of(x).blocks.data[latches.data[k]].last, head, twin);
+        if (sel err_on.err) { ret res[bool, refusal.Error].err{err_on.err}; }
+        k = k + 1;
+    }
+    val err_both: err[allocator.Error] = mark_copies(x, blocks, ?r);
+    if (sel err_both.err) { ret refused[bool](err_both.err); }
+    var j: usize = 0;
+    for (j < out.len) {
+        val v:        Value      = out.data[j];
+        val opt_copy: opt[Value] = remap.value(?r, v);
+        if (sel opt_copy.none) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.value{v}}}; }
+        val res_param: res[Value, refusal.Error] = route(x, exit, first, v, opt_copy.some);
+        if (sel res_param.err) { ret res[bool, refusal.Error].err{res_param.err}; }
+        val err_moved: err[refusal.Error] = reroute(x, v, res_param.ok);
+        if (sel err_moved.err) { ret res[bool, refusal.Error].err{err_moved.err}; }
+        j = j + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# copy every small innermost loop of one function once
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:            *Context                   = u.context;
+    val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, u.f);
+    if (sel res_loops_of.err) { ret res[bool, refusal.Error].err{res_loops_of.err}; }
+    val l:        *Loops               = res_loops_of.ok;
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var x: Run = Run{c: c, f: u.f, scratch: ?scratch, inside: vector.init[bool](c.m.a)};
+    fin { vector.dnit[bool](?x.inside); }
+    var changed: bool = false;
+    var n:       u32  = 0;
+    for (n < loops.count(l)) {
+        arena.reset(?ar);
+        val res_done: res[bool, refusal.Error] = unroll(?x, l, n);
+        if (sel res_done.err) { ret res_done; }
+        if (res_done.ok)      { changed = true; }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

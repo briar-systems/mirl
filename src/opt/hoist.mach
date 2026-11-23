@@ -1,0 +1,486 @@
+# constant hoisting: a constant the target makes again each time it is read, read inside a loop, is made once ahead
+# of it and carried through the loop as a parameter of its header
+#
+# a value with no operands may still cost an instruction at every read. a register target makes such a value in the
+# code where an instruction reads it, so a loop that reads it pays for it on every trip. the class is every constant
+# the target makes with an instruction at each read: an integer of at most 64 bits no signed 32-bit immediate holds,
+# the address of a symbol (a global or a function) where it is formed in a register, and a float or vector constant
+# the target reads from read-only data (`mirl.legal.pool`). for each loop that no other loop holds, every member of
+# the class an instruction of the loop's blocks reads becomes a new parameter of the loop's header: each edge entering
+# the header from outside the loop passes the constant and each back edge passes the parameter, so the parameter holds
+# the constant on every trip, and the loop's instructions read the parameter in its place. the constant is made once,
+# where the loop is entered, and a pooled one is loaded there, since the pool's load goes ahead of the edge that
+# passes it.
+#
+# a read leaves its constant alone where selection folds it into the instruction: an integer read in any role but a
+# value or a stored value (an offset, an index, a length, a call's argument and a branch's argument keep it), and an
+# address read as the address of an access or of an add whose offset or index is a constant, which selection folds
+# into the access's displacement. an address read as the address of an add whose offset or index is not a constant,
+# or as a value or a stored value, is formed in a register each time, as x86-64's lea of a rip-relative address,
+# aarch64's adrp and add and risc-v's auipc and addi. the judgement reads the opcode rows' roles and no target's
+# table, so it carries only where no register table mirl states folds the address: none states an access of a symbol
+# plus a register. a direct access of a symbol is left alone though aarch64 and risc-v form its high part at each
+# read, since only the selection table says what folds, which this pass does not read.
+#
+# the rule covers loops and not straight-line code. a second read of a constant in one block, or along a dominating
+# path, would reuse the first only if the constant had a definition that dominates both reads, and the ir gives a
+# constant none: a loop header's parameter is the one place a pass can make it a value. reuse in straight-line code
+# belongs to selection, which makes a constant at each read by the table's constant rules, together with an allocator
+# that can make a constant again in place of spilling it.
+#
+# a carried constant holds a register through the whole loop, so it is weighed against the loop's pressure: the most
+# values of its bank (the general registers, or the float and vector registers) the liveness of the function holds at
+# once at any point of the loop's blocks, against the registers of that bank the target's selection admits and its
+# convention does not reserve. a constant is carried only where that peak, with the constants already carried for the
+# loop, leaves a register free, so a loop never trades the instruction that makes a constant for a spill and a reload
+# of it. the constants with the most reads in the loop are weighed first.
+#
+# a loop held by another loop is left to its outermost loop, which carries the constant for both, so a constant is
+# carried once per nest, and a loop whose header is the function's entry is left alone, since the entry's parameters
+# are the function's. a stack or logical target reads every such constant as an immediate or a value of the module,
+# so the pass applies to register targets alone. it runs after the family's legalisations, ahead of the pool, so it
+# sees every constant the legalisations make, the words a wide integer is split into and the addresses typed address
+# folding forms, each as selection will read it.
+#
+# it costs each outermost loop its instructions times the constants it carries, and the liveness of the function
+# where a loop reads a constant. it reads the loops and the liveness of the function (and through them its graph and
+# dominator tree). it adds a parameter and edge arguments and moves no edge, and it changes which registers a loop
+# holds, so it is held to no constant-time proof and breaks constant time: every function that requires it is
+# skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.table;
+use types: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.legal.pool;
+use mirl.pass.analysis;
+use mirl.pass.analysis.live.Liveness;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+use rf: masc.core.register;
+
+# the pass: it adds parameters and arguments and moves no edge, so only the control flow analyses outlive it
+pub val HOIST: Pass = Pass{name: "hoist", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_LOOPS | analysis.OF_LIVENESS, preserves: analysis.FLOW, time: Time.breaks{}, applies: registered};
+
+# the bank of the integers and addresses
+val GENERAL: usize = 0;
+
+# the bank of the floats and vectors
+val OTHER: usize = 1;
+
+# a register target makes its constants in the code
+fun registered(g: *Ground) bool {
+    ret sel g.t.caps.evaluation.register;
+}
+
+# one use of a constant the pass carries: the instruction and the operand's place
+# ---
+# at:      the instruction
+# operand: the operand's place
+rec Use {
+    at:      Instruction;
+    operand: usize;
+}
+
+# whether constant `v` of a scalar integer type no signed 32-bit immediate holds, read at its width
+fun wide(m: *module.Module, b: *Body, v: Value) res[bool, refusal.Error] {
+    if (!(sel b.values.data[v].def.constant) || b.values.data[v].secret) { ret res[bool, refusal.Error].ok{false}; }
+    val res_lane: res[opt[Lane], refusal.Error] = emit.lane_of(m, b.values.data[v].type);
+    if (sel res_lane.err)     { ret res[bool, refusal.Error].err{res_lane.err}; }
+    if (sel res_lane.ok.none) { ret res[bool, refusal.Error].ok{false}; }
+    val bits: u32 = res_lane.ok.some.bits;
+    if (res_lane.ok.some.lanes != 0 || bits <= 32 || bits > 64) { ret res[bool, refusal.Error].ok{false}; }
+    val opt_known: opt[u64] = emit.known_in(m, b, v);
+    if (sel opt_known.none) { ret res[bool, refusal.Error].ok{false}; }
+    var x: u64 = opt_known.some;
+    if (bits < 64) {
+        x = x & ((1::u64 << bits::u64) - 1);
+        if ((x >> (bits - 1)::u64) != 0) { x = x | ~((1::u64 << bits::u64) - 1); }
+    }
+    val s: i64 = x:~i64;
+    ret res[bool, refusal.Error].ok{s < -0x80000000 || s > 0x7fffffff};
+}
+
+# whether value `v` is the address of a symbol: a pointer constant naming a global or a function
+fun address(m: *module.Module, b: *Body, v: Value) bool {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.constant))                 { ret false; }
+    if (module.specialized(m, def.constant)) { ret false; }
+    val res_data: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+    if (sel res_data.err) { ret false; }
+    val data: ConstantData = res_data.ok;
+    ret sel data.address && sel data.address.minus.none;
+}
+
+# whether the address operand `k` of instruction `d` of row `r` is formed in a register: the row adds an offset or an
+# index to it that is not a constant, which no displacement holds
+fun formed(b: *Body, d: *InstructionData, r: *Row, k: usize) bool {
+    var o: usize = 0;
+    for (o < opcode_row.fixed(r)::usize && o < d.operands.len) {
+        if (o != k && (sel r.operands[o].role.offset || sel r.operands[o].role.index)) {
+            val x: Value = d.operands.data[o];
+            if (!(sel b.values.data[x].def.constant)) { ret true; }
+        }
+        o = o + 1;
+    }
+    ret false;
+}
+
+# whether operand `k` of instruction `d` of row `r` reads a constant the target makes again at the read
+fun made(c: *Context, f: Function, b: *Body, d: *InstructionData, r: *Row, k: usize) res[bool, refusal.Error] {
+    val v: Value = d.operands.data[k];
+    if (k >= opcode_row.fixed(r)::usize || !(sel b.values.data[v].def.constant)) { ret res[bool, refusal.Error].ok{false}; }
+    if (sel r.operands[k].role.address)                                          { ret res[bool, refusal.Error].ok{address(c.m, b, v) && formed(b, d, r, k)}; }
+    if (!(sel r.operands[k].role.value || sel r.operands[k].role.stored))        { ret res[bool, refusal.Error].ok{false}; }
+    if (address(c.m, b, v))                                                      { ret res[bool, refusal.Error].ok{true}; }
+    val res_wide: res[bool, refusal.Error] = wide(c.m, b, v);
+    if (sel res_wide.err) { ret res_wide; }
+    if (res_wide.ok)      { ret res_wide; }
+    ret pool.loads(c, f, b, v);
+}
+
+# the bank a value of type `ty` is held in
+fun bank_of(m: *module.Module, ty: Type) usize {
+    val res_shape: res[*types.Shape, types.Error] = types.shape_at(?m.types, ty);
+    if (sel res_shape.err)                                 { ret GENERAL; }
+    if (sel res_shape.ok.float || sel res_shape.ok.vector) { ret OTHER; }
+    ret GENERAL;
+}
+
+# whether a class of storage of kind `kind` holds values of a bank
+fun in_bank(kind: rf.Kind, bank: usize) bool {
+    if (bank == GENERAL) { ret kind == rf.GENERAL; }
+    ret kind == rf.FLOAT || kind == rf.VECTOR;
+}
+
+# whether a list of registers holds `id`
+fun listed(list: Slice[rf.Id], id: rf.Id) bool {
+    var i: usize = 0;
+    for (i < list.size) {
+        if (list.data[i] == id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the registers of each bank a value may take: of the class of single registers of the bank with the most, those the
+# build's selection admits that hold no fixed role and the convention does not reserve. none without a selection
+fun registers(c: *Context, scratch: *allocator.Allocator, out: *u32) err[refusal.Error] {
+    out[GENERAL] = 0;
+    out[OTHER]   = 0;
+    if (sel c.basis.none) { ret err[refusal.Error].ok{}; }
+    val view: *rf.Available = ?c.basis.some.view;
+    val file: *rf.File      = view.file;
+    if (file == nil || file.class_count == 0) { ret err[refusal.Error].ok{}; }
+    var reserved: Slice[rf.Id] = Slice[rf.Id]{data: nil, size: 0};
+    if (sel c.t.convention.rows) { reserved = c.t.convention.rows.default.reserved; }
+    val res_counts: res[*u32, allocator.Error] = allocator.zallocate[u32](scratch, file.class_count::usize);
+    if (sel res_counts.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_counts.err}}; }
+    val counts: *u32 = res_counts.ok;
+    var i:      u32  = 0;
+    for (i < file.register_count) {
+        val row:      *rf.Register   = ?file.registers[i];
+        val id:       rf.Id          = rf.id_of(row);
+        val err_held: err[rf.Absent] = rf.admitted(view, id);
+        if (sel err_held.ok && (row.flags & (rf.STACK | rf.ZERO | rf.PC)) == 0 && !listed(reserved, id)) { counts[row.class::usize] = counts[row.class::usize] + 1; }
+        i = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < file.class_count) {
+        val class: *rf.Class = ?file.classes[k];
+        if (class.arity == 0 && !class.fixed) {
+            var bank: usize = GENERAL;
+            for (bank <= OTHER) {
+                if (in_bank(class.kind, bank) && counts[k::usize] > out[bank]) { out[bank] = counts[k::usize]; }
+                bank = bank + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether value `v` is one the liveness holds: defined by a block or an instruction, and known to it
+fun tracked(b: *Body, live: *Liveness, v: Value) bool {
+    val def: Def = b.values.data[v].def;
+    ret !(sel def.constant) && !(sel def.removed) && v::u32 < live.words * 64;
+}
+
+# the most values of each bank live at once at any point of a loop's blocks, by a walk back through each block from
+# the values live out of it
+fun peak(m: *module.Module, b: *Body, live: *Liveness, blocks: Slice[u32], scratch: *allocator.Allocator, out: *u32) err[refusal.Error] {
+    out[GENERAL] = 0;
+    out[OTHER]   = 0;
+    val words:   usize                      = live.words::usize;
+    val res_set: res[*u64, allocator.Error] = allocator.zallocate[u64](scratch, words + 1);
+    if (sel res_set.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_set.err}}; }
+    val set: *u64  = res_set.ok;
+    var k:   usize = 0;
+    for (k < blocks.size) {
+        val base: usize  = blocks.data[k]::usize * words;
+        var n:    [2]u32 = [2]u32{0, 0};
+        var w:    usize  = 0;
+        for (w < words) {
+            set[w] = live.live_out.data[base + w];
+            var bits: u64 = set[w];
+            var at:   u64 = 0;
+            for (bits != 0) {
+                if ((bits & 1) != 0) {
+                    val bank: usize = bank_of(m, b.values.data[(w * 64)::u32 + at::u32].type);
+                    n[bank] = n[bank] + 1;
+                }
+                bits = bits >> 1;
+                at   = at + 1;
+            }
+            w = w + 1;
+        }
+        var i: Instruction = b.blocks.data[blocks.data[k]].last;
+        for {
+            if (n[GENERAL] > out[GENERAL]) { out[GENERAL] = n[GENERAL]; }
+            if (n[OTHER] > out[OTHER])     { out[OTHER] = n[OTHER]; }
+            if (i == NO_INSTRUCTION)       { brk; }
+            val d: *InstructionData = ?b.instructions.data[i];
+            var r: usize            = 0;
+            for (r < d.results.len) {
+                val v: Value = d.results.data[r];
+                if (tracked(b, live, v)) {
+                    val slot: usize = (v / 64)::usize;
+                    val mask: u64   = 1::u64 << (v % 64)::u64;
+                    if ((set[slot] & mask) != 0) {
+                        set[slot] = set[slot] & ~mask;
+                        val bank: usize = bank_of(m, b.values.data[v].type);
+                        n[bank] = n[bank] - 1;
+                    }
+                }
+                r = r + 1;
+            }
+            var o: usize = 0;
+            for (o < d.operands.len) {
+                read(m, b, live, set, ?n[0], d.operands.data[o]);
+                o = o + 1;
+            }
+            var e: usize = 0;
+            for (e < d.edges.len) {
+                var x: usize = 0;
+                for (x < d.edges.data[e].arguments.len) {
+                    read(m, b, live, set, ?n[0], d.edges.data[e].arguments.data[x]);
+                    x = x + 1;
+                }
+                e = e + 1;
+            }
+            i = d.prev;
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# a read of value `v` in the walk back: live from here up, counted in its bank when it was not
+fun read(m: *module.Module, b: *Body, live: *Liveness, set: *u64, n: *u32, v: Value) {
+    if (!tracked(b, live, v)) { ret; }
+    val slot: usize = (v / 64)::usize;
+    val mask: u64   = 1::u64 << (v % 64)::u64;
+    if ((set[slot] & mask) != 0) { ret; }
+    set[slot] = set[slot] | mask;
+    val bank: usize = bank_of(m, b.values.data[v].type);
+    n[bank] = n[bank] + 1;
+}
+
+# carry each constant the blocks of loop `n` read that the target makes again at each read, as the loop's pressure
+# admits, through a new parameter of its header, answering whether one was
+fun carry(c: *Context, f: Function, l: *Loops, n: u32, scratch: *allocator.Allocator) res[bool, refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(c.m, f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:      *Body      = res_body.ok;
+    val head:   Block      = loops.loop(l, n).header;
+    val blocks: Slice[u32] = loops.body(l, n);
+    if (head == 0) { ret res[bool, refusal.Error].ok{false}; }
+    # the constants in the order first read, how often each is read, and every use of each
+    var constants: vector.Vector[Value] = vector.init[Value](scratch);
+    var reads:     vector.Vector[u32]   = vector.init[u32](scratch);
+    var uses:      vector.Vector[Use]   = vector.init[Use](scratch);
+    var owner:     vector.Vector[usize] = vector.init[usize](scratch);
+    var k:         usize                = 0;
+    for (k < blocks.size) {
+        var i: Instruction = b.blocks.data[blocks.data[k]].first;
+        for (i != NO_INSTRUCTION) {
+            val d:       *InstructionData = ?b.instructions.data[i];
+            val opt_row: opt[*Row]        = table.at(d.opcode);
+            var r:       *Row             = nil;
+            if (sel opt_row.some) { r = opt_row.some; }
+            if (r != nil && !d.metadata.secret) {
+                var o: usize = 0;
+                for (o < d.operands.len) {
+                    val res_made: res[bool, refusal.Error] = made(c, f, b, d, r, o);
+                    if (sel res_made.err) { ret res[bool, refusal.Error].err{res_made.err}; }
+                    if (res_made.ok) {
+                        val v:  Value = d.operands.data[o];
+                        var at: usize = 0;
+                        for (at < constants.len && constants.data[at] != v) { at = at + 1; }
+                        if (at == constants.len) {
+                            val res_pushed: res[usize, allocator.Error] = vector.push[Value](?constants, v);
+                            if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                            val res_read: res[usize, allocator.Error] = vector.push[u32](?reads, 0);
+                            if (sel res_read.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_read.err}}; }
+                        }
+                        reads.data[at] = reads.data[at] + 1;
+                        val res_use: res[usize, allocator.Error] = vector.push[Use](?uses, Use{at: i, operand: o});
+                        if (sel res_use.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_use.err}}; }
+                        val res_owner: res[usize, allocator.Error] = vector.push[usize](?owner, at);
+                        if (sel res_owner.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_owner.err}}; }
+                    }
+                    o = o + 1;
+                }
+            }
+            i = d.next;
+        }
+        k = k + 1;
+    }
+    if (constants.len == 0) { ret res[bool, refusal.Error].ok{false}; }
+    # the registers each bank leaves free at the loop's peak, which the constants take, the most read first
+    var free:     [2]u32             = [2]u32{0, 0};
+    var most:     [2]u32             = [2]u32{0, 0};
+    val err_regs: err[refusal.Error] = registers(c, scratch, ?free[0]);
+    if (sel err_regs.err) { ret res[bool, refusal.Error].err{err_regs.err}; }
+    val res_live: res[*Liveness, refusal.Error] = analysis.liveness_of(c.cache, f);
+    if (sel res_live.err) { ret res[bool, refusal.Error].err{res_live.err}; }
+    val err_peak: err[refusal.Error] = peak(c.m, b, res_live.ok, blocks, scratch, ?most[0]);
+    if (sel err_peak.err) { ret res[bool, refusal.Error].err{err_peak.err}; }
+    var bank: usize = GENERAL;
+    for (bank <= OTHER) {
+        if (most[bank] < free[bank]) { free[bank] = free[bank] - most[bank]; }
+        or                           { free[bank] = 0; }
+        bank = bank + 1;
+    }
+    val res_chosen: res[*bool, allocator.Error] = allocator.zallocate[bool](scratch, constants.len);
+    if (sel res_chosen.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_chosen.err}}; }
+    val res_weighed: res[*bool, allocator.Error] = allocator.zallocate[bool](scratch, constants.len);
+    if (sel res_weighed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_weighed.err}}; }
+    val chosen:  *bool = res_chosen.ok;
+    val weighed: *bool = res_weighed.ok;
+    var any:     bool  = false;
+    var left:    usize = constants.len;
+    for (left > 0) {
+        var best: usize = constants.len;
+        var j:    usize = 0;
+        for (j < constants.len) {
+            if (!weighed[j] && (best == constants.len || reads.data[j] > reads.data[best])) { best = j; }
+            j = j + 1;
+        }
+        weighed[best] = true;
+        left          = left - 1;
+        val held: usize = bank_of(c.m, b.values.data[constants.data[best]].type);
+        if (free[held] > 0) {
+            free[held]   = free[held] - 1;
+            chosen[best] = true;
+            any          = true;
+        }
+    }
+    if (!any) { ret res[bool, refusal.Error].ok{false}; }
+    # each constant's parameter: an edge from outside the loop passes the constant, a back edge the parameter, which
+    # is the value being made, so every edge passes the constant and a back edge's argument is set once it exists
+    val preds: usize = b.blocks.data[head].predecessors.len;
+    var j:     usize = 0;
+    for (j < constants.len) {
+        if (chosen[j]) {
+            val v:        Value                        = constants.data[j];
+            val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](scratch, preds + 1);
+            if (sel res_room.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_room.err}}; }
+            var p: usize = 0;
+            for (p < preds) {
+                res_room.ok[p] = v;
+                p              = p + 1;
+            }
+            val res_param: res[Value, module.Error] = body.add_parameter(c.m, f, head, Declaration{type: b.values.data[v].type, secret: false}, Slice[Value]{data: res_room.ok, size: preds});
+            if (sel res_param.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_param.err}}; }
+            val param: Value = res_param.ok;
+            p = 0;
+            for (p < b.blocks.data[head].predecessors.len) {
+                val from:  Instruction = b.blocks.data[head].predecessors.data[p];
+                val place: Place       = b.instructions.data[from].place;
+                if (sel place.placed && loops.contains(l, n, place.placed)) {
+                    val err_back: err[refusal.Error] = edit(body.substitute(c.m, f, from, v, param));
+                    if (sel err_back.err) { ret res[bool, refusal.Error].err{err_back.err}; }
+                }
+                p = p + 1;
+            }
+            var u: usize = 0;
+            for (u < uses.len) {
+                if (owner.data[u] == j) {
+                    val at:       Instruction        = uses.data[u].at;
+                    val err_read: err[refusal.Error] = edit(body.substitute(c.m, f, at, v, param));
+                    if (sel err_read.err) { ret res[bool, refusal.Error].err{err_read.err}; }
+                }
+                u = u + 1;
+            }
+        }
+        j = j + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# carry the constants of each outermost loop of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:            *Context                   = u.context;
+    val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, u.f);
+    if (sel res_loops_of.err) { ret res[bool, refusal.Error].err{res_loops_of.err}; }
+    val l:        *Loops               = res_loops_of.ok;
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var changed: bool = false;
+    var n:       u32  = 0;
+    for (n < loops.count(l)) {
+        if (loops.loop(l, n).parent == NONE) {
+            arena.reset(?ar);
+            val res_done: res[bool, refusal.Error] = carry(c, u.f, l, n, ?scratch);
+            if (sel res_done.err) { ret res_done; }
+            if (res_done.ok)      { changed = true; }
+        }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

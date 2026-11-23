@@ -1,0 +1,444 @@
+# constant folding: an operation on constants becomes the constant it computes,
+# a branch on a constant condition becomes a jump, and a block parameter every
+# edge passes the same constant for becomes that constant
+#
+# a fold never makes a constant of a float format the build holds no row of, nor a vector of one:
+# the half precision legalisation computes such a format on its encoding and
+# makes a value of it only where the convention places one, from its encoding
+# reinterpreted, which a fold of that reinterpretation would undo into a
+# constant no rule materialises.
+#
+# the pass never evaluates an opcode. every operation goes to the constant
+# folder, which answers with the results or refuses, and a refusal leaves the
+# instruction to run, so a trap happens at run time. an instruction that is
+# volatile, kept or secret stays as it is, since a constant is public. work
+# is queued by what it reads: a replaced value queues its users, and an edge
+# that changes queues its target's parameters, so the pass reaches a fixed
+# point without rescanning the function. the queue drains to empty before the
+# blocks the folded branches cut off are removed, all at once, so a round costs
+# one dominance and the parameters are judged after it, by the edges that can
+# run. the pass only removes work and adds no branch on a value, so it keeps
+# constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.build.failure;
+use mirl.fold.eval;
+use mirl.fold.record;
+use mirl.fold.word;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.cfg.prune;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.List;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.table;
+use type_format: mirl.ir.type.format;
+use type_table:  mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.opt.number;
+use mirl.opt.queue;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use target_basis: mirl.target.basis;
+use mirl.target.capability.Held;
+use mirl.target.capability.Nans;
+
+# the pass: it can remove blocks and values, so no analysis outlives it
+pub val FOLD: Pass = Pass{name: "fold", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_DOMINANCE, preserves: cache.NONE, time: Time.keeps{}};
+
+# one visit
+# ---
+# c:       the run
+# m:       the module
+# f:       the function
+# b:       its body
+# scratch: storage for one fold at a time, reset between folds
+# nans:    the nan the build's float operations return in each format
+# q:       the instructions to look at, and whether each is queued
+# due:     the blocks whose parameters to look at
+# waiting: per block, whether it is queued in due
+# stale:   a branch changed, so the cached analyses of the function are wrong
+# cut_due: blocks may have become unreachable
+# changed: the function was changed
+rec Work {
+    c:       *Context;
+    m:       *Module;
+    f:       Function;
+    b:       *Body;
+    scratch: *allocator.Allocator;
+    nans:    Slice[Nans];
+    q:       queue.Queue;
+    due:     vector.Vector[Block];
+    waiting: vector.Vector[u8];
+    stale:   bool;
+    cut_due: bool;
+    changed: bool;
+}
+
+# queue a block to have its parameters looked at, unless it is the entry or
+# waits already
+fun want_block(w: *Work, k: Block) err[refusal.Error] {
+    if (k == 0 || w.waiting.data[k] != 0) { ret err[refusal.Error].ok{}; }
+    w.waiting.data[k] = 1;
+    val res_pushed: res[usize, allocator.Error] = vector.push[Block](?w.due, k);
+    if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+# queue the instructions that use a value, and the parameters of the blocks
+# the ones that branch pass it to
+fun users(w: *Work, list: *vector.Vector[Instruction]) err[refusal.Error] {
+    var n: usize = 0;
+    for (n < list.len) {
+        val err_want: err[refusal.Error] = queue.want(?w.q, list.data[n]);
+        if (sel err_want.err) { ret err_want; }
+        val d: *InstructionData = ?w.b.instructions.data[list.data[n]];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            val err_want_block: err[refusal.Error] = want_block(w, d.edges.data[e].block);
+            if (sel err_want_block.err) { ret err_want_block; }
+            e = e + 1;
+        }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether the instruction is one the pass may rewrite
+fun open(d: *InstructionData) bool {
+    if (!(sel d.place.placed))     { ret false; }
+    if (d.metadata.flags.volatile) { ret false; }
+    if (d.metadata.flags.kept)     { ret false; }
+    ret !d.metadata.secret;
+}
+
+# replace the results of an instruction by the constants the folder gave
+fun settle(w: *Work, i: Instruction, done: record.Folded) err[refusal.Error] {
+    var list: vector.Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin { vector.dnit[Instruction](?list); }
+    var consts: vector.Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?consts); }
+    val results: *List[Value] = ?w.b.instructions.data[i].results;
+    var n:       usize        = 0;
+    for (n < results.len) {
+        val res_place: res[Value, refusal.Error] = number.place(w.m, w.f, w.scratch, done.results.data[n]);
+        if (sel res_place.err) { ret err[refusal.Error].err{res_place.err}; }
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?consts, res_place.ok);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        val err_copy_uses: err[refusal.Error] = queue.copy_uses(w.b, results.data[n], ?list);
+        if (sel err_copy_uses.err) { ret err_copy_uses; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < results.len) {
+        val err_edit: err[refusal.Error] = refusal.edit(body.replace(w.m, w.f, results.data[n], consts.data[n], Records.follow{}));
+        if (sel err_edit.err) { ret err_edit; }
+        n = n + 1;
+    }
+    val err_gone: err[refusal.Error] = refusal.edit(body.erase(w.m, w.f, i));
+    if (sel err_gone.err) { ret err_gone; }
+    ret users(w, ?list);
+}
+
+# whether a constant of a type is one the build holds: any but a float, or a vector of floats, of a format the build
+# holds no row of
+fun constant_held(w: *Work, ty: Type) res[bool, refusal.Error] {
+    var lane:         Type                                     = ty;
+    val res_shape_at: res[*type_table.Shape, type_table.Error] = type_table.shape_at(?w.m.types, ty);
+    if (sel res_shape_at.err)       { ret res[bool, refusal.Error].ok{true}; }
+    if (sel res_shape_at.ok.vector) { lane = res_shape_at.ok.vector.element; }
+    val res_format: res[type_format.Format, type_table.Error] = type_table.format(?w.m.types, lane);
+    if (sel res_format.err) { ret res[bool, refusal.Error].ok{true}; }
+    val res_row: res[opt[*Held], target_basis.Error] = target_basis.held(w.c.basis, ?w.c.t.caps, res_format.ok);
+    if (sel res_row.err) { ret res[bool, refusal.Error].err{refusal.Error.condition{res_row.err}}; }
+    ret res[bool, refusal.Error].ok{sel res_row.ok.some};
+}
+
+# fold one instruction whose operands are all constants
+fun fold_one(w: *Work, i: Instruction) err[refusal.Error] {
+    val d: *InstructionData = ?w.b.instructions.data[i];
+    if (!open(d) || d.results.len == 0) { ret err[refusal.Error].ok{}; }
+    var s: usize = 0;
+    for (s < d.results.len) {
+        if (w.b.values.data[d.results.data[s]].secret) { ret err[refusal.Error].ok{}; }
+        s = s + 1;
+    }
+    var operands: vector.Vector[record.Operand] = vector.init[record.Operand](w.scratch);
+    var n:        usize                         = 0;
+    for (n < d.operands.len) {
+        val v:        Value                                 = d.operands.data[n];
+        val res_read: res[opt[record.Value], refusal.Error] = number.read(w.m, w.b, w.scratch, v);
+        if (sel res_read.err)     { ret err[refusal.Error].err{res_read.err}; }
+        if (sel res_read.ok.none) { ret err[refusal.Error].ok{}; }
+        val res_pushed: res[usize, allocator.Error] = vector.push[record.Operand](?operands, record.Operand{value: res_read.ok.some, secret: w.b.values.data[v].secret});
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        n = n + 1;
+    }
+    val req: record.Request = record.Request{opcode: d.opcode, operands: Slice[record.Operand]{data: operands.data, size: operands.len}, immediates: Slice[Immediate]{data: d.immediates.data, size: d.immediates.len}};
+    val out: record.Outcome = eval.fold(w.scratch, ?w.m.types, w.nans, req);
+    if (sel out.refused) {
+        if (sel out.refused.unfoldable || sel out.refused.trap || sel out.refused.nan) { ret err[refusal.Error].ok{}; }
+        ret err[refusal.Error].err{number.unfolded(out.refused)};
+    }
+    if (out.folded.secret)                        { ret err[refusal.Error].ok{}; }
+    if (out.folded.results.size != d.results.len) { ret err[refusal.Error].err{refusal.Error.reason{"the folder gave a different number of results than the instruction has"}}; }
+    var r: usize = 0;
+    for (r < d.results.len) {
+        val res_held: res[bool, refusal.Error] = constant_held(w, w.b.values.data[d.results.data[r]].type);
+        if (sel res_held.err) { ret err[refusal.Error].err{res_held.err}; }
+        if (!res_held.ok)     { ret err[refusal.Error].ok{}; }
+        r = r + 1;
+    }
+    val err_settle: err[refusal.Error] = settle(w, i, out.folded);
+    if (sel err_settle.err) { ret err_settle; }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# turn a branch on a constant condition into a jump along the edge it takes
+fun jump(w: *Work, i: Instruction) err[refusal.Error] {
+    val d: *InstructionData = ?w.b.instructions.data[i];
+    if (!open(d)) { ret err[refusal.Error].ok{}; }
+    val res_read: res[opt[record.Value], refusal.Error] = number.read(w.m, w.b, w.scratch, d.operands.data[0]);
+    if (sel res_read.err)     { ret err[refusal.Error].err{res_read.err}; }
+    if (sel res_read.ok.none) { ret err[refusal.Error].ok{}; }
+    var take: usize = 1;
+    if ((res_read.ok.some.lanes.data[0].words.data[0] & 1) != 0) { take = 0; }
+    val cut:  Block     = d.edges.data[1 - take].block;
+    val keep: Block     = d.edges.data[take].block;
+    var to:   [1]Branch = [1]Branch{Branch{block: keep, arguments: Slice[Value]{data: d.edges.data[take].arguments.data, size: d.edges.data[take].arguments.len}}};
+
+    var bld: builder.Builder = builder.make(w.m);
+    builder.enter(?bld, w.f);
+    builder.derive(?bld, i);
+    builder.replacing(?bld, i);
+    builder.emit(?bld, Request{opcode: table.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?to[0], size: 1}});
+    val err_built: err[failure.Error] = builder.done(?bld);
+    if (sel err_built.err) { ret err[refusal.Error].err{refusal.Error.build{err_built.err}}; }
+
+    w.changed = true;
+    w.stale   = true;
+    w.cut_due = true;
+    val err_want_block: err[refusal.Error] = want_block(w, cut);
+    if (sel err_want_block.err) { ret err_want_block; }
+    ret want_block(w, keep);
+}
+
+# the parameter of a block, when every edge into it passes one constant for it
+fun parameter(w: *Work, k: Block, j: usize) err[refusal.Error] {
+    val p: Value = w.b.blocks.data[k].parameters.data[j];
+    if (w.b.values.data[p].secret) { ret err[refusal.Error].ok{}; }
+    val preds: *vector.Vector[Instruction] = ?w.b.blocks.data[k].predecessors;
+    var first: Value                       = p;
+    var held:  record.Value;
+    var seen:  bool                        = false;
+    var n:     usize                       = 0;
+    for (n < preds.len) {
+        val d: *InstructionData = ?w.b.instructions.data[preds.data[n]];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            if (d.edges.data[e].block == k) {
+                val arg:      Value                                 = d.edges.data[e].arguments.data[j];
+                val res_read: res[opt[record.Value], refusal.Error] = number.read(w.m, w.b, w.scratch, arg);
+                if (sel res_read.err)     { ret err[refusal.Error].err{res_read.err}; }
+                if (sel res_read.ok.none) { ret err[refusal.Error].ok{}; }
+                if (!seen) {
+                    seen  = true;
+                    first = arg;
+                    held  = res_read.ok.some;
+                }
+                or (arg != first && !number.same_value(held, res_read.ok.some)) { ret err[refusal.Error].ok{}; }
+            }
+            e = e + 1;
+        }
+        n = n + 1;
+    }
+    if (!seen) { ret err[refusal.Error].ok{}; }
+
+    var list: vector.Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin { vector.dnit[Instruction](?list); }
+    val err_copy_uses: err[refusal.Error] = queue.copy_uses(w.b, p, ?list);
+    if (sel err_copy_uses.err) { ret err_copy_uses; }
+    val err_edit: err[refusal.Error] = refusal.edit(body.replace(w.m, w.f, p, first, Records.follow{}));
+    if (sel err_edit.err) { ret err_edit; }
+    val err_gone: err[refusal.Error] = refusal.edit(body.remove_parameter(w.m, w.f, k, j::u32));
+    if (sel err_gone.err) { ret err_gone; }
+    w.changed = true;
+    ret users(w, ?list);
+}
+
+# the parameters of a block, last first so a removal leaves the others in place
+fun parameters(w: *Work, k: Block) err[refusal.Error] {
+    if (w.b.blocks.data[k].erased) { ret err[refusal.Error].ok{}; }
+    var j: usize = w.b.blocks.data[k].parameters.len;
+    for (j > 0) {
+        j = j - 1;
+        val err_parameter: err[refusal.Error] = parameter(w, k, j);
+        if (sel err_parameter.err) { ret err_parameter; }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# remove the blocks the entry no longer reaches, queueing the blocks they
+# branched to, whose parameters have fewer edges to judge
+fun cut(w: *Work) err[refusal.Error] {
+    if (w.stale) {
+        val err_dropped: err[allocator.Error] = cache.forget(w.c.cache, w.f);
+        if (sel err_dropped.err) { ret refusal.lost(err_dropped.err); }
+        w.stale = false;
+    }
+    val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(w.c.cache, w.f);
+    if (sel res_dominance_of.err) { ret err[refusal.Error].err{res_dominance_of.err}; }
+    var any: bool  = false;
+    var k:   usize = 0;
+    for (k < w.b.blocks.len) {
+        if (!w.b.blocks.data[k].erased && !dominance.reachable(res_dominance_of.ok, k::u32)) {
+            any = true;
+            var i: Instruction = w.b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d: *InstructionData = ?w.b.instructions.data[i];
+                var e: usize            = 0;
+                for (e < d.edges.len) {
+                    val err_want_block: err[refusal.Error] = want_block(w, d.edges.data[e].block);
+                    if (sel err_want_block.err) { ret err_want_block; }
+                    e = e + 1;
+                }
+                i = w.b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    if (!any) { ret err[refusal.Error].ok{}; }
+    val err_pruned: err[Error] = prune.unreached(w.m, w.f, res_dominance_of.ok);
+    if (sel err_pruned.err) { ret err[refusal.Error].err{refusal.Error.cfg{err_pruned.err}}; }
+    val err_dropped: err[allocator.Error] = cache.forget(w.c.cache, w.f);
+    if (sel err_dropped.err) { ret refusal.lost(err_dropped.err); }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# queue every instruction and every block parameter, the first to run first
+fun seed(w: *Work) err[refusal.Error] {
+    var k: usize = w.b.blocks.len;
+    for (k > 0) {
+        k = k - 1;
+        if (!w.b.blocks.data[k].erased) {
+            val err_want_block: err[refusal.Error] = want_block(w, (k::u32));
+            if (sel err_want_block.err) { ret err_want_block; }
+            var i: Instruction = w.b.blocks.data[k].last;
+            for (i != NO_INSTRUCTION) {
+                val err_want: err[refusal.Error] = queue.want(?w.q, i);
+                if (sel err_want.err) { ret err_want; }
+                i = w.b.instructions.data[i].prev;
+            }
+        }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# fold or jump each queued instruction until the queue is empty or a cut of
+# unreached blocks is due
+fun drain(w: *Work, ar: *arena.Arena) err[refusal.Error] {
+    for (!queue.is_empty(?w.q)) {
+        val i: Instruction = queue.take(?w.q);
+        arena.reset(ar);
+        val d: *InstructionData = ?w.b.instructions.data[i];
+        if (sel d.place.placed) {
+            var err_jump: err[refusal.Error] = err[refusal.Error].ok{};
+            if (d.opcode == table.CBR) { err_jump = jump(w, i); }
+            or                         { err_jump = fold_one(w, i); }
+            if (sel err_jump.err)      { ret err_jump; }
+        }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# look at the parameters of each queued block until none waits
+fun settle_blocks(w: *Work, ar: *arena.Arena) err[refusal.Error] {
+    for (w.due.len != 0) {
+        val k: Block = w.due.data[w.due.len - 1];
+        vector.truncate[Block](?w.due, w.due.len - 1);
+        w.waiting.data[k] = 0;
+        arena.reset(ar);
+        val err_parameters: err[refusal.Error] = parameters(w, k);
+        if (sel err_parameters.err) { ret err_parameters; }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# fold the constants of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+
+    val res_nans: res[Slice[Nans], refusal.Error] = number.rules(c, c.m.a);
+    if (sel res_nans.err) { ret res[bool, refusal.Error].err{res_nans.err}; }
+    fin { number.rules_free(c.m.a, res_nans.ok); }
+
+    var w: Work = Work{c: c, m: c.m, f: u.f, b: res_body.ok, scratch: ?scratch, nans: res_nans.ok, q: queue.init(c.m.a), due: vector.init[Block](c.m.a), waiting: vector.init[u8](c.m.a), stale: false, cut_due: true, changed: false};
+    fin {
+        queue.dnit(?w.q);
+        vector.dnit[Block](?w.due);
+        vector.dnit[u8](?w.waiting);
+    }
+    val err_sized: err[refusal.Error] = queue.grow(?w.waiting, w.b.blocks.len);
+    if (sel err_sized.err) { ret res[bool, refusal.Error].err{err_sized.err}; }
+    val err_seeded: err[refusal.Error] = seed(?w);
+    if (sel err_seeded.err) { ret res[bool, refusal.Error].err{err_seeded.err}; }
+
+    for {
+        if (w.cut_due) {
+            w.cut_due = false;
+            val err_cut: err[refusal.Error] = cut(?w);
+            if (sel err_cut.err) { ret res[bool, refusal.Error].err{err_cut.err}; }
+        }
+        val err_folded: err[refusal.Error] = drain(?w, ?ar);
+        if (sel err_folded.err) { ret res[bool, refusal.Error].err{err_folded.err}; }
+        if (w.cut_due)          { cnt; }
+        val err_params: err[refusal.Error] = settle_blocks(?w, ?ar);
+        if (sel err_params.err)                                   { ret res[bool, refusal.Error].err{err_params.err}; }
+        if (queue.is_empty(?w.q) && w.due.len == 0 && !w.cut_due) { brk; }
+    }
+    ret res[bool, refusal.Error].ok{w.changed};
+}

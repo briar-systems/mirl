@@ -1,0 +1,986 @@
+# the virtual form one round allocates, built from the input function and the
+# plan: the reload pieces, the spills and the copies that give an operand half
+# a value of its own
+#
+# the form holds every block and placed instruction of the input in order,
+# but the writes of values made again, with the input's virtual registers at
+# their own numbers, its slots, and
+# after them a slot for each virtual register carried in pieces, in the order
+# of their numbers. the slot is its class's, or its value's bits where the
+# value is its register's low bits alone (`function.virtual`) and the frame
+# code states a load and a store of exactly them for the class: the store
+# then carries all of the value and the load restores it, whatever it leaves
+# above, which no reader of the value reads. a value in pieces is stored by a spill after every
+# instruction that writes it, from a value of that write's own, and reloaded
+# once for each run of reads: the reads of one block from a reload to the
+# next write of the value, the next tied read or the block's end, whichever
+# comes first, share one piece. a read given its own value reloads into it
+# just before its instruction. a whole value's half given its own value is a
+# copy of it just before the instruction, for a read, or a copy back just
+# after, for a write. a write through a view of its value that keeps some of
+# it, as x86's setcc of a byte, reads it as well, as liveness reads it, so the
+# piece it writes is reloaded before it. every instruction is made through the
+# function's own maker, so it is checked against its row as any other. an
+# instruction the plan leaves as it is keeps its operands, which are not walked.
+#
+# a value in pieces that is a pure function of the frame pointer and
+# constants, every write of it a slot address or that value plus a number
+# (`remade`), is made again, never stored: its writes are left out of the
+# form, each run of reads starts with a slot address of its slot and
+# displacement into its piece where a reload would stand, and no slot is made
+# for it. so a frame address never passes through memory, and every access
+# through it stays off a register the frame sets from the stack or frame
+# pointer, as a constant-time walk places it.
+#
+# a value in pieces the plan splits at a loop is one value of the loop's
+# own there (`SPLIT`), which every plain read in the loop's blocks reads: a
+# reload of it, or a slot address for a value made again, stands before the
+# last instruction of the loop's preheader. the plan splits no value an
+# instruction of the loop names tied, so no read there consumes it.
+#
+# an inserted instruction keeps the source location and site of the one it
+# serves, and is secret when the value it carries may hold a secret, as the
+# input function states of its virtual register, so a spill never launders
+# a secret into a public slot.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Lists;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.metadata.NO_PUBLICS;
+use mirl.ir.metadata.UNBOUND;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Clobber;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.alloc.plan;
+use mirl.machine.alloc.plan.Plan;
+use mirl.machine.alloc.remade;
+use mirl.machine.alloc.remade.At;
+use mirl.machine.class;
+use mirl.machine.class.Class;
+use mirl.machine.frame.code;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.function;
+use mirl.machine.function.Area;
+use mirl.machine.function.Function;
+use mirl.machine.function.SlotData;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand;
+use mirl.machine.operand.Address;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.List;
+use mirl.machine.operand.Member;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Tied;
+use mirl.machine.operand.Virtual;
+use mirl.machine.pseudo;
+use mirl.machine.pseudo.Pseudo;
+use mirl.machine.storage;
+use mirl.machine.storage.Storage;
+use mirl.machine.vstate;
+
+use mo: masc.core.operand;
+use rf: masc.core.register;
+
+# a virtual register of the input, at its own number
+pub val ORIGINAL: u8 = 0;
+
+# a piece one run of reads of a value in pieces shares
+pub val PIECE: u8 = 1;
+
+# a value of one operand half's own, which lives from the instruction before
+# its half to its half, or from its half to the instruction after, and is
+# never shortened or carried any other way
+pub val OWN: u8 = 2;
+
+# the value of a loop's own a value in pieces is held in across the loop the
+# plan splits it at, from the loop's preheader on
+pub val SPLIT: u8 = 3;
+
+# no instruction of the input
+pub val NONE: u32 = 0xffffffff;
+
+# why a form was not built
+# ---
+# alloc:   the allocator refused storage
+# refused: the function's maker refused an instruction, a slot or a virtual register
+# class:   a value in pieces of a class the target's locations do not have
+# storage: a value in pieces whose class's storage is no fixed size plus a
+#          size per unit of one scale, so no slot states it
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    refused: function.Error;
+    class:   Virtual;
+    storage: Virtual;
+}
+
+# the allocator's refusal `e` stands for, its own or a step's it carries, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc)   { ret opt[allocator.Error].some{e.alloc}; }
+    if (sel e.refused) { ret function.starved(e.refused); }
+    ret opt[allocator.Error].none{};
+}
+
+# the slot a member of each class needs, by class key
+# ---
+# slots:   by class key, none when the class's storage is no slot's size
+# carried: by class key, the sizes of 1 to 64 bytes the frame code both loads
+#          and stores a register of the class at, bit n - 1 for n bytes
+pub rec Sizes {
+    slots:   vector.Vector[opt[SlotData]];
+    carried: vector.Vector[u64];
+}
+
+# one read a piece serves
+# ---
+# piece:       the piece
+# instruction: the input instruction
+# operand:     the operand position
+pub rec Run {
+    piece:       u32;
+    instruction: Instruction;
+    operand:     u32;
+}
+
+# the virtual form of one round
+# ---
+# f:        the form, when it is one of its own
+# input:    the input, when no value is in pieces and the form is the input, nil otherwise
+# kinds:    each virtual register's kind
+# origin:   each virtual register's input virtual register, whose value it carries
+# runs:     the reads each piece serves, in the order of the form
+# sources:  each instruction's input instruction, NONE for one the form inserted
+# renamed:  whether each instruction names other values than its input instruction
+# clobbers: the input's clobbers, at the form's instructions, each naming
+#           its set of the input's
+# spills:   the slots made for values in pieces, ascending
+# slots:    each input virtual register's slot, NONE for one of none
+pub rec Form {
+    f:        Function;
+    input:    *Function;
+    kinds:    vector.Vector[u8];
+    origin:   vector.Vector[u32];
+    runs:     vector.Vector[Run];
+    sources:  vector.Vector[u32];
+    renamed:  vector.Vector[bool];
+    clobbers: vector.Vector[Clobber];
+    spills:   vector.Vector[Slot];
+    slots:    vector.Vector[u32];
+}
+
+# an instruction to insert, a pseudo of two operands
+# ---
+# op:    the pseudo
+# dest:  its destination
+# src:   its source
+# value: the input virtual register it carries
+# disp:  the displacement of a slot address past its slot, 0 for any other
+pub rec Insert {
+    op:    Pseudo;
+    dest:  Operand;
+    src:   Operand;
+    value: u32;
+    disp:  i64;
+}
+
+# the storage the forms of an allocation's rounds are built in, which the
+# caller keeps across rounds and functions. the form is the last one built,
+# good until the next build, and the rest holds nothing between builds
+# ---
+# form:    the form
+# lifted:  each input virtual register's value of the loop it is split at,
+#          NONE for one split at none
+# current: each input virtual register's open piece, NONE for one of none
+# open:    the values with an open piece in the block
+# ends:    the values whose piece the instruction ends
+# pre:     the instructions to insert before the instruction
+# post:    the instructions to insert after it
+# ops:     the instruction's operands in the form
+pub rec Scratch {
+    form:    Form;
+    lifted:  vector.Vector[u32];
+    current: vector.Vector[u32];
+    open:    vector.Vector[u32];
+    ends:    vector.Vector[u32];
+    pre:     vector.Vector[Insert];
+    post:    vector.Vector[Insert];
+    ops:     vector.Vector[Operand];
+}
+
+# one build of a form: the input, the plan, the form being built and the tables of the scratch it works in
+rec Build {
+    src:      *Function;
+    p:        *Plan;
+    form:     *Form;
+    sizes:    *Sizes;
+    at:       *Locations;
+    clobbers: *Lists[u32];
+    slots:    *vector.Vector[u32];
+    remade:   *vector.Vector[At];
+    lifted:   *vector.Vector[u32];
+    block:    u32;
+    current:  *vector.Vector[u32];
+    open:     *vector.Vector[u32];
+    ends:     *vector.Vector[u32];
+    pre:      *vector.Vector[Insert];
+    post:     *vector.Vector[Insert];
+    ops:      *vector.Vector[Operand];
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun pushed(r: res[usize, allocator.Error]) err[Error] {
+    if (sel r.err) { ret alloc_err(r.err); }
+    ret err[Error].ok{};
+}
+
+# the slot a storage needs: its bits rounded up to bytes, fixed and per unit,
+# aligned to the power of two at or above its bytes, per unit when it scales
+pub fun slot_of(s: Storage) SlotData {
+    val size: u64 = (s.fixed + 7) / 8;
+    val per:  u64 = (s.per + 7) / 8;
+    var want: u64 = size;
+    if (per > want) { want = per; }
+    var align: u64 = 1;
+    for (align < want) { align = align * 2; }
+    ret SlotData{size: size, per: per, scale: s.scale, align: align, area: Area.local{}, secret: false, addressed: false, publics: NO_PUBLICS};
+}
+
+fun slot_for(s: opt[Storage]) opt[SlotData] {
+    if (sel s.none) { ret opt[SlotData].none{}; }
+    ret opt[SlotData].some{slot_of(s.some)};
+}
+
+# the slot a group of `span` registers of a class spills to, the class's
+# storage once per register and scaled where the class scales, so a group of
+# a scalable vector class spills at the vector length the target runs at
+pub fun group_slot(regs: *rf.Available, c: Class, span: u32) opt[SlotData] {
+    ret slot_for(storage.of_group(regs, c, span));
+}
+
+# the slot each class of a target's locations needs, read from masc's class
+# widths and the pieces of their rows through the selection's view, so a
+# scale the selection fixes is a fixed size, and the sizes the frame code
+# bound to the selection carries each class at, in O(c r) once per target
+pub fun sizes(a: *allocator.Allocator, at: *Locations, regs: *rf.Available, x: *code.Admitted) res[Sizes, allocator.Error] {
+    var s:          Sizes                       = Sizes{slots: vector.init[opt[SlotData]](a), carried: vector.init[u64](a)};
+    var err_failed: err[allocator.Error]        = err[allocator.Error].ok{};
+    val res_room:   res[usize, allocator.Error] = vector.reserve[opt[SlotData]](?s.slots, location.keys(at)::usize);
+    if (sel res_room.err) { keep(?err_failed, err[allocator.Error].err{res_room.err}); }
+    keep(?err_failed, slice.fill[u64](?s.carried, location.keys(at)::usize, 0));
+    if (sel err_failed.err) {
+        sizes_dnit(?s);
+        ret res[Sizes, allocator.Error].err{err_failed.err};
+    }
+    var k: u32 = 0;
+    if (at.file != nil) {
+        for (k < at.file.class_count) {
+            vector.push[opt[SlotData]](?s.slots, group_slot(regs, class.hardware(at.file, k::u16), 1));
+            var n: i64 = 1;
+            for (n <= 64) {
+                val size:      Offset           = Offset{fixed: n, per: 0, scale: 0};
+                val h:         class.Hardware   = class.Hardware{file: at.file, index: k::u16};
+                val opt_load:  opt[*code.Width] = code.class_width(x, h, size, false);
+                val opt_store: opt[*code.Width] = code.class_width(x, h, size, true);
+                if (sel opt_load.some && sel opt_store.some) { s.carried.data[k] = s.carried.data[k] | ((1::u64) << (n - 1)::u64); }
+                n = n + 1;
+            }
+            k = k + 1;
+        }
+    }
+    var m: usize = 0;
+    for (m < at.memories.len) {
+        vector.push[opt[SlotData]](?s.slots, group_slot(regs, Class.memory{at.memories.data[m]}, 1));
+        m = m + 1;
+    }
+    ret res[Sizes, allocator.Error].ok{s};
+}
+
+# give back the sizes' storage
+pub fun sizes_dnit(s: *Sizes) err[allocator.Error] {
+    var err_failed: err[allocator.Error] = vector.dnit[opt[SlotData]](?s.slots);
+    keep(?err_failed, vector.dnit[u64](?s.carried));
+    ret err_failed;
+}
+
+# the slot a value in pieces of class `c` and key `key` spills to: its
+# value's `bits` where the value is its register's low bits alone and the
+# frame code carries the class at exactly them, else its class's
+fun slot_of_value(b: *Build, c: Class, key: u32, bits: u64, whole: SlotData) SlotData {
+    if (bits == 0 || bits % 8 != 0 || bits > 512 || !(sel c.hardware)) { ret whole; }
+    val bytes: u64 = bits / 8;
+    if (bytes >= whole.size || whole.per != 0)                 { ret whole; }
+    if (((b.sizes.carried.data[key] >> (bytes - 1)) & 1) == 0) { ret whole; }
+    ret slot_of(Storage{fixed: bits, per: 0, scale: 0});
+}
+
+# give the form the placement of its source's entry
+fun inherit(x: *Form, src: *Function) err[Error] {
+    val err_inherited: err[allocator.Error] = function.inherit(?x.f, src);
+    if (sel err_inherited.err) { ret err[Error].err{Error.alloc{err_inherited.err}}; }
+    ret err[Error].ok{};
+}
+
+# the storage of the forms of an allocation's rounds, holding none yet
+pub fun scratch(a: *allocator.Allocator) Scratch {
+    ret Scratch{
+        form: Form{
+            f:        function.init(a, nil, false),
+            input:    nil,
+            kinds:    vector.init[u8](a),
+            origin:   vector.init[u32](a),
+            runs:     vector.init[Run](a),
+            sources:  vector.init[u32](a),
+            renamed:  vector.init[bool](a),
+            clobbers: vector.init[Clobber](a),
+            spills:   vector.init[Slot](a),
+            slots:    vector.init[u32](a),
+        },
+        lifted:  vector.init[u32](a),
+        current: vector.init[u32](a),
+        open:    vector.init[u32](a),
+        ends:    vector.init[u32](a),
+        pre:     vector.init[Insert](a),
+        post:    vector.init[Insert](a),
+        ops:     vector.init[Operand](a),
+    };
+}
+
+# give back the storage of the forms
+pub fun scratch_dnit(s: *Scratch) err[allocator.Error] {
+    val x:          *Form                = ?s.form;
+    var err_failed: err[allocator.Error] = function.dnit(?x.f);
+    keep(?err_failed, vector.dnit[u8](?x.kinds));
+    keep(?err_failed, vector.dnit[u32](?x.origin));
+    keep(?err_failed, vector.dnit[Run](?x.runs));
+    keep(?err_failed, vector.dnit[u32](?x.sources));
+    keep(?err_failed, vector.dnit[bool](?x.renamed));
+    keep(?err_failed, vector.dnit[Clobber](?x.clobbers));
+    keep(?err_failed, vector.dnit[Slot](?x.spills));
+    keep(?err_failed, vector.dnit[u32](?x.slots));
+    keep(?err_failed, vector.dnit[u32](?s.lifted));
+    keep(?err_failed, vector.dnit[u32](?s.current));
+    keep(?err_failed, vector.dnit[u32](?s.open));
+    keep(?err_failed, vector.dnit[u32](?s.ends));
+    keep(?err_failed, vector.dnit[Insert](?s.pre));
+    keep(?err_failed, vector.dnit[Insert](?s.post));
+    keep(?err_failed, vector.dnit[Operand](?s.ops));
+    ret err_failed;
+}
+
+# empty the form's tables, their storage kept
+fun clear(x: *Form) {
+    x.input = nil;
+    vector.clear[u8](?x.kinds);
+    vector.clear[u32](?x.origin);
+    vector.clear[Run](?x.runs);
+    vector.clear[u32](?x.sources);
+    vector.clear[bool](?x.renamed);
+    vector.clear[Clobber](?x.clobbers);
+    vector.clear[Slot](?x.spills);
+    vector.clear[u32](?x.slots);
+}
+
+# the function of a form
+pub fun function_of(x: *Form) *Function {
+    if (x.input != nil) { ret x.input; }
+    ret ?x.f;
+}
+
+fun made_err(e: function.Error) err[Error] {
+    ret err[Error].err{Error.refused{e}};
+}
+
+# a new virtual register of the form, of a kind, carrying an input value
+fun fresh(b: *Build, kind: u8, value: u32) res[u32, Error] {
+    val res_made: res[Virtual, function.Error] = function.virtual(?b.form.f, b.src.virtuals.data[value], b.src.secret.data[value], b.src.widths.data[value]);
+    if (sel res_made.err) { ret res[u32, Error].err{Error.refused{res_made.err}}; }
+    var err_failed:       err[allocator.Error]        = err[allocator.Error].ok{};
+    val res_kinds_pushed: res[usize, allocator.Error] = vector.push[u8](?b.form.kinds, kind);
+    if (sel res_kinds_pushed.err) { keep(?err_failed, err[allocator.Error].err{res_kinds_pushed.err}); }
+    val res_origin_pushed: res[usize, allocator.Error] = vector.push[u32](?b.form.origin, value);
+    if (sel res_origin_pushed.err) { keep(?err_failed, err[allocator.Error].err{res_origin_pushed.err}); }
+    if (sel err_failed.err)        { ret res[u32, Error].err{Error.alloc{err_failed.err}}; }
+    ret res[u32, Error].ok{res_made.ok};
+}
+
+fun virtual_operand(v: u32) Operand {
+    ret Operand.virtual{v};
+}
+
+fun slot_operand(b: *Build, value: u32) Operand {
+    ret Operand.slot{(b.slots.data[value])};
+}
+
+fun insert(list: *vector.Vector[Insert], op: Pseudo, dest: Operand, src: Operand, value: u32) err[Error] {
+    ret pushed(vector.push[Insert](list, Insert{op: op, dest: dest, src: src, value: value, disp: 0}));
+}
+
+# the instruction that gives a piece of value `v` into `dest`: a slot address of its slot and displacement for a value
+# made again, else a reload from its own slot
+fun reload(b: *Build, dest: u32, v: u32) err[Error] {
+    val at: At = b.remade.data[v];
+    if (at.slot != remade.NONE) { ret pushed(vector.push[Insert](b.pre, Insert{op: pseudo.ADDRESS, dest: virtual_operand(dest), src: Operand.slot{at.slot}, value: v, disp: at.disp})); }
+    ret insert(b.pre, pseudo.RELOAD, virtual_operand(dest), slot_operand(b, v), v);
+}
+
+# the value a read of an input virtual register reads in the form
+fun read(b: *Build, i: Instruction, k: u32, v: u32, tied: bool) res[u32, Error] {
+    val own: bool = plan.owns(b.p, i, k, false);
+    if (plan.mode(b.p, v) == plan.WHOLE) {
+        if (!own) { ret res[u32, Error].ok{v}; }
+        val res_fresh: res[u32, Error] = fresh(b, OWN, v);
+        if (sel res_fresh.err) { ret res_fresh; }
+        val err_ins: err[Error] = insert(b.pre, pseudo.COPY, virtual_operand(res_fresh.ok), virtual_operand(v), v);
+        if (sel err_ins.err) { ret res[u32, Error].err{err_ins.err}; }
+        ret res_fresh;
+    }
+    if (own) {
+        val res_fresh: res[u32, Error] = fresh(b, OWN, v);
+        if (sel res_fresh.err) { ret res_fresh; }
+        val err_ins: err[Error] = reload(b, res_fresh.ok, v);
+        if (sel err_ins.err) { ret res[u32, Error].err{err_ins.err}; }
+        ret res_fresh;
+    }
+    if (b.lifted.data[v] != NONE && plan.within(b.p, b.block, plan.split_at(b.p, v))) { ret res[u32, Error].ok{b.lifted.data[v]}; }
+    if (b.current.data[v] == NONE) {
+        val res_fresh: res[u32, Error] = fresh(b, PIECE, v);
+        if (sel res_fresh.err) { ret res_fresh; }
+        val err_ins: err[Error] = reload(b, res_fresh.ok, v);
+        if (sel err_ins.err) { ret res[u32, Error].err{err_ins.err}; }
+        val err_pushed: err[Error] = pushed(vector.push[u32](b.open, v));
+        if (sel err_pushed.err) { ret res[u32, Error].err{err_pushed.err}; }
+        b.current.data[v] = res_fresh.ok;
+    }
+    val piece:   u32        = b.current.data[v];
+    val err_run: err[Error] = pushed(vector.push[Run](?b.form.runs, Run{piece: piece, instruction: i, operand: k}));
+    if (sel err_run.err) { ret res[u32, Error].err{err_run.err}; }
+    if (tied) {
+        val err_pushed: err[Error] = pushed(vector.push[u32](b.ends, v));
+        if (sel err_pushed.err) { ret res[u32, Error].err{err_pushed.err}; }
+    }
+    ret res[u32, Error].ok{piece};
+}
+
+# the value a write of an input virtual register writes in the form
+fun write(b: *Build, i: Instruction, k: u32, v: u32) res[u32, Error] {
+    if (plan.mode(b.p, v) == plan.WHOLE) {
+        if (!plan.owns(b.p, i, k, true)) { ret res[u32, Error].ok{v}; }
+        val res_fresh: res[u32, Error] = fresh(b, OWN, v);
+        if (sel res_fresh.err) { ret res_fresh; }
+        val err_ins: err[Error] = insert(b.post, pseudo.COPY, virtual_operand(v), virtual_operand(res_fresh.ok), v);
+        if (sel err_ins.err) { ret res[u32, Error].err{err_ins.err}; }
+        ret res_fresh;
+    }
+    val res_fresh: res[u32, Error] = fresh(b, OWN, v);
+    if (sel res_fresh.err) { ret res_fresh; }
+    if (b.remade.data[v].slot == remade.NONE) {
+        val err_ins: err[Error] = insert(b.post, pseudo.SPILL, slot_operand(b, v), virtual_operand(res_fresh.ok), v);
+        if (sel err_ins.err) { ret res[u32, Error].err{err_ins.err}; }
+    }
+    val err_pushed: err[Error] = pushed(vector.push[u32](b.ends, v));
+    if (sel err_pushed.err) { ret res[u32, Error].err{err_pushed.err}; }
+    ret res_fresh;
+}
+
+# a virtual register operand both read and written names one value, so a
+# half given its own value or a value in pieces gives the whole operand one
+fun both(b: *Build, i: Instruction, k: u32, v: u32) res[u32, Error] {
+    val whole: bool = plan.mode(b.p, v) == plan.WHOLE;
+    if (whole && !plan.owns(b.p, i, k, false) && !plan.owns(b.p, i, k, true)) { ret res[u32, Error].ok{v}; }
+    val res_fresh: res[u32, Error] = fresh(b, OWN, v);
+    if (sel res_fresh.err) { ret res_fresh; }
+    if (whole) {
+        val err_before: err[Error] = insert(b.pre, pseudo.COPY, virtual_operand(res_fresh.ok), virtual_operand(v), v);
+        if (sel err_before.err) { ret res[u32, Error].err{err_before.err}; }
+        val err_after: err[Error] = insert(b.post, pseudo.COPY, virtual_operand(v), virtual_operand(res_fresh.ok), v);
+        if (sel err_after.err) { ret res[u32, Error].err{err_after.err}; }
+        ret res_fresh;
+    }
+    val err_load: err[Error] = insert(b.pre, pseudo.RELOAD, virtual_operand(res_fresh.ok), slot_operand(b, v), v);
+    if (sel err_load.err) { ret res[u32, Error].err{err_load.err}; }
+    val err_store: err[Error] = insert(b.post, pseudo.SPILL, slot_operand(b, v), virtual_operand(res_fresh.ok), v);
+    if (sel err_store.err) { ret res[u32, Error].err{err_store.err}; }
+    val err_pushed: err[Error] = pushed(vector.push[u32](b.ends, v));
+    if (sel err_pushed.err) { ret res[u32, Error].err{err_pushed.err}; }
+    ret res_fresh;
+}
+
+# the value an input virtual register named at operand `k` of `i` under
+# `role` is in the form
+fun virtual_of(b: *Build, i: Instruction, k: u32, v: u32, role: mo.Role) res[u32, Error] {
+    val reads:  bool = (role & mo.READ) != 0;
+    val writes: bool = (role & mo.WRITE) != 0;
+    if (reads && writes) { ret both(b, i, k, v); }
+    if (reads)           { ret read(b, i, k, v, false); }
+    if (writes)          { ret write(b, i, k, v); }
+    ret res[u32, Error].ok{v};
+}
+
+# operand `k` of input instruction `i` in the form: a virtual register or a list's first taken under `role`, a tie's source read and its destination written, an address's registers read and its base written back where the address writes it back
+fun operand_of(b: *Build, i: Instruction, k: u32, o: Operand, role: mo.Role) res[Operand, Error] {
+    if (sel o.virtual) {
+        val res_virtual_of: res[u32, Error] = virtual_of(b, i, k, o.virtual, role);
+        if (sel res_virtual_of.err) { ret res[Operand, Error].err{res_virtual_of.err}; }
+        ret res[Operand, Error].ok{virtual_operand(res_virtual_of.ok)};
+    }
+    if (sel o.tied) {
+        var dest:   Register = o.tied.dest;
+        var source: Register = o.tied.source;
+        if (sel o.tied.source.virtual) {
+            val res_read: res[u32, Error] = read(b, i, k, o.tied.source.virtual, true);
+            if (sel res_read.err) { ret res[Operand, Error].err{res_read.err}; }
+            source = Register.virtual{res_read.ok};
+        }
+        if (sel o.tied.dest.virtual) {
+            val res_write: res[u32, Error] = write(b, i, k, o.tied.dest.virtual);
+            if (sel res_write.err) { ret res[Operand, Error].err{res_write.err}; }
+            dest = Register.virtual{res_write.ok};
+        }
+        ret res[Operand, Error].ok{Operand.tied{Tied{dest: dest, source: source}}};
+    }
+    if (sel o.list) {
+        val first: Register = o.list.first;
+        if (!(sel first.virtual)) { ret res[Operand, Error].ok{o}; }
+        val res_virtual_of: res[u32, Error] = virtual_of(b, i, k, first.virtual, role);
+        if (sel res_virtual_of.err) { ret res[Operand, Error].err{res_virtual_of.err}; }
+        ret res[Operand, Error].ok{Operand.list{List{first: Register.virtual{res_virtual_of.ok}, count: o.list.count}}};
+    }
+    if (sel o.address) { ret addressed(b, i, k, o.address); }
+    ret res[Operand, Error].ok{o};
+}
+
+# an address with each virtual register it names read in the form, and its
+# base written back as well where the address writes it back
+fun addressed(b: *Build, i: Instruction, k: u32, a: Address) res[Operand, Error] {
+    var names: [operand.MOST_NAMED]Register;
+    val n:     u32 = operand.named(Operand.address{a}, ?names[0]);
+    var at:    u32 = 0;
+    for (at < n) {
+        val r: Register = names[at];
+        if (sel r.virtual) {
+            var role: mo.Role = mo.READ;
+            if (at == 0 && operand.writes_back(a)) {
+                if (sel a.base.some) { role = mo.READ_WRITE; }
+            }
+            val res_virtual_of: res[u32, Error] = virtual_of(b, i, k, r.virtual, role);
+            if (sel res_virtual_of.err) { ret res[Operand, Error].err{res_virtual_of.err}; }
+            names[at] = Register.virtual{res_virtual_of.ok};
+        }
+        at = at + 1;
+    }
+    if (n == 0) { ret res[Operand, Error].ok{Operand.address{a}}; }
+    ret res[Operand, Error].ok{operand.renamed(Operand.address{a}, ?names[0])};
+}
+
+# the metadata of an instruction inserted for one with `src`: its location and site, no flags or bindings, secret as given
+fun served(src: Metadata, secret: bool) Metadata {
+    ret Metadata{location: src.location, site: src.site, flags: NO_FLAGS, secret: secret, bindings: UNBOUND};
+}
+
+# the next instruction of the form's input instruction, and whether it names
+# other values than that instruction
+fun source(b: *Build, i: u32, renamed: bool) err[Error] {
+    val err_pushed: err[Error] = pushed(vector.push[u32](?b.form.sources, i));
+    if (sel err_pushed.err) { ret err_pushed; }
+    ret pushed(vector.push[bool](?b.form.renamed, renamed));
+}
+
+# append the instructions of `list` to block `k` of the form, each with the location and site of `md` and the secrecy of the value it carries
+fun place(b: *Build, k: Block, list: *vector.Vector[Insert], md: Metadata) err[Error] {
+    var j: usize = 0;
+    for (j < list.len) {
+        val x:     Insert     = list.data[j];
+        var ops:   [3]Operand = [3]Operand{x.dest, x.src, Operand.immediate{x.disp}};
+        var count: usize      = 2;
+        if (x.op == pseudo.ADDRESS) { count = 3; }
+        val res_made: res[Instruction, function.Error] = function.append(?b.form.f, k, Opcode.pseudo{x.op}, Slice[Operand]{data: ?ops[0], size: count}, served(md, b.src.secret.data[x.value]), false, vstate.NONE);
+        if (sel res_made.err) { ret made_err(res_made.err); }
+        val err_source: err[Error] = source(b, NONE, false);
+        if (sel err_source.err) { ret err_source; }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the operand before `k` of `d` naming a member of virtual register `v`, none
+# where `k` is the first
+fun earlier_member(d: *InstructionData, k: u32, v: Virtual) opt[u32] {
+    var n: u32 = 0;
+    for (n < k) {
+        val o: Operand = d.operands.data[n];
+        if (sel o.member) {
+            if (o.member.virtual == v) { ret opt[u32].some{n}; }
+        }
+        n = n + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# how an instruction uses a virtual register it names through members: read
+# where no member operand writes it, and read and written otherwise, as a
+# member's write keeps the others
+fun member_role(b: *Build, d: *InstructionData, v: Virtual) mo.Role {
+    val count: u32 = d.operands.size::u32;
+    var n:     u32 = 0;
+    for (n < count) {
+        val o: Operand = d.operands.data[n];
+        if (sel o.member) {
+            if (o.member.virtual == v && (instruction.stated_role(b.src.set, d, n) & mo.WRITE) != 0) { ret mo.READ_WRITE; }
+        }
+        n = n + 1;
+    }
+    ret mo.READ;
+}
+
+# a member operand in the form: every member of one virtual register an
+# instruction names is of the one value its first member operand gives it
+fun member_of(b: *Build, d: *InstructionData, i: Instruction, k: u32, m: Member) res[Operand, Error] {
+    val opt_prior: opt[u32] = earlier_member(d, k, m.virtual);
+    if (sel opt_prior.some) {
+        val held: Operand = b.ops.data[opt_prior.some];
+        if (sel held.member) { ret res[Operand, Error].ok{Operand.member{Member{virtual: held.member.virtual, index: m.index}}}; }
+    }
+    val res_virtual_of: res[u32, Error] = virtual_of(b, i, k, m.virtual, member_role(b, d, m.virtual));
+    if (sel res_virtual_of.err) { ret res[Operand, Error].err{res_virtual_of.err}; }
+    ret res[Operand, Error].ok{Operand.member{Member{virtual: res_virtual_of.ok, index: m.index}}};
+}
+
+# whether an instruction is a write of a value made again, a slot address or an offset of one (`remade`), which every
+# run of the value's reads forms anew, so nothing reads it
+fun remade_write(b: *Build, d: *InstructionData) bool {
+    var dest: Operand = Operand.immediate{0};
+    if (remade.addressed(d).slot != remade.NONE) { dest = d.operands.data[0]; }
+    or {
+        val opt_moved: opt[remade.Moved] = remade.moved(d);
+        if (sel opt_moved.none) { ret false; }
+        dest = d.operands.data[opt_moved.some.to::usize];
+    }
+    if (!(sel dest.virtual)) { ret false; }
+    ret plan.mode(b.p, dest.virtual) == plan.PIECES && b.remade.data[dest.virtual].slot != remade.NONE;
+}
+
+# the role operand `k` of `d` uses its value under: its stated role, and a
+# read as well for a write through a view that keeps some of the value, as
+# liveness reads it
+fun role_of(b: *Build, d: *InstructionData, k: u32, o: Operand) mo.Role {
+    val role: mo.Role = instruction.stated_role(b.src.set, d, k);
+    if ((role & mo.READ) != 0 || (role & mo.WRITE) == 0) { ret role; }
+    if (sel o.virtual) {
+        if (live.partly(b.src, d.opcode, k, o.virtual)) { ret role | mo.READ; }
+    }
+    ret role;
+}
+
+# whether the plan leaves every operand of an instruction as it is: none of
+# its halves has a value of its own and every value it names is whole
+fun unchanged(b: *Build, d: *InstructionData, i: Instruction) bool {
+    val count: u32 = d.operands.size::u32;
+    if (plan.owns_any(b.p, i, count)) { ret false; }
+    var names: [operand.MOST_NAMED]Register;
+    var k:     u32 = 0;
+    for (k < count) {
+        val n: u32 = operand.named(d.operands.data[k], ?names[0]);
+        var j: u32 = 0;
+        for (j < n) {
+            val r: Register = names[j];
+            if (sel r.virtual) {
+                if (plan.mode(b.p, r.virtual) != plan.WHOLE) { ret false; }
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# an instruction into the form, and its clobbers at the one it became
+fun carried(b: *Build, k: Block, d: *InstructionData, i: Instruction, operands: Slice[Operand], renamed: bool) err[Error] {
+    val res_made: res[Instruction, function.Error] = function.carry(?b.form.f, k, d, operands);
+    if (sel res_made.err) { ret made_err(res_made.err); }
+    val err_source: err[Error] = source(b, i, renamed);
+    if (sel err_source.err) { ret err_source; }
+    val extra: Slice[u32] = graph.list[u32](b.clobbers, i);
+    var c:     usize      = 0;
+    for (c < extra.size) {
+        val err_pushed: err[Error] = pushed(vector.push[Clobber](?b.form.clobbers, Clobber{instruction: res_made.ok, set: extra.data[c]}));
+        if (sel err_pushed.err) { ret err_pushed; }
+        c = c + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# input instruction `i` into block `k` of the form, with the instructions inserted before and after it, or nothing for the write of a value made again
+fun instruction_of(b: *Build, k: Block, i: Instruction) err[Error] {
+    val d:     *InstructionData = function.data(b.src, i);
+    val count: u32              = d.operands.size::u32;
+    if (unchanged(b, d, i)) { ret carried(b, k, d, i, d.operands, false); }
+    if (remade_write(b, d)) { ret err[Error].ok{}; }
+    vector.clear[Insert](b.pre);
+    vector.clear[Insert](b.post);
+    vector.clear[Operand](b.ops);
+    vector.clear[u32](b.ends);
+    val opt_sc:     opt[live.SelfConstant] = live.self_constant(b.src, d);
+    var has_sc:     bool                   = false;
+    var sc:         live.SelfConstant      = live.SelfConstant{virtual: 0, to: 0, from: 0, with: 0};
+    var sc_written: u32                    = 0;
+    if (sel opt_sc.some) {
+        sc = opt_sc.some;
+        val res_written: res[u32, Error] = write(b, i, sc.to, sc.virtual);
+        if (sel res_written.err) { ret err[Error].err{res_written.err}; }
+        sc_written = res_written.ok;
+        has_sc     = true;
+    }
+    var n: u32 = 0;
+    for (n < count) {
+        if (has_sc && (n == sc.to || n == sc.from || n == sc.with)) {
+            val err_pushed: err[Error] = pushed(vector.push[Operand](b.ops, virtual_operand(sc_written)));
+            if (sel err_pushed.err) { ret err_pushed; }
+            n = n + 1;
+            cnt;
+        }
+        val given: Operand = d.operands.data[n];
+        if (sel given.member) {
+            val res_member_of: res[Operand, Error] = member_of(b, d, i, n, given.member);
+            if (sel res_member_of.err) { ret err[Error].err{res_member_of.err}; }
+            val err_pushed: err[Error] = pushed(vector.push[Operand](b.ops, res_member_of.ok));
+            if (sel err_pushed.err) { ret err_pushed; }
+            n = n + 1;
+            cnt;
+        }
+        val res_operand_of: res[Operand, Error] = operand_of(b, i, n, given, role_of(b, d, n, given));
+        if (sel res_operand_of.err) { ret err[Error].err{res_operand_of.err}; }
+        val err_pushed: err[Error] = pushed(vector.push[Operand](b.ops, res_operand_of.ok));
+        if (sel err_pushed.err) { ret err_pushed; }
+        n = n + 1;
+    }
+    val err_before: err[Error] = place(b, k, b.pre, d.metadata);
+    if (sel err_before.err) { ret err_before; }
+    val err_middle: err[Error] = carried(b, k, d, i, Slice[Operand]{data: b.ops.data, size: b.ops.len}, true);
+    if (sel err_middle.err) { ret err_middle; }
+    val err_after: err[Error] = place(b, k, b.post, d.metadata);
+    if (sel err_after.err) { ret err_after; }
+    var e: usize = 0;
+    for (e < b.ends.len) {
+        b.current.data[b.ends.data[e]] = NONE;
+        e                              = e + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# a write of input virtual register `v`: `slot` for one by a slot address of that slot, NONE for any other
+# the form's virtual registers, slots and blocks before any instruction
+fun frame(b: *Build) err[Error] {
+    var v: usize = 0;
+    for (v < b.src.virtuals.len) {
+        val res_made: res[Virtual, function.Error] = function.virtual(?b.form.f, b.src.virtuals.data[v], b.src.secret.data[v], b.src.widths.data[v]);
+        if (sel res_made.err) { ret made_err(res_made.err); }
+        var err_failed:       err[allocator.Error]        = err[allocator.Error].ok{};
+        val res_kinds_pushed: res[usize, allocator.Error] = vector.push[u8](?b.form.kinds, ORIGINAL);
+        if (sel res_kinds_pushed.err) { keep(?err_failed, err[allocator.Error].err{res_kinds_pushed.err}); }
+        val res_origin_pushed: res[usize, allocator.Error] = vector.push[u32](?b.form.origin, v::u32);
+        if (sel res_origin_pushed.err) { keep(?err_failed, err[allocator.Error].err{res_origin_pushed.err}); }
+        if (sel err_failed.err)        { ret alloc_err(err_failed.err); }
+        v = v + 1;
+    }
+    var s: usize = 0;
+    for (s < b.src.slots.len) {
+        val res_made: res[Slot, function.Error] = function.slot(?b.form.f, b.src.slots.data[s]);
+        if (sel res_made.err) { ret made_err(res_made.err); }
+        s = s + 1;
+    }
+    v = 0;
+    for (v < b.src.virtuals.len) {
+        if (b.p.modes.data[v] == plan.PIECES && b.remade.data[v].slot == remade.NONE) {
+            val c:       Class    = b.src.virtuals.data[v];
+            val opt_key: opt[u32] = location.key(b.at, c);
+            if (sel opt_key.none) { ret err[Error].err{Error.class{(v::u32)}}; }
+            val opt_size: opt[SlotData] = b.sizes.slots.data[opt_key.some];
+            if (sel opt_size.none) { ret err[Error].err{Error.storage{(v::u32)}}; }
+            val res_made: res[Slot, function.Error] = function.slot(?b.form.f, slot_of_value(b, c, opt_key.some, b.src.widths.data[v], opt_size.some));
+            if (sel res_made.err) { ret made_err(res_made.err); }
+            b.slots.data[v] = res_made.ok;
+            val err_pushed: err[Error] = pushed(vector.push[Slot](?b.form.spills, res_made.ok));
+            if (sel err_pushed.err) { ret err_pushed; }
+        }
+        v = v + 1;
+    }
+    v = 0;
+    for (v < b.src.virtuals.len) {
+        if (b.p.modes.data[v] == plan.PIECES && plan.split_at(b.p, v::u32) != plan.NONE) {
+            val res_fresh: res[u32, Error] = fresh(b, SPLIT, v::u32);
+            if (sel res_fresh.err) { ret err[Error].err{res_fresh.err}; }
+            b.lifted.data[v] = res_fresh.ok;
+        }
+        v = v + 1;
+    }
+    var k: usize = 0;
+    for (k < b.src.blocks.len) {
+        val res_made: res[Block, function.Error] = function.block(?b.form.f);
+        if (sel res_made.err) { ret made_err(res_made.err); }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the reloads of the values split at a loop block `k` is the preheader of,
+# before its last instruction `last`
+fun lift(b: *Build, k: Block, last: Instruction) err[Error] {
+    val values: Slice[u32] = plan.lifts(b.p, k);
+    if (values.size == 0) { ret err[Error].ok{}; }
+    vector.clear[Insert](b.pre);
+    var n: usize = 0;
+    for (n < values.size) {
+        val v: u32 = values.data[n];
+        if (b.lifted.data[v] != NONE) {
+            val err_ins: err[Error] = reload(b, b.lifted.data[v], v);
+            if (sel err_ins.err) { ret err_ins; }
+        }
+        n = n + 1;
+    }
+    ret place(b, k, b.pre, function.data(b.src, last).metadata);
+}
+
+# build the form of a plan that carries some value in pieces or gives some half a value of its own
+fun run(b: *Build) err[Error] {
+    var err_failed: err[allocator.Error] = slice.fill[u32](b.slots, b.src.virtuals.len, NONE);
+    keep(?err_failed, slice.fill[u32](b.current, b.src.virtuals.len, NONE));
+    keep(?err_failed, slice.fill[u32](b.lifted, b.src.virtuals.len, NONE));
+    if (b.remade.len != b.src.virtuals.len) { keep(?err_failed, remade.of(b.src, b.remade)); }
+    if (sel err_failed.err)                 { ret alloc_err(err_failed.err); }
+    val err_framed: err[Error] = frame(b);
+    if (sel err_framed.err) { ret err_framed; }
+    val err_room: err[allocator.Error] = function.room_of(?b.form.f, b.src);
+    if (sel err_room.err) { ret alloc_err(err_room.err); }
+    var k: usize = 0;
+    for (k < b.src.blocks.len) {
+        val list: Slice[Instruction] = function.instructions(b.src, (k::u32));
+        b.block = k::u32;
+        var i: usize = 0;
+        for (i < list.size) {
+            if (i + 1 == list.size) {
+                val err_lifted: err[Error] = lift(b, k::u32, list.data[i]);
+                if (sel err_lifted.err) { ret err_lifted; }
+            }
+            val err_done: err[Error] = instruction_of(b, (k::u32), list.data[i]);
+            if (sel err_done.err) { ret err_done; }
+            i = i + 1;
+        }
+        var o: usize = 0;
+        for (o < b.open.len) {
+            b.current.data[b.open.data[o]] = NONE;
+            o                              = o + 1;
+        }
+        vector.clear[u32](b.open);
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the form of a round no value is in pieces in, which is the input: every
+# register and instruction its own
+fun bare(x: *Form, src: *Function, clobbers: *Lists[u32]) err[Error] {
+    var err_failed: err[allocator.Error] = slice.fill[u8](?x.kinds, src.virtuals.len, ORIGINAL);
+    keep(?err_failed, vector_ids(?x.origin, src.virtuals.len));
+    keep(?err_failed, vector_ids(?x.sources, src.instructions.len));
+    keep(?err_failed, slice.fill[bool](?x.renamed, src.instructions.len, false));
+    var i: usize = 0;
+    for (i < src.instructions.len && sel err_failed.ok) {
+        val extra: Slice[u32] = graph.list[u32](clobbers, i::u32);
+        var c:     usize      = 0;
+        for (c < extra.size) {
+            val res_clobbers_pushed: res[usize, allocator.Error] = vector.push[Clobber](?x.clobbers, Clobber{instruction: (i::u32), set: extra.data[c]});
+            if (sel res_clobbers_pushed.err) { keep(?err_failed, err[allocator.Error].err{res_clobbers_pushed.err}); }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    if (sel err_failed.err) { ret alloc_err(err_failed.err); }
+    x.input = src;
+    ret err[Error].ok{};
+}
+
+# `n` numbers from 0 onto `v`
+fun vector_ids(v: *vector.Vector[u32], n: usize) err[allocator.Error] {
+    val res_room: res[usize, allocator.Error] = vector.reserve[u32](v, n);
+    if (sel res_room.err) { ret err[allocator.Error].err{res_room.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        vector.push[u32](v, i::u32);
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the virtual form of a round, built as the scratch's form in place of the
+# last one, which a refusal leaves of no use
+# ---
+# s:        the storage the form is built in
+# src:      the input function
+# p:        the plan
+# at:       the locations of its target
+# sizes:    the slot a spilled value of each class needs, by class key
+# clobbers: the clobber set of each of the input's clobbers, grouped by input instruction
+# ret:      ok, or why the form was not built
+pub fun build(s: *Scratch, src: *Function, p: *Plan, at: *Locations, sizes: *Sizes, clobbers: *Lists[u32]) err[Error] {
+    val x: *Form = ?s.form;
+    clear(x);
+    if (p.bare) { ret bare(x, src, clobbers); }
+    val err_cleared: err[allocator.Error] = function.clear(?x.f, src.set, src.checked);
+    if (sel err_cleared.err) { ret alloc_err(err_cleared.err); }
+    vector.clear[u32](?s.lifted);
+    vector.clear[u32](?s.current);
+    vector.clear[u32](?s.open);
+    vector.clear[u32](?s.ends);
+    vector.clear[Insert](?s.pre);
+    vector.clear[Insert](?s.post);
+    vector.clear[Operand](?s.ops);
+    var b: Build = Build{
+        src:      src,
+        p:        p,
+        form:     x,
+        sizes:    sizes,
+        at:       at,
+        clobbers: clobbers,
+        slots:    ?x.slots,
+        remade:   ?p.remade,
+        lifted:   ?s.lifted,
+        block:    0,
+        current:  ?s.current,
+        open:     ?s.open,
+        ends:     ?s.ends,
+        pre:      ?s.pre,
+        post:     ?s.post,
+        ops:      ?s.ops,
+    };
+    val err_inherited: err[Error] = inherit(x, src);
+    if (sel err_inherited.err) { ret err_inherited; }
+    ret run(?b);
+}
+
+# the kind of a virtual register of the form
+pub fun kind(x: *Form, v: u32) u8 {
+    ret x.kinds.data[v];
+}

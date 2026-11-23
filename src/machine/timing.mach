@@ -1,0 +1,506 @@
+# the machine form's constant-time check of a selected function
+#
+# selection leaves every value in a virtual register, and a virtual register
+# holds a secret when the function states it may, as the ir value it was
+# made for is secret. for an instruction of a row, a secret
+# in an operand the row reads is asked of the row's class under the context
+# the function runs under (`mirl.ct.latency`), and a secret in a register an
+# address is formed from is a memory access whose address is formed from a
+# secret. the walk of the encoded bytes decides the rest, as the copies,
+# frame and loops the later steps make, so a target's loops and the
+# target-neutral pseudo-instructions are not asked here. a refusal is masc's
+# one record, at the instruction and the operand that holds the secret. a
+# conditional branch selection marked as declassifying reads what it tests as
+# public, as the walk's declassify point there says, and any other
+# declassifying instruction leaves what it writes public.
+#
+# the timing of the integer multiply at a width (`multiply`) is read the same
+# way, off the rows of every rule of the build's selection table that covers
+# each multiply the legalisations make of it (`realized`), so a front end asks
+# mirl, as mach's `$mach.build.ct_mul` does, and never states it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mct: mirl.ct;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.operand;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+
+use mirl.fold.algebra;
+use mirl.fold.algebra.Op;
+use mirl.ir.function.Body;
+use mirl.ir.id;
+use ir_instruction: mirl.ir.instruction;
+use typing:         mirl.ir.opcode.check;
+use mirl.ir.opcode.row.Opcode;
+use mirl.ir.opcode.rule.Class;
+use opcode_table: mirl.ir.opcode.table;
+use type_table:   mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.legal.helper;
+use legal_multiply: mirl.legal.multiply;
+use mirl.legal.narrow;
+use mirl.legal.wide;
+use mirl.machine.isa;
+use mirl.machine.isa.Isa;
+use mirl.machine.isa.Isas;
+use mirl.machine.select.rule;
+use mirl.machine.select.rule.Rule;
+use mirl.target.basis;
+use mirl.target.build.Build;
+use mirl.target.capability.Bits;
+use mirl.target.capability.Capabilities;
+use mirl.target.record.Target;
+
+use masc.core.constraint;
+use masc.core.ct;
+use mo:   masc.core.operand;
+use rows: masc.core.row;
+use masc.core.state;
+
+# a secret where constant-time code may hold none
+# ---
+# instruction: the instruction, by its index in the function
+# refusal:     masc's record
+pub rec Error {
+    instruction: u32;
+    refusal:     ct.Refusal;
+}
+
+fun secret_in(secret: *vector.Vector[bool], r: Register) bool {
+    if (sel r.virtual) { ret r.virtual::usize < secret.len && secret.data[r.virtual]; }
+    ret false;
+}
+
+# whether operand `o` reads a secret register its value is held in, an address's registers being asked by addressed_by_secret
+fun reads_secret(secret: *vector.Vector[bool], o: Operand) bool {
+    if (sel o.virtual) { ret secret_in(secret, Register.virtual{o.virtual}); }
+    if (sel o.member)  { ret secret_in(secret, Register.virtual{o.member.virtual}); }
+    if (sel o.tied)    { ret secret_in(secret, o.tied.source); }
+    if (sel o.list)    { ret secret_in(secret, o.list.first); }
+    ret false;
+}
+
+fun addressed_by_secret(secret: *vector.Vector[bool], o: Operand) bool {
+    if (!(sel o.address)) { ret false; }
+    val opt_base:  opt[Register] = o.address.base;
+    val opt_index: opt[Register] = o.address.index;
+    if (sel opt_base.some) {
+        if (secret_in(secret, opt_base.some)) { ret true; }
+    }
+    if (sel opt_index.some) {
+        if (secret_in(secret, opt_index.some)) { ret true; }
+    }
+    ret false;
+}
+
+# the first refusal of instruction `d` under context `ctx`, whose virtual registers are secret as `secret` says
+fun refusal(d: *InstructionData, ctx: *state.Context, secret: *vector.Vector[bool]) opt[ct.Refusal] {
+    if (!(sel d.opcode.row)) { ret opt[ct.Refusal].none{}; }
+    val public: bool = d.declassifies && d.opcode.row.effect.control.conditional;
+    val count:  u32  = d.operands.size::u32;
+    var n:      u32  = 0;
+    for (n < count) {
+        val o: Operand = d.operands.data[n];
+        if (addressed_by_secret(secret, o)) { ret opt[ct.Refusal].some{ct.refusal(ct.MEMORY, n::u8)}; }
+        val reads: bool = (instruction.role(d.opcode, count, n) & mo.READ) != 0;
+        if (reads && !public && reads_secret(secret, o)) {
+            val opt_late: opt[ct.Refusal] = mct.latency(d.opcode.row, ctx, ct.Input.operand{n::u8});
+            if (sel opt_late.some) { ret opt_late; }
+        }
+        n = n + 1;
+    }
+    ret opt[ct.Refusal].none{};
+}
+
+# the machine form's constant-time check of the selected function `f`, run under the context `ctx`
+# ---
+# ret: the first secret it holds where it may hold none, none when it holds none, or why there was no storage
+pub fun check(a: *allocator.Allocator, f: *Function, ctx: *state.Context) res[opt[Error], allocator.Error] {
+    var timed: mct.Timed = mct.plain(ctx);
+    fin { mct.dnit(?timed); }
+    val err_assumed: err[allocator.Error] = mct.assume(a, ctx, ?timed);
+    if (sel err_assumed.err) { ret res[opt[Error], allocator.Error].err{err_assumed.err}; }
+    var k: usize = 0;
+    for (k < f.blocks.len) {
+        val list: Slice[Instruction] = function.instructions(f, (k::u32));
+        var i:    usize              = 0;
+        for (i < list.size) {
+            val opt_refusal: opt[ct.Refusal] = refusal(function.data(f, list.data[i]), ?timed.context, ?f.secret);
+            if (sel opt_refusal.some) { ret res[opt[Error], allocator.Error].ok{opt[Error].some{Error{instruction: list.data[i], refusal: opt_refusal.some}}}; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    ret res[opt[Error], allocator.Error].ok{opt[Error].none{}};
+}
+
+# whether instruction `d` may write a secret: it is secret, or it reads a secret register
+fun writes_secret(d: *InstructionData, secret: *vector.Vector[bool]) bool {
+    if (d.metadata.secret) { ret true; }
+    val count: u32 = d.operands.size::u32;
+    var n:     u32 = 0;
+    for (n < count) {
+        if ((instruction.role(d.opcode, count, n) & mo.READ) != 0 && reads_secret(secret, d.operands.data[n])) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# each slot of `into` that an instruction of `f` writing a secret writes is marked secret, the slots of `f` being the
+# first of `into`'s in order
+fun mark_written(f: *Function, secret: *vector.Vector[bool], into: *Function) {
+    var k: usize = 0;
+    for (k < f.blocks.len) {
+        val list: Slice[Instruction] = function.instructions(f, (k::u32));
+        var i:    usize              = 0;
+        for (i < list.size) {
+            val d: *InstructionData = function.data(f, list.data[i]);
+            if (writes_secret(d, secret)) {
+                val count: u32 = d.operands.size::u32;
+                var n:     u32 = 0;
+                for (n < count) {
+                    val o: Operand = d.operands.data[n];
+                    if (sel o.slot) {
+                        if ((instruction.role(d.opcode, count, n) & mo.WRITE) != 0 && o.slot::usize < into.slots.len) { into.slots.data[o.slot].secret = true; }
+                    }
+                    n = n + 1;
+                }
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+}
+
+# the slots of the allocated function `allocated` that may hold a secret marked so: a frame local of the selected
+# function `selected` that an instruction writing a secret stores into, and a spill slot the allocator gave a value
+# that may hold a secret, as the spill that writes it is secret. allocation keeps the selected function's slots
+# first, in order
+pub fun mark_slots(selected: *Function, allocated: *Function) {
+    mark_written(selected, ?selected.secret, allocated);
+    mark_written(allocated, ?allocated.secret, allocated);
+}
+
+# whether an integer multiply of a width runs in time independent of its operands on a build
+# ---
+# constant:     it does under the timing modes the system sets for every process
+# under:        it does only under these timing modes too (`mirl.ct.Needs`), each named by the feature that
+#               guarantees it (`mirl.ct.missing`), as dit on aarch64 and zkt on riscv
+# variable:     it does under no timing mode the set has
+# helper:       a helper computes it, or no rule of the build's selection table covers a multiply it is made of
+# unclassified: the build's instruction set classifies no instruction's timing, or guarantees none, or mirl carries no
+#               selection table for it
+pub tag Multiply: u8 {
+    constant;
+    under: mct.Needs;
+    variable;
+    helper;
+    unclassified;
+}
+
+# whether type test `t` of a rule admits an integer of `width` bits, against the target's register of `register`
+fun admits_width(t: *rule.Test, width: u32, register: u32) bool {
+    if (t.lanes) { ret false; }
+    val c: Class = t.class;
+    if (sel c.width) {
+        if (c.width != width) { ret false; }
+    }
+    or (!(sel c.integer) && !(sel c.any) && !(sel c.scalar)) { ret false; }
+    val w: rule.Width = t.width;
+    if (sel w.any)      { ret true; }
+    if (sel w.register) { ret width == register; }
+    if (sel w.part)     { ret w.part != 0 && width * w.part::u32 == register; }
+    if (sel w.whole)    { ret width == register * w.whole::u32; }
+    ret false;
+}
+
+# whether rule `r` covers an instruction of opcode `op` as its root and each type test of the root admits an integer of
+# `width` bits. a node of `op` below the root, as an address's constant scale, never runs as that instruction
+fun covers(r: *Rule, op: Opcode, width: u32, register: u32) bool {
+    if (r.nodes.len == 0 || r.nodes.at[0].opcode != op) { ret false; }
+    var t: u32 = 0;
+    for (t < r.tests.len) {
+        val test: *rule.Test = ?r.tests.at[t];
+        t = t + 1;
+        val at: rule.Ref = test.at;
+        if (sel at.result && at.result.node != 0)   { cnt; }
+        if (sel at.operand && at.operand.node != 0) { cnt; }
+        if (!admits_width(test, width, register))   { ret false; }
+    }
+    ret true;
+}
+
+# whether every row of the expansion of rule `r` is admitted under `ctx`
+fun available(r: *Rule, ctx: *state.Context) bool {
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *rule.Emit = ?r.expansion.at[e];
+        var n:    u32        = 0;
+        for (n < instruction.rows_in(emit.opcode)) {
+            if (!state.admits(ctx, instruction.row_in(emit.opcode, n).requires)) { ret false; }
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+    ret true;
+}
+
+# whether some row of the expansion of rule `r` takes a time that depends on one of its operands under `timed`
+pub fun dependent(r: *Rule, timed: *state.Context) bool {
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *rule.Emit = ?r.expansion.at[e];
+        var n:    u32        = 0;
+        for (n < instruction.rows_in(emit.opcode)) {
+            val row: *rows.Row = instruction.row_in(emit.opcode, n);
+            var k:   u32       = 0;
+            for (k < row.operands.len) {
+                val opt_late: opt[ct.Refusal] = mct.latency(row, timed, ct.Input.operand{k::u8});
+                if (sel opt_late.some) { ret true; }
+                k = k + 1;
+            }
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+    ret false;
+}
+
+# whether some rule of `table` the build admits whose root covers `op` at `width` is dependent under `timed`, and whether
+# any is admitted at all
+fun any_dependent(table: *rule.Table, ctx: *state.Context, timed: *state.Context, op: Opcode, width: u32, register: u32, seen: *bool) bool {
+    @seen = false;
+    var i: u32 = 0;
+    for (i < table.rules.len) {
+        val r: *Rule = ?table.rules.at[i];
+        if (covers(r, op, width, register) && available(r, ctx)) {
+            @seen = true;
+            if (dependent(r, timed)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a multiply selection meets
+# ---
+# code:  `mul` for the low half or one of the high halves
+# width: the width of its operands
+rec Cell {
+    code:  Opcode;
+    width: u32;
+}
+
+# the multiplies selection meets for one multiply
+# ---
+# cells: the multiplies, the first count of them
+# count: how many, one or two
+rec Realization {
+    cells: [2]Cell;
+    count: u32;
+}
+
+# the multiplies selection meets for a scalar integer multiply of two operands once the legalisations have run in their
+# order, none where a helper computes it: the helpers take a width the target has no multiply for, the wide integer
+# splitting makes a product wider than a word the low and the unsigned high products of words
+# (`mirl.legal.wide.arith.product`), the narrow integer widening makes one narrower than the multiply's widths a product
+# at the width it widens to, and the multiply forms build a high half the target has no form for from products at its
+# width (`mirl.legal.multiply.builds`). it reads a target that carries no width at another
+# ---
+# t:     the target
+# met:   the build meets the condition of the target's multiply
+# code:  the multiply, `mul` for the low half or one of the high halves
+# width: the width of its operands
+# ret:   the multiplies selection meets, none where a helper computes it
+fun realized(t: *Target, met: bool, code: Opcode, width: u32) opt[Realization] {
+    if (!helper.multiplies(t, met, width)) { ret opt[Realization].none{}; }
+    var out:  Realization;
+    val word: u32 = wide.word_of(?t.caps);
+    if (width <= word) {
+        out.cells[0] = selected(?t.caps, code, width);
+        out.count    = 1;
+        ret opt[Realization].some{out};
+    }
+    out.cells[0] = selected(?t.caps, opcode_table.MUL, word);
+    out.cells[1] = selected(?t.caps, opcode_table.MUL_HIGH_U, word);
+    out.count    = 2;
+    if (out.cells[1].code == out.cells[0].code && out.cells[1].width == out.cells[0].width) { out.count = 1; }
+    ret opt[Realization].some{out};
+}
+
+# the multiply selection meets for one at a width no wider than a word, once
+# the narrow integer widening and the multiply forms have run
+fun selected(c: *Capabilities, code: Opcode, width: u32) Cell {
+    val opt_runs_at: opt[u32] = narrow.runs_at(c, code, width);
+    if (sel opt_runs_at.some) { ret Cell{code: opcode_table.MUL, width: opt_runs_at.some}; }
+    val op: Op = algebra.op(code);
+    if (sel op.high) {
+        if (legal_multiply.builds(?c.arithmetic, width, legal_multiply.signs_of(op.high.lhs, op.high.rhs))) { ret Cell{code: opcode_table.MUL, width: width}; }
+    }
+    ret Cell{code: code, width: width};
+}
+
+# whether some multiply of a realization is dependent under `timed`, as `any_dependent` reads it, and whether a rule
+# the build admits covers each
+fun any_realized_dependent(table: *rule.Table, ctx: *state.Context, timed: *state.Context, r: *Realization, register: u32, covered: *bool) bool {
+    @covered = true;
+    var dependent: bool = false;
+    var k:         u32  = 0;
+    for (k < r.count) {
+        var seen: bool = false;
+        if (any_dependent(table, ctx, timed, r.cells[k].code, r.cells[k].width, register, ?seen)) { dependent = true; }
+        if (!seen)                                                                                { @covered = false; }
+        k = k + 1;
+    }
+    ret dependent;
+}
+
+# whether the integer multiply `op` of `width` bits runs in time independent of its operands on build `b`, as the
+# legalisations make it
+# ---
+# a:     the allocator a context with a timing mode's extension takes
+# isas:  the instruction sets mirl carries for the build's family
+# b:     the build, opened for its target
+# op:    the multiply, `mul` for the low half or one of `mul.high.u`, `mul.high.s` and `mul.high.su`
+# width: the width of its operands, in bits
+# ret:   how its time depends on its operands, or why there was no storage or the condition of the target's multiply
+#        could not be read
+pub fun multiply(a: *allocator.Allocator, isas: *Isas, b: *Build, op: Opcode, width: u32) res[Multiply, basis.Error] {
+    val asked: ct.Required = ct.required(b.basis.set.ct);
+    if (!(sel asked.held)) { ret res[Multiply, basis.Error].ok{Multiply.unclassified{}}; }
+    val opt_found: opt[*Isa] = isa.of(isas, b.basis.set);
+    if (sel opt_found.none) { ret res[Multiply, basis.Error].ok{Multiply.unclassified{}}; }
+    val reg: Bits = b.basis.target.caps.widths.register;
+    if (!(sel reg.bits)) { ret res[Multiply, basis.Error].ok{Multiply.helper{}}; }
+    val res_met: res[bool, basis.Error] = basis.meets(opt[*basis.Basis].some{?b.basis}, b.basis.target.caps.arithmetic.multiplied);
+    if (sel res_met.err) { ret res[Multiply, basis.Error].err{res_met.err}; }
+    val opt_realized: opt[Realization] = realized(b.basis.target, res_met.ok, op, width);
+    if (sel opt_realized.none) { ret res[Multiply, basis.Error].ok{Multiply.helper{}}; }
+    var r:         Realization    = opt_realized.some;
+    val ctx:       *state.Context = ?b.basis.context;
+    var covered:   bool           = false;
+    var timed:     state.Context  = mct.stated(ctx);
+    val dependent: bool           = any_realized_dependent(opt_found.some.table, ctx, ?timed, ?r, reg.bits, ?covered);
+    if (!covered)   { ret res[Multiply, basis.Error].ok{Multiply.helper{}}; }
+    if (!dependent) { ret res[Multiply, basis.Error].ok{Multiply.constant{}}; }
+    val lifted: mct.Needs = mct.liftable_modes(ctx);
+    if (lifted == mct.NO_NEEDS) { ret res[Multiply, basis.Error].ok{Multiply.variable{}}; }
+    var t: mct.Timed = mct.plain(ctx);
+    fin { mct.dnit(?t); }
+    val err_opened: err[allocator.Error] = mct.under(a, ctx, lifted, ?t);
+    if (sel err_opened.err)                                                                    { ret res[Multiply, basis.Error].err{basis.Error.alloc{err_opened.err}}; }
+    if (any_realized_dependent(opt_found.some.table, ctx, ?t.context, ?r, reg.bits, ?covered)) { ret res[Multiply, basis.Error].ok{Multiply.variable{}}; }
+    ret res[Multiply, basis.Error].ok{Multiply.under{lifted}};
+}
+
+# whether the integer multiply `op` of `width` bits on build `b` runs in time independent of its operands under the
+# timing modes the build guarantees (`mirl.ct.guaranteed`), as a hard constant-time function holds it
+pub fun multiply_guaranteed(a: *allocator.Allocator, isas: *Isas, b: *Build, op: Opcode, width: u32) res[bool, basis.Error] {
+    val res_multiply: res[Multiply, basis.Error] = multiply(a, isas, b, op, width);
+    if (sel res_multiply.err) { ret res[bool, basis.Error].err{res_multiply.err}; }
+    val m: Multiply = res_multiply.ok;
+    if (sel m.constant) { ret res[bool, basis.Error].ok{true}; }
+    if (sel m.under)    { ret res[bool, basis.Error].ok{(m.under & ~mct.guaranteed(b.basis.set, ?b.basis.context)) == 0}; }
+    ret res[bool, basis.Error].ok{false};
+}
+
+# whether some row of the expansion of rule `r` has an operand whose role under `from` is not its role under `to`, as an
+# aarch64 fabs's destination is read under nep=on and not under nep=off
+pub fun shifts(r: *Rule, from: *state.Context, to: *state.Context) bool {
+    var e: u32 = 0;
+    for (e < r.expansion.len) {
+        val emit: *rule.Emit = ?r.expansion.at[e];
+        var n:    u32        = 0;
+        for (n < instruction.rows_in(emit.opcode)) {
+            val row: *rows.Row = instruction.row_in(emit.opcode, n);
+            var k:   u32       = 0;
+            for (k < row.operands.len) {
+                if (constraint.role_under(?row.operands.at[k], from) != constraint.role_under(?row.operands.at[k], to)) { ret true; }
+                k = k + 1;
+            }
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+    ret false;
+}
+
+# whether rule `r` is admitted under `ctx`, so selection may choose it
+pub fun admitted(r: *Rule, ctx: *state.Context) bool {
+    ret available(r, ctx);
+}
+
+# whether type test `t` holds of `ty`, against the target's register of `register` bits. a pointer is taken to hold
+# any width a test asks
+fun holds_type(types: *type_table.Table, t: *rule.Test, ty: Type, register: u32) res[bool, type_table.Error] {
+    var of: Type = ty;
+    if (t.lanes) {
+        val res_shape_at: res[*type_table.Shape, type_table.Error] = type_table.shape_at(types, of);
+        if (sel res_shape_at.err)          { ret res[bool, type_table.Error].err{res_shape_at.err}; }
+        if (!(sel res_shape_at.ok.vector)) { ret res[bool, type_table.Error].ok{false}; }
+        of = res_shape_at.ok.vector.element;
+    }
+    val res_held: res[bool, type_table.Error] = typing.within(types, t.class, of);
+    if (sel res_held.err) { ret res_held; }
+    if (!res_held.ok)     { ret res_held; }
+    val w: rule.Width = t.width;
+    if (sel w.any) { ret res[bool, type_table.Error].ok{true}; }
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(types, of);
+    if (sel res_shape.err)           { ret res[bool, type_table.Error].err{res_shape.err}; }
+    if (sel res_shape.ok.pointer)    { ret res[bool, type_table.Error].ok{true}; }
+    if (!(sel res_shape.ok.integer)) { ret res[bool, type_table.Error].ok{false}; }
+    ret res[bool, type_table.Error].ok{admits_width(t, res_shape.ok.integer.width::u32, register)};
+}
+
+# whether rule `r` may select instruction `i` of body `b`: its root is of the instruction's opcode and each type test of
+# the root's operands and results holds of the instruction's types, an operand of the first two read either way round
+# as a commuting root matches them. a test of another node is taken as holding, so the answer may be yes for a rule
+# selection never chooses for the instruction and is never no for one it may
+pub fun may_select(r: *Rule, types: *type_table.Table, register: u32, b: *Body, i: id.Instruction) res[bool, type_table.Error] {
+    val d: *ir_instruction.InstructionData = ?b.instructions.data[i];
+    if (r.nodes.len == 0 || r.nodes.at[0].opcode != d.opcode) { ret res[bool, type_table.Error].ok{false}; }
+    var t: u32 = 0;
+    for (t < r.tests.len) {
+        val test: *rule.Test = ?r.tests.at[t];
+        t = t + 1;
+        val at: rule.Ref = test.at;
+        if (sel at.result) {
+            if (at.result.node != 0)                     { cnt; }
+            if (at.result.index::usize >= d.results.len) { ret res[bool, type_table.Error].ok{false}; }
+            val res_result: res[bool, type_table.Error] = holds_type(types, test, b.values.data[d.results.data[at.result.index]].type, register);
+            if (sel res_result.err) { ret res_result; }
+            if (!res_result.ok)     { ret res_result; }
+        }
+        if (sel at.operand) {
+            if (at.operand.node != 0) { cnt; }
+            val k: usize = at.operand.index::usize;
+            if (k >= d.operands.len) { ret res[bool, type_table.Error].ok{false}; }
+            val res_operand: res[bool, type_table.Error] = holds_type(types, test, b.values.data[d.operands.data[k]].type, register);
+            if (sel res_operand.err) { ret res_operand; }
+            var held: bool = res_operand.ok;
+            if (!held && k < 2 && d.operands.len >= 2) {
+                val res_other: res[bool, type_table.Error] = holds_type(types, test, b.values.data[d.operands.data[1 - k]].type, register);
+                if (sel res_other.err) { ret res_other; }
+                held = res_other.ok;
+            }
+            if (!held) { ret res[bool, type_table.Error].ok{false}; }
+        }
+    }
+    ret res[bool, type_table.Error].ok{true};
+}

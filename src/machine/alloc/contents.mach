@@ -1,0 +1,926 @@
+# the contents proof: every value an allocated form reads is in its place
+# when it is read, by a rule of its own
+#
+# the allocator leaves out copies, spills and reloads by the value map
+# (`mirl.machine.alloc.value`), so a proof that read the map would share a
+# wrong rule of it. this one follows the form as it is emitted, each copy
+# the allocator dropped left out, and holds at each point the values of the
+# input each place, a location or a frame slot, holds: a place holds part
+# `sub` of a value when, on every path to that point, a write put it there
+# and nothing wrote the place or the value since.
+#
+# - the proof runs twice. the first proves the dropped copies: at the
+#   function's entry no place holds anything, and at a block's start a place
+#   holds a value when it holds it at the end of every predecessor the walk
+#   has reached, so storage nothing wrote never holds a value. the second
+#   proves the reads, each dropped copy the first proved moving as emitted:
+#   a read needs its place to hold its value only on the paths that write the
+#   value, since on a path that writes it nowhere the input reads bits nothing
+#   made, as a vector expansion's zeroing `pxor` of a register it wrote last
+#   time round a loop, so at a block's start a place holds a value when every
+#   predecessor reached either holds it there or writes the value on no path,
+#   and the function's entry writes nothing. a place held so is never taken
+#   as the same bits as another, so no dropped copy is proved by it.
+# - an instruction of the input that writes a virtual register writes its
+#   value anew: no place holds the value any more, every place sharing
+#   storage with one it writes, by an operand, its footprint or a clobber,
+#   holds nothing, and the register's places then hold the value.
+# - a copy, a spill or a reload the allocator inserted, and a copy of the
+#   input between virtual registers of one class, moves what its source holds
+#   to its destination, and a copy of the input besides gives its destination
+#   its own value, written anew. it moves a value only where both its places
+#   hold all of the value's bits, its width (`function.virtual`) or its
+#   class's register: a register by its storage, a slot by its size, so a
+#   copy that moves fewer bits than the value has moves none of it.
+# - a slot address the allocator inserted holds its value when the input
+#   forms that very frame address, slot and displacement, at every write of
+#   the value (`remade.of`, the one reading of the input the proof shares
+#   with the allocator). the address is one value through the function, so
+#   the other places holding it keep it: they hold it only where a write put
+#   it there.
+# - a dropped copy writes nothing. it is proved when its source and its
+#   destination hold one value, two places a write of it put there, and then
+#   it moves as it would emitted, since the two hold the same bits. any other
+#   instruction dropped is refused, and so is a dropped copy that declassifies.
+# - a read of a virtual register is proved when each of its places holds its
+#   part of the register's value, or when no path to the read writes the
+#   value, a read of storage nothing wrote, as a copy into one member of a
+#   tuple reads the others, or a row reads a register whose bits do not
+#   matter to it, as the first insert into a vector reads its other lanes.
+#   a copy of the input whose source no path to it writes is refused: a copy
+#   only carries a value, so the input moves bits nothing made, as a branch
+#   whose rule took the compare it passes on an edge once did.
+#
+# the reads and writes of each instruction are the checker's own liveness's.
+# the blocks are walked in linear order until no block's end changes, the
+# places held only shrinking and the values written only growing, then once
+# more refusing the first read or dropped copy that does not hold. the pairs
+# held are one sorted list, so a write costs the pairs held: slower than the
+# map, and run only under the checker.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Event;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Site;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.alloc.remade;
+use mirl.machine.class;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.pseudo;
+use mirl.machine.storage;
+use mirl.machine.storage.Storage;
+
+use rf: masc.core.register;
+
+# no place, value or instruction
+pub val NONE: u32 = 0xffffffff;
+
+# what the proof is of
+# ---
+# f:         the virtual form
+# input:     the function the form is of
+# origin:    each virtual register of the form's register of the input,
+#            whose value it carries
+# sources:   each instruction of the form's instruction of the input, NONE
+#            for one the allocator inserted
+# dropped:   each instruction of the form, whether the result leaves it out
+# at:        the locations of the target
+# locations: each virtual register's location, NONE for one with none
+# l:         the form's liveness, as the checker computed it
+# events:    the form's reads and writes, by linear number
+# graph:     the form's blocks' edges
+# regs:      the registers of the selection, which fix each place's storage
+pub rec Given {
+    f:         *Function;
+    input:     *Function;
+    origin:    Slice[u32];
+    sources:   Slice[u32];
+    dropped:   Slice[bool];
+    at:        *Locations;
+    locations: Slice[u32];
+    l:         *Live;
+    events:    live.Events;
+    graph:     *Graph;
+    regs:      *rf.Available;
+}
+
+# why the proof refused a form
+# ---
+# alloc:     the allocator refused storage
+# missing:   a read of a virtual register whose place does not hold its value
+# unwritten: a copy of the input whose source no path to it writes
+# unequal:   a dropped instruction that is not a copy whose places hold one value
+pub tag Error: u8 {
+    alloc:     allocator.Error;
+    missing:   Site;
+    unwritten: Site;
+    unequal:   Instruction;
+}
+
+# the allocator's refusal `e` stands for, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc) { ret opt[allocator.Error].some{e.alloc}; }
+    ret opt[allocator.Error].none{};
+}
+
+# a place holding part `sub` of a value
+rec Pair {
+    at:    u32;
+    value: u32;
+    sub:   u32;
+}
+
+# where a copy's operand is: its place, NONE for one the proof does not follow,
+# and its virtual register, NONE for none
+rec Holder {
+    place:   u32;
+    virtual: u32;
+}
+
+# the proof as it walks
+# ---
+# words:    the words of a set of the input's values
+# remade:   per value of the input, the frame address every write of it forms
+# cur:      the pairs held at this point, sorted by place, value and part
+# defined:  the values written on some path to this point, by bit
+# temp:     the pairs a copy moves
+# walked:   per block, whether its end is known
+# from:     per block, its end's first pair in ends
+# size:     per block, its end's pairs
+# ends:     the pairs of every block's end, a changed end appended anew
+# defs:     per block, its end's defined set, words apiece
+# changed:  whether a walk changed some block's end
+# checking: whether this walk refuses what does not hold
+# reading:  whether this is the second proof, of the reads
+rec Proof {
+    g:        *Given;
+    words:    u32;
+    remade:   vector.Vector[remade.At];
+    cur:      vector.Vector[Pair];
+    defined:  vector.Vector[u64];
+    temp:     vector.Vector[Pair];
+    walked:   vector.Vector[bool];
+    from:     vector.Vector[u32];
+    size:     vector.Vector[u32];
+    ends:     vector.Vector[Pair];
+    defs:     vector.Vector[u64];
+    changed:  bool;
+    checking: bool;
+    reading:  bool;
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun pushed(r: res[usize, allocator.Error]) err[Error] {
+    if (sel r.err) { ret alloc_err(r.err); }
+    ret err[Error].ok{};
+}
+
+fun order(x: Pair, y: Pair) i64 {
+    if (x.at != y.at) {
+        if (x.at < y.at) { ret -1; }
+        ret 1;
+    }
+    if (x.value != y.value) {
+        if (x.value < y.value) { ret -1; }
+        ret 1;
+    }
+    if (x.sub < y.sub) { ret -1; }
+    if (x.sub > y.sub) { ret 1; }
+    ret 0;
+}
+
+# the first pair of the list not before `p`
+fun lower(m: *Proof, p: Pair) usize {
+    var lo: usize = 0;
+    var hi: usize = m.cur.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (order(m.cur.data[mid], p) < 0) { lo = mid + 1; }
+        or                                 { hi = mid; }
+    }
+    ret lo;
+}
+
+fun has(m: *Proof, at: u32, value: u32, sub: u32) bool {
+    val p: Pair  = Pair{at: at, value: value, sub: sub};
+    val k: usize = lower(m, p);
+    ret k < m.cur.len && order(m.cur.data[k], p) == 0;
+}
+
+fun add(m: *Proof, at: u32, value: u32, sub: u32) err[Error] {
+    if (at == NONE) { ret err[Error].ok{}; }
+    val p: Pair  = Pair{at: at, value: value, sub: sub};
+    val k: usize = lower(m, p);
+    if (k < m.cur.len && order(m.cur.data[k], p) == 0) { ret err[Error].ok{}; }
+    val res_in: res[usize, vector.VectorError] = vector.insert[Pair](?m.cur, k, p);
+    if (sel res_in.err) {
+        val e: vector.VectorError = res_in.err;
+        if (sel e.alloc) { ret alloc_err(e.alloc); }
+    }
+    ret err[Error].ok{};
+}
+
+fun bit_of(words: *u64, v: u32) bool {
+    ret ((words[(v / 64)::usize] >> (v % 64)::u64) & 1) != 0;
+}
+
+fun define(m: *Proof, v: u32) {
+    val k: usize = (v / 64)::usize;
+    m.defined.data[k] = m.defined.data[k] | ((1::u64) << (v % 64)::u64);
+}
+
+fun rows(m: *Proof) u32 {
+    ret location.count(m.g.at);
+}
+
+# a place holds nothing
+fun kill_at(m: *Proof, at: u32) {
+    val k: usize = lower(m, Pair{at: at, value: 0, sub: 0});
+    var e: usize = k;
+    for (e < m.cur.len && m.cur.data[e].at == at) { e = e + 1; }
+    if (e == k) { ret; }
+    var i: usize = e;
+    for (i < m.cur.len) {
+        m.cur.data[k + i - e] = m.cur.data[i];
+        i                     = i + 1;
+    }
+    m.cur.len = m.cur.len - (e - k);
+}
+
+# a place written: every place sharing its storage holds nothing
+fun kill_place(m: *Proof, at: u32) {
+    if (at == NONE) { ret; }
+    if (at >= rows(m)) {
+        kill_at(m, at);
+        ret;
+    }
+    val alias: Slice[u32] = location.shares(m.g.at, at);
+    var k:     usize      = 0;
+    for (k < alias.size) {
+        kill_at(m, alias.data[k]);
+        k = k + 1;
+    }
+}
+
+# whether a clobber set holds storage of location `at`
+fun clobbers(m: *Proof, set: u32, at: u32) bool {
+    ret live.clobbered(m.g.l, set, at);
+}
+
+# every place a clobber set holds storage of holds nothing
+fun kill_set(m: *Proof, set: u32) {
+    var last: u32   = NONE;
+    var gone: bool  = false;
+    var n:    usize = 0;
+    var i:    usize = 0;
+    for (i < m.cur.len) {
+        val p: Pair = m.cur.data[i];
+        if (p.at != last) {
+            last = p.at;
+            gone = p.at < rows(m) && clobbers(m, set, p.at);
+        }
+        if (!gone) {
+            m.cur.data[n] = p;
+            n             = n + 1;
+        }
+        i = i + 1;
+    }
+    m.cur.len = n;
+}
+
+# a value written anew: no place holds its old value
+fun redefine(m: *Proof, v: u32) {
+    define(m, v);
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < m.cur.len) {
+        if (m.cur.data[i].value != v) {
+            m.cur.data[n] = m.cur.data[i];
+            n             = n + 1;
+        }
+        i = i + 1;
+    }
+    m.cur.len = n;
+}
+
+# what a place holds, onto the temporary list
+fun collect(m: *Proof, at: u32) err[Error] {
+    if (at == NONE) { ret err[Error].ok{}; }
+    var k: usize = lower(m, Pair{at: at, value: 0, sub: 0});
+    for (k < m.cur.len && m.cur.data[k].at == at) {
+        val err_pushed: err[Error] = pushed(vector.push[Pair](?m.temp, m.cur.data[k]));
+        if (sel err_pushed.err) { ret err_pushed; }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the bits pair `p` carries: its value's width, or a register of its class
+fun need_of(m: *Proof, p: Pair) opt[Storage] {
+    var need: Storage = Storage{fixed: function.width_of(m.g.input, p.value), per: 0, scale: 0};
+    if (need.fixed == 0 || p.sub != 0) {
+        val opt_class: opt[Storage] = storage.of_class(m.g.regs, function.class_of(m.g.input, p.value));
+        if (sel opt_class.none) { ret opt[Storage].none{}; }
+        need = opt_class.some;
+    }
+    ret opt[Storage].some{need};
+}
+
+# whether two places hold one value: a pair both hold whose bits cover all of
+# one of the places, since a narrower value leaves upper bits distinct
+fun same_value(m: *Proof, x: u32, y: u32) bool {
+    if (x == NONE || y == NONE) { ret false; }
+    if (x == y)                 { ret true; }
+    val opt_x: opt[Storage] = capacity(m, x);
+    val opt_y: opt[Storage] = capacity(m, y);
+    if (sel opt_x.none) { ret false; }
+    if (sel opt_y.none) { ret false; }
+    val x_cap: Storage = opt_x.some;
+    val y_cap: Storage = opt_y.some;
+    var k:     usize   = lower(m, Pair{at: x, value: 0, sub: 0});
+    for (k < m.cur.len && m.cur.data[k].at == x) {
+        val p: Pair = m.cur.data[k];
+        if (has(m, y, p.value, p.sub)) {
+            val opt_need: opt[Storage] = need_of(m, p);
+            if (sel opt_need.some) {
+                val need: Storage = opt_need.some;
+                if (storage.covers(need, x_cap) || storage.covers(need, y_cap)) { ret true; }
+            }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun origin(m: *Proof, v: u32) u32 {
+    ret m.g.origin.data[v];
+}
+
+fun original(m: *Proof, i: Instruction) bool {
+    ret m.g.sources.data[i] != NONE;
+}
+
+fun span(m: *Proof, v: u32) u32 {
+    ret live.span(m.g.l, v);
+}
+
+# the place of a virtual register's part `sub`, NONE for none
+fun place_of(m: *Proof, v: u32, sub: u32) u32 {
+    val loc: u32 = m.g.locations.data[v];
+    if (loc == NONE) { ret NONE; }
+    val at: u32 = location.past(m.g.at, loc, sub);
+    if (at == location.NONE) { ret NONE; }
+    ret at;
+}
+
+fun refuse(m: *Proof, e: Error) err[Error] {
+    if (!m.checking)                  { ret err[Error].ok{}; }
+    if (m.reading == (sel e.unequal)) { ret err[Error].ok{}; }
+    ret err[Error].err{e};
+}
+
+# a read of virtual register `v` at operand `k` of instruction `i`, a copy's source where `copied`
+fun check_read(m: *Proof, i: Instruction, k: u32, v: u32, copied: bool) err[Error] {
+    val value: u32 = origin(m, v);
+    if (!bit_of(m.defined.data, value)) {
+        if (copied && original(m, i)) { ret refuse(m, Error.unwritten{Site{instruction: i, operand: k}}); }
+        ret err[Error].ok{};
+    }
+    var g: u32 = 0;
+    for (g < span(m, v)) {
+        val at: u32 = place_of(m, v, g);
+        if (at == NONE || !has(m, at, value, g)) { ret refuse(m, Error.missing{Site{instruction: i, operand: k}}); }
+        g = g + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# where an operand of a copy is, none for one of another kind
+fun holder(m: *Proof, o: Operand, out: *Holder) bool {
+    if (sel o.virtual) {
+        if (span(m, o.virtual) != 1) { ret false; }
+        @out = Holder{place: place_of(m, o.virtual, 0), virtual: o.virtual};
+        ret true;
+    }
+    if (sel o.physical) {
+        var at:          u32                          = NONE;
+        val res_located: res[u32, location.Unlocated] = location.locate(m.g.at, o.physical);
+        if (sel res_located.ok) { at = res_located.ok; }
+        @out = Holder{place: at, virtual: NONE};
+        ret true;
+    }
+    if (sel o.slot) {
+        @out = Holder{place: rows(m) + o.slot, virtual: NONE};
+        ret true;
+    }
+    ret false;
+}
+
+# the bits place `at` holds: a register's storage, a cell's, a slot's size,
+# none for a register whose storage no fixed and scaled part states
+fun capacity(m: *Proof, at: u32) opt[Storage] {
+    if (at >= rows(m)) {
+        val sd: function.SlotData = m.g.f.slots.data[at - rows(m)];
+        ret opt[Storage].some{storage.fold(m.g.regs, Storage{fixed: sd.size * 8, per: sd.per * 8, scale: sd.scale})};
+    }
+    val p: class.Physical = location.physical(m.g.at, at);
+    if (sel p.cell) { ret opt[Storage].some{Storage{fixed: p.cell.class.width::u64, per: 0, scale: 0}}; }
+    val opt_row: opt[*rf.Register] = rf.row_of(m.g.regs.file, p.register);
+    if (sel opt_row.none) { ret opt[Storage].none{}; }
+    ret storage.of_register(m.g.regs, opt_row.some);
+}
+
+# whether a copy between places `dst` and `src` moves pair `p`: both hold all
+# the bits of its part, its value's width, or a register of its class
+fun carries(m: *Proof, dst: u32, src: u32, p: Pair) bool {
+    val opt_need: opt[Storage] = need_of(m, p);
+    if (sel opt_need.none) { ret false; }
+    val opt_dst: opt[Storage] = capacity(m, dst);
+    val opt_src: opt[Storage] = capacity(m, src);
+    if (sel opt_dst.none) { ret false; }
+    if (sel opt_src.none) { ret false; }
+    ret storage.covers(opt_dst.some, opt_need.some) && storage.covers(opt_src.some, opt_need.some);
+}
+
+# whether a copy moves what its source holds: one inserted does, one of the
+# input between virtual registers of one class does
+fun moves(m: *Proof, i: Instruction, dst: Holder, src: Holder) bool {
+    if (dst.place == NONE || src.place == NONE)     { ret false; }
+    if (!original(m, i))                            { ret true; }
+    if (dst.virtual == NONE || src.virtual == NONE) { ret false; }
+    ret class.same(function.class_of(m.g.f, dst.virtual), function.class_of(m.g.f, src.virtual));
+}
+
+# a copy, spill or reload of two operands, emitted or dropped
+fun copy_step(m: *Proof, i: Instruction, d: *InstructionData, dst: Holder, src: Holder) err[Error] {
+    if (src.virtual != NONE) {
+        val err_read: err[Error] = check_read(m, i, 1, src.virtual, true);
+        if (sel err_read.err) { ret err_read; }
+    }
+    if (m.g.dropped.data[i]) {
+        if (d.declassifies || !moves(m, i, dst, src) || !same_value(m, dst.place, src.place)) {
+            val err_refused: err[Error] = refuse(m, Error.unequal{i});
+            if (sel err_refused.err) { ret err_refused; }
+        }
+    }
+    val own:   bool = original(m, i) && dst.virtual != NONE;
+    var value: u32  = NONE;
+    if (own) { value = origin(m, dst.virtual); }
+    vector.clear[Pair](?m.temp);
+    if (moves(m, i, dst, src)) {
+        val err_held: err[Error] = collect(m, src.place);
+        if (sel err_held.err) { ret err_held; }
+    }
+    kill_place(m, dst.place);
+    if (own) { redefine(m, value); }
+    var t: usize = 0;
+    for (t < m.temp.len) {
+        val p: Pair = m.temp.data[t];
+        if (p.value != value && carries(m, dst.place, src.place, p)) {
+            val err_added: err[Error] = add(m, dst.place, p.value, p.sub);
+            if (sel err_added.err) { ret err_added; }
+        }
+        t = t + 1;
+    }
+    if (own) { ret add(m, dst.place, value, 0); }
+    ret err[Error].ok{};
+}
+
+# a parallel copy: its sources read, then each destination given what its
+# source held before any was written
+fun parallel_step(m: *Proof, i: Instruction, d: *InstructionData) err[Error] {
+    val half: u32 = (d.operands.size / 2)::u32;
+    var dst:  Holder;
+    var src:  Holder;
+    var j:    u32 = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j + half], ?src);
+        if (src.virtual != NONE) {
+            val err_read: err[Error] = check_read(m, i, j + half, src.virtual, true);
+            if (sel err_read.err) { ret err_read; }
+        }
+        j = j + 1;
+    }
+    vector.clear[Pair](?m.temp);
+    j = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j], ?dst);
+        holder(m, d.operands.data[j + half], ?src);
+        if (moves(m, i, dst, src)) {
+            val start:    usize      = m.temp.len;
+            val err_held: err[Error] = collect(m, src.place);
+            if (sel err_held.err) { ret err_held; }
+            var t:    usize = start;
+            var kept: usize = start;
+            for (t < m.temp.len) {
+                if (carries(m, dst.place, src.place, m.temp.data[t])) {
+                    m.temp.data[kept]    = m.temp.data[t];
+                    m.temp.data[kept].at = j;
+                    kept                 = kept + 1;
+                }
+                t = t + 1;
+            }
+            m.temp.len = kept;
+        }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j], ?dst);
+        if (dst.virtual != NONE) { redefine(m, origin(m, dst.virtual)); }
+        kill_place(m, dst.place);
+        j = j + 1;
+    }
+    var t: usize = 0;
+    for (t < m.temp.len) {
+        val p: Pair = m.temp.data[t];
+        if (!parallel_writes(m, d, half, p.value)) {
+            holder(m, d.operands.data[p.at], ?dst);
+            val err_added: err[Error] = add(m, dst.place, p.value, p.sub);
+            if (sel err_added.err) { ret err_added; }
+        }
+        t = t + 1;
+    }
+    j = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j], ?dst);
+        if (dst.virtual != NONE) {
+            val err_added: err[Error] = add(m, dst.place, origin(m, dst.virtual), 0);
+            if (sel err_added.err) { ret err_added; }
+        }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether a parallel copy writes value `v` anew
+fun parallel_writes(m: *Proof, d: *InstructionData, half: u32, v: u32) bool {
+    var dst: Holder;
+    var j:   u32 = 0;
+    for (j < half) {
+        holder(m, d.operands.data[j], ?dst);
+        if (dst.virtual != NONE && origin(m, dst.virtual) == v) { ret true; }
+        j = j + 1;
+    }
+    ret false;
+}
+
+# a slot address the allocator inserted to make a value again
+fun remake_step(m: *Proof, d: *InstructionData) err[Error] {
+    val dest: Operand = d.operands.data[0];
+    if (!(sel dest.virtual)) { ret err[Error].ok{}; }
+    val value: u32       = origin(m, dest.virtual);
+    val at:    u32       = place_of(m, dest.virtual, 0);
+    val made:  remade.At = remade.addressed(d);
+    val held:  remade.At = m.remade.data[value];
+    define(m, value);
+    kill_place(m, at);
+    if (made.slot != remade.NONE && held.slot == made.slot && held.disp == made.disp) { ret add(m, at, value, 0); }
+    ret err[Error].ok{};
+}
+
+fun is_virtual(m: *Proof, value: u32) bool {
+    ret value != NONE && value < m.g.l.virtuals;
+}
+
+# an instruction by its reads and writes as liveness gathers them
+fun generic(m: *Proof, i: Instruction, n: u32) err[Error] {
+    val start: u32          = m.g.events.first.data[n];
+    val ev:    Slice[Event] = Slice[Event]{data: ?m.g.events.events.data[start], size: (m.g.events.first.data[n + 1] - start)::usize};
+    var j:     usize        = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set == NONE && !e.write && is_virtual(m, e.value)) {
+            val err_read: err[Error] = check_read(m, i, e.operand, e.value, false);
+            if (sel err_read.err) { ret err_read; }
+        }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set == NONE && e.write && is_virtual(m, e.value)) { redefine(m, origin(m, e.value)); }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set != NONE) { kill_set(m, e.set); }
+        or (e.write && is_virtual(m, e.value)) {
+            var g: u32 = 0;
+            for (g < span(m, e.value)) {
+                kill_place(m, place_of(m, e.value, g));
+                g = g + 1;
+            }
+        }
+        or (e.write && e.value != NONE) { kill_place(m, m.g.events.touched.data[e.value - m.g.l.virtuals]); }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < ev.size) {
+        val e: Event = ev.data[j];
+        if (e.set == NONE && e.write && is_virtual(m, e.value)) {
+            var g: u32 = 0;
+            for (g < span(m, e.value)) {
+                val err_added: err[Error] = add(m, place_of(m, e.value, g), origin(m, e.value), g);
+                if (sel err_added.err) { ret err_added; }
+                g = g + 1;
+            }
+        }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# whether every operand of a copy is a place the proof follows
+fun copyable(m: *Proof, d: *InstructionData) bool {
+    var h: Holder;
+    var k: usize = 0;
+    for (k < d.operands.size) {
+        if (!holder(m, d.operands.data[k], ?h)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+fun step(m: *Proof, i: Instruction, n: u32) err[Error] {
+    val d:  *InstructionData = function.data(m.g.f, i);
+    val op: Opcode           = d.opcode;
+    if (sel op.pseudo) {
+        val p: pseudo.Pseudo = op.pseudo;
+        if ((p == pseudo.COPY || p == pseudo.SPILL || p == pseudo.RELOAD) && d.operands.size == 2 && copyable(m, d)) {
+            var dst: Holder;
+            var src: Holder;
+            holder(m, d.operands.data[0], ?dst);
+            holder(m, d.operands.data[1], ?src);
+            ret copy_step(m, i, d, dst, src);
+        }
+    }
+    if (m.g.dropped.data[i]) {
+        val err_refused: err[Error] = refuse(m, Error.unequal{i});
+        if (sel err_refused.err) { ret err_refused; }
+    }
+    if (sel op.pseudo) {
+        val p: pseudo.Pseudo = op.pseudo;
+        if (p == pseudo.PARALLEL_COPY && copyable(m, d))                    { ret parallel_step(m, i, d); }
+        if (p == pseudo.ADDRESS && !original(m, i) && d.operands.size == 3) { ret remake_step(m, d); }
+    }
+    ret generic(m, i, n);
+}
+
+# the working list at block `b`'s start, and the values some walked predecessor writes: in the first proof the pairs
+# every walked predecessor's end holds, none at the entry, in the second each pair every walked predecessor's end
+# holds or writes the value of on no path, the entry writing nothing
+fun load(m: *Proof, b: u32) err[Error] {
+    vector.clear[Pair](?m.cur);
+    var w: usize = 0;
+    for (w < m.words::usize) {
+        m.defined.data[w] = 0;
+        w                 = w + 1;
+    }
+    val entry: bool       = b == graph.entry(m.g.graph);
+    val preds: Slice[u32] = graph.predecessors(m.g.graph, b);
+    var first: bool       = true;
+    var k:     usize      = 0;
+    for (k < preds.size) {
+        val q: u32 = preds.data[k];
+        k = k + 1;
+        if (!m.walked.data[q]) { cnt; }
+        val base: usize       = q::usize * m.words::usize;
+        val end:  Slice[Pair] = Slice[Pair]{data: ?m.ends.data[m.from.data[q]], size: m.size.data[q]::usize};
+        if (m.reading) {
+            val err_met: err[Error] = meet_open(m, end, ?m.defs.data[base]);
+            if (sel err_met.err) { ret err_met; }
+        }
+        or (entry) {}
+        or (first) {
+            val res_ext: res[usize, allocator.Error] = vector.extend[Pair](?m.cur, end);
+            if (sel res_ext.err) { ret alloc_err(res_ext.err); }
+        }
+        or {
+            meet_strict(m, end);
+        }
+        first = false;
+        w     = 0;
+        for (w < m.words::usize) {
+            m.defined.data[w] = m.defined.data[w] | m.defs.data[base + w];
+            w                 = w + 1;
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# the working list met with a predecessor's end: the pairs both hold
+fun meet_strict(m: *Proof, end: Slice[Pair]) {
+    var n: usize = 0;
+    var i: usize = 0;
+    var j: usize = 0;
+    for (i < m.cur.len && j < end.size) {
+        val c: i64 = order(m.cur.data[i], end.data[j]);
+        if (c == 0) {
+            m.cur.data[n] = m.cur.data[i];
+            n             = n + 1;
+            i             = i + 1;
+            j             = j + 1;
+        }
+        or (c < 0) { i = i + 1; }
+        or         { j = j + 1; }
+    }
+    m.cur.len = n;
+}
+
+# the working list met with a predecessor's end that writes the values `defs`: a pair both hold, one only the list
+# holds whose value the predecessor writes on no path, and one only the end holds whose value no predecessor met
+# before writes
+fun meet_open(m: *Proof, end: Slice[Pair], defs: *u64) err[Error] {
+    vector.clear[Pair](?m.temp);
+    var i: usize = 0;
+    var j: usize = 0;
+    for (i < m.cur.len || j < end.size) {
+        var c: i64 = 0;
+        if (i >= m.cur.len) { c = 1; }
+        or (j >= end.size)  { c = -1; }
+        or                  { c = order(m.cur.data[i], end.data[j]); }
+        var p:    Pair = Pair{at: 0, value: 0, sub: 0};
+        var kept: bool = false;
+        if (c == 0) {
+            p    = m.cur.data[i];
+            kept = true;
+            i    = i + 1;
+            j    = j + 1;
+        }
+        or (c < 0) {
+            p    = m.cur.data[i];
+            kept = !bit_of(defs, p.value);
+            i    = i + 1;
+        }
+        or {
+            p    = end.data[j];
+            kept = !bit_of(m.defined.data, p.value);
+            j    = j + 1;
+        }
+        if (kept) {
+            val err_pushed: err[Error] = pushed(vector.push[Pair](?m.temp, p));
+            if (sel err_pushed.err) { ret err_pushed; }
+        }
+    }
+    vector.clear[Pair](?m.cur);
+    ret pushed(vector.extend[Pair](?m.cur, Slice[Pair]{data: m.temp.data, size: m.temp.len}));
+}
+
+# block `b`'s end as the working list leaves it, appended where it changed
+fun settle(m: *Proof, b: u32) err[Error] {
+    val base: usize = b::usize * m.words::usize;
+    var same: bool  = m.walked.data[b] && m.size.data[b]::usize == m.cur.len;
+    var w:    usize = 0;
+    for (same && w < m.words::usize) {
+        if (m.defs.data[base + w] != m.defined.data[w]) { same = false; }
+        w = w + 1;
+    }
+    var i: usize = 0;
+    for (same && i < m.cur.len) {
+        if (order(m.ends.data[m.from.data[b]::usize + i], m.cur.data[i]) != 0) { same = false; }
+        i = i + 1;
+    }
+    if (same) { ret err[Error].ok{}; }
+    m.changed        = true;
+    m.walked.data[b] = true;
+    m.from.data[b]   = m.ends.len::u32;
+    m.size.data[b]   = m.cur.len::u32;
+    w                = 0;
+    for (w < m.words::usize) {
+        m.defs.data[base + w] = m.defined.data[w];
+        w                     = w + 1;
+    }
+    ret pushed(vector.extend[Pair](?m.ends, Slice[Pair]{data: m.cur.data, size: m.cur.len}));
+}
+
+# whether block `b` is reached: the entry, or a block a walked one leads to
+fun reached(m: *Proof, b: u32) bool {
+    if (b == graph.entry(m.g.graph)) { ret true; }
+    val preds: Slice[u32] = graph.predecessors(m.g.graph, b);
+    var k:     usize      = 0;
+    for (k < preds.size) {
+        if (m.walked.data[preds.data[k]]) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun walk(m: *Proof) err[Error] {
+    m.changed = false;
+    val l: *Live = m.g.l;
+    var o: usize = 0;
+    for (o < l.order.len) {
+        val b: u32 = l.order.data[o];
+        o = o + 1;
+        if (!reached(m, b)) { cnt; }
+        val err_loaded: err[Error] = load(m, b);
+        if (sel err_loaded.err) { ret err_loaded; }
+        val list:  Slice[Instruction] = function.instructions(m.g.f, b);
+        val first: u32                = l.starts.data[b] / 2;
+        var j:     usize              = 0;
+        for (j < list.size) {
+            val err_stepped: err[Error] = step(m, list.data[j], first + j::u32);
+            if (sel err_stepped.err) { ret err_stepped; }
+            j = j + 1;
+        }
+        if (!m.checking) {
+            val err_settled: err[Error] = settle(m, b);
+            if (sel err_settled.err) { ret err_settled; }
+        }
+    }
+    ret err[Error].ok{};
+}
+
+fun dnit(m: *Proof) {
+    vector.dnit[remade.At](?m.remade);
+    vector.dnit[Pair](?m.cur);
+    vector.dnit[u64](?m.defined);
+    vector.dnit[Pair](?m.temp);
+    vector.dnit[bool](?m.walked);
+    vector.dnit[u32](?m.from);
+    vector.dnit[u32](?m.size);
+    vector.dnit[Pair](?m.ends);
+    vector.dnit[u64](?m.defs);
+}
+
+# prove that every value a form reads is in its place, the copies the given
+# names dropped left out
+# ---
+# a:   the allocator the proof takes
+# g:   the form, its input, its assignment, its liveness and its drops
+# ret: ok, or the first read or dropped instruction that does not hold
+pub fun prove(a: *allocator.Allocator, g: *Given) err[Error] {
+    val blocks: usize = g.f.blocks.len;
+    var m:      Proof = Proof{
+        g:        g,
+        words:    ((g.input.virtuals.len + 63) / 64)::u32,
+        remade:   vector.init[remade.At](a),
+        cur:      vector.init[Pair](a),
+        defined:  vector.init[u64](a),
+        temp:     vector.init[Pair](a),
+        walked:   vector.init[bool](a),
+        from:     vector.init[u32](a),
+        size:     vector.init[u32](a),
+        ends:     vector.init[Pair](a),
+        defs:     vector.init[u64](a),
+        changed:  false,
+        checking: false,
+        reading:  false,
+    };
+    fin { dnit(?m); }
+    var err_failed: err[allocator.Error] = remade.of(g.input, ?m.remade);
+    keep(?err_failed, slice.fill[u64](?m.defined, m.words::usize, 0));
+    keep(?err_failed, slice.fill[bool](?m.walked, blocks, false));
+    keep(?err_failed, slice.fill[u32](?m.from, blocks, 0));
+    keep(?err_failed, slice.fill[u32](?m.size, blocks, 0));
+    keep(?err_failed, slice.fill[u64](?m.defs, blocks * m.words::usize, 0));
+    if (sel err_failed.err) { ret alloc_err(err_failed.err); }
+    if (blocks == 0)        { ret err[Error].ok{}; }
+    val err_dropped: err[Error] = run(?m);
+    if (sel err_dropped.err) { ret err_dropped; }
+    vector.clear[Pair](?m.ends);
+    vector.clear[bool](?m.walked);
+    val err_cleared: err[allocator.Error] = slice.fill[bool](?m.walked, blocks, false);
+    if (sel err_cleared.err) { ret alloc_err(err_cleared.err); }
+    m.reading = true;
+    ret run(?m);
+}
+
+# one proof: walks until no block's end changes, then one that refuses
+fun run(m: *Proof) err[Error] {
+    m.checking = false;
+    for {
+        val err_walked: err[Error] = walk(m);
+        if (sel err_walked.err) { ret err_walked; }
+        if (!m.changed)         { brk; }
+    }
+    m.checking = true;
+    ret walk(m);
+}

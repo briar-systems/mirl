@@ -1,0 +1,299 @@
+# typed address folding: an address a row forms from the type it walks
+# becomes the byte offset the target's data layout gives, added to the
+# address it starts at
+#
+# a row that forms the address of a member states the structure and the
+# member, and its offset is the member's offset in the data layout. a row
+# that forms the address of an element states the array, and its offset is
+# the index read as signed at the pointer's width times the array's stride,
+# one constant where the index is one. each is laid out by the rules of the
+# space of the address it takes. every offset is an integer as wide as the
+# pointer, and the address is a `ptr.add` of it in the slot of the row it
+# replaces. a member of a member, or an element at a constant index, is one
+# add from the address the outer one starts at, their offsets summed, so a
+# nested field costs what a field does. an offset of zero is no add: the
+# address is the one it starts at, where it has the same type. the pass applies where the target's
+# addressing is physical, and a target whose addressing is logical keeps the
+# typed forms, which reach memory through access chains.
+#
+# the folding is an extension or truncation, a multiply and an add, with no
+# branch and no memory access, so it keeps constant time. a result keeps its
+# secrecy by the secrecy of the instructions it is made of.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.allocator.arena;
+
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.function.Body;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Indexed;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.rule.Member;
+use mirl.ir.opcode.rule.Subject;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.legal.emit;
+use mirl.legal.emit.Past;
+use mirl.legal.emit.Site;
+use mirl.pass.analysis;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.target.basis;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use target_record: mirl.target.record;
+
+# the pass: it adds instructions in front of the typed addresses it folds and
+# never touches an edge or a block
+pub val ADDRESS: Pass = Pass{name: "address", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: physical};
+
+# whether a target's addresses are numbers a byte offset is added to
+fun physical(g: *Ground) bool {
+    ret sel g.t.caps.addressing.physical;
+}
+
+# one visit
+# ---
+# site:    the function being rewritten
+# layout:  the target's data layout of the module's types
+# changed: the function was changed
+rec Work {
+    site:    Site;
+    layout:  Layout;
+    changed: bool;
+}
+
+fun types_failed[T](e: table.Error) res[T, refusal.Error] {
+    ret res[T, refusal.Error].err{refusal.Error.ir{module.Error.types{e}}};
+}
+
+fun unlaid[T](what: str) res[T, refusal.Error] {
+    ret res[T, refusal.Error].err{refusal.Error.reason{what}};
+}
+
+# the type a subject of a row names in an instruction: an operand's, or the
+# one a type immediate holds
+fun subject_type(s: *Site, d: *InstructionData, at: Subject) res[Type, refusal.Error] {
+    if (sel at.operand) {
+        val n: u32 = at.operand;
+        if (n::usize < d.operands.len) { ret res[Type, refusal.Error].ok{s.b.values.data[d.operands.data[n]].type}; }
+    }
+    if (sel at.immediate) {
+        val n: u32 = at.immediate;
+        if (n::usize < d.immediates.len) {
+            val imm: Immediate = d.immediates.data[n];
+            if (sel imm.ty) { ret res[Type, refusal.Error].ok{imm.ty}; }
+        }
+    }
+    ret unlaid[Type]("a typed address whose row names a type the instruction does not hold");
+}
+
+# the address space of a pointer type
+fun space_of(w: *Work, pointer: Type) res[u32, refusal.Error] {
+    val res_shape: res[table.Shape, table.Error] = table.shape(?w.site.m.types, pointer);
+    if (sel res_shape.err)           { ret types_failed[u32](res_shape.err); }
+    if (!(sel res_shape.ok.pointer)) { ret unlaid[u32]("a typed address whose address is not a pointer"); }
+    ret res[u32, refusal.Error].ok{res_shape.ok.pointer.space};
+}
+
+# the integer as wide as a pointer of a type in its space
+fun word_of(w: *Work, pointer: Type, space: u32) res[Type, refusal.Error] {
+    val res_bytes: res[u64, target_record.Error] = layout.size(?w.layout, pointer, space);
+    if (sel res_bytes.err) { ret unlaid[Type]("a typed address of a pointer with no size in memory"); }
+    val res_made: res[Type, table.Error] = table.intern(?w.site.m.types, table.Shape.integer{table.Integer{width: (res_bytes.ok * 8)::u32}});
+    if (sel res_made.err) { ret types_failed[Type](res_made.err); }
+    ret res[Type, refusal.Error].ok{res_made.ok};
+}
+
+# the byte offset of the member a row names in a space
+fun member_offset(w: *Work, d: *InstructionData, mb: Member, space: u32) res[u64, refusal.Error] {
+    val res_subject_type: res[Type, refusal.Error] = subject_type(?w.site, d, mb.of);
+    if (sel res_subject_type.err)           { ret res[u64, refusal.Error].err{res_subject_type.err}; }
+    if (mb.slot::usize >= d.immediates.len) { ret unlaid[u64]("a member address whose row names no member immediate"); }
+    val imm: Immediate = d.immediates.data[mb.slot];
+    if (!(sel imm.member)) { ret unlaid[u64]("a member address whose member immediate holds no index"); }
+    val res_offset: res[u64, target_record.Error] = layout.offset(?w.layout, res_subject_type.ok, space, imm.member);
+    if (sel res_offset.err) { ret unlaid[u64]("a member address of a structure the data layout does not place"); }
+    ret res[u64, refusal.Error].ok{res_offset.ok};
+}
+
+# the address a constant offset `bytes` from `address` is one add from, summed with the
+# offset of an outer constant add (`emit.past`) and wrapped to a word of `bits`
+fun folded(w: *Work, address: Value, bytes: u64, bits: u32) Past {
+    var at:        Past      = Past{base: address, bytes: bytes};
+    val opt_outer: opt[Past] = emit.past(?w.site, address);
+    if (sel opt_outer.some) {
+        at.base  = opt_outer.some.base;
+        at.bytes = bytes + opt_outer.some.bytes;
+    }
+    if (bits < 64) { at.bytes = at.bytes & ((1::u64 << bits::u64) - 1); }
+    ret at;
+}
+
+# the stride of the array a row names in a space, in bytes
+fun element_stride(w: *Work, d: *InstructionData, ix: Indexed, space: u32) res[u64, refusal.Error] {
+    val res_subject_type: res[Type, refusal.Error] = subject_type(?w.site, d, ix.of);
+    if (sel res_subject_type.err) { ret res[u64, refusal.Error].err{res_subject_type.err}; }
+    val res_step: res[u64, target_record.Error] = layout.stride(?w.layout, res_subject_type.ok, space);
+    if (sel res_step.err) { ret unlaid[u64]("an element address of an array the data layout does not lay out"); }
+    ret res[u64, refusal.Error].ok{res_step.ok};
+}
+
+# the byte offset of the element at constant index `known`, read as signed at its type's `width`, of an array of
+# stride `step`, at a word of `bits`
+fun element_offset(known: u64, width: u32, step: u64, bits: u32) u64 {
+    var index: u64 = known;
+    if (width < 64 && ((index >> (width - 1)::u64) & 1) != 0) { index = index | (~(0::u64) << width::u64); }
+    var bytes: u64 = index * step;
+    if (bits < 64) { bytes = bytes & ((1::u64 << bits::u64) - 1); }
+    ret bytes;
+}
+
+# the index read as signed at the width of the word
+fun widened(s: *Site, index: Value, word_type: Type, bits: u32) res[Value, refusal.Error] {
+    val res_width: res[u32, table.Error] = table.width(?s.m.types, s.b.values.data[index].type);
+    if (sel res_width.err)   { ret types_failed[Value](res_width.err); }
+    if (res_width.ok < bits) { ret res[Value, refusal.Error].ok{emit.convert(s, opcode_table.EXT_S, index, word_type)}; }
+    if (res_width.ok > bits) { ret res[Value, refusal.Error].ok{emit.convert(s, opcode_table.TRUNC, index, word_type)}; }
+    ret res[Value, refusal.Error].ok{index};
+}
+
+# the address of typed address `i` at a constant `bytes` past `from`: `from` itself where `bytes` is zero and it is of
+# the address's type and no more secret, else a `ptr.add` of the word in the slot of `i`
+fun placed(w: *Work, i: Instruction, from: Value, bytes: u64, word: Type) err[refusal.Error] {
+    val s:   *Site = ?w.site;
+    val old: Value = s.b.instructions.data[i].results.data[0];
+    if (bytes == 0 && table.same(s.b.values.data[from].type, s.b.values.data[old].type) && (s.b.values.data[old].secret || !s.b.values.data[from].secret)) {
+        val err_forwarded: err[refusal.Error] = refusal.edit(body.replace(s.m, s.f, old, from, Records.follow{}));
+        if (sel err_forwarded.err) { ret err_forwarded; }
+        val err_gone: err[refusal.Error] = refusal.edit(body.erase(s.m, s.f, i));
+        if (sel err_gone.err) { ret err_gone; }
+        w.changed = true;
+        ret err[refusal.Error].ok{};
+    }
+    val res_offset: res[Value, refusal.Error] = emit.word_constant(s, word, bytes);
+    if (sel res_offset.err) { ret err[refusal.Error].err{res_offset.err}; }
+    emit.begin(s, i);
+    emit.end(s, i);
+    emit.binary(s, opcode_table.PTR_ADD, from, res_offset.ok);
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret err_built; }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# fold an instruction if its row forms a typed address
+fun fold(w: *Work, i: Instruction) err[refusal.Error] {
+    val s:       *Site            = ?w.site;
+    val d:       *InstructionData = ?s.b.instructions.data[i];
+    val opt_row: opt[*Row]        = opcode_table.at(d.opcode);
+    if (sel opt_row.none)                                                    { ret err[refusal.Error].ok{}; }
+    if (!(sel opt_row.some.forms.member) && !(sel opt_row.some.forms.index)) { ret err[refusal.Error].ok{}; }
+    val r:         *Row     = opt_row.some;
+    val opt_start: opt[u32] = opcode_row.base(r);
+    if (sel opt_start.none) { ret err[refusal.Error].err{refusal.Error.reason{"a typed address whose row takes no address"}}; }
+    val at: u32 = opt_start.some;
+    if (at::usize >= d.operands.len) { ret err[refusal.Error].err{refusal.Error.reason{"a typed address whose row takes no address"}}; }
+    val address: Value = d.operands.data[at];
+    val pointer: Type  = s.b.values.data[address].type;
+
+    val res_space: res[u32, refusal.Error] = space_of(w, pointer);
+    if (sel res_space.err) { ret err[refusal.Error].err{res_space.err}; }
+    val res_word_type: res[Type, refusal.Error] = word_of(w, pointer, res_space.ok);
+    if (sel res_word_type.err) { ret err[refusal.Error].err{res_word_type.err}; }
+    val res_bits: res[u32, table.Error] = table.width(?s.m.types, res_word_type.ok);
+    if (sel res_bits.err) { ret err[refusal.Error].err{refusal.Error.ir{module.Error.types{res_bits.err}}}; }
+
+    if (sel r.forms.member) {
+        val res_member_offset: res[u64, refusal.Error] = member_offset(w, d, r.forms.member, res_space.ok);
+        if (sel res_member_offset.err) { ret err[refusal.Error].err{res_member_offset.err}; }
+        # a member of a member is one add from the address the outer one starts at, the sum
+        # of their offsets, so no register holds the address between them
+        val past: Past = folded(w, address, res_member_offset.ok, res_bits.ok);
+        ret placed(w, i, past.base, past.bytes, res_word_type.ok);
+    }
+    or (sel r.forms.index) {
+        val ix: Indexed = r.forms.index;
+        if (ix.operand::usize >= d.operands.len) { ret err[refusal.Error].err{refusal.Error.reason{"an element address whose row names no index operand"}}; }
+        val index:      Value                   = d.operands.data[ix.operand];
+        val res_stride: res[u64, refusal.Error] = element_stride(w, d, ix, res_space.ok);
+        if (sel res_stride.err) { ret err[refusal.Error].err{res_stride.err}; }
+        val opt_known: opt[u64] = emit.known(s, index);
+        if (sel opt_known.some) {
+            # an element at a constant index is a constant offset, as a member is, summed with an outer one
+            val res_width: res[u32, table.Error] = table.width(?s.m.types, s.b.values.data[index].type);
+            if (sel res_width.err) { ret err[refusal.Error].err{refusal.Error.ir{module.Error.types{res_width.err}}}; }
+            val past: Past = folded(w, address, element_offset(opt_known.some, res_width.ok, res_stride.ok, res_bits.ok), res_bits.ok);
+            ret placed(w, i, past.base, past.bytes, res_word_type.ok);
+        }
+        or {
+            val res_step: res[Value, refusal.Error] = emit.word_constant(s, res_word_type.ok, res_stride.ok);
+            if (sel res_step.err) { ret err[refusal.Error].err{res_step.err}; }
+            emit.begin(s, i);
+            val res_wide: res[Value, refusal.Error] = widened(s, index, res_word_type.ok, res_bits.ok);
+            if (sel res_wide.err) { ret err[refusal.Error].err{res_wide.err}; }
+            val offset: Value = emit.binary(s, opcode_table.MUL, res_wide.ok, res_step.ok);
+            emit.end(s, i);
+            emit.binary(s, opcode_table.PTR_ADD, address, offset);
+        }
+    }
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret err[refusal.Error].err{err_built.err}; }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# fold the typed addresses of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+
+    var w: Work = Work{site: emit.init(c.m, u.f, res_body.ok, ?scratch), layout: layout.of(c.t, ?c.m.types, basis.context_of(c.basis)), changed: false};
+    fin { emit.dnit(?w.site); }
+    var k: usize = 0;
+    for (k < res_body.ok.blocks.len) {
+        if (!res_body.ok.blocks.data[k].erased) {
+            var n: Instruction = res_body.ok.blocks.data[k].first;
+            for (n != NO_INSTRUCTION) {
+                arena.reset(?ar);
+                val i: Instruction = n;
+                n = res_body.ok.instructions.data[i].next;
+                val err_fold: err[refusal.Error] = fold(?w, i);
+                if (sel err_fold.err) { ret res[bool, refusal.Error].err{err_fold.err}; }
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{w.changed};
+}

@@ -1,0 +1,355 @@
+# the values a function forms from a frame slot's address and constants alone
+#
+# a value is a pure function of the frame pointer and constants when every
+# write of it is a slot address (`pseudo.ADDRESS`: a slot and a displacement)
+# or an instruction that writes it as another such value plus a number and
+# does nothing else, as masc's offset relation states x86 lea, aarch64's add of
+# an immediate and risc-v addi, writing the whole of a register of the class
+# it reads, since a relation holds only in the low bits of the narrower
+# register it names. such a value is never stored: the allocator
+# leaves its writes out and makes it again, a slot address of its slot and
+# displacement, at each run of its reads (`spill`), and the value map proves
+# what it made against this same reading of the input (`value`). so a frame
+# address never passes through memory, and every access through it stays off
+# a register the frame sets from the stack or frame pointer, as a constant-time
+# walk places it. the reading runs over the function's writes to a fixed
+# point: each value starts with no address, takes the one its first write
+# gives, and loses it to a write that gives another, to a write by any other
+# instruction, and to a write from a value that has none.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.slice;
+use mirl.machine.class;
+use mirl.machine.class.Class;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.pseudo;
+
+use masc.core.effect;
+use masc.core.field;
+use mo:   masc.core.operand;
+use rf:   masc.core.register;
+use rows: masc.core.row;
+
+# no slot
+pub val NONE: u32 = 0xffffffff;
+
+# more than one frame address, or a write of another kind
+val MANY: u32 = 0xfffffffe;
+
+# no write seen yet
+val UNSEEN: u32 = 0xfffffffd;
+
+# the frame address a value holds: its slot's address plus `disp`, NONE as the slot for a value that holds none
+pub rec At {
+    slot: u32;
+    disp: i64;
+}
+
+# an instruction that writes a register as another plus a number and does nothing else
+# ---
+# to:   the operand it writes, a virtual register
+# from: the operand whose register it starts from, a virtual register or an address whose base is one
+# by:   the number it adds
+pub rec Moved {
+    to:   u32;
+    from: u32;
+    by:   i64;
+}
+
+# the frame address a slot address of operands `d` writes, the slot NONE for an instruction that is none
+pub fun addressed(d: *InstructionData) At {
+    val op: Opcode = d.opcode;
+    if (sel op.pseudo) {
+        if (op.pseudo == pseudo.ADDRESS && d.operands.size == 3) {
+            val at:   Operand = d.operands.data[1];
+            val disp: Operand = d.operands.data[2];
+            if (sel at.slot) {
+                if (sel disp.immediate) { ret At{slot: at.slot, disp: disp.immediate}; }
+            }
+        }
+    }
+    ret At{slot: NONE, disp: 0};
+}
+
+fun empty(s: effect.Set) bool {
+    var w: u32 = 0;
+    for (w < s.len) {
+        if (s.words[w] != 0) { ret false; }
+        w = w + 1;
+    }
+    ret true;
+}
+
+# the number an immediate operand of `d` holds, none for another operand
+fun number(d: *InstructionData, n: u8) opt[i64] {
+    if (n::usize >= d.operands.size) { ret opt[i64].none{}; }
+    val o: Operand = d.operands.data[n::usize];
+    if (sel o.immediate) { ret opt[i64].some{o.immediate}; }
+    ret opt[i64].none{};
+}
+
+# whether `r` writes nothing but its operand `to`: no memory, no control transfer, no flag and no register no operand
+# names, and no other operand written
+fun only_writes(d: *InstructionData, r: *rows.Row, to: u32) bool {
+    val e: *effect.Effect = r.effect;
+    if (e.memory.len != 0 || e.control.transfer != effect.NONE) { ret false; }
+    if (!empty(e.flags.written) || !empty(e.flags.undefined))   { ret false; }
+    val regs: effect.Registers = e.implicit;
+    if (sel regs.ruled && !empty(regs.ruled.may.written))   { ret false; }
+    if (sel regs.opaque && !empty(regs.opaque.may.written)) { ret false; }
+    var k: usize = 0;
+    for (k < d.implicit.size) {
+        if (d.implicit.data[k].write) { ret false; }
+        k = k + 1;
+    }
+    var n: u32 = 0;
+    for (n < d.operands.size::u32) {
+        val o: Operand = d.operands.data[n::usize];
+        if (sel o.tied)                                                                       { ret false; }
+        if (n != to && (instruction.role(d.opcode, d.operands.size::u32, n) & mo.WRITE) != 0) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# whether `o` names a register, virtual or physical
+fun register(o: Operand) bool {
+    ret sel o.virtual || sel o.physical;
+}
+
+# whether operand `n` of `d` is an address of a register base plus its displacement alone
+fun plain(d: *InstructionData, n: u8) bool {
+    if (n::usize >= d.operands.size) { ret false; }
+    val o: Operand = d.operands.data[n::usize];
+    if (!(sel o.address))                                                                    { ret false; }
+    if (sel o.address.index.some || sel o.address.segment.some || sel o.address.symbol.some) { ret false; }
+    if (o.address.mode != mo.OFFSET)                                                         { ret false; }
+    val opt_base: opt[Register] = o.address.base;
+    if (sel opt_base.some) {
+        val b: Register = opt_base.some;
+        ret sel b.virtual || sel b.physical;
+    }
+    ret false;
+}
+
+# the move of an instruction that writes a register as another plus a number by an offset relation its row states,
+# and does nothing else, its registers virtual or physical. none for any other
+pub fun moved(d: *InstructionData) opt[Moved] {
+    val op: Opcode = d.opcode;
+    if (!(sel op.row)) { ret opt[Moved].none{}; }
+    val r: *rows.Row = op.row;
+    if (r.effect == nil) { ret opt[Moved].none{}; }
+    val e: *effect.Effect = r.effect;
+    var k: u32            = 0;
+    for (k < e.relations.len) {
+        val rel: effect.Relation = e.relations.at[k];
+        k = k + 1;
+        val to: effect.Place = rel.to;
+        val h:  effect.Holds = rel.holds;
+        var m:  u32          = NONE;
+        if (sel to.operand)                           { m = to.operand::u32; }
+        if (m == NONE || m::usize >= d.operands.size) { cnt; }
+        if (!register(d.operands.data[m::usize]))     { cnt; }
+        var o: effect.Offset;
+        if (sel h.offset) { o = h.offset; }
+        or                { cnt; }
+        if (o.when != field.NO_OPERAND) {
+            val opt_when: opt[i64] = number(d, o.when);
+            if (!(sel opt_when.some && opt_when.some == o.equals)) { cnt; }
+        }
+        var bits: u64 = 0;
+        if (o.shift != field.NO_OPERAND) {
+            val opt_units: opt[i64] = number(d, o.shift);
+            var units:     i64      = -1;
+            if (sel opt_units.some) { units = opt_units.some; }
+            if (units < 0)          { cnt; }
+            bits = units::u64 * o.step::u64;
+            if (bits >= 64) { cnt; }
+        }
+        var from: u32           = NONE;
+        val src:  effect.Source = o.from;
+        if (sel src.operand) {
+            if (src.operand::usize >= d.operands.size)          { cnt; }
+            if (!register(d.operands.data[src.operand::usize])) { cnt; }
+            from = src.operand::u32;
+        }
+        or (sel src.base) {
+            if (!plain(d, src.base)) { cnt; }
+            from = src.base::u32;
+        }
+        or { cnt; }
+        var add: i64           = 0;
+        val by:  effect.Addend = o.by;
+        if (sel by.immediate) {
+            val opt_held: opt[i64] = number(d, by.immediate);
+            if (sel opt_held.none) { cnt; }
+            add = opt_held.some;
+        }
+        or (sel by.displacement) {
+            if (by.displacement::u32 != from || !(sel src.base)) { cnt; }
+            val a: Operand = d.operands.data[from::usize];
+            if (sel a.address) { add = a.address.disp; }
+        }
+        or (sel by.held) { cnt; }
+        add = (add::u64 << bits)::i64;
+        if (o.negated)             { add = 0 - add; }
+        if (!only_writes(d, r, m)) { cnt; }
+        ret opt[Moved].some{Moved{to: m, from: from, by: add + o.constant}};
+    }
+    ret opt[Moved].none{};
+}
+
+# the virtual register operand `n` of `d` names, as a register or as an address's base, NONE for a physical one
+fun source_of(d: *InstructionData, n: u32) u32 {
+    val o: Operand = d.operands.data[n::usize];
+    if (sel o.virtual) { ret o.virtual; }
+    if (sel o.address) {
+        val opt_base: opt[Register] = o.address.base;
+        if (sel opt_base.some) {
+            val b: Register = opt_base.some;
+            if (sel b.virtual) { ret b.virtual; }
+        }
+    }
+    ret NONE;
+}
+
+# a write of value `v` giving frame address `at`, the slot MANY for a write that gives none
+fun wrote(out: *vector.Vector[At], v: u32, at: At, changed: *bool) {
+    val was: At = out.data[v::usize];
+    if (was.slot == MANY) { ret; }
+    if (was.slot == UNSEEN && at.slot != MANY) {
+        out.data[v::usize] = at;
+        @changed           = true;
+        ret;
+    }
+    if (was.slot == at.slot && was.disp == at.disp) { ret; }
+    out.data[v::usize] = At{slot: MANY, disp: 0};
+    @changed           = true;
+}
+
+# one sweep of the function's writes. `settled` takes a write from a value with no address yet as one that gives none
+fun sweep(f: *Function, out: *vector.Vector[At], settled: bool) bool {
+    var changed: bool  = false;
+    var b:       usize = 0;
+    for (b < f.blocks.len) {
+        val list: Slice[operand.Instruction] = function.instructions(f, b::u32);
+        b = b + 1;
+        var j: usize = 0;
+        for (j < list.size) {
+            val d: *InstructionData = function.data(f, list.data[j]);
+            j = j + 1;
+            swept(f, d, out, settled, ?changed);
+        }
+    }
+    ret changed;
+}
+
+# whether move `mv` of `d` writes the whole of its destination, of the class of the value it starts from, from the
+# whole of that value: a relation holds only in the low bits of the narrower register it names. whole at the widest the
+# class takes under any multiplier is whole at every width a scaled class (risc-v's xlen registers) has
+fun whole(f: *Function, d: *InstructionData, mv: Moved, from: u32, dest: u32) bool {
+    if (from == NONE || dest == NONE) { ret false; }
+    val c: Class = f.virtuals.data[dest::usize];
+    if (!class.same(c, f.virtuals.data[from::usize])) { ret false; }
+    if (!(sel c.hardware))                            { ret false; }
+    val index: u16 = c.hardware.index;
+    val bits:  u64 = rf.width_most(c.hardware.file, index);
+    if (!instruction.whole(d.opcode, mv.to, index, bits)) { ret false; }
+    val src: Operand = d.operands.data[mv.from::usize];
+    if (sel src.virtual) { ret instruction.whole(d.opcode, mv.from, index, bits); }
+    ret true;
+}
+
+# the writes of instruction `d`, as `sweep` takes them
+fun swept(f: *Function, d: *InstructionData, out: *vector.Vector[At], settled: bool, changed: *bool) {
+    val made:     At  = addressed(d);
+    var moved_to: u32 = NONE;
+    if (made.slot == NONE) {
+        val opt_moved: opt[Moved] = moved(d);
+        if (sel opt_moved.some) {
+            val mv:   Moved = opt_moved.some;
+            val from: u32   = source_of(d, mv.from);
+            moved_to = mv.to;
+            val wrote_to: Operand = d.operands.data[mv.to::usize];
+            var dest:     u32     = NONE;
+            if (sel wrote_to.virtual)         { dest = wrote_to.virtual; }
+            if (dest == NONE)                 {}
+            or (!whole(f, d, mv, from, dest)) { wrote(out, dest, At{slot: MANY, disp: 0}, changed); }
+            or {
+                val src: At = out.data[from::usize];
+                if (src.slot == UNSEEN) {
+                    if (settled) { wrote(out, dest, At{slot: MANY, disp: 0}, changed); }
+                }
+                or (src.slot == MANY) { wrote(out, dest, src, changed); }
+                or                    { wrote(out, dest, At{slot: src.slot, disp: src.disp + mv.by}, changed); }
+            }
+        }
+    }
+    var n: u32 = 0;
+    for (n < d.operands.size::u32) {
+        val o:      Operand = d.operands.data[n::usize];
+        val writes: bool    = (instruction.stated_role(f.set, d, n) & mo.WRITE) != 0;
+        if (n == 0 && made.slot != NONE) {
+            if (sel o.virtual) { wrote(out, o.virtual, made, changed); }
+        }
+        or (n == moved_to) {}
+        or (sel o.virtual) {
+            if (writes) { wrote(out, o.virtual, At{slot: MANY, disp: 0}, changed); }
+        }
+        or (sel o.member) {
+            if (writes) { wrote(out, o.member.virtual, At{slot: MANY, disp: 0}, changed); }
+        }
+        or (sel o.tied) {
+            val dest: Register = o.tied.dest;
+            if (sel dest.virtual) { wrote(out, dest.virtual, At{slot: MANY, disp: 0}, changed); }
+        }
+        or (sel o.list) {
+            val first: Register = o.list.first;
+            if (sel first.virtual) {
+                if (writes) { wrote(out, first.virtual, At{slot: MANY, disp: 0}, changed); }
+            }
+        }
+        or (sel o.address) {
+            val opt_base: opt[Register] = o.address.base;
+            if (sel opt_base.some) {
+                val b: Register = opt_base.some;
+                if (sel b.virtual) {
+                    if (operand.writes_back(o.address)) { wrote(out, b.virtual, At{slot: MANY, disp: 0}, changed); }
+                }
+            }
+        }
+        n = n + 1;
+    }
+}
+
+# the frame address each virtual register of `f` holds at every write, into `out` by register, the slot NONE for one
+# that holds none
+pub fun of(f: *Function, out: *vector.Vector[At]) err[allocator.Error] {
+    val err_filled: err[allocator.Error] = slice.fill[At](out, f.virtuals.len, At{slot: UNSEEN, disp: 0});
+    if (sel err_filled.err) { ret err_filled; }
+    for (sweep(f, out, false)) {}
+    for (sweep(f, out, true)) {}
+    var v: usize = 0;
+    for (v < out.len) {
+        if (out.data[v].slot == MANY || out.data[v].slot == UNSEEN) { out.data[v] = At{slot: NONE, disp: 0}; }
+        v = v + 1;
+    }
+    ret err[allocator.Error].ok{};
+}

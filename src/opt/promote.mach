@@ -1,0 +1,1078 @@
+# promotion of stack slots to values
+#
+# a slot whose address is only loaded from and stored to at the slot's own
+# type holds one value at a time, so the memory is replaced by the value that
+# reaches each load. a value merged where paths join becomes a block
+# parameter at the dominance frontier of the blocks that store, in the blocks
+# where the slot is read. a load that no store reaches gives a zero of the
+# slot's type. a slot with debug bindings keeps them as value records: one
+# where each store stood, one at the entry of each parameter's block reading
+# the parameter, and an unavailable one where the slot was made.
+#
+# a slot that a kept or volatile access touches stays in memory, so a kept
+# store or fill into it is never taken away. the markers of where a slot's
+# storage begins and ends (`slot.begin`, `slot.end`) are neither loads nor
+# stores of it, and go with the slot.
+#
+# where the build carries no variable pointer (mirl.target.basis.variable),
+# a slot of a pointer type is promoted only when no pointer merges where
+# paths join and every load has a pointer a store left, since no other
+# pointer stands. one that cannot be stays in memory.
+#
+# the walk is the optimisation's, over every slot of a scalar, pointer or
+# vector type, and a legalisation's, over the slots of a pointer type alone
+# where the build carries no variable pointer, which refuses a slot it cannot
+# take out, naming the slot and why.
+#
+# the function's dominance, the per-block marks and each instruction's
+# position in its block are made once for the walk, and each slot is taken in
+# turn, so a slot one promotion frees of a store of its address is taken after
+# it. the work for one slot is bounded by its own loads and stores, the blocks
+# that touch it, where it is live and where its parameters go, never by the
+# size of the function or of a block: its accesses are put in program order by
+# sorting them on their block's rank and their position, and a mark holds the
+# serial of the slot that set it, so no slot clears another's.
+#
+# it changes no branch and no address, so it keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.allocator.page;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.build.builder.Builder;
+use mirl.build.failure;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.failure.Error;
+use mirl.ir.cfg.prune;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.record.Binding;
+use ir_function: mirl.ir.function;
+use mirl.ir.function.Body;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.List;
+use mirl.ir.instruction.Place;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.UNBOUND;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.table;
+use mirl.ir.point;
+use mirl.ir.point.Bits;
+use mirl.ir.point.Operand;
+use mirl.ir.point.PLAIN;
+use mirl.ir.point.Reads;
+use mirl.ir.text.equal;
+use mirl.ir.text.printer;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.Kept;
+use mirl.pass.refusal.Unpromoted;
+use mirl.target.basis;
+use mirl.target.layout;
+use target_record: mirl.target.record;
+
+# no value reaches: the slot has not been stored to
+val UNDEF: u32 = 0xffffffff;
+# the high bit marks the parameter made in a block, the rest its index
+val PHI: u32 = 0x80000000;
+
+val NOT:   u8 = 0;
+val LOAD:  u8 = 1;
+val STORE: u8 = 2;
+
+# the pass
+# ---
+# it keeps no analysis, since it may take unreached blocks out of the graph
+pub val PROMOTE: Pass = Pass{name: "promote", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_DOMINANCE, time: Time.keeps{}};
+
+# the slots a walk takes, and what it does with one it cannot
+# ---
+# every:    each slot of a scalar, pointer or vector type, leaving one it
+#           cannot take where it is
+# pointers: each slot of a pointer type with no representation in memory,
+#           refusing one it cannot take. a pointer that is an address under
+#           the build's model, as a physical one, stays in its slot
+pub tag Reach: u8 {
+    every;
+    pointers;
+}
+
+# what became of one slot
+# ---
+# skipped:  the walk does not take it
+# promoted: its memory was replaced by values
+# kept:     it stays in memory, for this reason
+tag Outcome: u8 {
+    skipped;
+    promoted;
+    kept: Kept;
+}
+
+# what the walk keeps per block for the slot being promoted, a mark set when
+# it holds that slot's serial
+# ---
+# serial:  the slot being promoted, never 0
+# touched: it loads or stores the slot
+# stored:  it stores
+# upward:  it loads before it stores
+# live:    the slot is read on entry to it
+# cand:    a parameter is placed in it
+# inwork:  it is on the frontier worklist
+# phi:     it gets a parameter
+# listed:  it is in the rename sweep
+# outv:    what reaches its end, as a reach, set for the blocks of the sweep
+# result:  the parameter made in it, set for the blocks that get one
+# start:   where its accesses start in the slot's `order`, set for the blocks
+#          that touch it
+rec Blocks {
+    serial:  u32;
+    touched: vector.Vector[u32];
+    stored:  vector.Vector[u32];
+    upward:  vector.Vector[u32];
+    live:    vector.Vector[u32];
+    cand:    vector.Vector[u32];
+    inwork:  vector.Vector[u32];
+    phi:     vector.Vector[u32];
+    listed:  vector.Vector[u32];
+    outv:    vector.Vector[u32];
+    result:  vector.Vector[u32];
+    start:   vector.Vector[u32];
+}
+
+# one slot being promoted
+# ---
+# m, f, b:  the module, the function and its body
+# dom:      the function's dominance
+# s:        the allocator of the slot's scratch, reset for each slot
+# tag:      for every instruction of the function, whether it loads or
+#           stores the slot, borrowed
+# which:    for every such instruction, its position among the loads or the
+#           stores, borrowed
+# pos:      for every instruction placed when the walk began, its position in
+#           its block, borrowed
+# at:       the per-block marks, borrowed
+# alloca:   the slot's instruction
+# pointer:  its address
+# type:     its type
+# bindings: its debug bindings
+# secret:   its values are secret
+# members:  the loads and stores in no order
+# blocks:   the blocks that touch it, in reverse postorder
+# order:    the loads and stores in program order
+# loads:    the loads in program order
+# stores:   the stores in program order
+# marks:    the markers of where its storage begins and ends
+# loadval:  what reaches each load, as a reach: `UNDEF`, `PHI` with a block
+#           index, or a store's position
+# sval:     the value each store leaves, as a value index
+# phis:     the blocks that get a parameter, by index
+# zero:     the zero of the slot's type, when needed
+rec Slot {
+    m:        *Module;
+    f:        Function;
+    b:        *Body;
+    dom:      *Dominance;
+    s:        *allocator.Allocator;
+    tag:      *vector.Vector[u8];
+    which:    *vector.Vector[u32];
+    pos:      *vector.Vector[u32];
+    at:       *Blocks;
+    alloca:   Instruction;
+    pointer:  Value;
+    type:     Type;
+    bindings: Bindings;
+    piece:    Bits;
+    secret:   bool;
+    members:  vector.Vector[Instruction];
+    blocks:   vector.Vector[u32];
+    order:    vector.Vector[Instruction];
+    loads:    vector.Vector[Instruction];
+    stores:   vector.Vector[Instruction];
+    marks:    vector.Vector[Instruction];
+    loadval:  vector.Vector[u32];
+    sval:     vector.Vector[u32];
+    phis:     vector.Vector[u32];
+    zero:     Value;
+}
+
+# whether block k holds the mark of the slot being promoted
+fun on(x: *Slot, marks: *vector.Vector[u32], k: usize) bool {
+    ret marks.data[k] == x.at.serial;
+}
+
+# give block k the mark of the slot being promoted
+fun mark(x: *Slot, marks: *vector.Vector[u32], k: usize) {
+    marks.data[k] = x.at.serial;
+}
+
+# blocks sorted by a key of each, keys distinct
+fun sorted(x: *Slot, blocks: *vector.Vector[u32], key: fun(*Dominance, u32) u32) err[refusal.Error] {
+    var keyed: vector.Vector[u64] = vector.init[u64](x.s);
+    var n:     usize              = 0;
+    for (n < blocks.len) {
+        val k:               u32                = blocks.data[n];
+        val err_keyed_added: err[refusal.Error] = add[u64](?keyed, (key(x.dom, k)::u64 << 32) | k::u64);
+        if (sel err_keyed_added.err) { ret err_keyed_added; }
+        n = n + 1;
+    }
+    sort.sort[u64](keyed.data, keyed.len);
+    n = 0;
+    for (n < keyed.len) {
+        blocks.data[n] = (keyed.data[n] & 0xffffffff)::u32;
+        n              = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# a block's own index, as a sort key
+fun by_index(d: *Dominance, k: u32) u32 {
+    ret k;
+}
+
+fun alloc(e: allocator.Error) err[refusal.Error] {
+    ret err[refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+# an ir edit's outcome as a refusal
+fun lift(r: err[module.Error]) err[refusal.Error] {
+    if (sel r.err) { ret err[refusal.Error].err{refusal.Error.ir{r.err}}; }
+    ret err[refusal.Error].ok{};
+}
+
+fun add[T](v: *vector.Vector[T], x: T) err[refusal.Error] {
+    val res_vector_pushed: res[usize, allocator.Error] = vector.push[T](v, x);
+    if (sel res_vector_pushed.err) { ret alloc(res_vector_pushed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+# make a vector of n copies of a value
+fun filled[T](a: *allocator.Allocator, n: usize, x: T, out: *vector.Vector[T]) err[refusal.Error] {
+    @out = vector.init[T](a);
+    val res_room: res[usize, allocator.Error] = vector.reserve[T](out, n);
+    if (sel res_room.err) { ret alloc(res_room.err); }
+    var i: usize = 0;
+    for (i < n) {
+        val err_out_added: err[refusal.Error] = add[T](out, x);
+        if (sel err_out_added.err) { ret err_out_added; }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the block an instruction stands in, the entry when it is placed in none
+fun block_of(x: *Slot, i: Instruction) usize {
+    val at: Place = x.b.instructions.data[i].place;
+    if (sel at.placed) { ret at.placed::usize; }
+    ret 0;
+}
+
+# what tags an instruction of the function as an access of the slot
+fun tag_of(x: *Slot, i: Instruction) u8 {
+    if (i::usize >= x.tag.len) { ret NOT; }
+    ret x.tag.data[i];
+}
+
+# how a placed instruction that is neither kept nor volatile uses the address `pointer` of a slot of type `ty`: a load
+# of it at the type, a store of a value of the type to it, or any other use
+fun access_of(b: *Body, pointer: Value, ty: Type, d: *InstructionData) u8 {
+    if (d.opcode == table.LOAD) {
+        if (sel d.immediates.data[0].ty && type_table.same(d.immediates.data[0].ty, ty)) { ret LOAD; }
+    }
+    or (d.opcode == table.STORE) {
+        val stored: Value = d.operands.data[1];
+        if (stored != pointer && type_table.same(b.values.data[stored].type, ty)) { ret STORE; }
+    }
+    ret NOT;
+}
+
+# which instructions load from and store to the slot's address at its type,
+# or why the slot stays: its address is used otherwise, or a kept or volatile
+# access holds it
+fun collect(x: *Slot) res[opt[Kept], refusal.Error] {
+    val uses: Slice[Instruction] = Slice[Instruction]{data: x.b.values.data[x.pointer].uses.data, size: x.b.values.data[x.pointer].uses.len};
+    var n:    usize              = 0;
+    for (n < uses.size) {
+        val d: *InstructionData = ?x.b.instructions.data[uses.data[n]];
+        if (!(sel d.place.placed))                              { ret res[opt[Kept], refusal.Error].ok{opt[Kept].some{Kept.escapes{}}}; }
+        if (d.metadata.flags.volatile || d.metadata.flags.kept) { ret res[opt[Kept], refusal.Error].ok{opt[Kept].some{Kept.held{}}}; }
+        if (table.marks(d.opcode)) {
+            val err_marked: err[refusal.Error] = add[Instruction](?x.marks, uses.data[n]);
+            if (sel err_marked.err) { ret res[opt[Kept], refusal.Error].err{err_marked.err}; }
+            n = n + 1;
+            cnt;
+        }
+        val kind: u8 = access_of(x.b, x.pointer, x.type, d);
+        if (kind == NOT) { ret res[opt[Kept], refusal.Error].ok{opt[Kept].some{Kept.escapes{}}}; }
+        x.tag.data[uses.data[n]] = kind;
+        val err_members_added: err[refusal.Error] = add[Instruction](?x.members, uses.data[n]);
+        if (sel err_members_added.err) { ret res[opt[Kept], refusal.Error].err{err_members_added.err}; }
+        n = n + 1;
+    }
+    ret res[opt[Kept], refusal.Error].ok{opt[Kept].none{}};
+}
+
+# clear the tags the slot set, so the shared tag list is clean for the next slot
+fun release(x: *Slot) {
+    var n: usize = 0;
+    for (n < x.members.len) {
+        x.tag.data[x.members.data[n]] = NOT;
+        n                             = n + 1;
+    }
+}
+
+# an access and its place in program order: its block's rank, then its
+# position in the block
+rec Ordered {
+    key:  u64;
+    inst: Instruction;
+}
+
+fun earlier(a: *Ordered, b: *Ordered) i64 {
+    if (a.key < b.key) { ret -1; }
+    if (a.key > b.key) { ret 1; }
+    ret 0;
+}
+
+# list the loads and stores in program order, and per block what they do and
+# where its accesses start in that order. the accesses are sorted on their
+# place, so no block is walked
+fun scan(x: *Slot) err[refusal.Error] {
+    var keyed: vector.Vector[Ordered] = vector.init[Ordered](x.s);
+    var n:     usize                  = 0;
+    for (n < x.members.len) {
+        val inst: Instruction = x.members.data[n];
+        val k:    usize       = block_of(x, inst);
+        if (!on(x, ?x.at.touched, k)) {
+            mark(x, ?x.at.touched, k);
+            val err_blocks_added: err[refusal.Error] = add[u32](?x.blocks, k::u32);
+            if (sel err_blocks_added.err) { ret err_blocks_added; }
+        }
+        val key:             u64                = (dominance.rank(x.dom, k::u32)::u64 << 32) | x.pos.data[inst]::u64;
+        val err_keyed_added: err[refusal.Error] = add[Ordered](?keyed, Ordered{key: key, inst: inst});
+        if (sel err_keyed_added.err) { ret err_keyed_added; }
+        n = n + 1;
+    }
+    val err_sorted: err[refusal.Error] = sorted(x, ?x.blocks, dominance.rank);
+    if (sel err_sorted.err) { ret err_sorted; }
+    sort.sort_by[Ordered](keyed.data, keyed.len, earlier);
+    var from: usize = 0xffffffffffffffff;
+    n = 0;
+    for (n < keyed.len) {
+        val inst: Instruction = keyed.data[n].inst;
+        val k:    usize       = block_of(x, inst);
+        if (k != from) {
+            x.at.start.data[k] = x.order.len::u32;
+            from               = k;
+        }
+        val err_ordered: err[refusal.Error] = add[Instruction](?x.order, inst);
+        if (sel err_ordered.err) { ret err_ordered; }
+        val t: u8 = tag_of(x, inst);
+        if (t == LOAD) {
+            x.which.data[inst] = x.loads.len::u32;
+            if (!on(x, ?x.at.stored, k)) { mark(x, ?x.at.upward, k); }
+            val err_loads_added: err[refusal.Error] = add[Instruction](?x.loads, inst);
+            if (sel err_loads_added.err) { ret err_loads_added; }
+        }
+        or (t == STORE) {
+            x.which.data[inst] = x.stores.len::u32;
+            mark(x, ?x.at.stored, k);
+            val err_stores_added: err[refusal.Error] = add[Instruction](?x.stores, inst);
+            if (sel err_stores_added.err) { ret err_stores_added; }
+        }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether the slot holds secrets: a load of it is secret, or a value stored
+# to it is
+fun secret_slot(x: *Slot) bool {
+    var n: usize = 0;
+    for (n < x.loads.len) {
+        if (x.b.values.data[x.b.instructions.data[x.loads.data[n]].results.data[0]].secret) { ret true; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < x.stores.len) {
+        if (x.b.values.data[x.b.instructions.data[x.stores.data[n]].operands.data[1]].secret) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# whether every load keeps its secrecy: a value that reaches it is secret
+# exactly when the load is. a parameter made for the slot is secret when the
+# slot holds secrets, and may take public values in
+fun keeps_secrecy(x: *Slot) bool {
+    var n: usize = 0;
+    for (n < x.loads.len) {
+        val want: bool = x.b.values.data[x.b.instructions.data[x.loads.data[n]].results.data[0]].secret;
+        val at:   u32  = x.loadval.data[n];
+        var got:  bool = false;
+        if (at == UNDEF)     { got = false; }
+        or ((at & PHI) != 0) { got = x.secret; }
+        or {
+            got = x.b.values.data[x.b.instructions.data[x.stores.data[at::usize]].operands.data[1]].secret;
+        }
+        if (got != want) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# the blocks that read the slot on entry, and where parameters go
+fun place(x: *Slot) err[refusal.Error] {
+    var work: vector.Vector[u32] = vector.init[u32](x.s);
+    var n:    usize              = 0;
+    for (n < x.blocks.len) {
+        if (on(x, ?x.at.upward, x.blocks.data[n]::usize)) {
+            val err_work_added: err[refusal.Error] = add[u32](?work, x.blocks.data[n]);
+            if (sel err_work_added.err) { ret err_work_added; }
+        }
+        n = n + 1;
+    }
+    for (work.len > 0) {
+        val k: usize = work.data[work.len - 1]::usize;
+        vector.truncate[u32](?work, work.len - 1);
+        if (!on(x, ?x.at.live, k)) {
+            mark(x, ?x.at.live, k);
+            val preds: *vector.Vector[Instruction] = ?x.b.blocks.data[k].predecessors;
+            var p:     usize                       = 0;
+            for (p < preds.len) {
+                val from: usize = block_of(x, preds.data[p]);
+                if (!on(x, ?x.at.stored, from) && !on(x, ?x.at.live, from)) {
+                    val err_work_added: err[refusal.Error] = add[u32](?work, from::u32);
+                    if (sel err_work_added.err) { ret err_work_added; }
+                }
+                p = p + 1;
+            }
+        }
+    }
+
+    n = 0;
+    for (n < x.blocks.len) {
+        val k: usize = x.blocks.data[n]::usize;
+        if (on(x, ?x.at.stored, k)) {
+            mark(x, ?x.at.inwork, k);
+            val err_work_added: err[refusal.Error] = add[u32](?work, k::u32);
+            if (sel err_work_added.err) { ret err_work_added; }
+        }
+        n = n + 1;
+    }
+    for (work.len > 0) {
+        val k: u32 = work.data[work.len - 1];
+        vector.truncate[u32](?work, work.len - 1);
+        val front: Slice[u32] = dominance.frontier(x.dom, k);
+        var y:     usize      = 0;
+        for (y < front.size) {
+            val to: usize = front.data[y]::usize;
+            if (!on(x, ?x.at.cand, to)) {
+                mark(x, ?x.at.cand, to);
+                if (on(x, ?x.at.live, to)) {
+                    mark(x, ?x.at.phi, to);
+                    val err_phis_added: err[refusal.Error] = add[u32](?x.phis, to::u32);
+                    if (sel err_phis_added.err) { ret err_phis_added; }
+                }
+                if (!on(x, ?x.at.inwork, to)) {
+                    mark(x, ?x.at.inwork, to);
+                    val err_work_added: err[refusal.Error] = add[u32](?work, to::u32);
+                    if (sel err_work_added.err) { ret err_work_added; }
+                }
+            }
+            y = y + 1;
+        }
+    }
+    ret sorted(x, ?x.phis, by_index);
+}
+
+# put a block in the rename sweep once
+fun list(x: *Slot, sweep: *vector.Vector[u32], k: usize) err[refusal.Error] {
+    if (on(x, ?x.at.listed, k)) { ret err[refusal.Error].ok{}; }
+    mark(x, ?x.at.listed, k);
+    ret add[u32](sweep, k::u32);
+}
+
+# what reaches every load and the end of every block that touches the slot or
+# enters a block with a parameter. a block's entry takes its own parameter, or
+# what reaches the end of the nearest block above it in the dominator tree that
+# stores or has a parameter, so the sweep goes in preorder and keeps those
+# blocks on a stack
+fun rename(x: *Slot) err[refusal.Error] {
+    var sweep: vector.Vector[u32] = vector.init[u32](x.s);
+    var n:     usize              = 0;
+    for (n < x.blocks.len) {
+        val err_listed: err[refusal.Error] = list(x, ?sweep, x.blocks.data[n]::usize);
+        if (sel err_listed.err) { ret err_listed; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < x.phis.len) {
+        val k:          usize              = x.phis.data[n]::usize;
+        val err_listed: err[refusal.Error] = list(x, ?sweep, k);
+        if (sel err_listed.err) { ret err_listed; }
+        val preds: *vector.Vector[Instruction] = ?x.b.blocks.data[k].predecessors;
+        var p:     usize                       = 0;
+        for (p < preds.len) {
+            val err_pred_listed: err[refusal.Error] = list(x, ?sweep, block_of(x, preds.data[p]));
+            if (sel err_pred_listed.err) { ret err_pred_listed; }
+            p = p + 1;
+        }
+        n = n + 1;
+    }
+    val err_sorted: err[refusal.Error] = sorted(x, ?sweep, dominance.preorder);
+    if (sel err_sorted.err) { ret err_sorted; }
+
+    var above: vector.Vector[u32] = vector.init[u32](x.s);
+    n = 0;
+    for (n < sweep.len) {
+        val k: u32 = sweep.data[n];
+        for (above.len > 0 && !dominance.dominates(x.dom, above.data[above.len - 1], k)) { vector.truncate[u32](?above, above.len - 1); }
+        var cur: u32 = UNDEF;
+        if (on(x, ?x.at.phi, k::usize)) { cur = PHI | k; }
+        or (above.len > 0)              { cur = x.at.outv.data[above.data[above.len - 1]]; }
+        if (on(x, ?x.at.touched, k::usize)) {
+            var j: usize = x.at.start.data[k]::usize;
+            for (j < x.order.len && block_of(x, x.order.data[j]) == k::usize) {
+                val inst: Instruction = x.order.data[j];
+                val t:    u8          = tag_of(x, inst);
+                if (t == LOAD)  { x.loadval.data[x.which.data[inst]] = cur; }
+                or (t == STORE) { cur = x.which.data[inst]; }
+                j = j + 1;
+            }
+        }
+        x.at.outv.data[k] = cur;
+        if (on(x, ?x.at.stored, k::usize) || on(x, ?x.at.phi, k::usize)) {
+            val err_above_added: err[refusal.Error] = add[u32](?above, k);
+            if (sel err_above_added.err) { ret err_above_added; }
+        }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether a load reads the zero, as no store reaches it
+fun any_unstored(x: *Slot) bool {
+    var n: usize = 0;
+    for (n < x.loadval.len) {
+        if (x.loadval.data[n] == UNDEF) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
+fun zero_of(x: *Slot, ty: Type) res[Value, refusal.Error] {
+    val res_add_constant: res[Constant, module.Error] = module.add_constant(x.m, ConstantData.zero{ty});
+    if (sel res_add_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_add_constant.err}}; }
+    val res_constant: res[Value, module.Error] = body.constant(x.m, x.f, res_add_constant.ok);
+    if (sel res_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_constant.err}}; }
+    ret res[Value, refusal.Error].ok{res_constant.ok};
+}
+
+# the value a reach stands for: the zero, the parameter made in a block, or
+# the value a store leaves
+fun resolve(x: *Slot, v: u32) Value {
+    if (v == UNDEF)     { ret x.zero; }
+    if ((v & PHI) != 0) { ret (x.at.result.data[(v & ~PHI)::usize]); }
+    ret (x.sval.data[v::usize]);
+}
+
+# give every variable the slot binds a record just before an instruction of
+# block k, or at its end for `NO_INSTRUCTION`
+fun record(x: *Slot, b: *Builder, vars: Slice[Binding], k: usize, before: Instruction, reads: Reads) err[refusal.Error] {
+    var n: usize = 0;
+    for (n < vars.size) {
+        if (before == NO_INSTRUCTION) { builder.at_end(b, (k::u32)); }
+        or                            { builder.before(b, before); }
+        if (point.whole(x.piece))     { builder.bind_at(b, vars.data[n], reads); }
+        or                            { builder.bind_piece_at(b, vars.data[n], x.piece, reads); }
+        val err_done: err[failure.Error] = builder.done(b);
+        if (sel err_done.err) { ret err[refusal.Error].err{refusal.Error.build{err_done.err}}; }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# make the parameters, give every store its value, replace the loads, pass
+# the values on each edge and take the memory out
+fun apply(x: *Slot) err[refusal.Error] {
+    var vars: Slice[Binding] = Slice[Binding]{data: nil, size: 0};
+    if (x.bindings != UNBOUND) {
+        val res_named: res[Slice[Binding], module.Error] = module.bound(x.m, x.bindings);
+        if (sel res_named.err) { ret err[refusal.Error].err{refusal.Error.ir{res_named.err}}; }
+        vars = res_named.ok;
+    }
+    if (x.phis.len > 0 || any_unstored(x)) {
+        val res_zero_of: res[Value, refusal.Error] = zero_of(x, x.type);
+        if (sel res_zero_of.err) { ret err[refusal.Error].err{res_zero_of.err}; }
+        x.zero = res_zero_of.ok;
+    }
+    var b: Builder = builder.make(x.m);
+    builder.enter(?b, x.f);
+
+    val home:     usize              = block_of(x, x.alloca);
+    val err_none: err[refusal.Error] = record(x, ?b, vars, home, x.alloca, Reads.unavailable{});
+    if (sel err_none.err) { ret err_none; }
+
+    var n: usize = 0;
+    for (n < x.phis.len) {
+        val k:        usize                = x.phis.data[n]::usize;
+        var incoming: vector.Vector[Value] = vector.init[Value](x.s);
+        val count:    usize                = x.b.blocks.data[k].predecessors.len;
+        var j:        usize                = 0;
+        for (j < count) {
+            val err_incoming_added: err[refusal.Error] = add[Value](?incoming, x.zero);
+            if (sel err_incoming_added.err) { ret err_incoming_added; }
+            j = j + 1;
+        }
+        val declared:          Declaration              = Declaration{type: x.type, secret: x.secret, name: opt[View].none{}};
+        val res_add_parameter: res[Value, module.Error] = body.add_parameter(x.m, x.f, (k::u32), declared, Slice[Value]{data: incoming.data, size: incoming.len});
+        if (sel res_add_parameter.err) { ret err[refusal.Error].err{refusal.Error.ir{res_add_parameter.err}}; }
+        x.at.result.data[k] = res_add_parameter.ok;
+        val err_seen: err[refusal.Error] = record(x, ?b, vars, k, x.b.blocks.data[k].first, Reads.operand{Operand{value: res_add_parameter.ok, expression: PLAIN}});
+        if (sel err_seen.err) { ret err_seen; }
+        n = n + 1;
+    }
+
+    n = 0;
+    for (n < x.stores.len) {
+        val inst: Instruction = x.stores.data[n];
+        var v:    Value       = x.b.instructions.data[inst].operands.data[1];
+        val def:  Def         = x.b.values.data[v].def;
+        if (sel def.result) {
+            val from: Instruction = def.result.instruction;
+            if (tag_of(x, from) == LOAD) { v = resolve(x, x.loadval.data[x.which.data[from]::usize]); }
+        }
+        val blk:      usize              = block_of(x, inst);
+        val err_held: err[refusal.Error] = record(x, ?b, vars, blk, inst, Reads.operand{Operand{value: v, expression: PLAIN}});
+        if (sel err_held.err) { ret err_held; }
+        x.sval.data[n] = v;
+        n              = n + 1;
+    }
+
+    n = 0;
+    for (n < x.loads.len) {
+        val old:      Value              = x.b.instructions.data[x.loads.data[n]].results.data[0];
+        val err_lift: err[refusal.Error] = lift(body.replace(x.m, x.f, old, resolve(x, x.loadval.data[n]), Records.follow{}));
+        if (sel err_lift.err) { ret err_lift; }
+        n = n + 1;
+    }
+
+    n = 0;
+    for (n < x.phis.len) {
+        val err_pass_on: err[refusal.Error] = pass_on(x, x.phis.data[n]::usize);
+        if (sel err_pass_on.err) { ret err_pass_on; }
+        n = n + 1;
+    }
+
+    n = 0;
+    for (n < x.stores.len) {
+        val err_lift: err[refusal.Error] = lift(body.erase(x.m, x.f, x.stores.data[n]));
+        if (sel err_lift.err) { ret err_lift; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < x.loads.len) {
+        val err_lift: err[refusal.Error] = lift(body.erase(x.m, x.f, x.loads.data[n]));
+        if (sel err_lift.err) { ret err_lift; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < x.marks.len) {
+        val err_lift: err[refusal.Error] = lift(body.erase(x.m, x.f, x.marks.data[n]));
+        if (sel err_lift.err) { ret err_lift; }
+        n = n + 1;
+    }
+    ret lift(body.erase(x.m, x.f, x.alloca));
+}
+
+# an edge into a block: the instruction and its edge's position
+rec Into {
+    inst: Instruction;
+    edge: u32;
+}
+
+# give the parameter made in a block the value that reaches the end of each
+# block that enters it. the edges are read before any is moved, since moving
+# one reorders the block's predecessor list
+fun pass_on(x: *Slot, k: usize) err[refusal.Error] {
+    var edges: vector.Vector[Into]         = vector.init[Into](x.s);
+    val preds: *vector.Vector[Instruction] = ?x.b.blocks.data[k].predecessors;
+    var n:     usize                       = 0;
+    for (n < preds.len) {
+        val d: *InstructionData = ?x.b.instructions.data[preds.data[n]];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            if (d.edges.data[e].block == k::u32 && d.edges.data[e].rank::usize == n) {
+                val err_edges_added: err[refusal.Error] = add[Into](?edges, Into{inst: preds.data[n], edge: e::u32});
+                if (sel err_edges_added.err) { ret err_edges_added; }
+            }
+            e = e + 1;
+        }
+        n = n + 1;
+    }
+    val def: Def   = x.b.values.data[x.at.result.data[k]::usize].def;
+    var at:  usize = 0;
+    if (sel def.parameter) { at = def.parameter.index::usize; }
+    n = 0;
+    for (n < edges.len) {
+        val inst: Instruction          = edges.data[n].inst;
+        val held: *List[Value]         = ?x.b.instructions.data[inst].edges.data[edges.data[n].edge].arguments;
+        var args: vector.Vector[Value] = vector.init[Value](x.s);
+        var j:    usize                = 0;
+        for (j < held.len) {
+            val err_args_added: err[refusal.Error] = add[Value](?args, held.data[j]);
+            if (sel err_args_added.err) { ret err_args_added; }
+            j = j + 1;
+        }
+        args.data[at] = resolve(x, x.at.outv.data[block_of(x, inst)]);
+        val err_moved: err[refusal.Error] = lift(body.retarget(x.m, x.f, inst, edges.data[n].edge, (k::u32), Slice[Value]{data: args.data, size: args.len}));
+        if (sel err_moved.err) { ret err_moved; }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the marks of a walk over a function of n blocks, none set
+fun marks(a: *allocator.Allocator, n: usize, out: *Blocks) err[refusal.Error] {
+    out.serial = 0;
+    val err_touched: err[refusal.Error] = filled[u32](a, n, 0, ?out.touched);
+    if (sel err_touched.err) { ret err_touched; }
+    val err_stored: err[refusal.Error] = filled[u32](a, n, 0, ?out.stored);
+    if (sel err_stored.err) { ret err_stored; }
+    val err_upward: err[refusal.Error] = filled[u32](a, n, 0, ?out.upward);
+    if (sel err_upward.err) { ret err_upward; }
+    val err_live: err[refusal.Error] = filled[u32](a, n, 0, ?out.live);
+    if (sel err_live.err) { ret err_live; }
+    val err_cand: err[refusal.Error] = filled[u32](a, n, 0, ?out.cand);
+    if (sel err_cand.err) { ret err_cand; }
+    val err_inwork: err[refusal.Error] = filled[u32](a, n, 0, ?out.inwork);
+    if (sel err_inwork.err) { ret err_inwork; }
+    val err_phi: err[refusal.Error] = filled[u32](a, n, 0, ?out.phi);
+    if (sel err_phi.err) { ret err_phi; }
+    val err_listed: err[refusal.Error] = filled[u32](a, n, 0, ?out.listed);
+    if (sel err_listed.err) { ret err_listed; }
+    val err_outv: err[refusal.Error] = filled[u32](a, n, UNDEF, ?out.outv);
+    if (sel err_outv.err) { ret err_outv; }
+    val err_start: err[refusal.Error] = filled[u32](a, n, 0, ?out.start);
+    if (sel err_start.err) { ret err_start; }
+    ret filled[u32](a, n, UNDEF, ?out.result);
+}
+
+# give back the marks of a walk
+fun marks_dnit(at: *Blocks) {
+    vector.dnit[u32](?at.touched);
+    vector.dnit[u32](?at.stored);
+    vector.dnit[u32](?at.upward);
+    vector.dnit[u32](?at.live);
+    vector.dnit[u32](?at.cand);
+    vector.dnit[u32](?at.inwork);
+    vector.dnit[u32](?at.phi);
+    vector.dnit[u32](?at.listed);
+    vector.dnit[u32](?at.outv);
+    vector.dnit[u32](?at.result);
+    vector.dnit[u32](?at.start);
+}
+
+# whether a walk takes a slot of a type
+fun takes(r: Reach, k: type_table.Kind) bool {
+    if (sel r.pointers) { ret sel k.pointer; }
+    ret sel k.integer || sel k.float || sel k.pointer || sel k.vector;
+}
+
+fun stays(k: Kept) res[Outcome, refusal.Error] {
+    ret res[Outcome, refusal.Error].ok{Outcome.kept{k}};
+}
+
+# whether a pointer type is an address the build's addressing model holds in
+# memory, which merges and lives in memory as any value does
+fun addressed(c: *Context, ty: Type) bool {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?c.m.types, ty);
+    if (sel res_shape.err) { ret false; }
+    val sh: type_table.Shape = res_shape.ok;
+    if (!(sel sh.pointer)) { ret false; }
+    var l:        layout.Layout                 = layout.of(c.t, ?c.m.types, basis.context_of(c.basis));
+    val res_size: res[u64, target_record.Error] = layout.size(?l, ty, sh.pointer.space);
+    ret sel res_size.ok;
+}
+
+# promote one slot, or say why it stays where it is
+# ---
+# at:      the walk's per-block marks, which this slot stamps with its own serial
+# carries: whether the build carries a variable pointer
+fun promote_one(c: *Context, dom: *Dominance, s: *allocator.Allocator, tag: *vector.Vector[u8], which: *vector.Vector[u32], pos: *vector.Vector[u32], at: *Blocks, f: Function, alloca: Instruction, reach: Reach, carries: bool) res[Outcome, refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(c.m, f);
+    if (sel res_body.err) { ret res[Outcome, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:   *Body            = res_body.ok;
+    val d:   *InstructionData = ?b.instructions.data[alloca];
+    val imm: Immediate        = d.immediates.data[0];
+    if (!(sel d.place.placed)) { ret res[Outcome, refusal.Error].ok{Outcome.skipped{}}; }
+    if (!(sel imm.ty))         { ret res[Outcome, refusal.Error].ok{Outcome.skipped{}}; }
+    var x: Slot;
+    x.m        = c.m;
+    x.f        = f;
+    x.b        = b;
+    x.dom      = dom;
+    x.s        = s;
+    x.tag      = tag;
+    x.which    = which;
+    x.pos      = pos;
+    x.at       = at;
+    x.alloca   = alloca;
+    x.pointer  = d.results.data[0];
+    x.type     = imm.ty;
+    x.bindings = d.metadata.bindings;
+    x.piece    = d.metadata.piece;
+    val res_kind: res[type_table.Kind, type_table.Error] = type_table.kind(?c.m.types, x.type);
+    if (sel res_kind.err)           { ret res[Outcome, refusal.Error].err{refusal.Error.ir{module.Error.types{res_kind.err}}}; }
+    if (!takes(reach, res_kind.ok)) { ret res[Outcome, refusal.Error].ok{Outcome.skipped{}}; }
+    var fixed: bool = sel res_kind.ok.pointer && !carries;
+    if (fixed && addressed(c, x.type)) {
+        if (sel reach.pointers) { ret res[Outcome, refusal.Error].ok{Outcome.skipped{}}; }
+        fixed = false;
+    }
+
+    x.members = vector.init[Instruction](s);
+    x.blocks  = vector.init[u32](s);
+    x.order   = vector.init[Instruction](s);
+    x.loads   = vector.init[Instruction](s);
+    x.stores  = vector.init[Instruction](s);
+    x.marks   = vector.init[Instruction](s);
+    x.loadval = vector.init[u32](s);
+    x.sval    = vector.init[u32](s);
+    x.phis    = vector.init[u32](s);
+    fin { release(?x); }
+
+    val res_ours: res[opt[Kept], refusal.Error] = collect(?x);
+    if (sel res_ours.err)     { ret res[Outcome, refusal.Error].err{res_ours.err}; }
+    if (sel res_ours.ok.some) { ret stays(res_ours.ok.some); }
+    val err_scanned: err[refusal.Error] = scan(?x);
+    if (sel err_scanned.err) { ret res[Outcome, refusal.Error].err{err_scanned.err}; }
+    x.secret = secret_slot(?x);
+    val err_loadvals: err[refusal.Error] = filled[u32](s, x.loads.len, UNDEF, ?x.loadval);
+    if (sel err_loadvals.err) { ret res[Outcome, refusal.Error].err{err_loadvals.err}; }
+    val err_storevals: err[refusal.Error] = filled[u32](s, x.stores.len, UNDEF, ?x.sval);
+    if (sel err_storevals.err) { ret res[Outcome, refusal.Error].err{err_storevals.err}; }
+    val err_placed: err[refusal.Error] = place(?x);
+    if (sel err_placed.err)      { ret res[Outcome, refusal.Error].err{err_placed.err}; }
+    if (on(?x, ?at.phi, 0))      { ret stays(Kept.merged{}); }
+    if (fixed && x.phis.len > 0) { ret stays(Kept.merged{}); }
+    val err_named: err[refusal.Error] = rename(?x);
+    if (sel err_named.err)         { ret res[Outcome, refusal.Error].err{err_named.err}; }
+    if (fixed && any_unstored(?x)) { ret stays(Kept.unstored{}); }
+    if (!keeps_secrecy(?x))        { ret stays(Kept.secrecy{}); }
+
+    val err_applied: err[refusal.Error] = apply(?x);
+    if (sel err_applied.err) { ret res[Outcome, refusal.Error].err{err_applied.err}; }
+    ret res[Outcome, refusal.Error].ok{Outcome.promoted{}};
+}
+
+# whether a block the walk reaches or not makes a slot the walk takes, so a
+# legalisation leaves a function with none as it is
+fun any_taken(m: *Module, b: *Body, reach: Reach) res[bool, refusal.Error] {
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d: *InstructionData = ?b.instructions.data[i];
+                if (d.opcode == table.ALLOCA) {
+                    val imm: Immediate = d.immediates.data[0];
+                    if (sel imm.ty) {
+                        val res_kind: res[type_table.Kind, type_table.Error] = type_table.kind(?m.types, imm.ty);
+                        if (sel res_kind.err)          { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_kind.err}}}; }
+                        if (takes(reach, res_kind.ok)) { ret res[bool, refusal.Error].ok{true}; }
+                    }
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{false};
+}
+
+# promote every slot the optimisation takes in one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    ret walk(u, Reach.every{});
+}
+
+# promote the slots of one function a walk takes. the optimisation leaves a
+# slot it cannot take in memory, and the legalisation refuses it
+# ---
+# u:     the function
+# reach: the slots it takes
+# ret:   whether it changed the function, or why it refused it
+pub fun walk(u: *Unit, reach: Reach) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:           *Body                  = res_body.ok;
+    var changed:     bool                   = false;
+    val res_carried: res[bool, basis.Error] = basis.variable(c.basis, ?c.t.caps);
+    if (sel res_carried.err) { ret res[bool, refusal.Error].err{refusal.Error.condition{res_carried.err}}; }
+    if (sel reach.pointers) {
+        val res_any: res[bool, refusal.Error] = any_taken(c.m, b, reach);
+        if (sel res_any.err) { ret res_any; }
+        if (!res_any.ok)     { ret res[bool, refusal.Error].ok{false}; }
+    }
+    val res_first: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, u.f);
+    if (sel res_first.err) { ret res[bool, refusal.Error].err{res_first.err}; }
+    var tree:      *Dominance = res_first.ok;
+    var unreached: bool       = false;
+    var k:         usize      = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased && !dominance.reachable(tree, k::u32)) { unreached = true; }
+        k = k + 1;
+    }
+    if (unreached) {
+        val err_cut: err[Error] = prune.unreached(c.m, u.f, tree);
+        if (sel err_cut.err) { ret res[bool, refusal.Error].err{refusal.Error.cfg{err_cut.err}}; }
+        val err_dropped: err[allocator.Error] = cache.forget(c.cache, u.f);
+        if (sel err_dropped.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_dropped.err}}; }
+        val res_again: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, u.f);
+        if (sel res_again.err) { ret res[bool, refusal.Error].err{res_again.err}; }
+        tree    = res_again.ok;
+        changed = true;
+    }
+
+    var found: vector.Vector[Instruction] = vector.init[Instruction](c.m.a);
+    fin { vector.dnit[Instruction](?found); }
+    var pos:          vector.Vector[u32];
+    val err_numbered: err[refusal.Error] = filled[u32](c.m.a, b.instructions.len, 0, ?pos);
+    if (sel err_numbered.err) { ret res[bool, refusal.Error].err{err_numbered.err}; }
+    fin { vector.dnit[u32](?pos); }
+    val order: Slice[u32] = dominance.order(tree);
+    var n:     usize      = 0;
+    for (n < order.size) {
+        var i:     Instruction = b.blocks.data[order.data[n]].first;
+        var count: u32         = 0;
+        for (i != NO_INSTRUCTION) {
+            pos.data[i] = count;
+            count       = count + 1;
+            if (b.instructions.data[i].opcode == table.ALLOCA) {
+                val err_found_added: err[refusal.Error] = add[Instruction](?found, i);
+                if (sel err_found_added.err) { ret res[bool, refusal.Error].err{err_found_added.err}; }
+            }
+            i = b.instructions.data[i].next;
+        }
+        n = n + 1;
+    }
+    if (found.len == 0) { ret res[bool, refusal.Error].ok{changed}; }
+
+    var tag:        vector.Vector[u8];
+    var which:      vector.Vector[u32];
+    val err_tagged: err[refusal.Error] = filled[u8](c.m.a, b.instructions.len, NOT, ?tag);
+    if (sel err_tagged.err) { ret res[bool, refusal.Error].err{err_tagged.err}; }
+    fin { vector.dnit[u8](?tag); }
+    val err_placed: err[refusal.Error] = filled[u32](c.m.a, b.instructions.len, 0, ?which);
+    if (sel err_placed.err) { ret res[bool, refusal.Error].err{err_placed.err}; }
+    fin { vector.dnit[u32](?which); }
+    var at:        Blocks;
+    val err_marks: err[refusal.Error] = marks(c.m.a, b.blocks.len, ?at);
+    fin { marks_dnit(?at); }
+    if (sel err_marks.err) { ret res[bool, refusal.Error].err{err_marks.err}; }
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+
+    n = 0;
+    for (n < found.len) {
+        arena.reset(?ar);
+        at.serial = (n + 1)::u32;
+        val res_promote_one: res[Outcome, refusal.Error] = promote_one(c, tree, ?scratch, ?tag, ?which, ?pos, ?at, u.f, found.data[n], reach, res_carried.ok);
+        if (sel res_promote_one.err)         { ret res[bool, refusal.Error].err{res_promote_one.err}; }
+        if (sel res_promote_one.ok.promoted) { changed = true; }
+        if (sel res_promote_one.ok.kept) {
+            if (sel reach.pointers) { ret res[bool, refusal.Error].err{refusal.Error.slot{Unpromoted{slot: found.data[n], kept: res_promote_one.ok.kept, location: ir_function.location(b, found.data[n])}}}; }
+        }
+        n = n + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# the size of a body as promotion leaves it, which the inliner reads: its placed instructions but the markers of where
+# a slot's storage begins and ends, which make no code, leaving out each slot of a type the optimisation takes whose
+# address only loads and stores at its type and markers use, with those loads and stores, as the ones promotion
+# replaces by values. it models promotion without its merges, so a slot promotion keeps for a merged pointer or a
+# secrecy that differs is counted as taken
+pub fun size(m: *Module, b: *Body) res[usize, refusal.Error] {
+    var out:     usize = 0;
+    var removed: usize = 0;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d: *InstructionData = ?b.instructions.data[i];
+                if (!table.marks(d.opcode)) { out = out + 1; }
+                if (d.opcode == table.ALLOCA) {
+                    val res_taken: res[usize, refusal.Error] = taken(m, b, d);
+                    if (sel res_taken.err) { ret res_taken; }
+                    removed = removed + res_taken.ok;
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[usize, refusal.Error].ok{out - removed};
+}
+
+# how many loads and stores promotion replaces of the slot an alloca makes, plus one for the alloca, 0 where it keeps
+# the slot in memory by the uses of its address. its markers go with it and are counted by neither
+fun taken(m: *Module, b: *Body, alloca: *InstructionData) res[usize, refusal.Error] {
+    val imm: Immediate = alloca.immediates.data[0];
+    if (!(sel imm.ty)) { ret res[usize, refusal.Error].ok{0}; }
+    val res_kind: res[type_table.Kind, type_table.Error] = type_table.kind(?m.types, imm.ty);
+    if (sel res_kind.err)                   { ret res[usize, refusal.Error].err{refusal.Error.ir{module.Error.types{res_kind.err}}}; }
+    if (!takes(Reach.every{}, res_kind.ok)) { ret res[usize, refusal.Error].ok{0}; }
+    val pointer:  Value = alloca.results.data[0];
+    val uses:     usize = b.values.data[pointer].uses.len;
+    var accesses: usize = 0;
+    var n:        usize = 0;
+    for (n < uses) {
+        val d: *InstructionData = ?b.instructions.data[b.values.data[pointer].uses.data[n]];
+        n = n + 1;
+        if (!(sel d.place.placed) || d.metadata.flags.volatile || d.metadata.flags.kept) { ret res[usize, refusal.Error].ok{0}; }
+        if (table.marks(d.opcode))                                                       { cnt; }
+        if (access_of(b, pointer, imm.ty, d) == NOT)                                     { ret res[usize, refusal.Error].ok{0}; }
+        accesses = accesses + 1;
+    }
+    ret res[usize, refusal.Error].ok{accesses + 1};
+}

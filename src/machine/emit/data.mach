@@ -1,0 +1,298 @@
+# the image of a global's initial value: its bytes and the addresses in it
+#
+# the bytes are laid out by the target's data layout in the architecture's
+# byte order, every bit the constant does not state zero. an address is a
+# datum the object relocates, at its offset and of its type's width, and
+# its bytes stay zero for the relocation to fill.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use std.encoding.binary;
+
+use mirl.base.slice;
+use mirl.ir.constant.Address;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.Bytes;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.id;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.target.capability.Extent;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record;
+
+# an address in an image
+# ---
+# offset: where it starts
+# symbol: the function or global it is the address of
+# addend: added to that address
+# width:  its width in bytes
+# minus:  the symbol whose address is taken away, for the distance between two symbols
+pub rec Datum {
+    offset: u64;
+    symbol: id.Symbol;
+    addend: i64;
+    width:  u64;
+    minus:  opt[id.Symbol];
+}
+
+# the image of one initial value
+# ---
+# bytes:  its bytes, zero where an address is
+# datums: its addresses, by offset
+pub rec Image {
+    bytes:  vector.Vector[u8];
+    datums: vector.Vector[Datum];
+}
+
+# why an image was not made
+# ---
+# alloc:  the allocator refused storage
+# layout: the data layout gives a part of it no extent
+# ir:     the module refused a read of a constant or a type
+pub tag Error: u8 {
+    alloc:  allocator.Error;
+    layout: record.Error;
+    ir:     module.Error;
+}
+
+# what one image is made against
+rec Writer {
+    a:     *allocator.Allocator;
+    m:     *Module;
+    l:     *Layout;
+    space: u32;
+    order: binary.Order;
+    out:   *Image;
+}
+
+# the extent the data layout gives type `ty` in the image's address space
+fun extent(w: *Writer, ty: Type) res[Extent, Error] {
+    val res_extent: res[Extent, record.Error] = layout.extent(w.l, ty, w.space);
+    if (sel res_extent.err) { ret res[Extent, Error].err{Error.layout{res_extent.err}}; }
+    ret res[Extent, Error].ok{res_extent.ok};
+}
+
+# what the walk laid out of the type a place holds, which every element of an
+# array shares, so a constant of that type takes it in place of laying out its
+# own
+# ---
+# known:   anything was laid out, false for a place the walk knows nothing of
+# type:    the type
+# size:    its size
+# members: a structure's member types, none otherwise
+# offsets: a structure's member offsets, nil otherwise
+# sizes:   a structure's member sizes, nil otherwise
+rec Known {
+    known:   bool;
+    type:    Type;
+    size:    u64;
+    members: Slice[Type];
+    offsets: *u64;
+    sizes:   *u64;
+}
+
+# nothing known of a place
+fun unknown() Known {
+    ret Known{known: false, type: 0, size: 0, members: Slice[Type]{data: nil, size: 0}, offsets: nil, sizes: nil};
+}
+
+# the size of type `ty` held at a place `k` knows
+fun size_at(w: *Writer, ty: Type, k: *Known) res[u64, Error] {
+    if (k.known && k.type == ty) { ret res[u64, Error].ok{k.size}; }
+    val res_extent: res[Extent, Error] = extent(w, ty);
+    if (sel res_extent.err) { ret res[u64, Error].err{res_extent.err}; }
+    ret res[u64, Error].ok{res_extent.ok.size};
+}
+
+# a number's bits over its extent, low word first, in the image's byte order
+fun number(w: *Writer, b: Bits, at: u64, k: *Known) err[Error] {
+    val res_size_at: res[u64, Error] = size_at(w, b.type, k);
+    if (sel res_size_at.err) { ret err[Error].err{res_size_at.err}; }
+    val size: u64 = res_size_at.ok;
+    var n:    u64 = 0;
+    for (n < size) {
+        val word: usize = (n / 8)::usize;
+        if (word < b.words.size) {
+            val byte: u8  = ((b.words.data[word] >> ((n % 8) * 8)) & 0xff)::u8;
+            var to:   u64 = at + n;
+            if (w.order == binary.BIG) { to = at + size - 1 - n; }
+            w.out.bytes.data[to::usize] = byte;
+        }
+        n = n + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# what every element of type `ty` shares laid out once: its size, and a
+# structure's member offsets and sizes in `room`, which holds two per member
+fun lay_element(w: *Writer, ty: Type, room: *vector.Vector[u64]) res[Known, Error] {
+    val res_extent: res[Extent, Error] = extent(w, ty);
+    if (sel res_extent.err) { ret res[Known, Error].err{res_extent.err}; }
+    var k: Known = unknown();
+    k.known = true;
+    k.type  = ty;
+    k.size  = res_extent.ok.size;
+    val res_shape: res[table.Shape, table.Error] = table.shape(?w.m.types, ty);
+    if (sel res_shape.err)             { ret res[Known, Error].err{Error.ir{module.Error.types{res_shape.err}}}; }
+    if (!(sel res_shape.ok.structure)) { ret res[Known, Error].ok{k}; }
+    val members:    Slice[Type]          = res_shape.ok.structure.members;
+    val err_filled: err[allocator.Error] = slice.fill[u64](room, members.size * 2, 0);
+    if (sel err_filled.err) { ret res[Known, Error].err{Error.alloc{err_filled.err}}; }
+    val err_laid: err[record.Error] = layout.offsets(w.l, ty, w.space, room.data);
+    if (sel err_laid.err) { ret res[Known, Error].err{Error.layout{err_laid.err}}; }
+    var i: usize = 0;
+    for (i < members.size) {
+        val res_extent: res[Extent, Error] = extent(w, members.data[i]);
+        if (sel res_extent.err) { ret res[Known, Error].err{res_extent.err}; }
+        room.data[members.size + i] = res_extent.ok.size;
+        i                           = i + 1;
+    }
+    k.members = members;
+    k.offsets = room.data;
+    k.sizes   = ?room.data[members.size];
+    ret res[Known, Error].ok{k};
+}
+
+# each member of a structure whose offsets and sizes `k` holds at its offset
+fun members_known(w: *Writer, list: Slice[id.Constant], at: u64, k: *Known) err[Error] {
+    var i: usize = 0;
+    for (i < list.size && i < k.members.size) {
+        var member: Known = unknown();
+        member.known = true;
+        member.type  = k.members.data[i];
+        member.size  = k.sizes[i];
+        val err_put: err[Error] = constant(w, list.data[i], at + k.offsets[i], ?member);
+        if (sel err_put.err) { ret err_put; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# each element of an aggregate at its offset
+fun elements(w: *Writer, ty: Type, list: Slice[id.Constant], at: u64, k: *Known) err[Error] {
+    if (k.known && k.type == ty && k.offsets != nil && list.size == k.members.size) { ret members_known(w, list, at, k); }
+    val res_shape: res[table.Shape, table.Error] = table.shape(?w.m.types, ty);
+    if (sel res_shape.err) { ret err[Error].err{Error.ir{module.Error.types{res_shape.err}}}; }
+    if (sel res_shape.ok.structure) {
+        val res_room: res[*u64, allocator.Error] = allocator.allocate[u64](w.a, list.size + 1);
+        if (sel res_room.err) { ret err[Error].err{Error.alloc{res_room.err}}; }
+        fin { allocator.deallocate[u64](w.a, res_room.ok, list.size + 1); }
+        val err_laid: err[record.Error] = layout.offsets(w.l, ty, w.space, res_room.ok);
+        if (sel err_laid.err) { ret err[Error].err{Error.layout{err_laid.err}}; }
+        var none: Known = unknown();
+        var i:    usize = 0;
+        for (i < list.size) {
+            val err_put: err[Error] = constant(w, list.data[i], at + res_room.ok[i], ?none);
+            if (sel err_put.err) { ret err_put; }
+            i = i + 1;
+        }
+        ret err[Error].ok{};
+    }
+    var step:    u64  = 0;
+    var element: Type = 0;
+    if (sel res_shape.ok.array) {
+        val res_laid: res[u64, record.Error] = layout.stride(w.l, ty, w.space);
+        if (sel res_laid.err) { ret err[Error].err{Error.layout{res_laid.err}}; }
+        step    = res_laid.ok;
+        element = res_shape.ok.array.element;
+    }
+    or (sel res_shape.ok.vector) {
+        val res_extent: res[Extent, Error] = extent(w, res_shape.ok.vector.element);
+        if (sel res_extent.err) { ret err[Error].err{res_extent.err}; }
+        step    = res_extent.ok.size;
+        element = res_shape.ok.vector.element;
+    }
+    or {
+        ret err[Error].err{Error.ir{module.Error.mismatch{ty}}};
+    }
+    if (list.size == 0) { ret err[Error].ok{}; }
+    var room: vector.Vector[u64] = vector.init[u64](w.a);
+    fin { vector.dnit[u64](?room); }
+    val res_shared: res[Known, Error] = lay_element(w, element, ?room);
+    if (sel res_shared.err) { ret err[Error].err{res_shared.err}; }
+    var i: usize = 0;
+    for (i < list.size) {
+        val err_put: err[Error] = constant(w, list.data[i], at + i::u64 * step, ?res_shared.ok);
+        if (sel err_put.err) { ret err_put; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# each byte of a run at its element's offset
+fun run(w: *Writer, b: Bytes, at: u64) err[Error] {
+    val res_laid: res[u64, record.Error] = layout.stride(w.l, b.type, w.space);
+    if (sel res_laid.err) { ret err[Error].err{Error.layout{res_laid.err}}; }
+    var i: usize = 0;
+    for (i < b.data.size) {
+        w.out.bytes.data[(at + i::u64 * res_laid.ok)::usize] = b.data.data[i];
+        i                                                    = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# a constant at its offset, held at a place `k` knows
+fun constant(w: *Writer, c: id.Constant, at: u64, k: *Known) err[Error] {
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(w.m, c);
+    if (sel res_constant_data.err) { ret err[Error].err{Error.ir{res_constant_data.err}}; }
+    val d: ConstantData = res_constant_data.ok;
+    if (sel d.integer)    { ret number(w, d.integer, at, k); }
+    or (sel d.float)      { ret number(w, d.float, at, k); }
+    or (sel d.absolute)   { ret number(w, d.absolute, at, k); }
+    or (sel d.zero)       { ret err[Error].ok{}; }
+    or (sel d.aggregate)  { ret elements(w, d.aggregate.type, d.aggregate.elements, at, k); }
+    or (sel d.bytes)      { ret run(w, d.bytes, at); }
+    if (!(sel d.address)) { ret err[Error].err{Error.ir{module.Error.specialized{c}}}; }
+    val a:           Address         = d.address;
+    val res_size_at: res[u64, Error] = size_at(w, a.type, k);
+    if (sel res_size_at.err) { ret err[Error].err{res_size_at.err}; }
+    val res_pushed: res[usize, allocator.Error] = vector.push[Datum](?w.out.datums, Datum{offset: at, symbol: a.symbol, addend: a.offset, width: res_size_at.ok, minus: a.minus});
+    if (sel res_pushed.err) { ret err[Error].err{Error.alloc{res_pushed.err}}; }
+    ret err[Error].ok{};
+}
+
+# give back an image's storage
+pub fun dnit(i: *Image) {
+    vector.dnit[u8](?i.bytes);
+    vector.dnit[Datum](?i.datums);
+}
+
+# the image of a constant
+# ---
+# a:     the allocator the image takes, the caller's to release
+# m:     the module the constant is of
+# l:     the layout of the module's types for the target
+# space: the address space the constant is laid out in
+# order: the architecture's byte order
+# c:     the constant
+# size:  its type's size
+# ret:   its image, or why it has none, leaving nothing
+pub fun image(a: *allocator.Allocator, m: *Module, l: *Layout, space: u32, order: binary.Order, c: id.Constant, size: u64) res[Image, Error] {
+    var out:      Image                = Image{bytes: vector.init[u8](a), datums: vector.init[Datum](a)};
+    val err_room: err[allocator.Error] = slice.fill[u8](?out.bytes, size::usize, 0);
+    if (sel err_room.err) {
+        dnit(?out);
+        ret res[Image, Error].err{Error.alloc{err_room.err}};
+    }
+    var w:       Writer     = Writer{a: a, m: m, l: l, space: space, order: order, out: ?out};
+    var none:    Known      = unknown();
+    val err_put: err[Error] = constant(?w, c, 0, ?none);
+    if (sel err_put.err) {
+        dnit(?out);
+        ret res[Image, Error].err{err_put.err};
+    }
+    ret res[Image, Error].ok{out};
+}

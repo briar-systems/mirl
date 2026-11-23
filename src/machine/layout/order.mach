@@ -1,0 +1,281 @@
+# the order blocks are laid out in
+#
+# a greedy topological order over the forward edges. each block is followed by
+# its likely successor when that one is ready, the successor deepest in loops
+# so a loop's own successor wins over the way out of it, then the last one
+# listed, and otherwise by the ready block earliest in reverse postorder.
+# blocks the entry does not reach are dropped, and blocks that end in a fault
+# go last. the graph is the function's with every bypassed block's
+# name replaced by the block it lands at.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.heap;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Edge;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Undecided;
+use mirl.machine.layout.exit;
+use mirl.machine.layout.thread;
+use mirl.machine.layout.thread.Threads;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+
+# what placing reads and changes
+# ---
+# f:       the function
+# g:       its graph over the blocks that stay
+# d:       its dominance
+# l:       its loops
+# t:       the threading
+# placed:  per block, whether it has a place
+# forward: per block, the forward edges into it from blocks not yet placed
+# ready:   the blocks whose forward edges are all placed, by reverse postorder
+# order:   the blocks placed so far
+# cold:    the blocks that end in a fault, placed after the rest
+# faults:  per block, whether it ends in a fault
+rec Placement {
+    f:       *Function;
+    g:       *Graph;
+    d:       *Dominance;
+    l:       *Loops;
+    t:       *Threads;
+    placed:  vector.Vector[bool];
+    forward: vector.Vector[u32];
+    ready:   heap.Heap[u32, heap.Min];
+    order:   vector.Vector[u32];
+    cold:    vector.Vector[u32];
+    faults:  vector.Vector[bool];
+}
+
+# the edges of the blocks that stay, to the blocks their targets land at
+fun edges(a: *allocator.Allocator, f: *Function, t: *Threads) res[vector.Vector[Edge], allocator.Error] {
+    var out: vector.Vector[Edge] = vector.init[Edge](a);
+    var b:   u32                 = 0;
+    for (b::usize < f.blocks.len) {
+        if (!thread.removed(t, b)) {
+            val list: Slice[Instruction] = function.instructions(f, b);
+            var i:    usize              = 0;
+            for (i < list.size) {
+                val data: *InstructionData = function.data(f, list.data[i]);
+                var k:    usize            = 0;
+                for (k < data.operands.size) {
+                    val o: Operand = data.operands.data[k];
+                    if (sel o.block) {
+                        val res_pushed: res[usize, allocator.Error] = vector.push[Edge](?out, Edge{from: b, to: thread.resolve(t, o.block)});
+                        if (sel res_pushed.err) {
+                            vector.dnit[Edge](?out);
+                            ret res[vector.Vector[Edge], allocator.Error].err{res_pushed.err};
+                        }
+                    }
+                    k = k + 1;
+                }
+                i = i + 1;
+            }
+        }
+        b = b + 1;
+    }
+    ret res[vector.Vector[Edge], allocator.Error].ok{out};
+}
+
+# whether an edge returns to a block that dominates its source
+fun back(p: *Placement, from: u32, to: u32) bool {
+    ret dominance.dominates(p.d, to, from);
+}
+
+# whether a block ends in a fault
+fun cold(p: *Placement, b: u32) bool {
+    ret p.faults.data[b];
+}
+
+# mark each block that ends in a fault, or refuse a last instruction whose control is undecided
+fun mark_faults(p: *Placement) err[Undecided] {
+    var b: u32 = 0;
+    for (b::usize < p.f.blocks.len) {
+        val list: Slice[Instruction] = function.instructions(p.f, b);
+        if (list.size > 0) {
+            val res_faults: res[bool, Undecided] = exit.faults(p.f, list.data[list.size - 1]);
+            if (sel res_faults.err) { ret err[Undecided].err{res_faults.err}; }
+            p.faults.data[b] = res_faults.ok;
+        }
+        b = b + 1;
+    }
+    ret err[Undecided].ok{};
+}
+
+fun rank(p: *Placement, b: u32) u32 {
+    ret p.d.rank.data[b];
+}
+
+# a block has its place, and its forward edges are no longer waited for
+fun place(p: *Placement, b: u32) err[allocator.Error] {
+    p.placed.data[b] = true;
+    val res_pushed: res[usize, allocator.Error] = vector.push[u32](?p.order, b);
+    if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+    ret release(p, b);
+}
+
+fun release(p: *Placement, b: u32) err[allocator.Error] {
+    val next: Slice[u32] = graph.successors(p.g, b);
+    var e:    usize      = 0;
+    for (e < next.size) {
+        val s: u32 = next.data[e];
+        if (!back(p, b, s)) {
+            p.forward.data[s] = p.forward.data[s] - 1;
+            if (p.forward.data[s] == 0 && !p.placed.data[s]) {
+                val res_queued: res[usize, allocator.Error] = heap.push[u32, heap.Min](?p.ready, rank(p, s));
+                if (sel res_queued.err) { ret err[allocator.Error].err{res_queued.err}; }
+            }
+        }
+        e = e + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the successor to place right after a block, NONE when none is ready
+fun likely(p: *Placement, b: u32) u32 {
+    val next: Slice[u32] = graph.successors(p.g, b);
+    var best: u32        = NONE;
+    var e:    usize      = 0;
+    for (e < next.size) {
+        val s: u32 = next.data[e];
+        if (!p.placed.data[s] && p.forward.data[s] == 0 && !back(p, b, s) && !cold(p, s)) {
+            if (best == NONE || loops.depth(p.l, s) >= loops.depth(p.l, best)) { best = s; }
+        }
+        e = e + 1;
+    }
+    ret best;
+}
+
+fun place_all(p: *Placement) err[allocator.Error] {
+    val rpo: Slice[u32] = dominance.order(p.d);
+    var b:   u32        = 0;
+    for (b::usize < p.f.blocks.len) {
+        if (dominance.reachable(p.d, b)) {
+            val next: Slice[u32] = graph.successors(p.g, b);
+            var e:    usize      = 0;
+            for (e < next.size) {
+                if (!back(p, b, next.data[e])) { p.forward.data[next.data[e]] = p.forward.data[next.data[e]] + 1; }
+                e = e + 1;
+            }
+        }
+        b = b + 1;
+    }
+    val err_first: err[allocator.Error] = place(p, 0);
+    if (sel err_first.err) { ret err_first; }
+    for {
+        var next: u32 = likely(p, p.order.data[p.order.len - 1]);
+        for (next == NONE && p.ready.len > 0) {
+            val opt_popped: opt[u32] = heap.pop[u32, heap.Min](?p.ready);
+            if (sel opt_popped.some) {
+                val c: u32 = rpo.data[opt_popped.some];
+                if (!p.placed.data[c]) {
+                    if (cold(p, c)) {
+                        p.placed.data[c] = true;
+                        vector.push[u32](?p.cold, c);
+                        val err_freed: err[allocator.Error] = release(p, c);
+                        if (sel err_freed.err) { ret err_freed; }
+                    }
+                    or { next = c; }
+                }
+            }
+        }
+        if (next == NONE) { brk; }
+        val err_placed: err[allocator.Error] = place(p, next);
+        if (sel err_placed.err) { ret err_placed; }
+    }
+    b = 0;
+    for (b::usize < p.f.blocks.len) {
+        if (!p.placed.data[b] && !thread.removed(p.t, b) && dominance.reachable(p.d, b)) { vector.push[u32](?p.order, b); }
+        b = b + 1;
+    }
+    var c: usize = 0;
+    for (c < p.cold.len) {
+        vector.push[u32](?p.order, p.cold.data[c]);
+        c = c + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the blocks of a function in the order they are laid out
+# ---
+# a:   the allocator the result takes
+# f:   the function, unchanged
+# t:   where its bypassed blocks land
+# ret: every block that stays, the entry first, or why it was refused
+pub fun order(a: *allocator.Allocator, f: *Function, t: *Threads) res[vector.Vector[u32], exit.Error] {
+    val res_listed: res[vector.Vector[Edge], allocator.Error] = edges(a, f, t);
+    if (sel res_listed.err) { ret res[vector.Vector[u32], exit.Error].err{exit.Error.alloc{res_listed.err}}; }
+    var list: vector.Vector[Edge] = res_listed.ok;
+    fin { vector.dnit[Edge](?list); }
+    val res_made: res[Graph, allocator.Error] = graph.init(a, f.blocks.len::u32, 0, Slice[Edge]{data: list.data, size: list.len});
+    if (sel res_made.err) { ret res[vector.Vector[u32], exit.Error].err{exit.Error.alloc{res_made.err}}; }
+    var g: Graph = res_made.ok;
+    fin { graph.dnit(?g); }
+    val res_doms: res[Dominance, allocator.Error] = dominance.compute(a, ?g);
+    if (sel res_doms.err) { ret res[vector.Vector[u32], exit.Error].err{exit.Error.alloc{res_doms.err}}; }
+    var d: Dominance = res_doms.ok;
+    fin { dominance.dnit(?d); }
+    val res_nest: res[Loops, allocator.Error] = loops.compute(a, ?g, ?d);
+    if (sel res_nest.err) { ret res[vector.Vector[u32], exit.Error].err{exit.Error.alloc{res_nest.err}}; }
+    var l: Loops = res_nest.ok;
+    fin { loops.dnit(?l); }
+    var p: Placement = Placement{
+        f:       f,
+        g:       ?g,
+        d:       ?d,
+        l:       ?l,
+        t:       t,
+        placed:  vector.init[bool](a),
+        forward: vector.init[u32](a),
+        ready:   heap.init[u32, heap.Min](a),
+        order:   vector.init[u32](a),
+        cold:    vector.init[u32](a),
+        faults:  vector.init[bool](a),
+    };
+    fin {
+        vector.dnit[bool](?p.placed);
+        vector.dnit[u32](?p.forward);
+        heap.dnit[u32, heap.Min](?p.ready);
+        vector.dnit[u32](?p.cold);
+        vector.dnit[bool](?p.faults);
+    }
+    var err_failed: err[allocator.Error] = slice.fill[bool](?p.placed, f.blocks.len, false);
+    keep(?err_failed, slice.fill[u32](?p.forward, f.blocks.len, 0));
+    keep(?err_failed, slice.fill[bool](?p.faults, f.blocks.len, false));
+    if (sel err_failed.err) {
+        vector.dnit[u32](?p.order);
+        ret res[vector.Vector[u32], exit.Error].err{exit.Error.alloc{err_failed.err}};
+    }
+    val err_marked: err[Undecided] = mark_faults(?p);
+    if (sel err_marked.err) {
+        vector.dnit[u32](?p.order);
+        ret res[vector.Vector[u32], exit.Error].err{exit.Error.undecided{err_marked.err}};
+    }
+    val err_placed: err[allocator.Error] = place_all(?p);
+    if (sel err_placed.err) {
+        vector.dnit[u32](?p.order);
+        ret res[vector.Vector[u32], exit.Error].err{exit.Error.alloc{err_placed.err}};
+    }
+    ret res[vector.Vector[u32], exit.Error].ok{p.order};
+}

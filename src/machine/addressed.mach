@@ -1,0 +1,758 @@
+# which frame slots of an allocated function let their address out of the registers
+#
+# selection marks every frame local of an ir stack slot addressed, as the
+# alloca's result is its address. once allocation has placed every value, a
+# slot's address is formed only by the slot address pseudo-instruction, which
+# the frame expands into an add of a fixed offset to the stack or frame
+# pointer, and a walk of the encoded code follows a register holding it from
+# there. one the allocator made again past its slot by a displacement
+# (`mirl.machine.alloc.remade`) is the same add of another fixed offset, so it
+# holds the slot's address as surely as one with none. so a slot whose address is only ever the plain base of a memory
+# operand of a row instruction, in a register that holds it on every path that
+# reaches the access, is reached by no access the walk does not place in the
+# frame, and no callee is handed it. any other read of a register that may
+# hold a slot's address lets it out: a spill, which a reload brings back as a
+# pointer the walk no longer follows, a copy, a call's argument, an inline
+# block, an index, a segment, a base written back, an operand of arithmetic,
+# a register holding it on one path into a block and not on another, and a
+# write that leaves part of a register holding it. a slot an instruction names other
+# than a slot address, a spill or a reload lets it out too. the one read of it
+# arithmetic may make is the address of an access that states a frame extent
+# of that slot (`mirl.ir.metadata.Extent`), as each access of a loop a copy or
+# fill of the slot was made into: an instruction that only computes registers
+# from registers, reading no memory and transferring no control, makes what
+# it writes derived from every slot address it reads, an address it forms
+# without accessing memory there (x86 lea) included, and a derived register,
+# or the base of an access that adds an index to it, as aarch64's register
+# offset loads, keeps the slot in only as the base of such an access, which
+# the walk places by the range it states. the one arithmetic that is no such
+# read is a write of the whole of a register as one surely holding a slot's
+# address plus a number and nothing else (x86 lea of a base and displacement,
+# aarch64 add of an immediate, risc-v addi): the walk follows every register
+# as wide as the stack pointer through it at a known offset, so what it writes
+# holds the slot's address as surely as its source. this is decided
+# once for a function that requires constant time, whose walk states the slots
+# that keep their address in as private frame extents (`mirl.machine.emit.timed`),
+# as a forward pass over the physical registers to a fixed point.
+#
+# the same pass, run once more at its fixed point, lists where each slot is
+# reached through a register (`reached`): every access whose base holds its
+# address or a value derived from it, for the sharing of frame slots, which
+# needs to know where a slot that keeps its address in is still read or
+# written.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.metadata;
+use mirl.machine.alloc.remade;
+use mirl.machine.class.Physical;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.pseudo;
+
+use masc.core.effect;
+use mo:   masc.core.operand;
+use rf:   masc.core.register;
+use rows: masc.core.row;
+
+# a register that may hold a slot's address, or a value arithmetic made of one
+# ---
+# reg:     the register
+# slot:    the slot
+# sure:    it holds it on every path that reaches here
+# derived: it holds a value arithmetic made of the slot's address, not the address
+rec Held {
+    reg:     rf.Id;
+    slot:    u32;
+    sure:    bool;
+    derived: bool;
+}
+
+# what holds slot addresses where a block starts
+# ---
+# reached: a path from the entry reaches it yet
+# held:    the registers that may hold one there
+rec Start {
+    reached: bool;
+    held:    vector.Vector[Held];
+}
+
+# an instruction that reaches a slot through a register holding its address
+# or a value derived from it
+# ---
+# at:   the instruction
+# slot: the slot
+pub rec Reach {
+    at:   Instruction;
+    slot: u32;
+}
+
+# what the pass shares
+# ---
+# file:     the register file
+# held:     the registers that may hold a slot address before the instruction the pass is at
+# escaped:  whether each slot lets its address out
+# deriving: the slots whose addresses the instruction the pass is at reads as arithmetic
+# at:       the instruction the pass is at
+# reached:  where the reaches are listed, nil while the pass is not listing them
+rec Pass {
+    file:     *rf.File;
+    held:     vector.Vector[Held];
+    escaped:  vector.Vector[bool];
+    deriving: vector.Vector[u32];
+    at:       Instruction;
+    reached:  *vector.Vector[Reach];
+}
+
+fun escape(p: *Pass, slot: u32) {
+    if (slot::usize < p.escaped.len) { p.escaped.data[slot::usize] = true; }
+}
+
+fun overlaps(file: *rf.File, a: rf.Id, b: rf.Id) bool {
+    if (a == b) { ret true; }
+    val opt_row_of:      opt[*rf.Register] = rf.row_of(file, a);
+    val opt_row_of_file: opt[*rf.Register] = rf.row_of(file, b);
+    if (sel opt_row_of.some) {
+        if (sel opt_row_of_file.some) { ret rf.overlap(file, opt_row_of.some, opt_row_of_file.some); }
+    }
+    ret false;
+}
+
+# the register an operand register names, none for a virtual register or a cell
+fun physical_of(r: Register) opt[rf.Id] {
+    if (!(sel r.physical)) { ret opt[rf.Id].none{}; }
+    val at: Physical = r.physical;
+    if (sel at.register) { ret opt[rf.Id].some{at.register}; }
+    ret opt[rf.Id].none{};
+}
+
+fun named_of(r: opt[Register]) opt[rf.Id] {
+    if (sel r.none) { ret opt[rf.Id].none{}; }
+    ret physical_of(r.some);
+}
+
+# a read of `reg` as anything but a plain base lets out every slot address a register sharing its storage may hold, but
+# one an instruction that `derives` reads, whose slots it marks deriving
+fun read(p: *Pass, reg: rf.Id, derives: bool) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < p.held.len) {
+        if (overlaps(p.file, p.held.data[i].reg, reg)) {
+            if (derives) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](?p.deriving, p.held.data[i].slot);
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+            }
+            or { escape(p, p.held.data[i].slot); }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# a read of `reg` as the base of a memory operand, `plain` when it is a row instruction's with no index, segment,
+# symbol or write back, by an access stating a frame extent of slot `stated`, NO_SLOT for none: it keeps in an address
+# or derived value of the stated slot `reg` itself holds, and an address `reg` itself surely holds as a plain base
+fun based(p: *Pass, reg: rf.Id, plain: bool, stated: u32) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < p.held.len) {
+        val h: Held = p.held.data[i];
+        if (h.reg == reg) {
+            if (h.slot == stated)               {}
+            or (h.derived || !plain || !h.sure) { escape(p, h.slot); }
+            if (p.reached != nil) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Reach](p.reached, Reach{at: p.at, slot: h.slot});
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+            }
+        }
+        or (overlaps(p.file, h.reg, reg)) { escape(p, h.slot); }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the slot of the frame extent instruction `d` states, NO_SLOT for none
+fun stated_slot(d: *InstructionData) u32 {
+    if (!metadata.states_extent(?d.metadata)) { ret metadata.NO_SLOT; }
+    ret d.metadata.extent.slot;
+}
+
+# whether instruction `d` only computes registers from registers: a row reading and writing no memory, transferring no
+# control, naming no register list or slot and accessing memory through no address operand, so what it writes is made
+# of what it reads alone. an address operand of such a row is one it forms, as x86 lea's
+fun derives(d: *InstructionData) bool {
+    val op: Opcode = d.opcode;
+    if (!(sel op.row)) { ret false; }
+    val r: *rows.Row      = op.row;
+    val e: *effect.Effect = r.effect;
+    if (e == nil)                          { ret false; }
+    if (e.memory.len != 0)                 { ret false; }
+    if (e.control.transfer != effect.NONE) { ret false; }
+    var n: usize = 0;
+    for (n < d.operands.size) {
+        val o: Operand = d.operands.data[n];
+        if (sel o.list || sel o.slot)             { ret false; }
+        if (sel o.address && accesses(d, n::u32)) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# whether an instruction accesses memory through its address operand `n`: any but a row whose operand there names no
+# data, by a role of none or a width of 0, as masc reads an access (x86 lea's), which only forms the address
+fun accesses(d: *InstructionData, n: u32) bool {
+    val op: Opcode = d.opcode;
+    if (!(sel op.row)) { ret true; }
+    val r: *rows.Row = op.row;
+    if (n >= r.operands.len) { ret true; }
+    val desc: mo.Operand = r.operands.at[n];
+    ret desc.role != mo.NONE && desc.width != 0;
+}
+
+# whether a write of `reg` overwrites every bit of `held`, as its row's extension says, as x86's eax zeroing the
+# rest of rax or aarch64's w0 the rest of x0
+fun overwritten(file: *rf.File, reg: rf.Id, held: rf.Id) bool {
+    if (reg == held) { ret true; }
+    val opt_row_of:      opt[*rf.Register] = rf.row_of(file, reg);
+    val opt_row_of_file: opt[*rf.Register] = rf.row_of(file, held);
+    if (sel opt_row_of.some) {
+        if (sel opt_row_of_file.some) { ret rf.overwrites(file, opt_row_of.some, opt_row_of_file.some, opt[rf.Extend].none{}); }
+    }
+    ret false;
+}
+
+# a write of `reg` ends every slot address a register sharing its storage holds, and lets out one it leaves part of
+fun write(p: *Pass, reg: rf.Id) {
+    var i: usize = 0;
+    for (i < p.held.len) {
+        val h: Held = p.held.data[i];
+        if (overlaps(p.file, h.reg, reg)) {
+            if (!overwritten(p.file, reg, h.reg)) { escape(p, h.slot); }
+            vector.swap_remove[Held](?p.held, i);
+        }
+        or { i = i + 1; }
+    }
+}
+
+# a read or write of a register list, whose members the pass does not name one by one, lets out every slot address
+# held anywhere, and a write ends them
+fun listed(p: *Pass, writes: bool) {
+    var i: usize = 0;
+    for (i < p.held.len) {
+        escape(p, p.held.data[i].slot);
+        i = i + 1;
+    }
+    if (writes) { vector.clear[Held](?p.held); }
+}
+
+# whether an operand of `role` reads its register, a role stating neither read nor write counted as a read
+fun reads(role: mo.Role) bool {
+    ret (role & mo.READ) != 0 || (role & mo.WRITE) == 0;
+}
+
+fun writes(role: mo.Role) bool {
+    ret (role & mo.WRITE) != 0;
+}
+
+# whether a plain base of an operand of an instruction of opcode `op` keeps a slot address in
+fun plain(op: Opcode, a: operand.Address) bool {
+    if (!(sel op.row))                                                 { ret false; }
+    if (sel a.index.some || sel a.segment.some || operand.symbolic(a)) { ret false; }
+    ret !operand.writes_back(a);
+}
+
+# whether register operand `n` of instruction `d` is the base of a memory access its row states, and whether it is a
+# plain one, as aarch64 str's base register: an access through the address it holds, moved only by immediates, with
+# no index. none where it is no base, written, or carried to another register by a relation
+fun accessed_base(d: *InstructionData, n: u32) opt[bool] {
+    val op: Opcode = d.opcode;
+    if (!(sel op.row)) { ret opt[bool].none{}; }
+    val r: *rows.Row      = op.row;
+    val e: *effect.Effect = r.effect;
+    if (e == nil || n >= r.operands.len)         { ret opt[bool].none{}; }
+    if ((r.operands.at[n].role & mo.WRITE) != 0) { ret opt[bool].none{}; }
+    var found: bool = false;
+    var plain: bool = true;
+    var i:     u32  = 0;
+    for (i < e.memory.len) {
+        val a: effect.Access = e.memory.at[i];
+        if (a.operand::u32 == n) {
+            if (a.base != effect.NO_ROW || a.pop != 0)            { ret opt[bool].none{}; }
+            if (!(sel a.index.none) || !immediates(r, a.forming)) { plain = false; }
+            found = true;
+        }
+        i = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < e.relations.len) {
+        val h: effect.Holds = e.relations.at[k].holds;
+        if (sel h.offset) {
+            val from: effect.Source = h.offset.from;
+            if (sel from.operand) {
+                if (from.operand::u32 == n) { ret opt[bool].none{}; }
+            }
+        }
+        k = k + 1;
+    }
+    if (!found) { ret opt[bool].none{}; }
+    ret opt[bool].some{plain};
+}
+
+# whether every operand of `forming` in row `r` is an immediate
+fun immediates(r: *rows.Row, forming: mo.Positions) bool {
+    var k: u32 = 0;
+    for (k < 32) {
+        if (((forming >> k) & 1) != 0) {
+            if (k >= r.operands.len)                     { ret false; }
+            if (!(sel r.operands.at[k].shape.immediate)) { ret false; }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether instruction `d` names a slot only as the place it reads or writes directly, a spill's or a reload's, or
+# as the slot whose storage it marks
+fun direct(d: *InstructionData) bool {
+    val op: Opcode = d.opcode;
+    if (!(sel op.pseudo)) { ret false; }
+    ret op.pseudo == pseudo.SPILL || op.pseudo == pseudo.RELOAD || pseudo.marks(op.pseudo);
+}
+
+# the reads of instruction `d`
+fun reads_of(p: *Pass, d: *InstructionData) err[allocator.Error] {
+    val count:      u32                  = d.operands.size::u32;
+    val stated:     u32                  = stated_slot(d);
+    val deriver:    bool                 = derives(d);
+    var err_failed: err[allocator.Error] = err[allocator.Error].ok{};
+    var n:          u32                  = 0;
+    for (n < count && !(sel err_failed.err)) {
+        val o:    Operand = d.operands.data[n];
+        val role: mo.Role = instruction.role(d.opcode, count, n);
+        if (sel o.physical) {
+            val opt_reg: opt[rf.Id] = physical_of(Register.physical{o.physical});
+            if (sel opt_reg.some) {
+                if (reads(role)) {
+                    val opt_based: opt[bool] = accessed_base(d, n);
+                    if (sel opt_based.some) { err_failed = based(p, opt_reg.some, opt_based.some, stated); }
+                    or                      { err_failed = read(p, opt_reg.some, deriver); }
+                }
+            }
+        }
+        or (sel o.tied) {
+            val opt_reg: opt[rf.Id] = physical_of(o.tied.source);
+            if (sel opt_reg.some) { err_failed = read(p, opt_reg.some, deriver); }
+        }
+        or (sel o.list) {
+            if (reads(role)) { listed(p, false); }
+        }
+        or (sel o.address) {
+            val accessed: bool       = accesses(d, n);
+            val opt_base: opt[rf.Id] = named_of(o.address.base);
+            if (sel opt_base.some) {
+                if (accessed) { err_failed = based(p, opt_base.some, plain(d.opcode, o.address), stated); }
+                or            { err_failed = read(p, opt_base.some, deriver); }
+            }
+            val opt_index: opt[rf.Id] = named_of(o.address.index);
+            if (sel opt_index.some) {
+                if (!(sel err_failed.err)) { err_failed = read(p, opt_index.some, deriver); }
+            }
+            val opt_segment: opt[rf.Id] = named_of(o.address.segment);
+            if (sel opt_segment.some) {
+                if (!(sel err_failed.err)) { err_failed = read(p, opt_segment.some, deriver); }
+            }
+        }
+        or (sel o.slot) {
+            if (!direct(d)) { escape(p, o.slot); }
+        }
+        n = n + 1;
+    }
+    var k: usize = 0;
+    for (k < d.implicit.size && !(sel err_failed.err)) {
+        val at: Physical = d.implicit.data[k].location;
+        if (sel at.register) {
+            if (!d.implicit.data[k].write) { err_failed = read(p, at.register, false); }
+        }
+        k = k + 1;
+    }
+    ret err_failed;
+}
+
+# register `reg` made derived from each slot the instruction the pass is at read as arithmetic
+fun derive(p: *Pass, reg: rf.Id) err[allocator.Error] {
+    var i: usize = 0;
+    for (i < p.deriving.len) {
+        val opt_there: opt[usize] = find(?p.held, reg, p.deriving.data[i], true);
+        if (sel opt_there.none) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Held](?p.held, Held{reg: reg, slot: p.deriving.data[i], sure: true, derived: true});
+            if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# every register instruction `d` writes made derived from each slot it read as arithmetic
+fun derived(p: *Pass, d: *InstructionData) err[allocator.Error] {
+    if (p.deriving.len == 0) { ret err[allocator.Error].ok{}; }
+    val count: u32 = d.operands.size::u32;
+    var n:     u32 = 0;
+    for (n < count) {
+        val o:       Operand    = d.operands.data[n];
+        var opt_reg: opt[rf.Id] = opt[rf.Id].none{};
+        if (sel o.physical) {
+            if (writes(instruction.role(d.opcode, count, n))) { opt_reg = physical_of(Register.physical{o.physical}); }
+        }
+        or (sel o.tied) { opt_reg = physical_of(o.tied.dest); }
+        if (sel opt_reg.some) {
+            val err_made: err[allocator.Error] = derive(p, opt_reg.some);
+            if (sel err_made.err) { ret err_made; }
+        }
+        n = n + 1;
+    }
+    var k: usize = 0;
+    for (k < d.implicit.size) {
+        val at: Physical = d.implicit.data[k].location;
+        if (sel at.register) {
+            if (d.implicit.data[k].write) {
+                val err_made: err[allocator.Error] = derive(p, at.register);
+                if (sel err_made.err) { ret err_made; }
+            }
+        }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the writes of instruction `d`
+fun writes_of(p: *Pass, d: *InstructionData) {
+    val count: u32 = d.operands.size::u32;
+    var n:     u32 = 0;
+    for (n < count) {
+        val o:    Operand = d.operands.data[n];
+        val role: mo.Role = instruction.role(d.opcode, count, n);
+        if (sel o.physical) {
+            val opt_reg: opt[rf.Id] = physical_of(Register.physical{o.physical});
+            if (sel opt_reg.some) {
+                if (writes(role)) { write(p, opt_reg.some); }
+            }
+        }
+        or (sel o.tied) {
+            val opt_reg: opt[rf.Id] = physical_of(o.tied.dest);
+            if (sel opt_reg.some) { write(p, opt_reg.some); }
+        }
+        or (sel o.list) {
+            if (writes(role)) { listed(p, true); }
+        }
+        or (sel o.address) {
+            val opt_base: opt[rf.Id] = named_of(o.address.base);
+            if (sel opt_base.some) {
+                if (operand.writes_back(o.address)) { write(p, opt_base.some); }
+            }
+        }
+        n = n + 1;
+    }
+    var k: usize = 0;
+    for (k < d.implicit.size) {
+        val at: Physical = d.implicit.data[k].location;
+        if (sel at.register) {
+            if (d.implicit.data[k].write) { write(p, at.register); }
+        }
+        k = k + 1;
+    }
+}
+
+# the register `o` names, as a register or as the base of an address, none for any other
+fun register_of(o: Operand) opt[rf.Id] {
+    if (sel o.physical) { ret physical_of(Register.physical{o.physical}); }
+    if (sel o.address) {
+        val opt_base: opt[Register] = o.address.base;
+        if (sel opt_base.some) { ret physical_of(opt_base.some); }
+    }
+    ret opt[rf.Id].none{};
+}
+
+# whether `d` writes a register as another plus a number and does nothing else (`remade.moved`), the whole of a
+# register of the class of the one it starts from, which surely holds slot addresses and nothing derived. the one
+# it writes then holds those slots' addresses as surely, at a known offset, since the walk follows every register as
+# wide as the stack pointer through such a relation as it follows the slot address itself
+fun offset_step(p: *Pass, d: *InstructionData) res[bool, allocator.Error] {
+    val opt_moved: opt[remade.Moved] = remade.moved(d);
+    if (sel opt_moved.none) { ret res[bool, allocator.Error].ok{false}; }
+    val mv:       remade.Moved = opt_moved.some;
+    val opt_dest: opt[rf.Id]   = register_of(d.operands.data[mv.to::usize]);
+    val opt_src:  opt[rf.Id]   = register_of(d.operands.data[mv.from::usize]);
+    var dest:     rf.Id;
+    var src:      rf.Id;
+    if (sel opt_dest.some)                   { dest = opt_dest.some; }
+    or                                       { ret res[bool, allocator.Error].ok{false}; }
+    if (sel opt_src.some)                    { src = opt_src.some; }
+    or                                       { ret res[bool, allocator.Error].ok{false}; }
+    if (!same_class(p, d, mv.to, dest, src)) { ret res[bool, allocator.Error].ok{false}; }
+    vector.clear[u32](?p.deriving);
+    var i: usize = 0;
+    for (i < p.held.len) {
+        val h: Held = p.held.data[i];
+        i = i + 1;
+        if (h.reg == src) {
+            if (!h.sure || h.derived) { ret res[bool, allocator.Error].ok{false}; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[u32](?p.deriving, h.slot);
+            if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+        }
+        or (overlaps(p.file, h.reg, src)) { ret res[bool, allocator.Error].ok{false}; }
+    }
+    if (p.deriving.len == 0) { ret res[bool, allocator.Error].ok{false}; }
+    write(p, dest);
+    i = 0;
+    for (i < p.deriving.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Held](?p.held, Held{reg: dest, slot: p.deriving.data[i], sure: true, derived: false});
+        if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+        i = i + 1;
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# whether registers `dest` and `src` are of one class and operand `to` of `d` writes the whole of `dest` at the widest the
+# class takes under any multiplier, so at every width a scaled class (risc-v's xlen registers) has
+fun same_class(p: *Pass, d: *InstructionData, to: u32, dest: rf.Id, src: rf.Id) bool {
+    val opt_dest_row: opt[*rf.Register] = rf.row_of(p.file, dest);
+    val opt_src_row:  opt[*rf.Register] = rf.row_of(p.file, src);
+    var class:        u16               = 0;
+    if (sel opt_dest_row.some) { class = opt_dest_row.some.class; }
+    or                         { ret false; }
+    if (sel opt_src_row.some) {
+        if (opt_src_row.some.class != class) { ret false; }
+    }
+    or { ret false; }
+    ret instruction.whole(d.opcode, to, class, rf.width_most(p.file, class));
+}
+
+# instruction `d` run over what holds slot addresses before it
+fun step(p: *Pass, d: *InstructionData) err[allocator.Error] {
+    val op: Opcode = d.opcode;
+    if (sel op.pseudo) {
+        if (op.pseudo == pseudo.ADDRESS && d.operands.size == 3) {
+            val dest: Operand = d.operands.data[0];
+            val slot: Operand = d.operands.data[1];
+            if (sel slot.slot) {
+                var opt_reg: opt[rf.Id] = opt[rf.Id].none{};
+                if (sel dest.physical) { opt_reg = physical_of(Register.physical{dest.physical}); }
+                if (sel opt_reg.none) {
+                    escape(p, slot.slot);
+                    ret err[allocator.Error].ok{};
+                }
+                write(p, opt_reg.some);
+                val res_pushed: res[usize, allocator.Error] = vector.push[Held](?p.held, Held{reg: opt_reg.some, slot: slot.slot, sure: true, derived: false});
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+                ret err[allocator.Error].ok{};
+            }
+        }
+    }
+    val res_offset: res[bool, allocator.Error] = offset_step(p, d);
+    if (sel res_offset.err) { ret err[allocator.Error].err{res_offset.err}; }
+    if (res_offset.ok)      { ret err[allocator.Error].ok{}; }
+    vector.clear[u32](?p.deriving);
+    val err_read_all: err[allocator.Error] = reads_of(p, d);
+    if (sel err_read_all.err) { ret err_read_all; }
+    writes_of(p, d);
+    ret derived(p, d);
+}
+
+# the index in `held` of the entry for `reg` and `slot` that is or is not derived, none where there is none
+fun find(held: *vector.Vector[Held], reg: rf.Id, slot: u32, derived: bool) opt[usize] {
+    var i: usize = 0;
+    for (i < held.len) {
+        if (held.data[i].reg == reg && held.data[i].slot == slot && held.data[i].derived == derived) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# what holds slot addresses at the end of a predecessor joined into where block `into` starts: a register holds an
+# address surely only where it surely does on every path. whether that changed it
+fun join(into: *Start, from: *vector.Vector[Held]) res[bool, allocator.Error] {
+    if (!into.reached) {
+        into.reached = true;
+        val res_copied: res[usize, allocator.Error] = vector.extend[Held](?into.held, Slice[Held]{data: from.data, size: from.len});
+        if (sel res_copied.err) { ret res[bool, allocator.Error].err{res_copied.err}; }
+        ret res[bool, allocator.Error].ok{true};
+    }
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < into.held.len) {
+        val h: Held = into.held.data[i];
+        if (h.sure) {
+            val opt_other: opt[usize] = find(from, h.reg, h.slot, h.derived);
+            var kept:      bool       = false;
+            if (sel opt_other.some) { kept = from.data[opt_other.some].sure; }
+            if (!kept) {
+                into.held.data[i].sure = false;
+                changed                = true;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < from.len) {
+        val h:         Held       = from.data[i];
+        val opt_there: opt[usize] = find(?into.held, h.reg, h.slot, h.derived);
+        if (sel opt_there.none) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Held](?into.held, Held{reg: h.reg, slot: h.slot, sure: false, derived: h.derived});
+            if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+            changed = true;
+        }
+        i = i + 1;
+    }
+    ret res[bool, allocator.Error].ok{changed};
+}
+
+# one pass over block `k` from where it starts, joining what holds slot addresses after each instruction naming a
+# block into where that block starts, as a conditional branch may stand before the rest of its block. whether that
+# changed where one starts
+fun block(p: *Pass, f: *Function, starts: *vector.Vector[Start], k: usize) res[bool, allocator.Error] {
+    vector.clear[Held](?p.held);
+    val from:       *Start                      = ?starts.data[k];
+    val res_extend: res[usize, allocator.Error] = vector.extend[Held](?p.held, Slice[Held]{data: from.held.data, size: from.held.len});
+    if (sel res_extend.err) { ret res[bool, allocator.Error].err{res_extend.err}; }
+    var changed: bool               = false;
+    val list:    Slice[Instruction] = function.instructions(f, (k::u32));
+    var i:       usize              = 0;
+    for (i < list.size) {
+        val d: *InstructionData = function.data(f, list.data[i]);
+        p.at = list.data[i];
+        val err_stepped: err[allocator.Error] = step(p, d);
+        if (sel err_stepped.err) { ret res[bool, allocator.Error].err{err_stepped.err}; }
+        var n: usize = 0;
+        for (n < d.operands.size) {
+            val o: Operand = d.operands.data[n];
+            if (sel o.block) {
+                if (o.block::usize < starts.len) {
+                    val res_joined: res[bool, allocator.Error] = join(?starts.data[o.block::usize], ?p.held);
+                    if (sel res_joined.err) { ret res_joined; }
+                    changed = changed || res_joined.ok;
+                }
+            }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret res[bool, allocator.Error].ok{changed};
+}
+
+fun starts_dnit(starts: *vector.Vector[Start]) {
+    var k: usize = 0;
+    for (k < starts.len) {
+        vector.dnit[Held](?starts.data[k].held);
+        k = k + 1;
+    }
+    vector.dnit[Start](starts);
+}
+
+# the pass to its fixed point, then once more listing the reaches into
+# `reached` when it is not nil
+fun run(a: *allocator.Allocator, f: *Function, p: *Pass, reached: *vector.Vector[Reach]) err[allocator.Error] {
+    var starts: vector.Vector[Start] = vector.init[Start](a);
+    fin { starts_dnit(?starts); }
+    var i: usize = 0;
+    for (i < f.slots.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[bool](?p.escaped, false);
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Start](?starts, Start{reached: i == 0, held: vector.init[Held](a)});
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        i = i + 1;
+    }
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var k: usize = 0;
+        for (k < starts.len) {
+            if (starts.data[k].reached) {
+                val res_moved: res[bool, allocator.Error] = block(p, f, ?starts, k);
+                if (sel res_moved.err) { ret err[allocator.Error].err{res_moved.err}; }
+                changed = changed || res_moved.ok;
+            }
+            k = k + 1;
+        }
+    }
+    if (reached == nil) { ret err[allocator.Error].ok{}; }
+    p.reached = reached;
+    var k: usize = 0;
+    for (k < starts.len) {
+        if (starts.data[k].reached) {
+            val res_listed: res[bool, allocator.Error] = block(p, f, ?starts, k);
+            if (sel res_listed.err) { ret err[allocator.Error].err{res_listed.err}; }
+        }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+fun pass_init(a: *allocator.Allocator, f: *Function) Pass {
+    ret Pass{file: function.file(f), held: vector.init[Held](a), escaped: vector.init[bool](a), deriving: vector.init[u32](a), at: 0, reached: nil};
+}
+
+fun pass_dnit(p: *Pass) {
+    vector.dnit[Held](?p.held);
+    vector.dnit[bool](?p.escaped);
+    vector.dnit[u32](?p.deriving);
+}
+
+# each slot of the allocated function `f` marked addressed exactly where it lets its address out of the registers,
+# every other slot marked not addressed
+# ---
+# a:   the allocator the pass's storage takes
+# f:   the allocated function, every virtual register replaced by its location
+# ret: why there was no storage
+pub fun mark(a: *allocator.Allocator, f: *Function) err[allocator.Error] {
+    var p: Pass = pass_init(a, f);
+    fin { pass_dnit(?p); }
+    val err_ran: err[allocator.Error] = run(a, f, ?p, nil);
+    if (sel err_ran.err) { ret err_ran; }
+    var i: usize = 0;
+    for (i < f.slots.len) {
+        f.slots.data[i].addressed = p.escaped.data[i];
+        i                         = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# which slots of the allocated function `f` let their address out, and where
+# each of the others is reached through a register, leaving the slots'
+# marks as they are
+# ---
+# a:       the allocator the pass's storage takes
+# f:       the allocated function, every virtual register replaced by its location
+# escaped: filled with whether each slot lets its address out
+# reached: filled with every reach, in no order, a reach naming a slot that
+#          escaped among them
+# ret:     why there was no storage
+pub fun reaches(a: *allocator.Allocator, f: *Function, escaped: *vector.Vector[bool], reached: *vector.Vector[Reach]) err[allocator.Error] {
+    vector.clear[bool](escaped);
+    vector.clear[Reach](reached);
+    var p: Pass = pass_init(a, f);
+    fin { pass_dnit(?p); }
+    val err_ran: err[allocator.Error] = run(a, f, ?p, reached);
+    if (sel err_ran.err) { ret err_ran; }
+    val res_copied: res[usize, allocator.Error] = vector.extend[bool](escaped, Slice[bool]{data: p.escaped.data, size: p.escaped.len});
+    if (sel res_copied.err) { ret err[allocator.Error].err{res_copied.err}; }
+    ret err[allocator.Error].ok{};
+}

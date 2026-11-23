@@ -1,0 +1,2551 @@
+# the edits of a function body that keep its use lists, edges and value
+# binding records in step
+#
+# every edit takes what it may fail on first, so a refusal leaves the body as
+# it was. a use list holds an instruction once per operand or argument that
+# names the value, and a block's predecessor list holds an instruction once
+# per edge into the block. each operand and argument holds the position of its
+# use entry and each edge the position of its predecessor entry, so an entry
+# goes in constant time, the last one taking its place, and the instructions
+# of a block are linked both ways. every insert, erase, move and replacement
+# costs a constant plus the instruction's own operands and edges.
+#
+# a record lives in the body's pool and stands in a run: each instruction holds
+# the run just before it and each block the run at its end, linked through the
+# pool, so every edit re-anchors a run in constant time. an instruction placed
+# before another takes that one's run, and one appended takes the block's end
+# run. an erased instruction leaves its run to the instruction after it, and a
+# moved one takes its run along. a value's bound list names the pool position
+# of every record that reads it, so when the value goes, through an erase, a
+# replacement or a removed parameter, its records follow it or become
+# unavailable without a walk of the body.
+#
+# `builder_make` is the builder's own: every other module makes instructions
+# through mirl.build, and places, replaces and erases them here.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.block.BlockData;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.contents;
+use mirl.ir.debug.place;
+use mirl.ir.debug.record;
+use mirl.ir.debug.record.Binding;
+use debug_table: mirl.ir.debug.table;
+use mirl.ir.function.Body;
+use mirl.ir.function.Entry;
+use mirl.ir.function.FunctionData;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.List;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.module;
+use mirl.ir.module.Error;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.check;
+use opcode_row:   mirl.ir.opcode.row;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.place.Placed;
+use mirl.ir.point;
+use mirl.ir.point.Bits;
+use mirl.ir.point.Expression;
+use mirl.ir.point.Operand;
+use mirl.ir.point.Part;
+use mirl.ir.point.Point;
+use mirl.ir.point.Reads;
+use mirl.ir.point.Run;
+use mirl.ir.point.Step;
+use mirl.ir.pool;
+use mirl.ir.pool.Growing;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.ir.value.Output;
+use mirl.ir.value.Parameter;
+use mirl.ir.value.ValueData;
+
+fun fail[T](e: allocator.Error) res[T, Error] {
+    ret res[T, Error].err{Error.alloc{e}};
+}
+
+fun refuse(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun has_value(b: *Body, v: Value) bool {
+    ret v::usize < b.values.len;
+}
+
+fun has_block(b: *Body, k: Block) bool {
+    ret k::usize < b.blocks.len;
+}
+
+fun has_instruction(b: *Body, i: Instruction) bool {
+    ret i::usize < b.instructions.len;
+}
+
+# a block of the body that has not been erased
+fun live(b: *Body, k: Block) err[Error] {
+    if (!has_block(b, k))        { ret err[Error].err{Error.block{k}}; }
+    if (b.blocks.data[k].erased) { ret err[Error].err{Error.removed{k}}; }
+    ret err[Error].ok{};
+}
+
+fun known_type(m: *Module, ty: Type) err[Error] {
+    val res_shape: res[table.Shape, table.Error] = table.shape(?m.types, ty);
+    if (sel res_shape.err) { ret err[Error].err{Error.types{res_shape.err}}; }
+    ret err[Error].ok{};
+}
+
+fun list[T](v: *vector.Vector[T]) Slice[T] {
+    ret Slice[T]{data: v.data, size: v.len};
+}
+
+fun remove_at[T](v: *vector.Vector[T], at: usize) {
+    var i: usize = at;
+    for (i + 1 < v.len) {
+        v.data[i] = v.data[i + 1];
+        i         = i + 1;
+    }
+    vector.truncate[T](v, v.len - 1);
+}
+
+# take the entry at a position out of an instruction's list, the rest moving down
+fun cut_at[T](l: *List[T], at: usize) {
+    var i: usize = at;
+    for (i + 1 < l.len) {
+        l.data[i] = l.data[i + 1];
+        i         = i + 1;
+    }
+    l.len = l.len - 1;
+}
+
+# a list of values copied into a run of the body's pool, which has room for it
+fun held(b: *Body, s: Slice[Value]) List[Value] {
+    val run: *Value = pool.claim[Value](?b.lists, s.size);
+    var i:   usize  = 0;
+    for (i < s.size) {
+        run[i] = s.data[i];
+        i      = i + 1;
+    }
+    ret List[Value]{data: run, len: s.size};
+}
+
+# a use of value v by instruction i put at the end of v's use list, which has
+# room for it, giving the entry's position
+fun added(b: *Body, v: Value, i: Instruction) u32 {
+    val l: *Growing[Instruction] = ?b.values.data[v].uses;
+    val p: u32                   = l.len::u32;
+    l.data[l.len] = i;
+    l.len         = l.len + 1;
+    ret p;
+}
+
+# the operand or argument of instruction i whose entry in value v's use list
+# stood at position from stands at to
+fun renumber(b: *Body, i: Instruction, v: Value, from: u32, to: u32) {
+    val d: *InstructionData = ?b.instructions.data[i];
+    var k: usize            = 0;
+    for (k < d.operands.len) {
+        if (d.operands.data[k] == v && d.entries.data[k] == from) {
+            d.entries.data[k] = to;
+            ret;
+        }
+        k = k + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val edge: *Edge = ?d.edges.data[e];
+        k = 0;
+        for (k < edge.arguments.len) {
+            if (edge.arguments.data[k] == v && edge.entries.data[k] == from) {
+                edge.entries.data[k] = to;
+                ret;
+            }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+}
+
+# take the entry at position p out of value v's use list, the last entry
+# taking its place
+fun drop_use(b: *Body, v: Value, p: u32) {
+    val l:    *Growing[Instruction] = ?b.values.data[v].uses;
+    val last: u32                   = (l.len - 1)::u32;
+    if (p != last) {
+        val moved: Instruction = l.data[last];
+        l.data[p] = moved;
+        renumber(b, moved, v, last, p);
+    }
+    l.len = last::usize;
+}
+
+# an edge of instruction i into block k put at the end of k's predecessor
+# list, which has room for it
+fun entered(b: *Body, k: Block, i: Instruction, edge: *Edge) {
+    val l: *vector.Vector[Instruction] = ?b.blocks.data[k].predecessors;
+    edge.rank = l.len::u32;
+    vector.push[Instruction](l, i);
+}
+
+# take the entry at position rank out of block k's predecessor list, the last
+# entry taking its place
+fun drop_entry(b: *Body, k: Block, rank: u32) {
+    val l:    *vector.Vector[Instruction] = ?b.blocks.data[k].predecessors;
+    val last: u32                         = (l.len - 1)::u32;
+    if (rank != last) {
+        val moved: Instruction = l.data[last];
+        l.data[rank] = moved;
+        val d: *InstructionData = ?b.instructions.data[moved];
+        var e: usize            = 0;
+        for (e < d.edges.len) {
+            if (d.edges.data[e].block == k && d.edges.data[e].rank == last) {
+                d.edges.data[e].rank = rank;
+                e                    = d.edges.len;
+            }
+            e = e + 1;
+        }
+    }
+    l.len = last::usize;
+}
+
+# a list of entry positions, a run of the body's pool, which has room for it,
+# its entries unset
+fun entries_of(b: *Body, n: usize) List[u32] {
+    ret List[u32]{data: pool.claim[Value](?b.lists, n), len: n};
+}
+
+# drop one entry naming a record from a bound list
+fun drop_record(v: *vector.Vector[u32], r: u32) {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == r) {
+            remove_at[u32](v, i);
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# the empty run
+fun no_run() Run {
+    ret Run{first: 0, last: 0};
+}
+
+# run y joined after run x, the records linked in order, each record of x that a record of y gives every bit of
+# again dropped, since at one point the later record of a variable's bits is the one that holds
+fun join(b: *Body, x: Run, y: Run) Run {
+    if (x.first == 0) { ret y; }
+    if (y.first == 0) { ret x; }
+    var kept: Run = x;
+    var p:    u32 = x.first;
+    for (p != 0) {
+        val r:    u32  = p - 1;
+        val next: u32  = b.points.data[r].next;
+        val last: bool = p == x.last;
+        if (superseded(b, b.points.data[r], y)) {
+            unlink(b, ?kept, r);
+            val opt_read: opt[Value] = point.read(b.points.data[r].reads);
+            if (sel opt_read.some) { drop_record(?b.values.data[opt_read.some].bound, r); }
+            b.points.data[r].reads = Reads.unavailable{};
+        }
+        if (last) { brk; }
+        p = next;
+    }
+    if (kept.first == 0) { ret y; }
+    b.points.data[kept.last - 1].next = y.first;
+    ret Run{first: kept.first, last: y.last};
+}
+
+# whether a record of run y gives every bit record `pt` gives, of its variable
+fun superseded(b: *Body, pt: Point, y: Run) bool {
+    var q: u32 = y.first;
+    for (q != 0) {
+        val later: Point = b.points.data[q - 1];
+        if (later.binding == pt.binding) {
+            if (point.whole(later.piece))                                                                                                                    { ret true; }
+            if (!point.whole(pt.piece) && later.piece.offset <= pt.piece.offset && pt.piece.offset + pt.piece.size <= later.piece.offset + later.piece.size) { ret true; }
+        }
+        if (q == y.last) { brk; }
+        q = later.next;
+    }
+    ret false;
+}
+
+# make every record that reads a value unavailable, the value going
+fun unbind(b: *Body, v: Value) {
+    val bound: *vector.Vector[u32] = ?b.values.data[v].bound;
+    var e:     usize               = 0;
+    for (e < bound.len) {
+        b.points.data[bound.data[e]].reads = Reads.unavailable{};
+        e                                  = e + 1;
+    }
+    vector.truncate[u32](bound, 0);
+}
+
+# move every record that reads old to read new, its expression kept, where
+# new's bound list has room for them
+fun move_reads(b: *Body, old: Value, new: Value) {
+    val bound: *vector.Vector[u32] = ?b.values.data[old].bound;
+    var e:     usize               = 0;
+    for (e < bound.len) {
+        val r:   u32   = bound.data[e];
+        val was: Reads = b.points.data[r].reads;
+        if (sel was.operand) { b.points.data[r].reads = Reads.operand{Operand{value: new, expression: was.operand.expression}}; }
+        vector.push[u32](?b.values.data[new].bound, r);
+        e = e + 1;
+    }
+    vector.truncate[u32](bound, 0);
+}
+
+# room for every use and record of old to move to new
+fun room_to_move(b: *Body, old: Value, new: Value) err[allocator.Error] {
+    val err_uses: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[new].uses, b.values.data[old].uses.len);
+    if (sel err_uses.err) { ret err[allocator.Error].err{err_uses.err}; }
+    val res_bound: res[usize, allocator.Error] = vector.reserve[u32](?b.values.data[new].bound, b.values.data[old].bound.len);
+    if (sel res_bound.err) { ret err[allocator.Error].err{res_bound.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+# the edge of the predecessor entry at position k of a block's list
+fun edge_of(b: *Body, target: Block, k: usize) *Edge {
+    val d: *InstructionData = ?b.instructions.data[b.blocks.data[target].predecessors.data[k]];
+    var e: usize            = 0;
+    for (e < d.edges.len) {
+        if (d.edges.data[e].block == target && d.edges.data[e].rank::usize == k) { ret ?d.edges.data[e]; }
+        e = e + 1;
+    }
+    ret nil;
+}
+
+# whether a name asked for is none or not empty
+fun named(name: opt[View]) bool {
+    if (sel name.some) { ret name.some.len > 0; }
+    ret true;
+}
+
+# a copy of a name the module owns
+fun own_name(a: *allocator.Allocator, name: opt[View]) res[opt[View], allocator.Error] {
+    if (sel name.none) { ret res[opt[View], allocator.Error].ok{name}; }
+    val res_copy_view: res[View, allocator.Error] = slice.copy_view(a, name.some);
+    if (sel res_copy_view.err) { ret res[opt[View], allocator.Error].err{res_copy_view.err}; }
+    ret res[opt[View], allocator.Error].ok{opt[View].some{res_copy_view.ok}};
+}
+
+# give back a name the module owns
+pub fun name_free(a: *allocator.Allocator, name: opt[View]) err[allocator.Error] {
+    if (sel name.some) { ret slice.view_free(a, name.some); }
+    ret err[allocator.Error].ok{};
+}
+
+# give a value the name the text form prints it by, in place of any it had
+# ---
+# m:    the module
+# f:    the function
+# v:    the value
+# name: the name, which is copied, or none to print it by number
+# ret:  ok, or why it was refused
+pub fun name_value(m: *Module, f: Function, v: Value, name: opt[View]) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err)           { ret err[Error].err{res_body.err}; }
+    if (!has_value(res_body.ok, v)) { ret err[Error].err{Error.value{v}}; }
+    if (!named(name))               { ret err[Error].err{Error.name{}}; }
+    val res_owned: res[opt[View], allocator.Error] = own_name(m.a, name);
+    if (sel res_owned.err) { ret refuse(res_owned.err); }
+    val d: *ValueData = ?res_body.ok.values.data[v];
+    name_free(m.a, d.name);
+    d.name = res_owned.ok;
+    ret err[Error].ok{};
+}
+
+# give a block the name the text form prints it by, in place of any it had
+# ---
+# m:    the module
+# f:    the function
+# k:    the block
+# name: the name, which is copied, or none to print it by number
+# ret:  ok, or why it was refused
+pub fun name_block(m: *Module, f: Function, k: Block, name: opt[View]) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val err_open: err[Error] = live(res_body.ok, k);
+    if (sel err_open.err) { ret err_open; }
+    if (!named(name))     { ret err[Error].err{Error.name{}}; }
+    val res_owned: res[opt[View], allocator.Error] = own_name(m.a, name);
+    if (sel res_owned.err) { ret refuse(res_owned.err); }
+    val d: *BlockData = ?res_body.ok.blocks.data[k];
+    name_free(m.a, d.name);
+    d.name = res_owned.ok;
+    ret err[Error].ok{};
+}
+
+# make a block
+# ---
+# m:          the module
+# f:          the function whose body takes the block
+# parameters: its parameters, in order
+# ret:        the block, the entry when it is the body's first, or why it was refused
+pub fun block(m: *Module, f: Function, parameters: Slice[Declaration]) res[Block, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Block, Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    var i: usize = 0;
+    for (i < parameters.size) {
+        val err_known_type: err[Error] = known_type(m, parameters.data[i].type);
+        if (sel err_known_type.err)          { ret res[Block, Error].err{err_known_type.err}; }
+        if (!named(parameters.data[i].name)) { ret res[Block, Error].err{Error.name{}}; }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < parameters.size) {
+        val err_noted: err[allocator.Error] = contents.note_type(?b.contents, parameters.data[i].type);
+        if (sel err_noted.err) { ret fail[Block](err_noted.err); }
+        i = i + 1;
+    }
+
+    var d: BlockData;
+    d.parameters   = vector.init[Value](m.a);
+    d.first        = NO_INSTRUCTION;
+    d.last         = NO_INSTRUCTION;
+    d.predecessors = vector.init[Instruction](m.a);
+    d.ending       = no_run();
+    val res_room: res[usize, allocator.Error] = vector.reserve[Value](?d.parameters, parameters.size);
+    if (sel res_room.err) { ret fail[Block](res_room.err); }
+    val res_values: res[usize, allocator.Error] = vector.reserve[ValueData](?b.values, parameters.size);
+    if (sel res_values.err) {
+        vector.dnit[Value](?d.parameters);
+        ret fail[Block](res_values.err);
+    }
+    val res_blocks: res[usize, allocator.Error] = vector.reserve[BlockData](?b.blocks, 1);
+    if (sel res_blocks.err) {
+        vector.dnit[Value](?d.parameters);
+        ret fail[Block](res_blocks.err);
+    }
+    var names: vector.Vector[opt[View]] = vector.init[opt[View]](m.a);
+    fin { vector.dnit[opt[View]](?names); }
+    val res_name_room: res[usize, allocator.Error] = vector.reserve[opt[View]](?names, parameters.size);
+    if (sel res_name_room.err) {
+        vector.dnit[Value](?d.parameters);
+        ret fail[Block](res_name_room.err);
+    }
+    i = 0;
+    for (i < parameters.size) {
+        val res_owned: res[opt[View], allocator.Error] = own_name(m.a, parameters.data[i].name);
+        if (sel res_owned.err) {
+            var k: usize = 0;
+            for (k < names.len) {
+                name_free(m.a, names.data[k]);
+                k = k + 1;
+            }
+            vector.dnit[Value](?d.parameters);
+            ret fail[Block](res_owned.err);
+        }
+        vector.push[opt[View]](?names, res_owned.ok);
+        i = i + 1;
+    }
+
+    val id: Block = (b.blocks.len::u32);
+    i = 0;
+    for (i < parameters.size) {
+        val v: Value = (b.values.len::u32);
+        vector.push[ValueData](?b.values, ValueData{type: parameters.data[i].type, secret: parameters.data[i].secret, def: Def.parameter{Parameter{block: id, index: i::u32}}, uses: pool.nothing[Instruction](), bound: vector.init[u32](m.a), name: names.data[i]});
+        vector.push[Value](?d.parameters, v);
+        i = i + 1;
+    }
+    vector.push[BlockData](?b.blocks, d);
+    ret res[Block, Error].ok{id};
+}
+
+# what a block is, its lists valid until the body next changes
+pub fun block_data(m: *Module, f: Function, k: Block) res[BlockData, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err)           { ret res[BlockData, Error].err{res_body.err}; }
+    if (!has_block(res_body.ok, k)) { ret res[BlockData, Error].err{Error.block{k}}; }
+    ret res[BlockData, Error].ok{res_body.ok.blocks.data[k]};
+}
+
+# how a block ends
+# ---
+# last:       its last instruction, `NO_INSTRUCTION` for none
+# terminated: whether that one is a terminator
+pub rec Ending {
+    last:       Instruction;
+    terminated: bool;
+}
+
+# how a block ends, read in place
+pub fun ending(m: *Module, f: Function, k: Block) res[Ending, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Ending, Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (!has_block(b, k)) { ret res[Ending, Error].err{Error.block{k}}; }
+    val last: Instruction = b.blocks.data[k].last;
+    if (last == NO_INSTRUCTION) { ret res[Ending, Error].ok{Ending{last: last, terminated: false}}; }
+    val opt_data_at: opt[*opcode_row.Row] = opcode_table.at(b.instructions.data[last].opcode);
+    ret res[Ending, Error].ok{Ending{last: last, terminated: sel opt_data_at.some && opt_data_at.some.terminator}};
+}
+
+# add a parameter to a block, and its argument to every edge into it
+# ---
+# m:        the module
+# f:        the function
+# k:        the block
+# declared: the parameter
+# incoming: the argument each edge into the block passes, one per entry of
+#           its predecessor list and in that order
+# ret:      the parameter, or why it was refused
+pub fun add_parameter(m: *Module, f: Function, k: Block, declared: Declaration, incoming: Slice[Value]) res[Value, Error] {
+    val ty:       Type              = declared.type;
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Value, Error].err{res_body.err}; }
+    val b:        *Body      = res_body.ok;
+    val err_open: err[Error] = live(b, k);
+    if (sel err_open.err) { ret res[Value, Error].err{err_open.err}; }
+    val err_known: err[Error] = known_type(m, ty);
+    if (sel err_known.err)     { ret res[Value, Error].err{err_known.err}; }
+    if (!named(declared.name)) { ret res[Value, Error].err{Error.name{}}; }
+    val preds: usize = b.blocks.data[k].predecessors.len;
+    if (incoming.size != preds) { ret res[Value, Error].err{Error.incoming{incoming.size::u32}}; }
+
+    var i: usize = 0;
+    for (i < preds) {
+        val v: Value = incoming.data[i];
+        if (!has_value(b, v))                            { ret res[Value, Error].err{Error.value{v}}; }
+        if (!table.same(b.values.data[v].type, ty))      { ret res[Value, Error].err{Error.mismatch{b.values.data[v].type}}; }
+        if (b.values.data[v].secret && !declared.secret) { ret res[Value, Error].err{Error.secret{v}}; }
+        i = i + 1;
+    }
+
+    val err_noted: err[allocator.Error] = contents.note_type(?b.contents, ty);
+    if (sel err_noted.err) { ret fail[Value](err_noted.err); }
+    val res_values: res[usize, allocator.Error] = vector.reserve[ValueData](?b.values, 1);
+    if (sel res_values.err) { ret fail[Value](res_values.err); }
+    val res_params: res[usize, allocator.Error] = vector.reserve[Value](?b.blocks.data[k].parameters, 1);
+    if (sel res_params.err) { ret fail[Value](res_params.err); }
+    i = 0;
+    for (i < preds) {
+        var same: usize = 0;
+        var j:    usize = 0;
+        for (j < preds) {
+            if (incoming.data[j] == incoming.data[i]) { same = same + 1; }
+            j = j + 1;
+        }
+        val err_uses: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[incoming.data[i]].uses, same);
+        if (sel err_uses.err) { ret fail[Value](err_uses.err); }
+        i = i + 1;
+    }
+
+    var held: usize = 0;
+    i = 0;
+    for (i < preds) {
+        held = held + (edge_of(b, k, i).arguments.len + 1) * 2;
+        i    = i + 1;
+    }
+    val err_args: err[allocator.Error] = pool.ensure[Value](?b.lists, held);
+    if (sel err_args.err) { ret fail[Value](err_args.err); }
+    val res_owned: res[opt[View], allocator.Error] = own_name(m.a, declared.name);
+    if (sel res_owned.err) { ret fail[Value](res_owned.err); }
+
+    val index: u32   = b.blocks.data[k].parameters.len::u32;
+    val p:     Value = (b.values.len::u32);
+    vector.push[ValueData](?b.values, ValueData{type: ty, secret: declared.secret, def: Def.parameter{Parameter{block: k, index: index}}, uses: pool.nothing[Instruction](), bound: vector.init[u32](m.a), name: res_owned.ok});
+    vector.push[Value](?b.blocks.data[k].parameters, p);
+    i = 0;
+    for (i < preds) {
+        val e:    *Edge     = edge_of(b, k, i);
+        val run:  *Value    = pool.claim[Value](?b.lists, e.arguments.len + 1);
+        val made: List[u32] = entries_of(b, e.arguments.len + 1);
+        var j:    usize     = 0;
+        for (j < e.arguments.len) {
+            run[j]       = e.arguments.data[j];
+            made.data[j] = e.entries.data[j];
+            j            = j + 1;
+        }
+        run[e.arguments.len]       = incoming.data[i];
+        made.data[e.arguments.len] = added(b, incoming.data[i], b.blocks.data[k].predecessors.data[i]);
+        e.arguments                = List[Value]{data: run, len: e.arguments.len + 1};
+        e.entries                  = made;
+        i                          = i + 1;
+    }
+    ret res[Value, Error].ok{p};
+}
+
+# take a parameter out of its block and its argument out of every edge into
+# it, every record that reads it becoming unavailable
+fun cut_parameter(b: *Body, k: Block, index: u32) {
+    val d: *BlockData = ?b.blocks.data[k];
+    val p: Value      = d.parameters.data[index];
+    var i: usize      = 0;
+    for (i < d.predecessors.len) {
+        val e:     *Edge = edge_of(b, k, i);
+        val arg:   Value = e.arguments.data[index];
+        val entry: u32   = e.entries.data[index];
+        cut_at[Value](?e.arguments, index::usize);
+        cut_at[u32](?e.entries, index::usize);
+        drop_use(b, arg, entry);
+        i = i + 1;
+    }
+    remove_at[Value](?d.parameters, index::usize);
+    i = index::usize;
+    for (i < d.parameters.len) {
+        b.values.data[d.parameters.data[i]].def = Def.parameter{Parameter{block: k, index: i::u32}};
+        i                                       = i + 1;
+    }
+    unbind(b, p);
+    b.values.data[p].def = Def.removed{};
+}
+
+# remove an unused parameter from a block, and its argument from every edge
+# into it. every record that reads it becomes unavailable
+# ---
+# m:     the module
+# f:     the function
+# k:     the block
+# index: the parameter's position
+# ret:   ok, or why it was refused
+pub fun remove_parameter(m: *Module, f: Function, k: Block, index: u32) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:        *Body      = res_body.ok;
+    val err_open: err[Error] = live(b, k);
+    if (sel err_open.err) { ret err_open; }
+    val d: *BlockData = ?b.blocks.data[k];
+    if (index::usize >= d.parameters.len) { ret err[Error].err{Error.parameter{index}}; }
+    val p: Value = d.parameters.data[index];
+    if (b.values.data[p].uses.len != 0) { ret err[Error].err{Error.used{p}}; }
+
+    cut_parameter(b, k, index);
+    ret err[Error].ok{};
+}
+
+# state where a function's entry parameters arrive, one place per parameter,
+# once the abi legalisation has made them its pieces
+# ---
+# m:      the module
+# f:      the function
+# places: one place for each entry parameter, in order, copied
+# ret:    ok, or why it was refused
+pub fun place_entry(m: *Module, f: Function, places: Slice[Placed]) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (b.blocks.len == 0)                              { ret err[Error].err{Error.parameter{places.size::u32}}; }
+    if (b.blocks.data[0].parameters.len != places.size) { ret err[Error].err{Error.parameter{places.size::u32}}; }
+    var list:     vector.Vector[Placed]       = vector.init[Placed](m.a);
+    val res_room: res[usize, allocator.Error] = vector.reserve[Placed](?list, places.size);
+    if (sel res_room.err) { ret refuse(res_room.err); }
+    var i: usize = 0;
+    for (i < places.size) {
+        vector.push[Placed](?list, places.data[i]);
+        i = i + 1;
+    }
+    if (sel b.entry.placed) { vector.dnit[Placed](?b.entry.placed); }
+    b.entry = Entry.placed{list};
+    ret err[Error].ok{};
+}
+
+# the value that stands for a constant in a function, the same one each time.
+# a fixed address stands in no function, which forms one as `inttoptr`
+# ---
+# m:   the module
+# f:   the function
+# c:   the constant
+# ret: its value, or why it was refused
+pub fun constant(m: *Module, f: Function, c: Constant) res[Value, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Value, Error].err{res_body.err}; }
+    val b:         *Body       = res_body.ok;
+    val key:       u32         = c;
+    val opt_found: opt[*Value] = map.get[u32, Value](?b.constants, ?key);
+    if (sel opt_found.some) { ret res[Value, Error].ok{@opt_found.some}; }
+    val res_constant_data: res[ConstantData, Error] = module.constant_data(m, c);
+    if (sel res_constant_data.err)         { ret res[Value, Error].err{res_constant_data.err}; }
+    if (sel res_constant_data.ok.absolute) { ret res[Value, Error].err{Error.absolute{c}}; }
+    val res_constant_type: res[Type, Error] = module.constant_type(m, c);
+    if (sel res_constant_type.err) { ret res[Value, Error].err{res_constant_type.err}; }
+    val err_noted: err[allocator.Error] = contents.note_type(?b.contents, res_constant_type.ok);
+    if (sel err_noted.err) { ret fail[Value](err_noted.err); }
+
+    val res_room: res[usize, allocator.Error] = vector.reserve[ValueData](?b.values, 1);
+    if (sel res_room.err) { ret fail[Value](res_room.err); }
+    val v:          Value                      = (b.values.len::u32);
+    val res_linked: res[bool, allocator.Error] = map.insert[u32, Value](?b.constants, key, v);
+    if (sel res_linked.err) { ret fail[Value](res_linked.err); }
+    vector.push[ValueData](?b.values, ValueData{type: res_constant_type.ok, secret: false, def: Def.constant{c}, uses: pool.nothing[Instruction](), bound: vector.init[u32](m.a)});
+    ret res[Value, Error].ok{v};
+}
+
+# what a value is, its use list valid until the body next changes
+pub fun value_data(m: *Module, f: Function, v: Value) res[ValueData, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err)           { ret res[ValueData, Error].err{res_body.err}; }
+    if (!has_value(res_body.ok, v)) { ret res[ValueData, Error].err{Error.value{v}}; }
+    ret res[ValueData, Error].ok{res_body.ok.values.data[v]};
+}
+
+# the instructions that use a value, once per use, valid until the body next changes
+pub fun uses(m: *Module, f: Function, v: Value) res[Slice[Instruction], Error] {
+    val res_value_data: res[ValueData, Error] = value_data(m, f, v);
+    if (sel res_value_data.err) { ret res[Slice[Instruction], Error].err{res_value_data.err}; }
+    ret res[Slice[Instruction], Error].ok{Slice[Instruction]{data: res_value_data.ok.uses.data, size: res_value_data.ok.uses.len}};
+}
+
+# how many times a request names a value, as an operand or an edge argument
+fun occurrences(req: *Request, v: Value) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < req.operands.size) {
+        if (req.operands.data[i] == v) { n = n + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < req.targets.size) {
+        val args: Slice[Value] = req.targets.data[i].arguments;
+        var j:    usize        = 0;
+        for (j < args.size) {
+            if (args.data[j] == v) { n = n + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# how many of a request's targets enter a block
+fun targeting(req: *Request, k: Block) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < req.targets.size) {
+        if (req.targets.data[i].block == k) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# type a request against its opcode's row, its result types left in the
+# module's scratch, giving whether its results are secret
+#
+# each value and block it names is checked to be the body's as it is read,
+# its operands first and then each target, and a value an argument passes is
+# no more secret than the parameter it binds.
+fun typed(m: *Module, f: Function, b: *Body, r: *opcode_row.Row, req: *Request, md: Metadata) res[bool, Error] {
+    val tys:     *vector.Vector[Type]       = ?m.scratch.types;
+    val secrets: *vector.Vector[bool]       = ?m.scratch.secret;
+    val edges:   *vector.Vector[check.Edge] = ?m.scratch.edges;
+    tys.len               = 0;
+    secrets.len           = 0;
+    edges.len             = 0;
+    m.scratch.results.len = 0;
+    val res_room: res[usize, allocator.Error] = vector.reserve[Type](tys, req.operands.size);
+    if (sel res_room.err) { ret fail[bool](res_room.err); }
+    val res_secret_room: res[usize, allocator.Error] = vector.reserve[bool](secrets, req.operands.size);
+    if (sel res_secret_room.err) { ret fail[bool](res_secret_room.err); }
+
+    var i: usize = 0;
+    for (i < req.operands.size) {
+        val v: Value = req.operands.data[i];
+        if (!has_value(b, v)) { ret res[bool, Error].err{Error.value{v}}; }
+        val d: *ValueData = ?b.values.data[v];
+        tys.data[i]     = d.type;
+        secrets.data[i] = d.secret;
+        i               = i + 1;
+    }
+    tys.len     = req.operands.size;
+    secrets.len = req.operands.size;
+
+    if (req.targets.size != 0) {
+        var total: usize = 0;
+        i = 0;
+        for (i < req.targets.size) {
+            val t:        Branch     = req.targets.data[i];
+            val err_open: err[Error] = live(b, t.block);
+            if (sel err_open.err) { ret res[bool, Error].err{err_open.err}; }
+            val params: *vector.Vector[Value] = ?b.blocks.data[t.block].parameters;
+            var j:      usize                 = 0;
+            for (j < t.arguments.size) {
+                val v: Value = t.arguments.data[j];
+                if (!has_value(b, v)) { ret res[bool, Error].err{Error.value{v}}; }
+                if (j < params.len && b.values.data[v].secret && !b.values.data[params.data[j]].secret) {
+                    ret res[bool, Error].err{Error.secret{v}};
+                }
+                j = j + 1;
+            }
+            total = total + t.arguments.size + params.len;
+            i     = i + 1;
+        }
+        val res_more: res[usize, allocator.Error] = vector.reserve[Type](tys, total);
+        if (sel res_more.err) { ret fail[bool](res_more.err); }
+        val res_edge_room: res[usize, allocator.Error] = vector.reserve[check.Edge](edges, req.targets.size);
+        if (sel res_edge_room.err) { ret fail[bool](res_edge_room.err); }
+        i = 0;
+        for (i < req.targets.size) {
+            val t:      Branch                = req.targets.data[i];
+            val params: *vector.Vector[Value] = ?b.blocks.data[t.block].parameters;
+            val first:  usize                 = tys.len;
+            var j:      usize                 = 0;
+            for (j < t.arguments.size) {
+                vector.push[Type](tys, b.values.data[t.arguments.data[j]].type);
+                j = j + 1;
+            }
+            val second: usize = tys.len;
+            j = 0;
+            for (j < params.len) {
+                vector.push[Type](tys, b.values.data[params.data[j]].type);
+                j = j + 1;
+            }
+            vector.push[check.Edge](edges, check.Edge{
+                arguments:  Slice[Type]{data: ?tys.data[first], size: second - first},
+                parameters: Slice[Type]{data: ?tys.data[second], size: tys.len - second},
+            });
+            i = i + 1;
+        }
+    }
+
+    var inst: check.Instance;
+    inst.operands   = Slice[Type]{data: tys.data, size: req.operands.size};
+    inst.secret     = list[bool](secrets);
+    inst.declared   = md.secret;
+    inst.kept       = md.flags.kept;
+    inst.bounded    = md.flags.bounded;
+    inst.checked    = md.flags.checked;
+    inst.oriented   = md.flags.ascending || md.flags.descending;
+    inst.immediates = req.immediates;
+    inst.edges      = list[check.Edge](edges);
+    if (check.takes_returns(r)) {
+        val res_function_data: res[FunctionData, Error] = module.function_data(m, f);
+        if (sel res_function_data.err) { ret res[bool, Error].err{res_function_data.err}; }
+        val res_sig: res[table.Function, table.Error] = table.signature(?m.types, res_function_data.ok.signature);
+        if (sel res_sig.err) { ret res[bool, Error].err{Error.types{res_sig.err}}; }
+        inst.returns = res_sig.ok.results;
+    }
+    val res_checked: res[bool, check.Error] = check.check_row(?m.types, r, ?inst, ?m.scratch.results);
+    if (sel res_checked.err) { ret res[bool, Error].err{Error.typing{res_checked.err}}; }
+    ret res[bool, Error].ok{res_checked.ok};
+}
+
+# the instruction's own lists, runs of the body's pools, before anything in
+# the body changes, into a zeroed record: detached, in no run and with no
+# immediates yet. its results are left for the maker to fill
+fun prepare(m: *Module, b: *Body, req: *Request, md: Metadata, results: usize, d: *InstructionData) err[allocator.Error] {
+    d.opcode   = req.opcode;
+    d.metadata = md;
+    var values: usize = req.operands.size * 2 + results;
+    var i:      usize = 0;
+    for (i < req.targets.size) {
+        values = values + req.targets.data[i].arguments.size * 2;
+        i      = i + 1;
+    }
+    val err_listed: err[allocator.Error] = pool.ensure[Value](?b.lists, values);
+    if (sel err_listed.err) { ret err_listed; }
+    val err_edged: err[allocator.Error] = pool.ensure[Edge](?b.edges, req.targets.size);
+    if (sel err_edged.err) { ret err_edged; }
+    val err_slotted: err[allocator.Error] = pool.ensure[opcode_row.Immediate](?b.immediates, req.immediates.size);
+    if (sel err_slotted.err) { ret err_slotted; }
+    d.operands = held(b, req.operands);
+    d.entries  = entries_of(b, req.operands.size);
+    d.results  = List[Value]{data: pool.claim[Value](?b.lists, results), len: results};
+    d.edges    = List[Edge]{data: pool.claim[Edge](?b.edges, req.targets.size), len: req.targets.size};
+    i          = 0;
+    for (i < req.targets.size) {
+        d.edges.data[i] = Edge{block: req.targets.data[i].block, arguments: held(b, req.targets.data[i].arguments), entries: entries_of(b, req.targets.data[i].arguments.size), rank: 0};
+        i               = i + 1;
+    }
+    d.immediates.data = pool.claim[opcode_row.Immediate](?b.immediates, req.immediates.size);
+    i                 = 0;
+    for (i < req.immediates.size) {
+        val res_kept: res[opcode_row.Immediate, allocator.Error] = instruction.own(m.a, req.immediates.data[i]);
+        if (sel res_kept.err) { ret err[allocator.Error].err{res_kept.err}; }
+        d.immediates.data[i] = res_kept.ok;
+        d.immediates.len     = i + 1;
+        i                    = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# record in the body's contents the opcode of an instruction, the types it
+# gives and the types its immediates name
+fun note(b: *Body, req: *Request, results: *vector.Vector[Type]) err[allocator.Error] {
+    val err_coded: err[allocator.Error] = contents.note_opcode(?b.contents, req.opcode);
+    if (sel err_coded.err) { ret err_coded; }
+    var i: usize = 0;
+    for (i < results.len) {
+        val err_typed: err[allocator.Error] = contents.note_type(?b.contents, results.data[i]);
+        if (sel err_typed.err) { ret err_typed; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < req.immediates.size) {
+        val imm: opcode_row.Immediate = req.immediates.data[i];
+        if (sel imm.ty) {
+            val err_named: err[allocator.Error] = contents.note_type(?b.contents, imm.ty);
+            if (sel err_named.err) { ret err_named; }
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# room in every list the instruction joins
+fun make_room(b: *Body, req: *Request, results: usize) err[allocator.Error] {
+    val res_values: res[usize, allocator.Error] = vector.reserve[ValueData](?b.values, results);
+    if (sel res_values.err) { ret err[allocator.Error].err{res_values.err}; }
+    val res_insts: res[usize, allocator.Error] = vector.reserve[InstructionData](?b.instructions, 1);
+    if (sel res_insts.err) { ret err[allocator.Error].err{res_insts.err}; }
+    var i: usize = 0;
+    for (i < req.operands.size) {
+        val v:        Value                = req.operands.data[i];
+        val err_room: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[v].uses, occurrences(req, v));
+        if (sel err_room.err) { ret err[allocator.Error].err{err_room.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < req.targets.size) {
+        val t:         Branch                      = req.targets.data[i];
+        val res_preds: res[usize, allocator.Error] = vector.reserve[Instruction](?b.blocks.data[t.block].predecessors, targeting(req, t.block));
+        if (sel res_preds.err) { ret err[allocator.Error].err{res_preds.err}; }
+        var j: usize = 0;
+        for (j < t.arguments.size) {
+            val v:        Value                = t.arguments.data[j];
+            val err_room: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[v].uses, occurrences(req, v));
+            if (sel err_room.err) { ret err[allocator.Error].err{err_room.err}; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# make an instruction, typed by its opcode's row and placed in no block, for
+# mirl.build alone
+#
+# its operands and arguments are used from now on, and each of its edges is
+# an entry in its target's predecessor list.
+# ---
+# m:   the module
+# f:   the function whose body takes it
+# r:   the row of its opcode
+# req: what it is made from, whose lists are copied
+# md:  its metadata record
+# ret: the instruction, or why it was refused
+pub fun builder_make(m: *Module, f: Function, r: *opcode_row.Row, req: Request, md: Metadata) res[Instruction, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Instruction, Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+
+    val res_checked: res[bool, Error] = typed(m, f, b, r, ?req, md);
+    if (sel res_checked.err) { ret res[Instruction, Error].err{res_checked.err}; }
+    val out:       *vector.Vector[Type] = ?m.scratch.results;
+    val err_noted: err[allocator.Error] = note(b, ?req, out);
+    if (sel err_noted.err) { ret fail[Instruction](err_noted.err); }
+
+    var d:            InstructionData;
+    val err_prepared: err[allocator.Error] = prepare(m, b, ?req, md, out.len, ?d);
+    if (sel err_prepared.err) {
+        instruction.dnit(m.a, ?d);
+        ret fail[Instruction](err_prepared.err);
+    }
+    val err_room: err[allocator.Error] = make_room(b, ?req, out.len);
+    if (sel err_room.err) {
+        instruction.dnit(m.a, ?d);
+        ret fail[Instruction](err_room.err);
+    }
+
+    # every list below has the room make_room took
+    val id: Instruction = (b.instructions.len::u32);
+    var i:  usize       = 0;
+    for (i < out.len) {
+        d.results.data[i]           = (b.values.len::u32);
+        b.values.data[b.values.len] = ValueData{type: out.data[i], secret: res_checked.ok, def: Def.result{Output{instruction: id, index: i::u32}}, uses: pool.nothing[Instruction](), bound: vector.init[u32](m.a)};
+        b.values.len                = b.values.len + 1;
+        i                           = i + 1;
+    }
+    i = 0;
+    for (i < req.operands.size) {
+        d.entries.data[i] = added(b, req.operands.data[i], id);
+        i                 = i + 1;
+    }
+    i = 0;
+    for (i < req.targets.size) {
+        val t: Branch = req.targets.data[i];
+        val e: *Edge  = ?d.edges.data[i];
+        entered(b, t.block, id, e);
+        var j: usize = 0;
+        for (j < t.arguments.size) {
+            e.entries.data[j] = added(b, t.arguments.data[j], id);
+            j                 = j + 1;
+        }
+        i = i + 1;
+    }
+    b.instructions.data[b.instructions.len] = d;
+    b.instructions.len                      = b.instructions.len + 1;
+    ret res[Instruction, Error].ok{id};
+}
+
+# what an instruction is, its lists valid until the body next changes
+pub fun instruction_data(m: *Module, f: Function, i: Instruction) res[InstructionData, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err)                 { ret res[InstructionData, Error].err{res_body.err}; }
+    if (!has_instruction(res_body.ok, i)) { ret res[InstructionData, Error].err{Error.instruction{i}}; }
+    ret res[InstructionData, Error].ok{res_body.ok.instructions.data[i]};
+}
+
+# the result of an instruction at a position, none past its last
+pub fun result(m: *Module, f: Function, i: Instruction, index: u32) res[opt[Value], Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err)                 { ret res[opt[Value], Error].err{res_body.err}; }
+    if (!has_instruction(res_body.ok, i)) { ret res[opt[Value], Error].err{Error.instruction{i}}; }
+    val results: *List[Value] = ?res_body.ok.instructions.data[i].results;
+    if (index::usize >= results.len) { ret res[opt[Value], Error].ok{opt[Value].none{}}; }
+    ret res[opt[Value], Error].ok{opt[Value].some{results.data[index]}};
+}
+
+# replace an instruction's metadata record whole
+#
+# the secrecy mark may be raised and never lowered, so the secrecy of a
+# declared row's results cannot drift from it. the kept mark likewise may be
+# set and never taken off.
+pub fun set_metadata(m: *Module, f: Function, i: Instruction, md: Metadata) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err)                                                       { ret err[Error].err{res_body.err}; }
+    if (!has_instruction(res_body.ok, i))                                       { ret err[Error].err{Error.instruction{i}}; }
+    if (res_body.ok.instructions.data[i].metadata.secret && !md.secret)         { ret err[Error].err{Error.lowered{i}}; }
+    if (res_body.ok.instructions.data[i].metadata.flags.kept && !md.flags.kept) { ret err[Error].err{Error.unkept{i}}; }
+    res_body.ok.instructions.data[i].metadata = md;
+    ret err[Error].ok{};
+}
+
+# refuse what a record cannot read: a value the body did not give out or has
+# removed, or an expression that does not apply to the value's type
+fun readable(m: *Module, b: *Body, r: Reads) err[Error] {
+    if (!(sel r.operand)) { ret err[Error].ok{}; }
+    val v: Value = r.operand.value;
+    if (!has_value(b, v)) { ret err[Error].err{Error.value{v}}; }
+    val def: Def = b.values.data[v].def;
+    if (sel def.removed) { ret err[Error].err{Error.value{v}}; }
+    val res_salvaged: res[Type, Error] = module.salvaged(m, b.values.data[v].type, r.operand.expression);
+    if (sel res_salvaged.err) { ret err[Error].err{res_salvaged.err}; }
+    ret err[Error].ok{};
+}
+
+# room in the bound list of the value a record reads
+fun bound_room(b: *Body, r: Reads) err[allocator.Error] {
+    if (!(sel r.operand)) { ret err[allocator.Error].ok{}; }
+    val res_room: res[usize, allocator.Error] = vector.reserve[u32](?b.values.data[r.operand.value].bound, 1);
+    if (sel res_room.err) { ret err[allocator.Error].err{res_room.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+# bind a variable at a point of a block, for mirl.build alone
+#
+# the record stands just before an instruction of the block, after the
+# records already there, or at the block's end. reading a value is no use of
+# it.
+# ---
+# m:       the module
+# f:       the function
+# k:       the block
+# before:  the instruction of the block it stands before, `NO_INSTRUCTION` for
+#          the block's end
+# binding: the variable, an entry of the module's debug table
+# piece:   the bits of the variable it gives, point.WHOLE for all of them
+# reads:   what it gives them from its point on
+# ret:     ok, or why it was refused
+pub fun builder_bind(m: *Module, f: Function, k: Block, before: Instruction, binding: Binding, piece: Bits, reads: Reads) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:        *Body      = res_body.ok;
+    val err_open: err[Error] = live(b, k);
+    if (sel err_open.err) { ret err_open; }
+    val d: *BlockData = ?b.blocks.data[k];
+    if (before != NO_INSTRUCTION) {
+        val res_at: res[Block, Error] = placed(b, before);
+        if (sel res_at.err) { ret err[Error].err{res_at.err}; }
+        if (res_at.ok != k) { ret err[Error].err{Error.position{before}}; }
+    }
+    val res_known: res[record.Variable, debug_table.Error] = place.variable(?m.debug, binding);
+    if (sel res_known.err) { ret err[Error].err{Error.binding{binding}}; }
+    val err_valid: err[Error] = readable(m, b, reads);
+    if (sel err_valid.err) { ret err_valid; }
+    val res_room: res[usize, allocator.Error] = vector.reserve[Point](?b.points, 1);
+    if (sel res_room.err) { ret refuse(res_room.err); }
+    val err_spot: err[allocator.Error] = bound_room(b, reads);
+    if (sel err_spot.err) { ret refuse(err_spot.err); }
+
+    val r: u32 = b.points.len::u32;
+    vector.push[Point](?b.points, Point{binding: binding, piece: piece, reads: reads, next: 0});
+    val one: Run = Run{first: r + 1, last: r + 1};
+    if (before != NO_INSTRUCTION) {
+        val i: *InstructionData = ?b.instructions.data[before];
+        i.points = join(b, i.points, one);
+    }
+    or                     { d.ending = join(b, d.ending, one); }
+    if (sel reads.operand) { vector.push[u32](?b.values.data[reads.operand.value].bound, r); }
+    ret err[Error].ok{};
+}
+
+# give a record what it reads from now on, its point and variable kept, so a
+# pass salvages a record whose value is going or makes it unavailable
+# ---
+# m:     the module
+# f:     the function
+# r:     the record's position among the body's records, as a value's bound
+#        list names it
+# reads: what it gives the variable from its point on
+# ret:   ok, or why it was refused
+pub fun rebind(m: *Module, f: Function, r: u32, reads: Reads) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (r::usize >= b.points.len) { ret err[Error].err{Error.point{r}}; }
+    val err_valid: err[Error] = readable(m, b, reads);
+    if (sel err_valid.err) { ret err_valid; }
+    val err_spot: err[allocator.Error] = bound_room(b, reads);
+    if (sel err_spot.err) { ret refuse(err_spot.err); }
+    val opt_old: opt[Value] = point.read(b.points.data[r].reads);
+    if (sel opt_old.some) { drop_record(?b.values.data[opt_old.some].bound, r); }
+    b.points.data[r].reads = reads;
+    if (sel reads.operand) { vector.push[u32](?b.values.data[reads.operand.value].bound, r); }
+    ret err[Error].ok{};
+}
+
+# the run that ends at a record, given the record after it now ends it
+fun ended(b: *Body, last: u32, now: u32) {
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (b.blocks.data[k].ending.last == last) {
+            b.blocks.data[k].ending.last = now;
+            ret;
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < b.instructions.len) {
+        if (b.instructions.data[k].points.last == last) {
+            b.instructions.data[k].points.last = now;
+            ret;
+        }
+        k = k + 1;
+    }
+}
+
+# how many parts from `from` on read a value
+fun reading(parts: Slice[Part], from: usize, v: Value) usize {
+    var n: usize = 0;
+    var i: usize = from;
+    for (i < parts.size) {
+        val r: Reads = parts.data[i].reads;
+        if (sel r.operand && r.operand.value == v) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# split a record into the parts of a composite binding at its point, as a pass
+# that splits the value it reads into several does, so no part is lost to the
+# split
+#
+# the record gives the first part and each other part is a record of its own
+# just after it, in order, of the same variable, so a pass later rewrites or
+# salvages one part and leaves the others.
+# ---
+# m:     the module
+# f:     the function
+# r:     the record's position among the body's records
+# parts: the parts, at least one, no two sharing a bit
+# ret:   ok, or why it was refused, the body left as it was
+pub fun split(m: *Module, f: Function, r: u32, parts: Slice[Part]) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (r::usize >= b.points.len) { ret err[Error].err{Error.point{r}}; }
+    if (parts.size == 0)          { ret err[Error].err{Error.piece{r}}; }
+    var i: usize = 0;
+    for (i < parts.size) {
+        val err_valid: err[Error] = readable(m, b, parts.data[i].reads);
+        if (sel err_valid.err) { ret err_valid; }
+        var j: usize = i + 1;
+        for (j < parts.size) {
+            if (point.overlap(parts.data[i].piece, parts.data[j].piece)) { ret err[Error].err{Error.piece{r}}; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    val res_room: res[usize, allocator.Error] = vector.reserve[Point](?b.points, parts.size - 1);
+    if (sel res_room.err) { ret refuse(res_room.err); }
+    i = 0;
+    for (i < parts.size) {
+        val read: Reads = parts.data[i].reads;
+        if (sel read.operand) {
+            val v: Value = read.operand.value;
+            if (reading(parts, 0, v) == reading(parts, i, v)) {
+                val res_spot: res[usize, allocator.Error] = vector.reserve[u32](?b.values.data[v].bound, reading(parts, 0, v));
+                if (sel res_spot.err) { ret refuse(res_spot.err); }
+            }
+        }
+        i = i + 1;
+    }
+    val opt_old: opt[Value] = point.read(b.points.data[r].reads);
+    if (sel opt_old.some) { drop_record(?b.values.data[opt_old.some].bound, r); }
+    val binding: Binding = b.points.data[r].binding;
+    var prev:    u32     = r;
+    i = 0;
+    for (i < parts.size) {
+        val read: Reads = parts.data[i].reads;
+        var at:   u32   = r;
+        if (i == 0) {
+            b.points.data[r].piece = parts.data[0].piece;
+            b.points.data[r].reads = read;
+        }
+        or {
+            at = b.points.len::u32;
+            val next: u32 = b.points.data[prev].next;
+            vector.push[Point](?b.points, Point{binding: binding, piece: parts.data[i].piece, reads: read, next: next});
+            b.points.data[prev].next = at + 1;
+            if (next == 0) { ended(b, prev + 1, at + 1); }
+            prev = at;
+        }
+        if (sel read.operand) { vector.push[u32](?b.values.data[read.operand.value].bound, at); }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the step that gives an instruction's result from its first operand, by the
+# step row that names its opcode, or none
+fun step_for(b: *Body, d: *InstructionData, result: Value, from: *Value) opt[Step] {
+    var k: u32 = 0;
+    for (k::usize < point.rows()) {
+        val opt_found: opt[point.Row] = point.row(k);
+        if (sel opt_found.some) {
+            val row:   point.Row   = opt_found.some;
+            val kind:  point.Kind  = k;
+            val takes: point.Takes = row.takes;
+            if (row.opcode == d.opcode && sel takes.to && d.operands.len == 1) {
+                @from = d.operands.data[0];
+                ret opt[Step].some{Step{kind: kind, argument: point.Argument.to{b.values.data[result].type}}};
+            }
+            if (row.opcode == d.opcode && sel takes.constant && d.operands.len == 2) {
+                val second: Def = b.values.data[d.operands.data[1]].def;
+                val first:  Def = b.values.data[d.operands.data[0]].def;
+                if (sel second.constant) {
+                    @from = d.operands.data[0];
+                    ret opt[Step].some{Step{kind: kind, argument: point.Argument.constant{second.constant}}};
+                }
+                or (sel first.constant) {
+                    if (row.swaps) {
+                        @from = d.operands.data[1];
+                        ret opt[Step].some{Step{kind: kind, argument: point.Argument.constant{first.constant}}};
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret opt[Step].none{};
+}
+
+# what a record reads once the instruction defining its value goes: the same
+# variable through a step over that instruction's first operand, by the step
+# row that names its opcode, before the steps it already had, or unavailable
+# when no row applies or it reads no instruction's result
+#
+# the operand dominates the instruction, which dominates the record, so the
+# salvaged record stands where the record stood. the caller rebinds it.
+# ---
+# m:   the module
+# f:   the function
+# r:   what the record reads
+# ret: what it reads salvaged, or why the expression could not be made
+pub fun salvage(m: *Module, f: Function, r: Reads) res[Reads, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Reads, Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (!(sel r.operand)) { ret res[Reads, Error].ok{Reads.unavailable{}}; }
+    val v: Value = r.operand.value;
+    if (!has_value(b, v)) { ret res[Reads, Error].err{Error.value{v}}; }
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.result)) { ret res[Reads, Error].ok{Reads.unavailable{}}; }
+    var from:     Value     = v;
+    val opt_step: opt[Step] = step_for(b, ?b.instructions.data[def.result.instruction], v, ?from);
+    if (sel opt_step.none) { ret res[Reads, Error].ok{Reads.unavailable{}}; }
+    val res_had: res[Slice[Step], Error] = module.steps(m, r.operand.expression);
+    if (sel res_had.err) { ret res[Reads, Error].err{res_had.err}; }
+    var steps: vector.Vector[Step] = vector.init[Step](m.a);
+    fin { vector.dnit[Step](?steps); }
+    val res_room: res[usize, allocator.Error] = vector.reserve[Step](?steps, res_had.ok.size + 1);
+    if (sel res_room.err) { ret fail[Reads](res_room.err); }
+    vector.push[Step](?steps, opt_step.some);
+    var i: usize = 0;
+    for (i < res_had.ok.size) {
+        vector.push[Step](?steps, res_had.ok.data[i]);
+        i = i + 1;
+    }
+    val res_expression: res[Expression, Error] = module.expression(m, Slice[Step]{data: steps.data, size: steps.len});
+    if (sel res_expression.err) { ret res[Reads, Error].err{res_expression.err}; }
+    ret res[Reads, Error].ok{Reads.operand{Operand{value: from, expression: res_expression.ok}}};
+}
+
+# refuse an instruction the body did not give out, or one that is placed or erased
+fun detached(b: *Body, i: Instruction) err[Error] {
+    if (!has_instruction(b, i)) { ret err[Error].err{Error.instruction{i}}; }
+    val at: Place = b.instructions.data[i].place;
+    if (sel at.placed) { ret err[Error].err{Error.placed{i}}; }
+    if (sel at.erased) { ret err[Error].err{Error.erased{i}}; }
+    ret err[Error].ok{};
+}
+
+# the block a placed instruction stands in, refusing one the body did not give out, a detached one or an erased one
+fun placed(b: *Body, i: Instruction) res[Block, Error] {
+    if (!has_instruction(b, i)) { ret res[Block, Error].err{Error.instruction{i}}; }
+    val at: Place = b.instructions.data[i].place;
+    if (sel at.erased) { ret res[Block, Error].err{Error.erased{i}}; }
+    if (sel at.placed) { ret res[Block, Error].ok{at.placed}; }
+    ret res[Block, Error].err{Error.detached{i}};
+}
+
+# link an instruction into block k just before another of its instructions, or
+# at its end for `NO_INSTRUCTION`, placed there
+fun link_in(b: *Body, k: Block, before: Instruction, i: Instruction) {
+    val d:  *InstructionData = ?b.instructions.data[i];
+    val bd: *BlockData       = ?b.blocks.data[k];
+    d.next = before;
+    if (before == NO_INSTRUCTION) {
+        d.prev  = bd.last;
+        bd.last = i;
+    }
+    or {
+        d.prev                           = b.instructions.data[before].prev;
+        b.instructions.data[before].prev = i;
+    }
+    if (d.prev == NO_INSTRUCTION) { bd.first = i; }
+    or                            { b.instructions.data[d.prev].next = i; }
+    d.place = Place.placed{k};
+}
+
+# unlink a placed instruction from its block k, its place left to the caller
+fun link_out(b: *Body, k: Block, i: Instruction) {
+    val d:  *InstructionData = ?b.instructions.data[i];
+    val bd: *BlockData       = ?b.blocks.data[k];
+    if (d.prev == NO_INSTRUCTION) { bd.first = d.next; }
+    or                            { b.instructions.data[d.prev].next = d.next; }
+    if (d.next == NO_INSTRUCTION) { bd.last = d.prev; }
+    or                            { b.instructions.data[d.next].prev = d.prev; }
+    d.prev = NO_INSTRUCTION;
+    d.next = NO_INSTRUCTION;
+}
+
+# the run of records after a placed instruction: the next one's, or the block's end
+fun after_run(b: *Body, k: Block, i: Instruction) *Run {
+    val next: Instruction = b.instructions.data[i].next;
+    if (next == NO_INSTRUCTION) { ret ?b.blocks.data[k].ending; }
+    ret ?b.instructions.data[next].points;
+}
+
+# place a detached instruction at the end of a block, after the records there
+pub fun append(m: *Module, f: Function, k: Block, i: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:        *Body      = res_body.ok;
+    val err_open: err[Error] = live(b, k);
+    if (sel err_open.err) { ret err_open; }
+    val err_free: err[Error] = detached(b, i);
+    if (sel err_free.err) { ret err_free; }
+    link_in(b, k, NO_INSTRUCTION, i);
+    b.instructions.data[i].points = join(b, b.instructions.data[i].points, b.blocks.data[k].ending);
+    b.blocks.data[k].ending       = no_run();
+    ret err[Error].ok{};
+}
+
+# place a detached instruction just before a placed one, after the records
+# standing before it, which stand before the new one from then on
+pub fun insert(m: *Module, f: Function, before: Instruction, i: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:          *Body             = res_body.ok;
+    val res_placed: res[Block, Error] = placed(b, before);
+    if (sel res_placed.err) { ret err[Error].err{res_placed.err}; }
+    val err_free: err[Error] = detached(b, i);
+    if (sel err_free.err) { ret err_free; }
+    link_in(b, res_placed.ok, before, i);
+    b.instructions.data[i].points      = join(b, b.instructions.data[i].points, b.instructions.data[before].points);
+    b.instructions.data[before].points = no_run();
+    ret err[Error].ok{};
+}
+
+# move the records standing before one placed instruction to stand before a
+# later one of its block, ahead of the records already there, as a pass that
+# builds a value at the head of a block makes its variables read it from
+# where it is built. the edit checks no dominance, and the verifier refuses a
+# record whose value does not stand at its new point
+# ---
+# m:    the module
+# f:    the function
+# from: the placed instruction the records stand before
+# to:   a placed instruction after it in its block
+# ret:  ok, or why it was refused
+pub fun hand(m: *Module, f: Function, from: Instruction, to: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:        *Body             = res_body.ok;
+    val res_here: res[Block, Error] = placed(b, from);
+    if (sel res_here.err) { ret err[Error].err{res_here.err}; }
+    val res_there: res[Block, Error] = placed(b, to);
+    if (sel res_there.err)           { ret err[Error].err{res_there.err}; }
+    if (res_here.ok != res_there.ok) { ret err[Error].err{Error.position{to}}; }
+    var walk: Instruction = from;
+    for (walk != to && walk != NO_INSTRUCTION) { walk = b.instructions.data[walk].next; }
+    if (walk == NO_INSTRUCTION) { ret err[Error].err{Error.position{to}}; }
+    if (from == to)             { ret err[Error].ok{}; }
+    b.instructions.data[to].points   = join(b, b.instructions.data[from].points, b.instructions.data[to].points);
+    b.instructions.data[from].points = no_run();
+    ret err[Error].ok{};
+}
+
+# take a record out of the run it stands in, which holds it
+fun unlink(b: *Body, run: *Run, r: u32) bool {
+    if (run.first == 0) { ret false; }
+    if (run.first == r + 1) {
+        if (run.last == r + 1) { @run = no_run(); }
+        or                     { run.first = b.points.data[r].next; }
+        b.points.data[r].next = 0;
+        ret true;
+    }
+    var p: u32 = run.first;
+    for (p != 0 && p != run.last) {
+        val next: u32 = b.points.data[p - 1].next;
+        if (next == r + 1) {
+            b.points.data[p - 1].next = b.points.data[r].next;
+            if (run.last == r + 1) { run.last = p; }
+            b.points.data[r].next = 0;
+            ret true;
+        }
+        p = next;
+    }
+    ret false;
+}
+
+# turn a value binding record into the storage form: its variable is bound to
+# the storage an instruction's result addresses, which describes it at every
+# point, and the record stands nowhere from then on, so no point reads it as
+# unavailable. a pass that moves a variable's value into memory does this in
+# place of letting its record lose the value
+# ---
+# m:   the module
+# f:   the function
+# r:   the record's position among the body's records
+# at:  the placed instruction whose result addresses the storage
+# ret: ok, or why it was refused, the body left as it was
+pub fun store_binding(m: *Module, f: Function, r: u32, at: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:         *Body             = res_body.ok;
+    val res_where: res[Block, Error] = placed(b, at);
+    if (sel res_where.err)        { ret err[Error].err{res_where.err}; }
+    if (r::usize >= b.points.len) { ret err[Error].err{Error.point{r}}; }
+    val named:   Binding                    = b.points.data[r].binding;
+    val res_had: res[Slice[Binding], Error] = module.bound(m, b.instructions.data[at].metadata.bindings);
+    if (sel res_had.err) { ret err[Error].err{res_had.err}; }
+    var list: vector.Vector[Binding] = vector.init[Binding](m.a);
+    fin { vector.dnit[Binding](?list); }
+    val res_room: res[usize, allocator.Error] = vector.reserve[Binding](?list, res_had.ok.size + 1);
+    if (sel res_room.err) { ret refuse(res_room.err); }
+    var known: bool  = false;
+    var i:     usize = 0;
+    for (i < res_had.ok.size) {
+        if (res_had.ok.data[i] == named) { known = true; }
+        vector.push[Binding](?list, res_had.ok.data[i]);
+        i = i + 1;
+    }
+    if (!known) {
+        vector.push[Binding](?list, named);
+        val res_made: res[Bindings, Error] = module.bindings(m, Slice[Binding]{data: list.data, size: list.len});
+        if (sel res_made.err) { ret err[Error].err{res_made.err}; }
+        b.instructions.data[at].metadata.bindings = res_made.ok;
+    }
+    var taken: bool  = false;
+    var k:     usize = 0;
+    for (k < b.blocks.len && !taken) {
+        if (!b.blocks.data[k].erased) {
+            taken = unlink(b, ?b.blocks.data[k].ending, r);
+            var p: Instruction = b.blocks.data[k].first;
+            for (p != NO_INSTRUCTION && !taken) {
+                taken = unlink(b, ?b.instructions.data[p].points, r);
+                p     = b.instructions.data[p].next;
+            }
+        }
+        k = k + 1;
+    }
+    val opt_old: opt[Value] = point.read(b.points.data[r].reads);
+    if (sel opt_old.some) { drop_record(?b.values.data[opt_old.some].bound, r); }
+    b.points.data[r].reads = Reads.unavailable{};
+    ret err[Error].ok{};
+}
+
+# move a placed instruction to just before another placed one, which must
+# stand where the first one's operands already do: the edit checks no
+# dominance, and the verifier refuses a body where it does not hold. the
+# records standing before the moved instruction stay where they were, before
+# the instruction after it, and the records standing before the other one stand
+# before the moved one from then on. a record that reads a result keeps reading
+# it, since the result stands at every point the moved instruction dominated.
+# ---
+# m:      the module
+# f:      the function
+# i:      the placed instruction, not kept and not a terminator
+# before: the placed instruction it goes before, another one, and an
+#         instruction asked to go before itself stays
+# ret:    ok, or why it was refused, the body left as it was
+pub fun relocate(m: *Module, f: Function, i: Instruction, before: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:        *Body             = res_body.ok;
+    val res_from: res[Block, Error] = placed(b, i);
+    if (sel res_from.err) { ret err[Error].err{res_from.err}; }
+    val res_placed: res[Block, Error] = placed(b, before);
+    if (sel res_placed.err)                         { ret err[Error].err{res_placed.err}; }
+    if (i == before)                                { ret err[Error].ok{}; }
+    if (b.instructions.data[i].metadata.flags.kept) { ret err[Error].err{Error.unkept{i}}; }
+    if (b.instructions.data[i].edges.len != 0)      { ret err[Error].err{Error.terminator{i}}; }
+
+    val d:     *InstructionData = ?b.instructions.data[i];
+    val run:   Run              = d.points;
+    val after: *Run             = after_run(b, res_from.ok, i);
+    d.points = no_run();
+    @after   = join(b, run, @after);
+    link_out(b, res_from.ok, i);
+    link_in(b, res_placed.ok, before, i);
+    d.points                           = b.instructions.data[before].points;
+    b.instructions.data[before].points = no_run();
+    ret err[Error].ok{};
+}
+
+# what a replacement does with the records that read the value it replaces
+# ---
+# follow:      the new value's definition dominates the old one's, so it stands
+#              at every point a record of the old one does, and the records
+#              read it from then on
+# unavailable: nothing is known of where the new value stands, so the records
+#              become unavailable at their points
+pub tag Records: u8 {
+    follow;
+    unavailable;
+}
+
+# replace every use of a value by another value of the same type
+#
+# a record that reads the old value reads the new one when the new one is a
+# constant, which stands everywhere, or when records says follow, and becomes
+# unavailable otherwise. a record never refuses a replacement.
+# ---
+# m:       the module
+# f:       the function
+# old:     the value replaced
+# new:     the value that takes its uses
+# records: what the records reading old do
+# ret:     ok, or why it was refused
+pub fun replace(m: *Module, f: Function, old: Value, new: Value, records: Records) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (!has_value(b, old)) { ret err[Error].err{Error.value{old}}; }
+    if (!has_value(b, new)) { ret err[Error].err{Error.value{new}}; }
+    if (!table.same(b.values.data[old].type, b.values.data[new].type)) {
+        ret err[Error].err{Error.mismatch{b.values.data[new].type}};
+    }
+    if (old == new)                                              { ret err[Error].ok{}; }
+    if (b.values.data[new].secret && !b.values.data[old].secret) { ret err[Error].err{Error.secret{new}}; }
+    val def:    Def  = b.values.data[new].def;
+    val follow: bool = sel records.follow || sel def.constant;
+    if (follow) {
+        val err_room: err[allocator.Error] = room_to_move(b, old, new);
+        if (sel err_room.err) { ret refuse(err_room.err); }
+    }
+    or {
+        val err_room: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[new].uses, b.values.data[old].uses.len);
+        if (sel err_room.err) { ret refuse(err_room.err); }
+        unbind(b, old);
+    }
+    move_uses(b, old, new);
+    ret err[Error].ok{};
+}
+
+# move one instruction's uses of a value, as operands and as arguments, to
+# another value
+# ---
+# m:   the module
+# f:   the function
+# i:   the instruction, which uses old
+# old: the value it stops using
+# new: the value it uses in old's place, of old's type and no more secret
+# ret: ok, or why it was refused
+pub fun substitute(m: *Module, f: Function, i: Instruction, old: Value, new: Value) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (!has_instruction(b, i)) { ret err[Error].err{Error.instruction{i}}; }
+    if (!has_value(b, old))     { ret err[Error].err{Error.value{old}}; }
+    if (!has_value(b, new))     { ret err[Error].err{Error.value{new}}; }
+    if (!table.same(b.values.data[old].type, b.values.data[new].type)) {
+        ret err[Error].err{Error.mismatch{b.values.data[new].type}};
+    }
+    if (old == new)                                              { ret err[Error].ok{}; }
+    if (b.values.data[new].secret && !b.values.data[old].secret) { ret err[Error].err{Error.secret{new}}; }
+    val d:    *InstructionData = ?b.instructions.data[i];
+    var many: usize            = 0;
+    var k:    usize            = 0;
+    for (k < d.operands.len) {
+        if (d.operands.data[k] == old) { many = many + 1; }
+        k = k + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val args: *List[Value] = ?d.edges.data[e].arguments;
+        k = 0;
+        for (k < args.len) {
+            if (args.data[k] == old) { many = many + 1; }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+    val err_room: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[new].uses, many);
+    if (sel err_room.err) { ret refuse(err_room.err); }
+    k = 0;
+    for (k < d.operands.len) {
+        if (d.operands.data[k] == old) {
+            drop_use(b, old, d.entries.data[k]);
+            d.operands.data[k] = new;
+            d.entries.data[k]  = added(b, new, i);
+        }
+        k = k + 1;
+    }
+    e = 0;
+    for (e < d.edges.len) {
+        val edge: *Edge = ?d.edges.data[e];
+        k = 0;
+        for (k < edge.arguments.len) {
+            if (edge.arguments.data[k] == old) {
+                drop_use(b, old, edge.entries.data[k]);
+                edge.arguments.data[k] = new;
+                edge.entries.data[k]   = added(b, new, i);
+            }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# move every use and record of old to new, whose lists have room for them
+fun move_uses(b: *Body, old: Value, new: Value) {
+    move_reads(b, old, new);
+    val count: usize = b.values.data[old].uses.len;
+    var k:     usize = 0;
+    for (k < count) {
+        val user: Instruction      = b.values.data[old].uses.data[k];
+        val d:    *InstructionData = ?b.instructions.data[user];
+        var done: bool             = false;
+        var i:    usize            = 0;
+        for (!done && i < d.operands.len) {
+            if (d.operands.data[i] == old && d.entries.data[i]::usize == k) {
+                d.operands.data[i] = new;
+                d.entries.data[i]  = added(b, new, user);
+                done               = true;
+            }
+            i = i + 1;
+        }
+        var e: usize = 0;
+        for (!done && e < d.edges.len) {
+            val edge: *Edge = ?d.edges.data[e];
+            var j:    usize = 0;
+            for (!done && j < edge.arguments.len) {
+                if (edge.arguments.data[j] == old && edge.entries.data[j]::usize == k) {
+                    edge.arguments.data[j] = new;
+                    edge.entries.data[j]   = added(b, new, user);
+                    done                   = true;
+                }
+                j = j + 1;
+            }
+            e = e + 1;
+        }
+        k = k + 1;
+    }
+    b.values.data[old].uses.len = 0;
+}
+
+fun is_result(d: *InstructionData, v: Value) bool {
+    var k: usize = 0;
+    for (k < d.results.len) {
+        if (d.results.data[k] == v) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# an instruction that uses one of the results of another
+fun uses_result(user: *InstructionData, of: *InstructionData) opt[Value] {
+    var i: usize = 0;
+    for (i < user.operands.len) {
+        if (is_result(of, user.operands.data[i])) { ret opt[Value].some{user.operands.data[i]}; }
+        i = i + 1;
+    }
+    var e: usize = 0;
+    for (e < user.edges.len) {
+        val args: *List[Value] = ?user.edges.data[e].arguments;
+        var j:    usize        = 0;
+        for (j < args.len) {
+            if (is_result(of, args.data[j])) { ret opt[Value].some{args.data[j]}; }
+            j = j + 1;
+        }
+        e = e + 1;
+    }
+    ret opt[Value].none{};
+}
+
+# room in the body's marks for every instruction and value it holds, and a
+# fresh epoch, so nothing is marked
+fun marking(b: *Body) err[allocator.Error] {
+    if (b.marks.instructions.len < b.instructions.len) {
+        val err_instructions: err[allocator.Error] = slice.fill[u32](?b.marks.instructions, b.instructions.len - b.marks.instructions.len, 0);
+        if (sel err_instructions.err) { ret err_instructions; }
+    }
+    if (b.marks.values.len < b.values.len) {
+        val err_values: err[allocator.Error] = slice.fill[u32](?b.marks.values, b.values.len - b.marks.values.len, 0);
+        if (sel err_values.err) { ret err_values; }
+    }
+    b.marks.epoch = b.marks.epoch + 1;
+    if (b.marks.epoch == 0) {
+        var k: usize = 0;
+        for (k < b.marks.instructions.len) {
+            b.marks.instructions.data[k] = 0;
+            k                            = k + 1;
+        }
+        k = 0;
+        for (k < b.marks.values.len) {
+            b.marks.values.data[k] = 0;
+            k                      = k + 1;
+        }
+        b.marks.epoch = 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether instruction i holds this edit's mark
+fun marked(b: *Body, i: Instruction) bool {
+    ret b.marks.instructions.data[i] == b.marks.epoch;
+}
+
+# whether value v holds this edit's mark, as one listed dead
+fun dead_marked(b: *Body, v: Value) bool {
+    ret b.marks.values.data[v] == b.marks.epoch;
+}
+
+# take an instruction whose results are unused out of the body, its records
+# left to the instruction after it and those reading its results unavailable
+fun take_out(b: *Body, i: Instruction) {
+    val d:  *InstructionData = ?b.instructions.data[i];
+    val at: Place            = d.place;
+    if (sel at.placed) {
+        val run:   Run  = d.points;
+        val after: *Run = after_run(b, at.placed, i);
+        d.points = no_run();
+        @after   = join(b, run, @after);
+        link_out(b, at.placed, i);
+    }
+    var k: usize = 0;
+    for (k < d.operands.len) {
+        drop_use(b, d.operands.data[k], d.entries.data[k]);
+        k = k + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val edge: *Edge = ?d.edges.data[e];
+        drop_entry(b, edge.block, edge.rank);
+        var j: usize = 0;
+        for (j < edge.arguments.len) {
+            drop_use(b, edge.arguments.data[j], edge.entries.data[j]);
+            j = j + 1;
+        }
+        e = e + 1;
+    }
+    k = 0;
+    for (k < d.results.len) {
+        unbind(b, d.results.data[k]);
+        b.values.data[d.results.data[k]].def = Def.removed{};
+        k                                    = k + 1;
+    }
+    d.place = Place.erased{};
+}
+
+# take an instruction out of its body: out of its block, the use list of
+# every value it uses and the predecessor list of every block it branches to
+#
+# the records standing before it stand before the instruction after it, or at
+# the block's end, and every record that reads one of its results becomes
+# unavailable at its point. its record stays, erased, so the ids given out
+# stay valid.
+# ---
+# a placed kept instruction is never erased alone. it goes only with a block
+# that cannot run, through `erase_unreached`. a detached one was never part of
+# the program and may go.
+# ---
+# m:   the module
+# f:   the function
+# i:   the instruction, whose results must have no uses
+# ret: ok, or why it was refused
+pub fun erase(m: *Module, f: Function, i: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (!has_instruction(b, i)) { ret err[Error].err{Error.instruction{i}}; }
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (sel d.place.erased)                          { ret err[Error].err{Error.erased{i}}; }
+    if (sel d.place.placed && d.metadata.flags.kept) { ret err[Error].err{Error.unkept{i}}; }
+    var k: usize = 0;
+    for (k < d.results.len) {
+        val r: Value = d.results.data[k];
+        if (b.values.data[r].uses.len != 0) { ret err[Error].err{Error.used{r}}; }
+        k = k + 1;
+    }
+    take_out(b, i);
+    ret err[Error].ok{};
+}
+
+# the place of a value known to be a block parameter
+fun param_of(b: *Body, v: Value) Parameter {
+    val def: Def = b.values.data[v].def;
+    if (sel def.parameter) { ret def.parameter; }
+    ret Parameter{block: 0, index: 0};
+}
+
+# whether the use entry at position p of value v's list is the argument an
+# edge passes for a parameter marked dead
+fun passed_dead(b: *Body, v: Value, p: u32) bool {
+    val d: *InstructionData = ?b.instructions.data[b.values.data[v].uses.data[p]];
+    var e: usize            = 0;
+    for (e < d.edges.len) {
+        val edge: *Edge = ?d.edges.data[e];
+        var a:    usize = 0;
+        for (a < edge.arguments.len) {
+            if (edge.arguments.data[a] == v && edge.entries.data[a] == p) { ret dead_marked(b, b.blocks.data[edge.block].parameters.data[a]); }
+            a = a + 1;
+        }
+        e = e + 1;
+    }
+    ret false;
+}
+
+# whether every use of a value is by an instruction marked to go, or is the
+# argument an edge passes for a parameter marked dead
+fun only_dead_use(b: *Body, v: Value) bool {
+    val uses: *Growing[Instruction] = ?b.values.data[v].uses;
+    var u:    usize                 = 0;
+    for (u < uses.len) {
+        if (!marked(b, uses.data[u]) && !passed_dead(b, v, u::u32)) { ret false; }
+        u = u + 1;
+    }
+    ret true;
+}
+
+# take instructions and block parameters out of the body together, which only
+# each other use
+#
+# a result or parameter may be used by an instruction taken out, or as the
+# argument an edge passes for a parameter taken out, so values that only feed
+# each other leave together. the arguments of the parameters go from every edge
+# into their blocks. a placed kept instruction is refused, as `erase` refuses
+# it.
+# ---
+# m:     the module
+# f:     the function
+# items: the instructions, each placed or detached and listed once
+# dead:  the parameters, of blocks that have not been erased, listed once
+# ret:   ok, or why it was refused with the body left as it was
+pub fun remove_dead(m: *Module, f: Function, items: Slice[Instruction], dead: Slice[Value]) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:           *Body                = res_body.ok;
+    val err_marking: err[allocator.Error] = marking(b);
+    if (sel err_marking.err) { ret refuse(err_marking.err); }
+    var n: usize = 0;
+    for (n < items.size) {
+        val i: Instruction = items.data[n];
+        if (!has_instruction(b, i)) { ret err[Error].err{Error.instruction{i}}; }
+        val at: Place = b.instructions.data[i].place;
+        if (sel at.erased)                                               { ret err[Error].err{Error.erased{i}}; }
+        if (sel at.placed && b.instructions.data[i].metadata.flags.kept) { ret err[Error].err{Error.unkept{i}}; }
+        if (marked(b, i))                                                { ret err[Error].err{Error.erased{i}}; }
+        b.marks.instructions.data[i] = b.marks.epoch;
+        n                            = n + 1;
+    }
+    n = 0;
+    for (n < dead.size) {
+        val p: Value = dead.data[n];
+        if (!has_value(b, p)) { ret err[Error].err{Error.value{p}}; }
+        val def: Def = b.values.data[p].def;
+        if (!(sel def.parameter)) { ret err[Error].err{Error.value{p}}; }
+        val err_open: err[Error] = live(b, def.parameter.block);
+        if (sel err_open.err)  { ret err_open; }
+        if (dead_marked(b, p)) { ret err[Error].err{Error.value{p}}; }
+        b.marks.values.data[p] = b.marks.epoch;
+        n                      = n + 1;
+    }
+    n = 0;
+    for (n < dead.size) {
+        if (!only_dead_use(b, dead.data[n])) { ret err[Error].err{Error.used{dead.data[n]}}; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < items.size) {
+        val d: *InstructionData = ?b.instructions.data[items.data[n]];
+        var k: usize            = 0;
+        for (k < d.results.len) {
+            if (!only_dead_use(b, d.results.data[k])) { ret err[Error].err{Error.used{d.results.data[k]}}; }
+            k = k + 1;
+        }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < dead.size) {
+        val at: Parameter = param_of(b, dead.data[n]);
+        cut_parameter(b, at.block, at.index);
+        n = n + 1;
+    }
+    n = 0;
+    for (n < items.size) {
+        take_out(b, items.data[n]);
+        n = n + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# put a detached instruction in a placed one's slot, move every use and record
+# of each of the placed one's results to the result at the same position, and
+# erase the placed one, whose records stand before the new one. a kept one is
+# supplanted only by a kept one.
+# ---
+# m:   the module
+# f:   the function
+# old: the placed instruction
+# new: the detached one, its results as many and of the same types
+# ret: ok, or why it was refused
+pub fun supplant(m: *Module, f: Function, old: Instruction, new: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:          *Body             = res_body.ok;
+    val res_placed: res[Block, Error] = placed(b, old);
+    if (sel res_placed.err) { ret err[Error].err{res_placed.err}; }
+    val err_free: err[Error] = detached(b, new);
+    if (sel err_free.err) { ret err_free; }
+    val od: *InstructionData = ?b.instructions.data[old];
+    val nd: *InstructionData = ?b.instructions.data[new];
+    if (od.metadata.flags.kept && !nd.metadata.flags.kept) { ret err[Error].err{Error.unkept{old}}; }
+    if (od.results.len != nd.results.len)                  { ret err[Error].err{Error.results{nd.results.len::u32}}; }
+    var k: usize = 0;
+    for (k < od.results.len) {
+        val ov: *ValueData = ?b.values.data[od.results.data[k]];
+        val nv: *ValueData = ?b.values.data[nd.results.data[k]];
+        if (!table.same(ov.type, nv.type)) { ret err[Error].err{Error.mismatch{nv.type}}; }
+        if (nv.secret && !ov.secret)       { ret err[Error].err{Error.secret{nd.results.data[k]}}; }
+        k = k + 1;
+    }
+    val opt_loop: opt[Value] = uses_result(nd, od);
+    if (sel opt_loop.some) { ret err[Error].err{Error.circular{opt_loop.some}}; }
+    k = 0;
+    for (k < od.results.len) {
+        val err_room: err[allocator.Error] = room_to_move(b, od.results.data[k], nd.results.data[k]);
+        if (sel err_room.err) { ret refuse(err_room.err); }
+        k = k + 1;
+    }
+
+    k = 0;
+    for (k < od.results.len) {
+        move_uses(b, od.results.data[k], nd.results.data[k]);
+        k = k + 1;
+    }
+    link_in(b, res_placed.ok, old, new);
+    link_out(b, res_placed.ok, old);
+    nd.points = join(b, nd.points, od.points);
+    od.points = no_run();
+    od.place  = Place.detached{};
+    take_out(b, old);
+    ret err[Error].ok{};
+}
+
+# move an edge of an instruction to another block, passing new arguments
+# ---
+# m:         the module
+# f:         the function
+# i:         the instruction
+# edge:      the edge's position among the instruction's edges
+# to:        the block the edge enters from now on
+# arguments: one value per parameter of to, in order
+# ret:       ok, or why it was refused
+pub fun retarget(m: *Module, f: Function, i: Instruction, edge: u32, to: Block, arguments: Slice[Value]) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (!has_instruction(b, i)) { ret err[Error].err{Error.instruction{i}}; }
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (sel d.place.erased)         { ret err[Error].err{Error.erased{i}}; }
+    if (edge::usize >= d.edges.len) { ret err[Error].err{Error.edge{edge}}; }
+    val err_open: err[Error] = live(b, to);
+    if (sel err_open.err) { ret err_open; }
+    val params: *vector.Vector[Value] = ?b.blocks.data[to].parameters;
+    if (arguments.size != params.len) { ret err[Error].err{Error.arguments{arguments.size::u32}}; }
+    var j: usize = 0;
+    for (j < arguments.size) {
+        val v: Value = arguments.data[j];
+        if (!has_value(b, v)) { ret err[Error].err{Error.value{v}}; }
+        val p: *ValueData = ?b.values.data[params.data[j]];
+        if (!table.same(b.values.data[v].type, p.type)) { ret err[Error].err{Error.mismatch{b.values.data[v].type}}; }
+        if (b.values.data[v].secret && !p.secret)       { ret err[Error].err{Error.secret{v}}; }
+        j = j + 1;
+    }
+
+    val e:        *Edge                       = ?d.edges.data[edge];
+    val res_room: res[usize, allocator.Error] = vector.reserve[Instruction](?b.blocks.data[to].predecessors, 1);
+    if (sel res_room.err) { ret refuse(res_room.err); }
+    j = 0;
+    for (j < arguments.size) {
+        var same: usize = 0;
+        var k:    usize = 0;
+        for (k < arguments.size) {
+            if (arguments.data[k] == arguments.data[j]) { same = same + 1; }
+            k = k + 1;
+        }
+        val err_uses: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[arguments.data[j]].uses, same);
+        if (sel err_uses.err) { ret refuse(err_uses.err); }
+        j = j + 1;
+    }
+    val err_args: err[allocator.Error] = pool.ensure[Value](?b.lists, arguments.size * 2);
+    if (sel err_args.err) { ret refuse(err_args.err); }
+
+    drop_entry(b, e.block, e.rank);
+    j = 0;
+    for (j < e.arguments.len) {
+        drop_use(b, e.arguments.data[j], e.entries.data[j]);
+        j = j + 1;
+    }
+    e.arguments = held(b, arguments);
+    e.entries   = entries_of(b, arguments.size);
+    j           = 0;
+    for (j < arguments.size) {
+        e.entries.data[j] = added(b, arguments.data[j], i);
+        j                 = j + 1;
+    }
+    e.block = to;
+    entered(b, to, i, e);
+    ret err[Error].ok{};
+}
+
+# an edge of a branch, by the branch and its position among its edges
+# ---
+# branch: the instruction holding the edge
+# edge:   the edge's position among its edges
+pub rec Source {
+    branch: Instruction;
+    edge:   u32;
+}
+
+# move edges to a block whose parameters take the arguments they carry, each
+# edge keeping its arguments
+# ---
+# m:       the module
+# f:       the function
+# sources: the edges
+# to:      the block they enter from now on
+# ret:     ok, or why it was refused, the body left as it was
+pub fun reroute(m: *Module, f: Function, sources: Slice[Source], to: Block) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:        *Body      = res_body.ok;
+    val err_open: err[Error] = live(b, to);
+    if (sel err_open.err) { ret err_open; }
+    val params: *vector.Vector[Value] = ?b.blocks.data[to].parameters;
+    var j:      usize                 = 0;
+    for (j < sources.size) {
+        val i: Instruction = sources.data[j].branch;
+        if (!has_instruction(b, i)) { ret err[Error].err{Error.instruction{i}}; }
+        val d: *InstructionData = ?b.instructions.data[i];
+        if (sel d.place.erased)                         { ret err[Error].err{Error.erased{i}}; }
+        if (sources.data[j].edge::usize >= d.edges.len) { ret err[Error].err{Error.edge{sources.data[j].edge}}; }
+        val args: List[Value] = d.edges.data[sources.data[j].edge].arguments;
+        if (args.len != params.len) { ret err[Error].err{Error.arguments{args.len::u32}}; }
+        var a: usize = 0;
+        for (a < args.len) {
+            val v: Value      = args.data[a];
+            val p: *ValueData = ?b.values.data[params.data[a]];
+            if (!table.same(b.values.data[v].type, p.type)) { ret err[Error].err{Error.mismatch{b.values.data[v].type}}; }
+            if (b.values.data[v].secret && !p.secret)       { ret err[Error].err{Error.secret{v}}; }
+            a = a + 1;
+        }
+        j = j + 1;
+    }
+
+    val res_room: res[usize, allocator.Error] = vector.reserve[Instruction](?b.blocks.data[to].predecessors, sources.size);
+    if (sel res_room.err) { ret refuse(res_room.err); }
+    j = 0;
+    for (j < sources.size) {
+        val i: Instruction = sources.data[j].branch;
+        val e: *Edge       = ?b.instructions.data[i].edges.data[sources.data[j].edge];
+        drop_entry(b, e.block, e.rank);
+        e.block = to;
+        entered(b, to, i, e);
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# move the instructions of a block from one of them on to the end of another,
+# with the records standing before them and at the block's end, after the
+# records at the other's end
+# ---
+# m:    the module
+# f:    the function
+# from: the block they leave
+# at:   the first instruction moved, one of from's, or `NO_INSTRUCTION` to move
+#       only the records at from's end
+# to:   the block they join, in order
+# ret:  ok, or why it was refused
+pub fun move(m: *Module, f: Function, from: Block, at: Instruction, to: Block) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:          *Body      = res_body.ok;
+    val err_source: err[Error] = live(b, from);
+    if (sel err_source.err) { ret err_source; }
+    val err_target: err[Error] = live(b, to);
+    if (sel err_target.err) { ret err_target; }
+    if (from == to)         { ret err[Error].err{Error.same{from}}; }
+    if (at != NO_INSTRUCTION) {
+        val res_at: res[Block, Error] = placed(b, at);
+        if (sel res_at.err)    { ret err[Error].err{res_at.err}; }
+        if (res_at.ok != from) { ret err[Error].err{Error.position{at}}; }
+    }
+    val to_end: *Run = ?b.blocks.data[to].ending;
+    val leaves: *Run = ?b.blocks.data[from].ending;
+    if (at != NO_INSTRUCTION) {
+        val lead: *InstructionData = ?b.instructions.data[at];
+        lead.points = join(b, @to_end, lead.points);
+        @to_end     = @leaves;
+    }
+    or { @to_end = join(b, @to_end, @leaves); }
+    @leaves = no_run();
+    if (at == NO_INSTRUCTION) { ret err[Error].ok{}; }
+    val src:  *BlockData  = ?b.blocks.data[from];
+    val dst:  *BlockData  = ?b.blocks.data[to];
+    val tail: Instruction = src.last;
+    val head: Instruction = b.instructions.data[at].prev;
+    if (head == NO_INSTRUCTION) { src.first = NO_INSTRUCTION; }
+    or                          { b.instructions.data[head].next = NO_INSTRUCTION; }
+    src.last                     = head;
+    b.instructions.data[at].prev = dst.last;
+    if (dst.last == NO_INSTRUCTION) { dst.first = at; }
+    or                              { b.instructions.data[dst.last].next = at; }
+    dst.last = tail;
+    var k: Instruction = at;
+    for (k != NO_INSTRUCTION) {
+        b.instructions.data[k].place = Place.placed{to};
+        k                            = b.instructions.data[k].next;
+    }
+    ret err[Error].ok{};
+}
+
+# split a block in two at one of its instructions: a new block takes that instruction and every one after it, in
+# order, with the records standing before them and at the block's end, and the block ends where it stood, holding no
+# terminator until one is placed. every edge the moved instructions hold keeps its target, and every block they enter
+# keeps them as its predecessors, so the new block is entered by no edge and each value the block defines before the
+# split stands in it wherever an edge into it comes from the block. the chains are spliced, so the cost is the place
+# each moved instruction states and nothing that grows with the rest of the body
+# ---
+# m:          the module
+# f:          the function
+# at:         the first instruction moved, a placed one
+# parameters: the new block's parameters, in order
+# ret:        the new block, or why it was refused with the body left as it was
+pub fun split_block(m: *Module, f: Function, at: Instruction, parameters: Slice[Declaration]) res[Block, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Block, Error].err{res_body.err}; }
+    val res_from: res[Block, Error] = placed(res_body.ok, at);
+    if (sel res_from.err) { ret res[Block, Error].err{res_from.err}; }
+    val res_made: res[Block, Error] = block(m, f, parameters);
+    if (sel res_made.err) { ret res_made; }
+    val err_moved: err[Error] = move(m, f, res_from.ok, at, res_made.ok);
+    if (sel err_moved.err) { ret res[Block, Error].err{err_moved.err}; }
+    ret res_made;
+}
+
+# take a block out of its body, its parameters with it
+#
+# every record that reads a parameter becomes unavailable, and the records the
+# block holds go with it, since it holds no point any more. its record stays,
+# erased, so the ids given out stay valid.
+# ---
+# m:   the module
+# f:   the function
+# k:   the block, entered by no edge, holding no instruction and with no
+#      parameter in use
+# ret: ok, or why it was refused
+pub fun erase_block(m: *Module, f: Function, k: Block) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:        *Body      = res_body.ok;
+    val err_open: err[Error] = live(b, k);
+    if (sel err_open.err) { ret err_open; }
+    if (k == 0)           { ret err[Error].err{Error.entry{}}; }
+    val d: *BlockData = ?b.blocks.data[k];
+    if (d.predecessors.len != 0)   { ret err[Error].err{Error.reached{k}}; }
+    if (d.first != NO_INSTRUCTION) { ret err[Error].err{Error.occupied{k}}; }
+    var i: usize = 0;
+    for (i < d.parameters.len) {
+        val p: Value = d.parameters.data[i];
+        if (b.values.data[p].uses.len != 0) { ret err[Error].err{Error.used{p}}; }
+        i = i + 1;
+    }
+    drop_block(b, k);
+    ret err[Error].ok{};
+}
+
+# mark an empty block erased, its parameters removed and its records gone
+fun drop_block(b: *Body, k: Block) {
+    val d: *BlockData = ?b.blocks.data[k];
+    var i: usize      = 0;
+    for (i < d.parameters.len) {
+        unbind(b, d.parameters.data[i]);
+        b.values.data[d.parameters.data[i]].def = Def.removed{};
+        i                                       = i + 1;
+    }
+    var r: u32 = d.ending.first;
+    for (r != 0) {
+        val pt:       *Point     = ?b.points.data[r - 1];
+        val opt_read: opt[Value] = point.read(pt.reads);
+        if (sel opt_read.some) { drop_record(?b.values.data[opt_read.some].bound, r - 1); }
+        pt.reads = Reads.unavailable{};
+        r        = pt.next;
+    }
+    d.ending = no_run();
+    d.erased = true;
+}
+
+# whether every use of a value is by an instruction placed in a marked block
+fun used_within(b: *Body, v: Value, marked: *vector.Vector[bool]) bool {
+    val uses: *Growing[Instruction] = ?b.values.data[v].uses;
+    var u:    usize                 = 0;
+    for (u < uses.len) {
+        val at: Place = b.instructions.data[uses.data[u]].place;
+        if (!(sel at.placed && marked.data[at.placed])) { ret false; }
+        u = u + 1;
+    }
+    ret true;
+}
+
+# take a set of blocks out of the body with every instruction they hold
+#
+# no edge from outside the set enters it and the entry is not in it, so no
+# path from the entry reaches any of its instructions and none of them can
+# run. a kept instruction goes with them, since it never runs. the set's
+# values may use each other in any order, and no instruction outside it uses
+# one.
+# ---
+# m:      the module
+# f:      the function
+# blocks: the blocks, each listed once and not erased
+# ret:    ok, or why it was refused with the body left as it was
+pub fun erase_unreached(m: *Module, f: Function, blocks: Slice[Block]) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:      *Body               = res_body.ok;
+    var marked: vector.Vector[bool] = vector.init[bool](m.a);
+    fin { vector.dnit[bool](?marked); }
+    val res_room: res[usize, allocator.Error] = vector.reserve[bool](?marked, b.blocks.len);
+    if (sel res_room.err) { ret refuse(res_room.err); }
+    var n: usize = 0;
+    for (n < b.blocks.len) {
+        vector.push[bool](?marked, false);
+        n = n + 1;
+    }
+    n = 0;
+    for (n < blocks.size) {
+        val k:        Block      = blocks.data[n];
+        val err_open: err[Error] = live(b, k);
+        if (sel err_open.err) { ret err_open; }
+        if (k == 0)           { ret err[Error].err{Error.entry{}}; }
+        if (marked.data[k])   { ret err[Error].err{Error.removed{k}}; }
+        marked.data[k] = true;
+        n              = n + 1;
+    }
+    n = 0;
+    for (n < blocks.size) {
+        val d: *BlockData = ?b.blocks.data[blocks.data[n]];
+        var i: usize      = 0;
+        for (i < d.predecessors.len) {
+            val at: Place = b.instructions.data[d.predecessors.data[i]].place;
+            if (!(sel at.placed && marked.data[at.placed])) { ret err[Error].err{Error.reached{blocks.data[n]}}; }
+            i = i + 1;
+        }
+        i = 0;
+        for (i < d.parameters.len) {
+            if (!used_within(b, d.parameters.data[i], ?marked)) { ret err[Error].err{Error.used{d.parameters.data[i]}}; }
+            i = i + 1;
+        }
+        var x: Instruction = d.first;
+        for (x != NO_INSTRUCTION) {
+            val inst: *InstructionData = ?b.instructions.data[x];
+            var r:    usize            = 0;
+            for (r < inst.results.len) {
+                if (!used_within(b, inst.results.data[r], ?marked)) { ret err[Error].err{Error.used{inst.results.data[r]}}; }
+                r = r + 1;
+            }
+            x = inst.next;
+        }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < blocks.size) {
+        val bd: *BlockData = ?b.blocks.data[blocks.data[n]];
+        for (bd.last != NO_INSTRUCTION) { take_out(b, bd.last); }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < blocks.size) {
+        drop_block(b, blocks.data[n]);
+        n = n + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# put the block one branch alone enters in that branch's place: every use and
+# record of its parameters moves to the argument the edge passes, the branch
+# is erased, the block's instructions take its slot with its records after the
+# branch's, and the block is erased
+# ---
+# m:    the module
+# f:    the function
+# jump: a placed instruction of one edge and no used result, the only edge
+#       into a block other than its own and the entry
+# ret:  ok, or why it was refused, the body left as it was
+pub fun splice(m: *Module, f: Function, jump: Instruction) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b:          *Body             = res_body.ok;
+    val res_placed: res[Block, Error] = placed(b, jump);
+    if (sel res_placed.err) { ret err[Error].err{res_placed.err}; }
+    val into: Block            = res_placed.ok;
+    val d:    *InstructionData = ?b.instructions.data[jump];
+    if (d.edges.len != 1) { ret err[Error].err{Error.edge{d.edges.len::u32}}; }
+    val k:        Block      = d.edges.data[0].block;
+    val err_open: err[Error] = live(b, k);
+    if (sel err_open.err)                       { ret err_open; }
+    if (k == 0)                                 { ret err[Error].err{Error.entry{}}; }
+    if (k == into)                              { ret err[Error].err{Error.same{k}}; }
+    if (b.blocks.data[k].predecessors.len != 1) { ret err[Error].err{Error.reached{k}}; }
+    var i: usize = 0;
+    for (i < d.results.len) {
+        if (b.values.data[d.results.data[i]].uses.len != 0) { ret err[Error].err{Error.used{d.results.data[i]}}; }
+        i = i + 1;
+    }
+    val params: *vector.Vector[Value] = ?b.blocks.data[k].parameters;
+    val args:   *List[Value]          = ?d.edges.data[0].arguments;
+    i = 0;
+    for (i < args.len) {
+        var j: usize = 0;
+        for (j < params.len) {
+            if (args.data[i] == params.data[j]) { ret err[Error].err{Error.circular{args.data[i]}}; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < args.len) {
+        var moving: usize = 0;
+        var bound:  usize = 0;
+        var j:      usize = 0;
+        for (j < args.len) {
+            if (args.data[j] == args.data[i]) {
+                moving = moving + b.values.data[params.data[j]].uses.len;
+                bound  = bound + b.values.data[params.data[j]].bound.len;
+            }
+            j = j + 1;
+        }
+        val err_room: err[allocator.Error] = pool.reserve[Instruction](?b.lists, ?b.values.data[args.data[i]].uses, moving);
+        if (sel err_room.err) { ret refuse(err_room.err); }
+        val res_spots: res[usize, allocator.Error] = vector.reserve[u32](?b.values.data[args.data[i]].bound, bound);
+        if (sel res_spots.err) { ret refuse(res_spots.err); }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < params.len) {
+        move_uses(b, params.data[i], args.data[i]);
+        i = i + 1;
+    }
+    val jd:    *InstructionData = ?b.instructions.data[jump];
+    val kd:    *BlockData       = ?b.blocks.data[k];
+    var carry: Run              = kd.ending;
+    kd.ending = no_run();
+    if (kd.first != NO_INSTRUCTION) {
+        val lead: *InstructionData = ?b.instructions.data[kd.first];
+        lead.points = join(b, jd.points, lead.points);
+    }
+    or { carry = join(b, jd.points, carry); }
+    jd.points = no_run();
+    val after: *Run = after_run(b, into, jump);
+    @after = join(b, carry, @after);
+    val next: Instruction = jd.next;
+    take_out(b, jump);
+    var x: Instruction = kd.first;
+    for (x != NO_INSTRUCTION) {
+        val moved: Instruction = x;
+        x = b.instructions.data[x].next;
+        link_in(b, into, next, moved);
+    }
+    kd.first = NO_INSTRUCTION;
+    kd.last  = NO_INSTRUCTION;
+    i        = 0;
+    for (i < params.len) {
+        b.values.data[params.data[i]].def = Def.removed{};
+        i                                 = i + 1;
+    }
+    b.blocks.data[k].erased = true;
+    ret err[Error].ok{};
+}
+
+# how far a body's lists reach, so a refused edit can be taken back to it
+# ---
+# blocks:       its number of blocks
+# values:       its number of values
+# instructions: its number of instructions
+# points:       its number of value binding records
+pub rec Mark {
+    blocks:       u32;
+    values:       u32;
+    instructions: u32;
+    points:       u32;
+}
+
+# where a body's lists end now
+pub fun mark(m: *Module, f: Function) res[Mark, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Mark, Error].err{res_body.err}; }
+    ret res[Mark, Error].ok{Mark{blocks: res_body.ok.blocks.len::u32, values: res_body.ok.values.len::u32, instructions: res_body.ok.instructions.len::u32, points: res_body.ok.points.len::u32}};
+}
+
+# take back every block, value and instruction made since a mark, leaving the
+# body as it was at the mark
+#
+# what was made since may be used, entered, listed and read by a record only
+# by what was made since, and a record made since stands in a block made
+# since, so what came before is left exactly as it was. it never allocates.
+# ---
+# m:   the module
+# f:   the function
+# at:  a mark of the body
+# ret: ok, or why it was refused with the body left as it was, or the first
+#      release the allocator refused once everything was taken back
+pub fun rewind(m: *Module, f: Function, at: Mark) err[Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret err[Error].err{res_body.err}; }
+    val b: *Body = res_body.ok;
+    if (at.blocks::usize > b.blocks.len)             { ret err[Error].err{Error.block{at.blocks}}; }
+    if (at.values::usize > b.values.len)             { ret err[Error].err{Error.value{at.values}}; }
+    if (at.instructions::usize > b.instructions.len) { ret err[Error].err{Error.instruction{at.instructions}}; }
+    if (at.points::usize > b.points.len)             { ret err[Error].err{Error.point{at.points}}; }
+    var i: usize = at.values::usize;
+    for (i < b.values.len) {
+        val v: *ValueData = ?b.values.data[i];
+        var u: usize      = 0;
+        for (u < v.uses.len) {
+            if (v.uses.data[u] < at.instructions) { ret err[Error].err{Error.used{(i::u32)}}; }
+            u = u + 1;
+        }
+        u = 0;
+        for (u < v.bound.len) {
+            if (v.bound.data[u] < at.points) { ret err[Error].err{Error.bound{(i::u32)}}; }
+            u = u + 1;
+        }
+        if (sel v.def.parameter) {
+            if (v.def.parameter.block < at.blocks) { ret err[Error].err{Error.parameter{v.def.parameter.index}}; }
+        }
+        i = i + 1;
+    }
+    i = at.blocks::usize;
+    for (i < b.blocks.len) {
+        val k: *BlockData = ?b.blocks.data[i];
+        var u: usize      = 0;
+        for (u < k.predecessors.len) {
+            if (k.predecessors.data[u] < at.instructions) { ret err[Error].err{Error.reached{(i::u32)}}; }
+            u = u + 1;
+        }
+        var x: Instruction = k.first;
+        for (x != NO_INSTRUCTION) {
+            if (x < at.instructions) { ret err[Error].err{Error.occupied{(i::u32)}}; }
+            x = b.instructions.data[x].next;
+        }
+        i = i + 1;
+    }
+
+    var err_failed: err[allocator.Error] = err[allocator.Error].ok{};
+    i = b.instructions.len;
+    for (i > at.instructions::usize) {
+        i = i - 1;
+        if (!(sel b.instructions.data[i].place.erased)) { take_out(b, (i::u32)); }
+        keep(?err_failed, instruction.dnit(m.a, ?b.instructions.data[i]));
+    }
+    vector.truncate[InstructionData](?b.instructions, at.instructions::usize);
+    i = at.values::usize;
+    for (i < b.values.len) {
+        val def: Def = b.values.data[i].def;
+        if (sel def.constant) {
+            val key: u32 = def.constant;
+            map.remove[u32, Value](?b.constants, ?key);
+        }
+        keep(?err_failed, module.value_dnit(m.a, ?b.values.data[i]));
+        i = i + 1;
+    }
+    vector.truncate[ValueData](?b.values, at.values::usize);
+    i = at.blocks::usize;
+    for (i < b.blocks.len) {
+        keep(?err_failed, module.block_dnit(m.a, ?b.blocks.data[i]));
+        i = i + 1;
+    }
+    vector.truncate[BlockData](?b.blocks, at.blocks::usize);
+    var r: usize = at.points::usize;
+    for (r < b.points.len) {
+        val opt_read: opt[Value] = point.read(b.points.data[r].reads);
+        if (sel opt_read.some) {
+            if (opt_read.some < at.values) { drop_record(?b.values.data[opt_read.some].bound, r::u32); }
+        }
+        r = r + 1;
+    }
+    vector.truncate[Point](?b.points, at.points::usize);
+    if (sel err_failed.err) { ret refuse(err_failed.err); }
+    ret err[Error].ok{};
+}

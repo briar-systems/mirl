@@ -1,0 +1,430 @@
+# reading the debug table
+#
+# the table is one `debug` block of statements, each naming an entry. a debug
+# type may name a type declared after it, so each type is declared when its
+# statement is read, and its members are read once the block is.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use debug_entry: mirl.ir.debug.entry;
+use mirl.ir.debug.place;
+use mirl.ir.debug.record;
+use debug_table: mirl.ir.debug.table;
+use mirl.ir.text.notes;
+use mirl.ir.text.parse.lexer;
+use mirl.ir.text.parse.lexer.Token;
+use mirl.ir.text.parse.reason;
+use mirl.ir.text.parse.reason.Named;
+use mirl.ir.text.parse.state;
+use mirl.ir.text.parse.state.Mark;
+use mirl.ir.text.parse.state.Parser;
+use mirl.ir.text.parse.state.Scope;
+use mirl.ir.text.parse.ty;
+use type_table: mirl.ir.type.table;
+
+val STRUCTURE:   u8 = 1;
+val UNION:       u8 = 2;
+val TAGGED:      u8 = 3;
+val ENUMERATION: u8 = 4;
+val ARRAY:       u8 = 5;
+val FUNCTION:    u8 = 6;
+
+# a declared debug type whose members are still to be read
+# ---
+# at:     where they start
+# type:   the type
+# kind:   which shape they are
+# line:   where the entry starts
+# column: where the entry starts
+pub rec Pending {
+    at:     Mark;
+    type:   record.Type;
+    kind:   u8;
+    line:   u32;
+    column: u32;
+}
+
+# take a read of the debug table into out, or refuse at a position and give false
+fun got[T](p: *Parser, line: u32, column: u32, r: res[T, debug_table.Error], out: *T) bool {
+    if (sel r.err) {
+        state.fail_at(p, line, column, reason.Error.debug{r.err});
+        ret false;
+    }
+    @out = r.ok;
+    ret true;
+}
+
+# read the name of an entry of a scope
+pub fun ref(p: *Parser, s: *Scope, what: str) u32 {
+    val t: Token = state.expect(p, lexer.WORD, what);
+    ret state.resolve(p, s, what, t);
+}
+
+fun string(p: *Parser) View {
+    ret state.expect(p, lexer.STRING, "a string").text;
+}
+
+fun location(p: *Parser, t: Token) {
+    val file: u32 = ref(p, ?p.files, "file");
+    state.expect(p, lexer.COLON, ":");
+    val line: u32 = state.number32(p);
+    state.expect(p, lexer.COLON, ":");
+    val col: u32 = state.number32(p);
+    if (!state.ok(p)) { ret; }
+    var l: record.Location;
+    if (got[record.Location](p, t.line, t.column, place.location(?p.m.debug, record.Position{file: file, line: line, column: col}), ?l)) {
+        state.define(p, ?p.places, "location", t, l);
+    }
+}
+
+fun site(p: *Parser, t: Token) {
+    val callee: View = string(p);
+    state.expect_word(p, "at");
+    val call:       u32              = ref(p, ?p.places, "location");
+    var opt_parent: opt[record.Site] = opt[record.Site].none{};
+    if (state.accept_word(p, "in")) { opt_parent = opt[record.Site].some{(ref(p, ?p.sites, "site"))}; }
+    if (!state.ok(p))               { ret; }
+    var s: record.Site;
+    if (got[record.Site](p, t.line, t.column, place.site(?p.m.debug, record.Inlining{call: call, callee: callee, parent: opt_parent}), ?s)) {
+        state.define(p, ?p.sites, "site", t, s);
+    }
+}
+
+fun variable(p: *Parser, t: Token) {
+    val name: View = string(p);
+    state.expect(p, lexer.COLON, ":");
+    val type: u32 = ref(p, ?p.dtypes, "debug type");
+    state.expect_word(p, "at");
+    val declared:      u32      = ref(p, ?p.places, "location");
+    var opt_parameter: opt[u32] = opt[u32].none{};
+    if (state.accept_word(p, "parameter")) { opt_parameter = opt[u32].some{state.number32(p)}; }
+    if (!state.ok(p))                      { ret; }
+    var b: record.Binding;
+    val v: record.Variable = record.Variable{name: name, type: type, declared: declared, parameter: opt_parameter};
+    if (got[record.Binding](p, t.line, t.column, place.bind(?p.m.debug, v), ?b)) {
+        state.define(p, ?p.vars, "variable", t, b);
+    }
+}
+
+fun encoding(p: *Parser) record.Encoding {
+    if (state.accept_word(p, "signed"))    { ret record.Encoding.signed{}; }
+    if (state.accept_word(p, "unsigned"))  { ret record.Encoding.unsigned{}; }
+    if (state.accept_word(p, "float"))     { ret record.Encoding.float{}; }
+    if (state.accept_word(p, "boolean"))   { ret record.Encoding.boolean{}; }
+    if (state.accept_word(p, "character")) { ret record.Encoding.character{}; }
+    if (state.accept_word(p, "address"))   { ret record.Encoding.address{}; }
+    state.expected(p, "an encoding");
+    ret record.Encoding.signed{};
+}
+
+# read a debug type statement: declare the type, and keep where its members
+# start to read once the block is read
+fun dtype(p: *Parser, t: Token, pending: *vector.Vector[Pending]) {
+    val keyed: Token       = state.expect(p, lexer.STRING, "a string");
+    val key:   View        = keyed.text;
+    val name:  View        = string(p);
+    var home:  record.Home = record.Home.shared{};
+    if (state.accept_word(p, "own"))     { home = record.Home.own{}; }
+    or (state.accept_word(p, "outside")) { home = record.Home.outside{}; }
+    val kind: Token = p.tok;
+    if (!state.ok(p)) { ret; }
+    if (kind.kind != lexer.WORD) {
+        state.expected(p, "a shape");
+        ret;
+    }
+    state.advance(p);
+    var head: record.Head = record.Head.enumeration{};
+    var code: u8          = 0;
+    if (lexer.spelled(kind.text, "base")) {
+        state.expect(p, lexer.LPAREN, "(");
+        val e: record.Encoding = encoding(p);
+        state.expect(p, lexer.COMMA, ",");
+        head = record.Head.base{record.Base{encoding: e, width: state.number32(p)}};
+        state.expect(p, lexer.RPAREN, ")");
+    }
+    or (lexer.spelled(kind.text, "structure")) {
+        head = record.Head.structure{laid(p)};
+        code = STRUCTURE;
+    }
+    or (lexer.spelled(kind.text, "union")) {
+        head = record.Head.union{laid(p)};
+        code = UNION;
+    }
+    or (lexer.spelled(kind.text, "tagged")) {
+        head = record.Head.tagged{laid(p)};
+        code = TAGGED;
+    }
+    or (lexer.spelled(kind.text, "enumeration")) { code = ENUMERATION; }
+    or (lexer.spelled(kind.text, "array")) {
+        code = ARRAY;
+        head = record.Head.array{};
+    }
+    or (lexer.spelled(kind.text, "pointer")) {
+        state.expect(p, lexer.LPAREN, "(");
+        head = record.Head.pointer{string(p)};
+        state.expect(p, lexer.RPAREN, ")");
+    }
+    or (lexer.spelled(kind.text, "function")) {
+        code = FUNCTION;
+        head = record.Head.function{};
+    }
+    or {
+        state.fail_at(p, kind.line, kind.column, reason.Error.unknown{Named{what: "shape", name: kind.raw}});
+        ret;
+    }
+    if (!state.ok(p))     { ret; }
+    if (sel home.outside) { code = 0; }
+    # a bound text's type of a key the module describes already is that type, as the module describes it
+    if (p.bind) {
+        val opt_held: opt[record.Type] = debug_entry.find(?p.m.debug, key);
+        if (sel opt_held.some) {
+            state.define(p, ?p.dtypes, "debug type", t, opt_held.some);
+            state.skip_statement(p);
+            ret;
+        }
+    }
+    val at:          Mark                                    = state.mark(p);
+    val res_declare: res[record.Declared, debug_table.Error] = debug_entry.declare(?p.m.debug, ?p.m.types, record.Entry{key: key, name: name, head: head, home: home});
+    if (sel res_declare.err) {
+        state.fail_at(p, t.line, t.column, reason.Error.debug{res_declare.err});
+        ret;
+    }
+    if (sel res_declare.ok.known) {
+        state.fail_at(p, t.line, t.column, reason.Error.duplicate{Named{what: "debug type key", name: keyed.raw}});
+        ret;
+    }
+    state.define(p, ?p.dtypes, "debug type", t, res_declare.ok.fresh);
+    if (code == 0) { ret; }
+    state.push[Pending](p, pending, Pending{at: at, type: res_declare.ok.fresh, kind: code, line: t.line, column: t.column});
+    state.skip_statement(p);
+}
+
+# read the ir type an aggregate entry is laid out as, in parentheses
+fun laid(p: *Parser) type_table.Type {
+    state.expect(p, lexer.LPAREN, "(");
+    val t: type_table.Type = ty.ty(p);
+    state.expect(p, lexer.RPAREN, ")");
+    ret t;
+}
+
+# read one statement of the block, declaring what it names
+fun statement(p: *Parser, pending: *vector.Vector[Pending]) {
+    val kind: Token = state.expect(p, lexer.WORD, "a debug entry");
+    val t:    Token = state.expect(p, lexer.WORD, "the entry's name");
+    state.expect(p, lexer.EQUALS, "=");
+    if (!state.ok(p)) { ret; }
+    if (lexer.spelled(kind.text, "file")) {
+        val path: View = string(p);
+        var f:    record.File;
+        if (state.ok(p) && got[record.File](p, t.line, t.column, place.file(?p.m.debug, path), ?f)) {
+            state.define(p, ?p.files, "file", t, f);
+        }
+    }
+    or (lexer.spelled(kind.text, "loc"))  { location(p, t); }
+    or (lexer.spelled(kind.text, "site")) { site(p, t); }
+    or (lexer.spelled(kind.text, "type")) { dtype(p, t, pending); }
+    or (lexer.spelled(kind.text, "var"))  { variable(p, t); }
+    or                                    { state.fail_at(p, kind.line, kind.column, reason.Error.unknown{Named{what: "debug entry", name: kind.raw}}); }
+    state.expect_end(p);
+    entered(p, kind, t);
+}
+
+# mark the entry a statement made, found by the name it gave it
+fun entered(p: *Parser, kind: Token, t: Token) {
+    var s:    *Scope = ?p.files;
+    var what: u32    = notes.FILE;
+    if (lexer.spelled(kind.text, "loc")) {
+        s    = ?p.places;
+        what = notes.LOCATION;
+    }
+    or (lexer.spelled(kind.text, "site")) {
+        s    = ?p.sites;
+        what = notes.SITE;
+    }
+    or (lexer.spelled(kind.text, "type")) {
+        s    = ?p.dtypes;
+        what = notes.TYPE;
+    }
+    or (lexer.spelled(kind.text, "var")) {
+        s    = ?p.vars;
+        what = notes.VARIABLE;
+    }
+    val opt_found: opt[u32] = state.lookup(s, t.text);
+    if (sel opt_found.some) { state.note(p, kind.line, notes.at(notes.ENTRY, what, opt_found.some)); }
+}
+
+# read the debug block, from its `debug` word, then the members of every type
+# it declared
+pub fun table(p: *Parser) {
+    var pending: vector.Vector[Pending] = vector.init[Pending](p.a);
+    fin { vector.dnit[Pending](?pending); }
+    state.note(p, p.tok.line, notes.at(notes.DEBUG, 0, 0));
+    state.expect_word(p, "debug");
+    state.expect(p, lexer.LBRACE, "{");
+    for (state.ok(p) && !state.is(p, lexer.RBRACE)) {
+        if (state.is(p, lexer.END)) { state.expected(p, "}"); }
+        or                          { statement(p, ?pending); }
+    }
+    state.note(p, p.tok.line, notes.at(notes.DEBUG_END, 0, 0));
+    state.expect(p, lexer.RBRACE, "}");
+    val after: Mark = state.mark(p);
+    define_all(p, ?pending);
+    state.rewind(p, after);
+}
+
+fun member(p: *Parser) record.Member {
+    val name: View = string(p);
+    state.expect(p, lexer.COLON, ":");
+    val type: u32 = ref(p, ?p.dtypes, "debug type");
+    state.expect_word(p, "field");
+    ret record.Member{name: name, type: type, field: state.number32(p)};
+}
+
+fun members(p: *Parser, out: *vector.Vector[record.Member]) {
+    state.expect(p, lexer.LBRACE, "{");
+    if (!state.is(p, lexer.RBRACE)) {
+        for {
+            val m: record.Member = member(p);
+            state.push[record.Member](p, out, m);
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RBRACE, "}");
+}
+
+fun dtype_list(p: *Parser, out: *vector.Vector[record.Type]) {
+    state.expect(p, lexer.LPAREN, "(");
+    if (!state.is(p, lexer.RPAREN)) {
+        for {
+            val i: u32 = ref(p, ?p.dtypes, "debug type");
+            state.push[record.Type](p, out, i);
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RPAREN, ")");
+}
+
+fun tagged(p: *Parser, d: Pending) {
+    var cases: vector.Vector[record.Case] = vector.init[record.Case](p.a);
+    fin { vector.dnit[record.Case](?cases); }
+    state.expect_word(p, "discriminant");
+    val disc: record.Member = member(p);
+    state.expect(p, lexer.LBRACE, "{");
+    if (!state.is(p, lexer.RBRACE)) {
+        for {
+            val name: View = string(p);
+            state.expect(p, lexer.COLON, ":");
+            val value:       u64                 = state.number(p);
+            var opt_payload: opt[record.Carried] = opt[record.Carried].none{};
+            if (state.accept_word(p, "payload")) {
+                val union: u32 = state.number32(p);
+                opt_payload = opt[record.Carried].some{record.Carried{union: union, member: member(p)}};
+            }
+            state.push[record.Case](p, ?cases, record.Case{name: name, value: value, payload: opt_payload});
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RBRACE, "}");
+    complete(p, d, record.Shape.tagged{record.Tagged{discriminant: disc, cases: Slice[record.Case]{data: cases.data, size: cases.len}}});
+}
+
+fun enumeration(p: *Parser, d: Pending) {
+    var list: vector.Vector[record.Enumerator] = vector.init[record.Enumerator](p.a);
+    fin { vector.dnit[record.Enumerator](?list); }
+    state.expect(p, lexer.LPAREN, "(");
+    val base: u32 = ref(p, ?p.dtypes, "debug type");
+    state.expect(p, lexer.RPAREN, ")");
+    state.expect(p, lexer.LBRACE, "{");
+    if (!state.is(p, lexer.RBRACE)) {
+        for {
+            val name: View = string(p);
+            state.expect(p, lexer.COLON, ":");
+            val value: u64 = state.number(p);
+            state.push[record.Enumerator](p, ?list, record.Enumerator{name: name, value: value});
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RBRACE, "}");
+    complete(p, d, record.Shape.enumeration{record.Enumeration{base: base, enumerators: Slice[record.Enumerator]{data: list.data, size: list.len}}});
+}
+
+# give a declared type the shape just read, if it was read whole
+fun complete(p: *Parser, d: Pending, s: record.Shape) {
+    if (!state.ok(p)) { ret; }
+    val err_define: err[debug_table.Error] = debug_entry.define(?p.m.debug, ?p.m.types, d.type, s);
+    if (sel err_define.err) { state.fail_at(p, d.line, d.column, reason.Error.debug{err_define.err}); }
+}
+
+# read what follows a declared type's head and define the type
+fun shape(p: *Parser, d: Pending) {
+    if (d.kind == STRUCTURE || d.kind == UNION) {
+        var list: vector.Vector[record.Member] = vector.init[record.Member](p.a);
+        fin { vector.dnit[record.Member](?list); }
+        members(p, ?list);
+        val s: Slice[record.Member] = Slice[record.Member]{data: list.data, size: list.len};
+        if (d.kind == STRUCTURE) { complete(p, d, record.Shape.structure{s}); }
+        or                       { complete(p, d, record.Shape.union{s}); }
+        ret;
+    }
+    if (d.kind == TAGGED) {
+        tagged(p, d);
+        ret;
+    }
+    if (d.kind == ENUMERATION) {
+        enumeration(p, d);
+        ret;
+    }
+    if (d.kind == ARRAY) {
+        state.expect(p, lexer.LPAREN, "(");
+        val element: u32 = ref(p, ?p.dtypes, "debug type");
+        state.expect(p, lexer.COMMA, ",");
+        val count: u64 = state.number(p);
+        state.expect(p, lexer.RPAREN, ")");
+        complete(p, d, record.Shape.array{record.Array{element: element, count: count}});
+        ret;
+    }
+    var params:  vector.Vector[record.Type] = vector.init[record.Type](p.a);
+    var results: vector.Vector[record.Type] = vector.init[record.Type](p.a);
+    fin {
+        vector.dnit[record.Type](?params);
+        vector.dnit[record.Type](?results);
+    }
+    dtype_list(p, ?params);
+    dtype_list(p, ?results);
+    complete(p, d, record.Shape.function{record.Function{params: Slice[record.Type]{data: params.data, size: params.len}, results: Slice[record.Type]{data: results.data, size: results.len}}});
+}
+
+# read the members of every declared type, now that all are declared
+#
+# arrays go first, since a member held by value agrees with its array's count
+# and element, and an array asks only that its element is declared.
+fun define_all(p: *Parser, pending: *vector.Vector[Pending]) {
+    define_some(p, pending, true);
+    define_some(p, pending, false);
+    if (state.ok(p)) { debug_entry.pending(?p.m.debug); }
+}
+
+# read the members of the declared arrays, or of every other declared type
+fun define_some(p: *Parser, pending: *vector.Vector[Pending], arrays: bool) {
+    var i: usize = 0;
+    for (i < pending.len && state.ok(p)) {
+        val d: Pending = pending.data[i];
+        if ((d.kind == ARRAY) == arrays) {
+            state.rewind(p, d.at);
+            if (!state.accept_word(p, "open")) { shape(p, d); }
+            state.expect_end(p);
+        }
+        i = i + 1;
+    }
+}

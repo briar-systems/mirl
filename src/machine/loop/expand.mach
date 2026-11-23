@@ -1,0 +1,349 @@
+# the expansion of a framed function's loops into their steps
+#
+# this runs after the frame and the lowering of copies, where every operand of
+# a loop is a register location or, at a parameter, an immediate, and before
+# block layout. a loop's steps take its operands where they name one, the
+# immediates of its formulas computed from its parameters, and its literals,
+# fixed registers and blocks where they name those. the block a loop stands in
+# ends with the steps before its body and the jump to the body, the body is a
+# block of its own ending in the jump to the block after it, and that block
+# opens with the steps after the body and holds every instruction that
+# followed the loop. so no instruction of another stage stands inside the
+# body, and layout, which never moves an instruction between blocks, keeps it
+# whole. a loop with no body writes its steps where it stands. every other
+# instruction is copied, and the call frame facts and origins follow the
+# instructions they name. the function changes only when every loop expands.
+#
+# nothing here names a loop, a row or an architecture: every step is the
+# loop's row, read as data.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Fact;
+use mirl.machine.frame.record.Framed;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.instruction.Places;
+use mirl.machine.instruction.Undecided;
+use mirl.machine.layout.exit;
+use mirl.machine.layout.exit.Exit;
+use lrow: mirl.machine.loop.row;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Virtual;
+use mirl.machine.vstate;
+
+use mo: masc.core.operand;
+use masc.core.query;
+
+# an operand of a loop, by its position
+# ---
+# at:       the loop
+# position: the operand's position
+pub rec At {
+    at:       Instruction;
+    position: u32;
+}
+
+# a loop that breaks the schema of a loop
+# ---
+# at:   the loop
+# what: what it breaks
+pub rec Shape {
+    at:   Instruction;
+    what: str;
+}
+
+# a loop whose jump's control turns on an operand that names no register
+# ---
+# at:  the loop
+# why: why its control is undecided
+pub rec Control {
+    at:  Instruction;
+    why: query.Undecided;
+}
+
+# why a function's loops were not expanded
+# ---
+# alloc:     the allocator refused storage
+# made:      the function's maker refused an instruction or a block
+# shape:     a loop that breaks the schema of a loop, naming what
+# operand:   an operand of a loop that is no register location, or a
+#            parameter that is no immediate, by position
+# label:     a loop a partner names, which becomes many instructions
+# implied:   a loop that states locations beyond its operands, which its
+#            steps would not state
+# jump:      a loop whose jump does not go unconditionally to its target
+# undecided: a loop whose jump's control turns on an operand that names no
+#            register
+pub tag Error: u8 {
+    alloc:     allocator.Error;
+    made:      function.Error;
+    shape:     Shape;
+    operand:   At;
+    label:     Instruction;
+    implied:   Instruction;
+    jump:      Instruction;
+    undecided: Control;
+}
+
+# the allocator's refusal `e` stands for, its own or a step's it carries, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc) { ret opt[allocator.Error].some{e.alloc}; }
+    if (sel e.made)  { ret function.starved(e.made); }
+    ret opt[allocator.Error].none{};
+}
+
+# what expanding one function works with
+# ---
+# src:     the framed function
+# out:     the function written
+# block:   the block of `out` instructions are written to
+# at:      the instruction of `src` being written
+# d:       its record
+# origins: each written instruction's instruction of the input
+rec Writer {
+    src:     *Framed;
+    out:     *Function;
+    block:   Block;
+    at:      Instruction;
+    d:       *InstructionData;
+    origins: *vector.Vector[u32];
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun refuse(e: Error) err[Error] {
+    ret err[Error].err{e};
+}
+
+fun made_err(e: function.Error) err[Error] {
+    ret err[Error].err{Error.made{e}};
+}
+
+# write a step of the loop being expanded into a block
+fun step(w: *Writer, b: Block, s: *lrow.Step, p: Places) res[Instruction, Error] {
+    var ops:      [mo.MAX_OPERANDS]Operand;
+    val stated:   Slice[Operand]                   = instruction.step_operands(function.file(w.out), s, w.d.operands, p, ?ops[0]);
+    val res_made: res[Instruction, function.Error] = function.append(w.out, b, Opcode.row{s.row}, stated, w.d.metadata, w.d.declassifies, vstate.under(s.row, w.d.state));
+    if (sel res_made.err) { ret res[Instruction, Error].err{Error.made{res_made.err}}; }
+    ret res[Instruction, Error].ok{res_made.ok};
+}
+
+fun steps(w: *Writer, b: Block, part: lrow.Parts, p: Places) err[Error] {
+    var k: u32 = 0;
+    for (k < lrow.steps_in(part)) {
+        val res_made: res[Instruction, Error] = step(w, b, lrow.step_of(part, k), p);
+        if (sel res_made.err) { ret err[Error].err{res_made.err}; }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# end a block with the loop's jump to `to`, which must leave it unconditionally there
+fun jump(w: *Writer, b: Block, l: *lrow.Loop, p: Places, to: Block) err[Error] {
+    var aimed: Places = p;
+    aimed.target = to;
+    val res_made: res[Instruction, Error] = step(w, b, ?l.jump, aimed);
+    if (sel res_made.err) { ret err[Error].err{res_made.err}; }
+    val res_exit_of: res[opt[Exit], Undecided] = exit.exit_of(w.out, res_made.ok);
+    if (sel res_exit_of.err) { ret refuse(Error.undecided{Control{at: w.at, why: res_exit_of.err.why}}); }
+    val opt_left: opt[Exit] = res_exit_of.ok;
+    if (sel opt_left.none)                                      { ret refuse(Error.jump{w.at}); }
+    if (opt_left.some.conditional || opt_left.some.block != to) { ret refuse(Error.jump{w.at}); }
+    ret err[Error].ok{};
+}
+
+# write a loop's steps: before and its jump at the end of the current block,
+# the body in a block of its own, and the steps after it opening the block
+# after it, which the instructions that followed the loop are written to. a
+# loop with no body writes its steps in place
+fun expand_loop(w: *Writer, l: *lrow.Loop) err[Error] {
+    if (w.d.label != instruction.NO_LABEL) { ret refuse(Error.label{w.at}); }
+    if (w.d.implicit.size != 0)            { ret refuse(Error.implied{w.at}); }
+    val opt_bad: opt[str] = lrow.check(l, function.file(w.out));
+    if (sel opt_bad.some) { ret refuse(Error.shape{Shape{at: w.at, what: opt_bad.some}}); }
+    var k: u32 = 0;
+    for (k::usize < w.d.operands.size) {
+        val o:         Operand = w.d.operands.data[k];
+        val placed:    bool    = sel o.physical && sel o.physical.register;
+        val parameter: bool    = k < l.roles.len && l.roles.at[k] == mo.NONE;
+        if (parameter && !(sel o.immediate)) { ret refuse(Error.operand{At{at: w.at, position: k}}); }
+        if (!parameter && !placed)           { ret refuse(Error.operand{At{at: w.at, position: k}}); }
+        k = k + 1;
+    }
+    if (!lrow.loops(l)) {
+        val none:       Places     = Places{head: w.block, exit: w.block, target: w.block};
+        val err_opened: err[Error] = steps(w, w.block, l.before, none);
+        if (sel err_opened.err) { ret err_opened; }
+        ret steps(w, w.block, l.after, none);
+    }
+    val res_body: res[Block, function.Error] = function.block(w.out);
+    if (sel res_body.err) { ret made_err(res_body.err); }
+    val res_after: res[Block, function.Error] = function.block(w.out);
+    if (sel res_after.err) { ret made_err(res_after.err); }
+    val p:          Places     = Places{head: res_body.ok, exit: res_after.ok, target: res_after.ok};
+    val err_opened: err[Error] = steps(w, w.block, l.before, p);
+    if (sel err_opened.err) { ret err_opened; }
+    val err_entered: err[Error] = jump(w, w.block, l, p, res_body.ok);
+    if (sel err_entered.err) { ret err_entered; }
+    val err_looped: err[Error] = steps(w, res_body.ok, l.body, p);
+    if (sel err_looped.err) { ret err_looped; }
+    val err_left: err[Error] = jump(w, res_body.ok, l, p, res_after.ok);
+    if (sel err_left.err) { ret err_left; }
+    w.block = res_after.ok;
+    ret steps(w, res_after.ok, l.after, p);
+}
+
+# the function's virtual registers, slots and blocks, then its instructions
+# with every loop expanded, noting where each instruction's own begin and how
+# many it made
+fun write(w: *Writer, first: *vector.Vector[u32], made: *vector.Vector[u32]) err[Error] {
+    val f: *Function = ?w.src.function;
+    var i: usize     = 0;
+    for (i < f.virtuals.len) {
+        val res_virtual: res[Virtual, function.Error] = function.virtual(w.out, f.virtuals.data[i], f.secret.data[i], f.widths.data[i]);
+        if (sel res_virtual.err) { ret made_err(res_virtual.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.slots.len) {
+        val res_slot: res[Slot, function.Error] = function.slot(w.out, f.slots.data[i]);
+        if (sel res_slot.err) { ret made_err(res_slot.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        val res_block: res[Block, function.Error] = function.block(w.out);
+        if (sel res_block.err) { ret made_err(res_block.err); }
+        i = i + 1;
+    }
+    val err_room: err[allocator.Error] = function.room_of(w.out, f);
+    if (sel err_room.err) { ret alloc_err(err_room.err); }
+    i = 0;
+    for (i < f.blocks.len) {
+        w.block = (i::u32);
+        val list: Slice[Instruction] = function.instructions(f, w.block);
+        var k:    usize              = 0;
+        for (k < list.size) {
+            w.at = list.data[k];
+            w.d  = function.data(f, w.at);
+            val from:     usize      = w.out.instructions.len;
+            val op:       Opcode     = w.d.opcode;
+            var err_done: err[Error] = err[Error].ok{};
+            if (sel op.loop) { err_done = expand_loop(w, op.loop); }
+            or {
+                val res_carried: res[Instruction, function.Error] = function.carry(w.out, w.block, w.d, w.d.operands);
+                if (sel res_carried.err) { err_done = made_err(res_carried.err); }
+            }
+            if (sel err_done.err) { ret err_done; }
+            first.data[w.at] = from::u32;
+            made.data[w.at]  = (w.out.instructions.len - from)::u32;
+            var o: usize = from;
+            for (o < w.out.instructions.len) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](w.origins, w.src.origins.data[w.at]);
+                if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+                o = o + 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun per_instruction(v: *vector.Vector[u32], n: usize) err[Error] {
+    val err_filled: err[allocator.Error] = slice.fill[u32](v, n, 0);
+    if (sel err_filled.err) { ret alloc_err(err_filled.err); }
+    ret err[Error].ok{};
+}
+
+fun expanded(a: *allocator.Allocator, w: *Writer, out: *Framed) err[Error] {
+    var first: vector.Vector[u32] = vector.init[u32](a);
+    var made:  vector.Vector[u32] = vector.init[u32](a);
+    fin {
+        vector.dnit[u32](?first);
+        vector.dnit[u32](?made);
+    }
+    val count:      usize      = w.src.function.instructions.len;
+    val err_starts: err[Error] = per_instruction(?first, count);
+    if (sel err_starts.err) { ret err_starts; }
+    val err_inherited: err[allocator.Error] = function.inherit(w.out, ?w.src.function);
+    if (sel err_inherited.err) { ret alloc_err(err_inherited.err); }
+    val err_counts: err[Error] = per_instruction(?made, count);
+    if (sel err_counts.err) { ret err_counts; }
+    val err_written: err[Error] = write(w, ?first, ?made);
+    if (sel err_written.err) { ret err_written; }
+    val err_followed: err[allocator.Error] = record.follow(?w.src.facts, Slice[u32]{data: first.data, size: first.len}, Slice[u32]{data: made.data, size: made.len}, ?out.facts);
+    if (sel err_followed.err) { ret alloc_err(err_followed.err); }
+    val err_carried: err[allocator.Error] = function.carry_written(w.out, ?w.src.function, Slice[u32]{data: first.data, size: first.len}, Slice[u32]{data: made.data, size: made.len});
+    if (sel err_carried.err) { ret alloc_err(err_carried.err); }
+    ret err[Error].ok{};
+}
+
+# whether writing a function out would give it back as it is: it names no loop
+# and every instruction stands in its blocks in the order of its number
+fun settled(f: *Function) bool {
+    var next: usize = 0;
+    var k:    usize = 0;
+    for (k < f.blocks.len) {
+        val list: Slice[Instruction] = function.instructions(f, (k::u32));
+        var i:    usize              = 0;
+        for (i < list.size) {
+            if (list.data[i]::usize != next) { ret false; }
+            val op: Opcode = f.instructions.data[next].opcode;
+            if (sel op.loop) { ret false; }
+            next = next + 1;
+            i    = i + 1;
+        }
+        k = k + 1;
+    }
+    ret next == f.instructions.len;
+}
+
+# expand the loops of a framed function into their steps
+# ---
+# a:   the allocator the expanded function takes
+# x:   the framed function, its copies lowered and every loop operand a
+#      register, replaced by the expanded one when every loop expands and
+#      unchanged when one is refused
+# ret: ok, or why a loop was not expanded
+pub fun expand(a: *allocator.Allocator, x: *Framed) err[Error] {
+    if (settled(?x.function)) { ret err[Error].ok{}; }
+    var out:      Framed     = Framed{function: function.init(a, x.function.set, x.function.checked), layout: x.layout, facts: vector.init[Fact](a), origins: vector.init[u32](a)};
+    var w:        Writer     = Writer{src: x, out: ?out.function, block: 0, at: 0, d: nil, origins: ?out.origins};
+    val err_done: err[Error] = expanded(a, ?w, ?out);
+    if (sel err_done.err) {
+        function.dnit(?out.function);
+        vector.dnit[Fact](?out.facts);
+        vector.dnit[u32](?out.origins);
+        ret err_done;
+    }
+    var err_failed: err[allocator.Error] = function.dnit(?x.function);
+    keep(?err_failed, vector.dnit[Fact](?x.facts));
+    keep(?err_failed, vector.dnit[u32](?x.origins));
+    x.function = out.function;
+    x.facts    = out.facts;
+    x.origins  = out.origins;
+    ret err[Error].ok{};
+}

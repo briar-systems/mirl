@@ -1,0 +1,286 @@
+# call effects: what a call of each function of the unit may do beyond the callee's own frame
+#
+# a function's own effects are read from its body. an access to a slot of its own whose address never escapes
+# (`mirl.pass.analysis.slots`) is no effect, any other read or write reaches anywhere, and an ordered or volatile
+# access reaches anywhere both ways, so a call of the function is ordered as what it orders. a marker of where one of
+# its slots' storage begins or ends (`slot.begin`, `slot.end`) is no effect, escaped slot or not: it writes only the
+# function's own frame, which no caller reads, and no access of the slot while its storage does not last is defined,
+# so nothing a call does beyond the frame turns on it. an inline assembly item,
+# a target op and a call the unit cannot follow may do anything: a callee that is not the address of a function, one
+# with no body here, or one a replaceable definition may stand for at link time. a weak instance is every definition of
+# its name, so its body speaks for it. a function traps where one of its instructions may trap, and ends, may never
+# return, where its graph holds a cycle, since no rule here bounds one.
+#
+# the effects are joined bottom up over the unit's call graph one strongly connected group at a time, in the order the
+# groups close (`mirl.pass.analysis.calls`), so each group is joined after every group it calls and its members share
+# one statement. a group whose members call each other ends, as nothing bounds the recursion. a function
+# with no body, or a replaceable one, states nothing, since no body here speaks for a call of it.
+#
+# the pass changes no body and reads no secret, so it keeps constant time. it states facts of the bodies as they
+# stand: a pass that adds an access a statement leaves out runs before this one runs again, which the schedule runs
+# ahead of the readers of memory in each block that has them.
+#
+# cost: one scan of every body, each access asked of the memory analysis, and one walk of the call graph, linear in
+# its functions and calls.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.slice;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.function;
+use mirl.ir.function.Body;
+use mirl.ir.function.Effects;
+use mirl.ir.function.Reach;
+use mirl.ir.function.Summary;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.row.Traps;
+use mirl.ir.opcode.rule.Trap;
+use mirl.ir.opcode.table;
+use mirl.pass.analysis;
+use mirl.pass.analysis.calls;
+use mirl.pass.analysis.memory;
+use mirl.pass.analysis.memory.Effect;
+use mirl.pass.analysis.memory.Memory;
+use mirl.pass.analysis.read;
+use mirl.pass.cache;
+use mirl.pass.record.Changed;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.changed;
+use mirl.pass.refusal;
+
+# the pass: it changes no body, so every analysis outlives it
+pub val EFFECTS: Pass = Pass{name: "effects", kind: Kind.optimise{}, scope: Scope.module{run}, needs: analysis.OF_GRAPH | analysis.OF_DOMINANCE | analysis.OF_MEMORY, preserves: cache.ALL, time: Time.keeps{}};
+
+# one run over the unit
+# ---
+# own:    each function's own effects, its calls of functions the unit follows apart
+# calls:  the calls of functions the unit follows, function by function
+# groups: the strongly connected groups of those calls
+# done:   each function's joined effects, once its group is joined
+rec Run {
+    own:    vector.Vector[Summary];
+    calls:  calls.Calls;
+    groups: calls.Groups;
+    done:   vector.Vector[Summary];
+}
+
+# the effects of nothing
+fun nothing() Summary {
+    ret Summary{reads: Reach.none{}, writes: Reach.none{}, traps: false, ends: false};
+}
+
+# the effects of what may do anything
+fun everything() Summary {
+    ret Summary{reads: Reach.anywhere{}, writes: Reach.anywhere{}, traps: true, ends: true};
+}
+
+fun join(a: Summary, b: Summary) Summary {
+    var out: Summary = a;
+    if (sel b.reads.anywhere)  { out.reads = Reach.anywhere{}; }
+    if (sel b.writes.anywhere) { out.writes = Reach.anywhere{}; }
+    out.traps = a.traps || b.traps;
+    out.ends  = a.ends || b.ends;
+    ret out;
+}
+
+# whether a row states it may trap
+fun trapping(r: *Row) bool {
+    var t: usize = 0;
+    for (t < $length_of(Traps)) {
+        val trap: Trap = r.effects.traps[t];
+        if (!(sel trap.unstated)) { ret true; }
+        t = t + 1;
+    }
+    ret false;
+}
+
+# whether a graph holds a cycle: an edge between reachable blocks into one no later in reverse postorder than its source
+fun cycles(g: *Graph, d: *Dominance) bool {
+    var n: u32 = 0;
+    for (n < g.count) {
+        if (dominance.reachable(d, n)) {
+            val next: Slice[u32] = graph.successors(g, n);
+            var k:    usize      = 0;
+            for (k < next.size) {
+                val to: u32 = next.data[k];
+                if (dominance.reachable(d, to) && dominance.rank(d, to) <= dominance.rank(d, n)) { ret true; }
+                k = k + 1;
+            }
+        }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# what an access stated by its effect reaches beyond the function's private slots
+fun accessed(own: Summary, e: *Effect) Summary {
+    var out:    Summary = own;
+    var beyond: bool    = e.ordered || e.anywhere;
+    var p:      usize   = 0;
+    for (p < e.places.len) {
+        if (!e.places.data[p].private) { beyond = true; }
+        p = p + 1;
+    }
+    if (e.ordered) {
+        out.reads  = Reach.anywhere{};
+        out.writes = Reach.anywhere{};
+    }
+    if (beyond && e.reads)  { out.reads = Reach.anywhere{}; }
+    if (beyond && e.writes) { out.writes = Reach.anywhere{}; }
+    ret out;
+}
+
+# the effects of function `f`'s own body, its calls of functions the unit follows pushed onto `r.calls`
+fun scan(c: *Context, r: *Run, f: Function) res[Summary, refusal.Error] {
+    val m:   *Module = c.m;
+    val b:   *Body   = ?m.functions.data[f].body;
+    var own: Summary = nothing();
+    var mem: *Memory = nil;
+    var k:   usize   = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d:       *InstructionData = ?b.instructions.data[i];
+                val opt_row: opt[*Row]        = table.at(d.opcode);
+                if (sel opt_row.none) { ret res[Summary, refusal.Error].err{refusal.Error.reason{"an instruction whose opcode has no row"}}; }
+                val row: *Row = opt_row.some;
+                if (trapping(row) || d.opcode == table.UNREACHABLE) { own.traps = true; }
+                if (read.calls(d)) {
+                    val opt_callee: opt[Function] = read.callee(m, b, d);
+                    var to:         u32           = calls.NONE;
+                    if (sel opt_callee.some) {
+                        if (calls.followed(m, opt_callee.some)) { to = opt_callee.some; }
+                    }
+                    if (to != calls.NONE) {
+                        val err_added: err[allocator.Error] = calls.add(?r.calls, to);
+                        if (sel err_added.err) { ret res[Summary, refusal.Error].err{refusal.Error.alloc{err_added.err}}; }
+                    }
+                    or { own = everything(); }
+                }
+                or (d.opcode == table.ASM || table.target_op(d.opcode)) { own = everything(); }
+                or (table.marks(d.opcode))                              {}
+                or (row.effects.reads || row.effects.writes || d.metadata.flags.volatile) {
+                    if (mem == nil) {
+                        val res_memory_of: res[*Memory, refusal.Error] = analysis.memory_of(c.cache, f);
+                        if (sel res_memory_of.err) { ret res[Summary, refusal.Error].err{res_memory_of.err}; }
+                        mem = res_memory_of.ok;
+                    }
+                    var res_effect_of: res[Effect, refusal.Error] = memory.effect_of(mem, i);
+                    if (sel res_effect_of.err) { ret res[Summary, refusal.Error].err{res_effect_of.err}; }
+                    own = accessed(own, ?res_effect_of.ok);
+                    memory.dnit(?res_effect_of.ok);
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    val res_graph_of: res[*Graph, refusal.Error] = analysis.graph_of(c.cache, f);
+    if (sel res_graph_of.err) { ret res[Summary, refusal.Error].err{res_graph_of.err}; }
+    val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, f);
+    if (sel res_dominance_of.err)                     { ret res[Summary, refusal.Error].err{res_dominance_of.err}; }
+    if (cycles(res_graph_of.ok, res_dominance_of.ok)) { own.ends = true; }
+    ret res[Summary, refusal.Error].ok{own};
+}
+
+# join group `g`'s effects: its members' own and those of every group they call, which closed before it. a group whose
+# members call each other or one that calls itself ends
+fun join_group(r: *Run, g: usize) {
+    val from:   u32     = r.groups.starts.data[g];
+    val to:     u32     = r.groups.starts.data[g + 1];
+    var joined: Summary = nothing();
+    var cyclic: bool    = to - from > 1;
+    var k:      u32     = from;
+    for (k < to) {
+        val x: u32 = r.groups.order.data[k];
+        joined = join(joined, r.own.data[x]);
+        var at: u32 = r.calls.first.data[x];
+        for (at < r.calls.first.data[x + 1]) {
+            val callee: u32 = r.calls.callees.data[at];
+            if (r.groups.group.data[callee] == g::u32) { cyclic = true; }
+            or                                         { joined = join(joined, r.done.data[callee]); }
+            at = at + 1;
+        }
+        k = k + 1;
+    }
+    if (cyclic) { joined.ends = true; }
+    k = from;
+    for (k < to) {
+        r.done.data[r.groups.order.data[k]] = joined;
+        k                                   = k + 1;
+    }
+}
+
+fun dnit(r: *Run) {
+    vector.dnit[Summary](?r.own);
+    calls.dnit(?r.calls);
+    calls.groups_dnit(?r.groups);
+    vector.dnit[Summary](?r.done);
+}
+
+# state the effects of every function of the unit, marking each whose statement changed
+fun run(c: *Context, ch: *Changed) res[bool, refusal.Error] {
+    val m: *Module              = c.m;
+    val n: usize                = m.functions.len;
+    val a: *allocator.Allocator = m.a;
+    var r: Run                  = Run{own: vector.init[Summary](a), calls: calls.init(a), groups: calls.groups_init(a), done: vector.init[Summary](a)};
+    fin { dnit(?r); }
+    var err_failed: err[allocator.Error] = slice.fill[Summary](?r.own, n, nothing());
+    if (!(sel err_failed.err)) { err_failed = slice.fill[Summary](?r.done, n, nothing()); }
+    if (sel err_failed.err)    { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_failed.err}}; }
+    var f: usize = 0;
+    for (f < n) {
+        val err_begun: err[allocator.Error] = calls.begin(?r.calls);
+        if (sel err_begun.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_begun.err}}; }
+        if (calls.followed(m, f::u32)) {
+            val res_scan: res[Summary, refusal.Error] = scan(c, ?r, f::u32);
+            if (sel res_scan.err) { ret res[bool, refusal.Error].err{res_scan.err}; }
+            r.own.data[f] = res_scan.ok;
+        }
+        f = f + 1;
+    }
+    var err_listed: err[allocator.Error] = calls.end(?r.calls, n);
+    if (!(sel err_listed.err)) { err_listed = calls.groups(a, m, ?r.calls, ?r.groups); }
+    if (sel err_listed.err)    { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_listed.err}}; }
+    var g: usize = 0;
+    for (g < calls.count(?r.groups)) {
+        join_group(?r, g);
+        g = g + 1;
+    }
+    var any: bool = false;
+    f = 0;
+    for (f < n) {
+        var stated: Effects = Effects.unstated{};
+        if (calls.followed(m, f::u32)) { stated = Effects.stated{r.done.data[f]}; }
+        if (!function.same_effects(m.functions.data[f].data.effects, stated)) {
+            m.functions.data[f].data.effects = stated;
+            changed(ch, f::u32);
+            any = true;
+        }
+        f = f + 1;
+    }
+    ret res[bool, refusal.Error].ok{any};
+}

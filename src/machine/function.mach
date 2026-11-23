@@ -1,0 +1,912 @@
+# machine functions: blocks, instructions, virtual registers and frame slots
+#
+# a function is made for one instruction set of masc, the target's, whose
+# register file and catalog rows every instruction is checked against when it
+# is appended to a checked function. an unchecked one, as an unchecked
+# compilation makes, appends as given, since its passes make only what
+# stands. its first block is its entry.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.debug.record.Location;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.NO_PUBLICS;
+use mirl.ir.metadata.Publics;
+use mirl.ir.place.Placed;
+use mirl.machine.block.BlockData;
+use mirl.machine.class;
+use mirl.machine.class.Class;
+use mirl.machine.class.Physical;
+use mirl.machine.instruction;
+use mirl.machine.instruction.Context;
+use mirl.machine.instruction.Implicit;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Virtual;
+use mirl.machine.point.Point;
+use mirl.machine.view;
+use mirl.machine.vstate;
+
+use masc.core.index;
+use rf:   masc.core.register;
+use mset: masc.core.set;
+
+# an offset into an argument area, fixed bytes plus per bytes for each unit of
+# the multiplier of its slot's scale, as a stack piece past arguments of scaled
+# size is placed
+# ---
+# fixed: its fixed bytes
+# per:   its bytes per unit of the multiplier, 0 for a fixed offset
+pub rec Argued {
+    fixed: u64;
+    per:   u64;
+}
+
+# an offset into an argument area of fixed bytes
+pub fun argued(fixed: u64) Argued {
+    ret Argued{fixed: fixed, per: 0};
+}
+
+# bytes of another slot
+# ---
+# slot:   the slot they are bytes of, one made before this
+# offset: where they start in it
+pub rec Within {
+    slot:   u32;
+    offset: u64;
+}
+
+# the area of the stack a slot is in
+# ---
+# local:    the function's own frame, where the frame places it
+# incoming: a stack argument of the function's own, at this offset above the
+#           canonical frame address, the stack pointer's value at the call
+# outgoing: a stack argument of a call the function makes, at this offset
+#           above the stack pointer at the call
+# within:   bytes of another slot, which a load or a store of part of a stack
+#           slot reads or writes in place. it has no storage of its own and
+#           is wherever the slot it is within is
+pub tag Area: u8 {
+    local;
+    incoming: Argued;
+    outgoing: Argued;
+    within:   Within;
+}
+
+# a frame slot, of size bytes plus per bytes for each unit of the multiplier
+# of a scale of the register file the selection leaves to the implementation,
+# as a scalable vector's spill slot follows the vector length
+# ---
+# size:      its fixed bytes
+# per:       its bytes per unit of the multiplier, 0 for a slot of fixed size
+# scale:     the scale, read only when per or its argument area offset's per is
+#            nonzero
+# align:     the alignment it needs, a power of two
+# area:      the area it is in
+# secret:    it may hold a secret, which the walk of a constant-time
+#            function's code seeds it with
+# addressed: the code lets its address out, so a pointer a call is handed or
+#            an access a walk does not place may reach it: every frame local
+#            of an ir stack slot once selected, and for a function that
+#            requires constant time, once allocated, the slots whose address
+#            is read as anything but a plain base (`mirl.machine.addressed`)
+# publics:   the bytes the front end's type of the local it holds lays out as
+#            public, the public ranges of its ir stack slot's alloca as an id
+#            into the module's lists (`mirl.ir.metadata.Publics`), which the
+#            walk of a constant-time function's code takes as typed frame
+#            extents
+pub rec SlotData {
+    size:      u64;
+    per:       u64;
+    scale:     u8;
+    align:     u64;
+    area:      Area;
+    secret:    bool;
+    addressed: bool;
+    publics:   Publics;
+}
+
+# one machine function
+# ---
+# a:            the allocator its storage takes
+# set:          the instruction set it is made for
+# blocks:       its blocks, the entry first
+# instructions: its instructions, indexed by their ids
+# virtuals:     the class of each virtual register
+# secret:       whether each virtual register may hold a secret, as the ir
+#               value it was made for is, which a constant-time check and a
+#               spill of it read
+# widths:       the bits of each virtual register's value, 0 for its class's
+#               whole register (`virtual`)
+# slots:        its frame slots
+# entry:        where its parameters arrive, as the abi legalisation placed
+#               them, none for a function whose entry was never placed
+# points:       its value binding records, those before one instruction in
+#               their order
+# runs:         the storage of its instructions' operands, which every
+#               instruction shares and which goes back only with the function
+# left:         how many operands the last run has room for
+# checked:      whether an instruction is checked against its opcode's row
+#               as it is appended, refused when it does not stand
+pub rec Function {
+    a:            *allocator.Allocator;
+    set:          *mset.Set;
+    blocks:       vector.Vector[BlockData];
+    instructions: vector.Vector[InstructionData];
+    virtuals:     vector.Vector[Class];
+    secret:       vector.Vector[bool];
+    widths:       vector.Vector[u64];
+    slots:        vector.Vector[SlotData];
+    entry:        opt[Slice[Placed]];
+    points:       vector.Vector[Point];
+    runs:         vector.Vector[Slice[Operand]];
+    left:         usize;
+    checked:      bool;
+}
+
+# why a function refused a request
+# ---
+# alloc:   the allocator refused storage
+# refused: an instruction does not stand against its opcode's row
+# class:   a class the target's register file has no row for
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    refused: instruction.Error;
+    class:   Class;
+}
+
+# the allocator's refusal `e` stands for, its own or a step's it carries, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc) { ret opt[allocator.Error].some{e.alloc}; }
+    ret opt[allocator.Error].none{};
+}
+
+# how many operands a function's first run holds when nothing says how many it
+# takes, and the most a run grown from the one before it holds
+val FIRST_RUN: usize = 16;
+val LAST_RUN:  usize = 4096;
+
+# an empty function for an instruction set
+# ---
+# a:       the allocator its storage takes
+# set:     the instruction set
+# checked: whether appending checks each instruction against its row, as a
+#          checked compilation and a trial of whether an instruction stands do
+pub fun init(a: *allocator.Allocator, set: *mset.Set, checked: bool) Function {
+    ret Function{
+        a:            a,
+        set:          set,
+        blocks:       vector.init[BlockData](a),
+        instructions: vector.init[InstructionData](a),
+        virtuals:     vector.init[Class](a),
+        secret:       vector.init[bool](a),
+        widths:       vector.init[u64](a),
+        slots:        vector.init[SlotData](a),
+        entry:        opt[Slice[Placed]].none{},
+        points:       vector.init[Point](a),
+        runs:         vector.init[Slice[Operand]](a),
+        left:         0,
+        checked:      checked,
+    };
+}
+
+# give back a function's storage
+pub fun dnit(f: *Function) err[allocator.Error] {
+    var err_failed: err[allocator.Error] = err[allocator.Error].ok{};
+    var i:          usize                = 0;
+    for (i < f.instructions.len) {
+        val d: *InstructionData = ?f.instructions.data[i];
+        if (d.implicit.size != 0) { keep(?err_failed, slice.free[Implicit](f.a, d.implicit)); }
+        if (d.places.size != 0)   { keep(?err_failed, slice.free[Placed](f.a, d.places)); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        keep(?err_failed, vector.dnit[Instruction](?f.blocks.data[i].instructions));
+        i = i + 1;
+    }
+    keep(?err_failed, vector.dnit[BlockData](?f.blocks));
+    keep(?err_failed, vector.dnit[InstructionData](?f.instructions));
+    keep(?err_failed, vector.dnit[Class](?f.virtuals));
+    keep(?err_failed, vector.dnit[bool](?f.secret));
+    keep(?err_failed, vector.dnit[u64](?f.widths));
+    keep(?err_failed, vector.dnit[SlotData](?f.slots));
+    keep(?err_failed, vector.dnit[Point](?f.points));
+    i = 0;
+    for (i < f.runs.len) {
+        keep(?err_failed, slice.free[Operand](f.a, f.runs.data[i]));
+        i = i + 1;
+    }
+    keep(?err_failed, vector.dnit[Slice[Operand]](?f.runs));
+    if (sel f.entry.some) { keep(?err_failed, slice.free[Placed](f.a, f.entry.some)); }
+    ret err_failed;
+}
+
+# empty a function to be made anew for an instruction set, as `init` makes
+# one, its storage kept for what it is made of next: its last run of operand
+# storage stays whole for the next instructions and the rest goes back
+# ---
+# f:       the function
+# set:     the instruction set
+# checked: whether appending checks each instruction against its row
+# ret:     ok, or the allocator's refusal of storage given back
+pub fun clear(f: *Function, set: *mset.Set, checked: bool) err[allocator.Error] {
+    var err_failed: err[allocator.Error] = err[allocator.Error].ok{};
+    var i:          usize                = 0;
+    for (i < f.instructions.len) {
+        val d: *InstructionData = ?f.instructions.data[i];
+        if (d.implicit.size != 0) { keep(?err_failed, slice.free[Implicit](f.a, d.implicit)); }
+        if (d.places.size != 0)   { keep(?err_failed, slice.free[Placed](f.a, d.places)); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        keep(?err_failed, vector.dnit[Instruction](?f.blocks.data[i].instructions));
+        i = i + 1;
+    }
+    vector.clear[BlockData](?f.blocks);
+    vector.clear[InstructionData](?f.instructions);
+    vector.clear[Class](?f.virtuals);
+    vector.clear[bool](?f.secret);
+    vector.clear[u64](?f.widths);
+    vector.clear[SlotData](?f.slots);
+    vector.clear[Point](?f.points);
+    if (sel f.entry.some) { keep(?err_failed, slice.free[Placed](f.a, f.entry.some)); }
+    f.entry = opt[Slice[Placed]].none{};
+    f.left  = 0;
+    if (f.runs.len != 0) {
+        val last: Slice[Operand] = f.runs.data[f.runs.len - 1];
+        i = 0;
+        for (i + 1 < f.runs.len) {
+            keep(?err_failed, slice.free[Operand](f.a, f.runs.data[i]));
+            i = i + 1;
+        }
+        f.runs.data[0] = last;
+        vector.truncate[Slice[Operand]](?f.runs, 1);
+        f.left = last.size;
+    }
+    f.set     = set;
+    f.checked = checked;
+    ret err_failed;
+}
+
+# state where a function's parameters arrive, in place of any it had
+# ---
+# f:    the function
+# list: the places, copied
+# ret:  ok, or the allocator's refusal
+pub fun place_entry(f: *Function, list: Slice[Placed]) err[allocator.Error] {
+    val res_owned: res[Slice[Placed], allocator.Error] = slice.copy[Placed](f.a, list);
+    if (sel res_owned.err) { ret err[allocator.Error].err{res_owned.err}; }
+    if (sel f.entry.some)  { slice.free[Placed](f.a, f.entry.some); }
+    f.entry = opt[Slice[Placed]].some{res_owned.ok};
+    ret err[allocator.Error].ok{};
+}
+
+# give a function made anew from another the placement of the other's entry,
+# so every stage that rebuilds a function keeps it
+pub fun inherit(to: *Function, from: *Function) err[allocator.Error] {
+    if (sel from.entry.none) { ret err[allocator.Error].ok{}; }
+    ret place_entry(to, from.entry.some);
+}
+
+# no instruction of the output
+pub val UNMADE: u32 = 0xffffffff;
+
+# by instruction of a stage's input, the first instruction of its output made
+# for it, UNMADE for one none was made for
+# ---
+# inputs:  how many instructions the input has
+# origins: by instruction of the output, the input instruction it was made
+#          for, UNMADE for one the stage made of its own
+# out:     where the firsts go
+# ret:     ok, or the allocator's refusal
+pub fun firsts(inputs: usize, origins: Slice[u32], out: *vector.Vector[u32]) err[allocator.Error] {
+    val err_filled: err[allocator.Error] = slice.fill[u32](out, inputs, UNMADE);
+    if (sel err_filled.err) { ret err_filled; }
+    var j: usize = 0;
+    for (j < origins.size) {
+        val o: u32 = origins.data[j];
+        if (o != UNMADE && o::usize < inputs) {
+            if (out.data[o] == UNMADE) { out.data[o] = j::u32; }
+        }
+        j = j + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# by instruction of a stage's input, the first instruction of its output, from
+# the first and the count a stage that writes in input order states for each
+# ---
+# first: by input instruction, the first instruction written for it
+# made:  by input instruction, how many were written for it
+# out:   where the firsts go, UNMADE for one none was written for
+# ret:   ok, or the allocator's refusal
+pub fun firsts_of(first: Slice[u32], made: Slice[u32], out: *vector.Vector[u32]) err[allocator.Error] {
+    val err_filled: err[allocator.Error] = slice.fill[u32](out, first.size, UNMADE);
+    if (sel err_filled.err) { ret err_filled; }
+    var i: usize = 0;
+    for (i < first.size) {
+        if (i < made.size && made.data[i] != 0) { out.data[i] = first.data[i]; }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the instruction of a stage's output a record before input instruction `at`
+# stands before: the first made for it, or for the next of its block that
+# kept one, none when the rest of its block made none
+fun carried_to(from: *Function, first: Slice[u32], at: Instruction, block: *vector.Vector[u32], position: *vector.Vector[u32]) opt[Instruction] {
+    if (at::usize >= first.size)  { ret opt[Instruction].none{}; }
+    if (first.data[at] != UNMADE) { ret opt[Instruction].some{(first.data[at])}; }
+    val k: u32 = block.data[at];
+    if (k == UNMADE) { ret opt[Instruction].none{}; }
+    val list: *vector.Vector[Instruction] = ?from.blocks.data[k].instructions;
+    var p:    usize                       = position.data[at]::usize + 1;
+    for (p < list.len) {
+        val next: u32 = list.data[p];
+        if (next::usize < first.size && first.data[next] != UNMADE) { ret opt[Instruction].some{(first.data[next])}; }
+        p = p + 1;
+    }
+    ret opt[Instruction].none{};
+}
+
+# the value binding records of a stage's input carried to its output, each
+# before the instruction its own now begins at, or the next one of its block
+# that the stage kept, and dropped when the rest of its block was not kept,
+# with what each reads kept as it was
+# ---
+# to:    the output
+# from:  the input
+# first: by input instruction, the first output instruction made for it, as
+#        `firsts` gives it
+# ret:   ok, or the allocator's refusal
+pub fun carry_points(to: *Function, from: *Function, first: Slice[u32]) err[allocator.Error] {
+    if (from.points.len == 0) { ret err[allocator.Error].ok{}; }
+    var block:    vector.Vector[u32] = vector.init[u32](to.a);
+    var position: vector.Vector[u32] = vector.init[u32](to.a);
+    fin {
+        vector.dnit[u32](?block);
+        vector.dnit[u32](?position);
+    }
+    var err_failed: err[allocator.Error] = slice.fill[u32](?block, from.instructions.len, UNMADE);
+    keep(?err_failed, slice.fill[u32](?position, from.instructions.len, 0));
+    val res_room: res[usize, allocator.Error] = vector.reserve[Point](?to.points, from.points.len);
+    if (sel res_room.err)   { keep(?err_failed, err[allocator.Error].err{res_room.err}); }
+    if (sel err_failed.err) { ret err_failed; }
+    var k: usize = 0;
+    for (k < from.blocks.len) {
+        val list: *vector.Vector[Instruction] = ?from.blocks.data[k].instructions;
+        var p:    usize                       = 0;
+        for (p < list.len) {
+            block.data[list.data[p]]    = k::u32;
+            position.data[list.data[p]] = p::u32;
+            p                           = p + 1;
+        }
+        k = k + 1;
+    }
+    var i: usize = 0;
+    for (i < from.points.len) {
+        var pt:             Point            = from.points.data[i];
+        val opt_carried_to: opt[Instruction] = carried_to(from, first, pt.at, ?block, ?position);
+        if (sel opt_carried_to.some) {
+            pt.at = opt_carried_to.some;
+            vector.push[Point](?to.points, pt);
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the value binding records of the input of a stage that writes in input
+# order carried to its output, as `carry_points` carries them
+# ---
+# to:    the output
+# from:  the input
+# first: by input instruction, the first instruction written for it
+# made:  by input instruction, how many were written for it
+# ret:   ok, or the allocator's refusal
+pub fun carry_written(to: *Function, from: *Function, first: Slice[u32], made: Slice[u32]) err[allocator.Error] {
+    if (from.points.len == 0) { ret err[allocator.Error].ok{}; }
+    var at: vector.Vector[u32] = vector.init[u32](to.a);
+    fin { vector.dnit[u32](?at); }
+    val err_firsts_of: err[allocator.Error] = firsts_of(first, made, ?at);
+    if (sel err_firsts_of.err) { ret err_firsts_of; }
+    ret carry_points(to, from, Slice[u32]{data: at.data, size: at.len});
+}
+
+# state where the pieces of the call an instruction makes travel, in place of
+# any it stated
+# ---
+# f:    the function
+# i:    the instruction
+# list: the places, its arguments' and then its results', copied
+# ret:  ok, or the allocator's refusal
+pub fun place(f: *Function, i: Instruction, list: Slice[Placed]) err[allocator.Error] {
+    val res_owned: res[Slice[Placed], allocator.Error] = slice.copy[Placed](f.a, list);
+    if (sel res_owned.err) { ret err[allocator.Error].err{res_owned.err}; }
+    val d: *InstructionData = ?f.instructions.data[i];
+    slice.free[Placed](f.a, d.places);
+    d.places = res_owned.ok;
+    ret err[allocator.Error].ok{};
+}
+
+# the register file of a function's instruction set, nil when it has none
+pub fun file(f: *Function) *rf.File {
+    ret instruction.file_of(f.set);
+}
+
+# add a block after the last
+pub fun block(f: *Function) res[Block, Error] {
+    val b:                 BlockData                   = BlockData{instructions: vector.init[Instruction](f.a)};
+    val res_blocks_pushed: res[usize, allocator.Error] = vector.push[BlockData](?f.blocks, b);
+    if (sel res_blocks_pushed.err) { ret res[Block, Error].err{Error.alloc{res_blocks_pushed.err}}; }
+    ret res[Block, Error].ok{((f.blocks.len - 1)::u32)};
+}
+
+# add a virtual register of a class, of the function's register file or memory-backed, that may hold a secret when
+# `secret` says, whose value is its register's low `bits`
+#
+# a value of nonzero `bits` is held in its register's low `bits` alone: no
+# instruction made for it reads a bit of the register above them, so a write
+# of at least those bits at the bottom of the register writes all of the
+# value, and a store and a load of exactly them carry it. 0 is the class's
+# whole register, which every value whose maker cannot say that is
+# (`mirl.machine.select.rule.Hold`)
+pub fun virtual(f: *Function, c: Class, secret: bool, bits: u64) res[Virtual, Error] {
+    if (!class.valid(c) || (sel c.hardware && c.hardware.file != file(f))) { ret res[Virtual, Error].err{Error.class{c}}; }
+    val res_room: res[usize, allocator.Error] = vector.reserve[u64](?f.widths, 1);
+    if (sel res_room.err) { ret res[Virtual, Error].err{Error.alloc{res_room.err}}; }
+    val res_secret_pushed: res[usize, allocator.Error] = vector.push[bool](?f.secret, secret);
+    if (sel res_secret_pushed.err) { ret res[Virtual, Error].err{Error.alloc{res_secret_pushed.err}}; }
+    val res_virtuals_pushed: res[usize, allocator.Error] = vector.push[Class](?f.virtuals, c);
+    if (sel res_virtuals_pushed.err) {
+        vector.pop[bool](?f.secret);
+        ret res[Virtual, Error].err{Error.alloc{res_virtuals_pushed.err}};
+    }
+    vector.push[u64](?f.widths, bits);
+    ret res[Virtual, Error].ok{((f.virtuals.len - 1)::u32)};
+}
+
+# the bits of a virtual register's value, 0 for its class's whole register
+pub fun width_of(f: *Function, v: Virtual) u64 {
+    ret f.widths.data[v];
+}
+
+# the class of a virtual register
+pub fun class_of(f: *Function, v: Virtual) Class {
+    ret f.virtuals.data[v];
+}
+
+# whether a virtual register may hold a secret
+pub fun secret_of(f: *Function, v: Virtual) bool {
+    ret f.secret.data[v];
+}
+
+# state that a virtual register may hold a secret
+pub fun mark_secret(f: *Function, v: Virtual) {
+    f.secret.data[v] = true;
+}
+
+# a slot of fixed size
+pub fun fixed_slot(size: u64, align: u64) SlotData {
+    ret SlotData{size: size, per: 0, scale: 0, align: align, area: Area.local{}, secret: false, addressed: false, publics: NO_PUBLICS};
+}
+
+# add a frame slot
+pub fun slot(f: *Function, s: SlotData) res[Slot, Error] {
+    val res_slots_pushed: res[usize, allocator.Error] = vector.push[SlotData](?f.slots, s);
+    if (sel res_slots_pushed.err) { ret res[Slot, Error].err{Error.alloc{res_slots_pushed.err}}; }
+    ret res[Slot, Error].ok{((f.slots.len - 1)::u32)};
+}
+
+# whether an opcode and operands stand together in a function, as an appended instruction does
+# ---
+# f:        the function
+# op:       the opcode
+# operands: the operands
+# state:    the vector state it runs under, none when it states none
+# ret:      ok, or the first operand that does not stand where it is
+pub fun check(f: *Function, op: Opcode, operands: Slice[Operand], state: opt[vstate.State]) err[instruction.Error] {
+    var c: Context = Context{
+        set:      f.set,
+        virtuals: Slice[Class]{data: f.virtuals.data, size: f.virtuals.len},
+        slots:    f.slots.len::u32,
+        blocks:   f.blocks.len::u32,
+    };
+    ret instruction.check(?c, op, operands, state);
+}
+
+# put an opcode and operands in an instruction's place, the operands copied into the ones it has
+# ---
+# f:        the function
+# i:        the instruction, which has as many operands as are given
+# op:       the opcode
+# operands: the operands, which `check` admitted with the opcode
+pub fun replace(f: *Function, i: Instruction, op: Opcode, operands: Slice[Operand]) {
+    val d: *InstructionData = ?f.instructions.data[i];
+    d.opcode = op;
+    var k: usize = 0;
+    for (k < operands.size) {
+        d.operands.data[k] = operands.data[k];
+        k                  = k + 1;
+    }
+}
+
+# where a function's lists end, as `mark` takes it
+# ---
+# blocks:       how many blocks it has
+# instructions: how many instruction records it has
+# virtuals:     how many virtual registers it has
+# slots:        how many frame slots it has
+# points:       how many value binding records it has
+pub rec Mark {
+    blocks:       u32;
+    instructions: u32;
+    virtuals:     u32;
+    slots:        u32;
+    points:       u32;
+}
+
+# where a function's lists end now
+pub fun mark(f: *Function) Mark {
+    ret Mark{blocks: f.blocks.len::u32, instructions: f.instructions.len::u32, virtuals: f.virtuals.len::u32, slots: f.slots.len::u32, points: f.points.len::u32};
+}
+
+# take back every block, instruction, virtual register, slot and record made
+# since a mark, each block made before it keeping only the instructions made
+# before it
+#
+# what was made before the mark is left as it was, so it must not have been
+# changed since. the operand storage the instructions taken back held stays
+# with the function and goes back with it.
+# ---
+# f:   the function
+# at:  a mark of the function
+# ret: ok, or the first release the allocator refused once everything was taken back
+pub fun rewind(f: *Function, at: Mark) err[allocator.Error] {
+    var err_failed: err[allocator.Error] = err[allocator.Error].ok{};
+    val made:       bool                 = f.instructions.len > at.instructions::usize;
+    var i:          usize                = at.instructions::usize;
+    for (i < f.instructions.len) {
+        val d: *InstructionData = ?f.instructions.data[i];
+        if (d.implicit.size != 0) { keep(?err_failed, slice.free[Implicit](f.a, d.implicit)); }
+        if (d.places.size != 0)   { keep(?err_failed, slice.free[Placed](f.a, d.places)); }
+        i = i + 1;
+    }
+    vector.truncate[InstructionData](?f.instructions, at.instructions::usize);
+    i = at.blocks::usize;
+    for (i < f.blocks.len) {
+        keep(?err_failed, vector.dnit[Instruction](?f.blocks.data[i].instructions));
+        i = i + 1;
+    }
+    vector.truncate[BlockData](?f.blocks, at.blocks::usize);
+    # a block made before the mark holds an instruction made since only when one was
+    i = 0;
+    for (made && i < f.blocks.len) {
+        val list: *vector.Vector[Instruction] = ?f.blocks.data[i].instructions;
+        var kept: usize                       = 0;
+        var k:    usize                       = 0;
+        for (k < list.len) {
+            if (list.data[k] < at.instructions) {
+                list.data[kept] = list.data[k];
+                kept            = kept + 1;
+            }
+            k = k + 1;
+        }
+        vector.truncate[Instruction](list, kept);
+        i = i + 1;
+    }
+    vector.truncate[Class](?f.virtuals, at.virtuals::usize);
+    vector.truncate[bool](?f.secret, at.virtuals::usize);
+    vector.truncate[u64](?f.widths, at.virtuals::usize);
+    vector.truncate[SlotData](?f.slots, at.slots::usize);
+    vector.truncate[Point](?f.points, at.points::usize);
+    ret err_failed;
+}
+
+# take the last instruction of a block out of it, its record staying so the ids of the others hold
+pub fun detach_last(f: *Function, b: Block) {
+    vector.pop[Instruction](?f.blocks.data[b].instructions);
+}
+
+# take the instruction at position `k` of block `b` out of it, its record staying so the ids of the others hold, and
+# stand each value binding record before it before `onto` instead, an instruction of the block
+pub fun detach(f: *Function, b: Block, k: usize, onto: Instruction) {
+    val opt_removed: opt[Instruction] = vector.remove[Instruction](?f.blocks.data[b].instructions, k);
+    if (sel opt_removed.none) { ret; }
+    var i: usize = 0;
+    for (i < f.points.len) {
+        if (f.points.data[i].at == opt_removed.some) { f.points.data[i].at = onto; }
+        i = i + 1;
+    }
+}
+
+# append an instruction to a block, checked against its opcode's row when
+# the function is checked
+# ---
+# f:            the function
+# b:            the block
+# op:           the opcode
+# operands:     the operands, copied
+# metadata:     the metadata record of the ir instruction it came from
+# declassifies: that instruction's row declassifies
+# state:        the vector state it runs under, none when it states none
+# ret:          the instruction, or why it was refused
+pub fun append(f: *Function, b: Block, op: Opcode, operands: Slice[Operand], metadata: Metadata, declassifies: bool, state: opt[vstate.State]) res[Instruction, Error] {
+    if (b::usize >= f.blocks.len) { ret res[Instruction, Error].err{Error.refused{instruction.Error{operand: instruction.NO_OPERAND, what: instruction.UNKNOWN_BLOCK}}}; }
+    ret insert(f, b, f.blocks.data[b].instructions.len, op, operands, metadata, declassifies, state);
+}
+
+# put an instruction first in a block, checked against its opcode's row, as
+# append does
+pub fun prepend(f: *Function, b: Block, op: Opcode, operands: Slice[Operand], metadata: Metadata, declassifies: bool, state: opt[vstate.State]) res[Instruction, Error] {
+    ret insert(f, b, 0, op, operands, metadata, declassifies, state);
+}
+
+# a run of storage for `n` operands more, at least, made the function's last
+fun run(f: *Function, n: usize) err[allocator.Error] {
+    val res_allocate: res[*Operand, allocator.Error] = allocator.allocate[Operand](f.a, n);
+    if (sel res_allocate.err) { ret err[allocator.Error].err{res_allocate.err}; }
+    val res_pushed: res[usize, allocator.Error] = vector.push[Slice[Operand]](?f.runs, Slice[Operand]{data: res_allocate.ok, size: n});
+    if (sel res_pushed.err) {
+        allocator.deallocate[Operand](f.a, res_allocate.ok, n);
+        ret err[allocator.Error].err{res_pushed.err};
+    }
+    f.left = n;
+    ret err[allocator.Error].ok{};
+}
+
+# a copy of an instruction's operands in the function's runs, each twice the
+# one before it up to LAST_RUN, or as long as these operands need
+fun kept(f: *Function, operands: Slice[Operand]) res[Slice[Operand], allocator.Error] {
+    var out: Slice[Operand];
+    out.data = nil;
+    out.size = operands.size;
+    if (operands.size == 0) { ret res[Slice[Operand], allocator.Error].ok{out}; }
+    if (operands.size > f.left) {
+        var next: usize = FIRST_RUN;
+        if (f.runs.len != 0)      { next = f.runs.data[f.runs.len - 1].size * 2; }
+        if (next > LAST_RUN)      { next = LAST_RUN; }
+        if (next < operands.size) { next = operands.size; }
+        val err_grown: err[allocator.Error] = run(f, next);
+        if (sel err_grown.err) { ret res[Slice[Operand], allocator.Error].err{err_grown.err}; }
+    }
+    val last: *Slice[Operand] = ?f.runs.data[f.runs.len - 1];
+    out.data = ?last.data[last.size - f.left];
+    f.left   = f.left - operands.size;
+    var i: usize = 0;
+    for (i < operands.size) {
+        out.data[i] = operands.data[i];
+        i           = i + 1;
+    }
+    ret res[Slice[Operand], allocator.Error].ok{out};
+}
+
+# set out the room a function made anew from another takes: its instructions,
+# the operands they hold and each block's list, once its blocks are made, so
+# that writing it grows nothing
+# ---
+# to:   the function being made, whose blocks up to `from`'s are the same blocks
+# from: the function it is made from
+# ret:  ok, or the allocator's refusal
+pub fun room_of(to: *Function, from: *Function) err[allocator.Error] {
+    var err_failed: err[allocator.Error] = lists_of(to, from);
+    var total:      usize                = 0;
+    var i:          usize                = 0;
+    for (i < from.instructions.len) {
+        total = total + from.instructions.data[i].operands.size;
+        i     = i + 1;
+    }
+    if (total > to.left) { keep(?err_failed, run(to, total)); }
+    ret err_failed;
+}
+
+# set out the room a function made anew from another takes for its
+# instructions and each block's list, as `room_of` does, and none for
+# operands, as one that carries the other's in place takes
+# ---
+# to:   the function being made, whose blocks up to `from`'s are the same blocks
+# from: the function it is made from
+# ret:  ok, or the allocator's refusal
+pub fun lists_of(to: *Function, from: *Function) err[allocator.Error] {
+    var err_failed: err[allocator.Error]        = err[allocator.Error].ok{};
+    val res_listed: res[usize, allocator.Error] = vector.reserve[InstructionData](?to.instructions, from.instructions.len);
+    if (sel res_listed.err) { keep(?err_failed, err[allocator.Error].err{res_listed.err}); }
+    var i: usize = 0;
+    for (i < from.blocks.len && i < to.blocks.len) {
+        val res_room: res[usize, allocator.Error] = vector.reserve[Instruction](?to.blocks.data[i].instructions, from.blocks.data[i].instructions.len);
+        if (sel res_room.err) { keep(?err_failed, err[allocator.Error].err{res_room.err}); }
+        i = i + 1;
+    }
+    ret err_failed;
+}
+
+# give a function the operand storage of another, whose instructions it
+# carried with `carry_held`, leaving the other none: its instructions'
+# operands then live as long as this function. the run this function fills
+# stays its last
+# ---
+# to:   the function that carried them
+# from: the function they were carried from, whose operands it must not read
+#       again
+# ret:  ok, or the allocator's refusal, with nothing moved
+pub fun adopt(to: *Function, from: *Function) err[allocator.Error] {
+    if (from.runs.len == 0) { ret err[allocator.Error].ok{}; }
+    val res_room: res[usize, allocator.Error] = vector.reserve[Slice[Operand]](?to.runs, from.runs.len);
+    if (sel res_room.err) { ret err[allocator.Error].err{res_room.err}; }
+    val opt_filling: opt[Slice[Operand]] = vector.pop[Slice[Operand]](?to.runs);
+    var i:           usize               = 0;
+    for (i < from.runs.len) {
+        vector.push[Slice[Operand]](?to.runs, from.runs.data[i]);
+        i = i + 1;
+    }
+    if (sel opt_filling.some) { vector.push[Slice[Operand]](?to.runs, opt_filling.some); }
+    vector.truncate[Slice[Operand]](?from.runs, 0);
+    from.left = 0;
+    ret err[allocator.Error].ok{};
+}
+
+# an instruction made and placed at position `at` of a block, at most its length
+fun insert(f: *Function, b: Block, at: usize, op: Opcode, operands: Slice[Operand], metadata: Metadata, declassifies: bool, state: opt[vstate.State]) res[Instruction, Error] {
+    if (b::usize >= f.blocks.len) { ret res[Instruction, Error].err{Error.refused{instruction.Error{operand: instruction.NO_OPERAND, what: instruction.UNKNOWN_BLOCK}}}; }
+    if (f.checked) {
+        val err_checked: err[instruction.Error] = check(f, op, operands, state);
+        if (sel err_checked.err) { ret res[Instruction, Error].err{Error.refused{err_checked.err}}; }
+    }
+    val res_owned: res[Slice[Operand], allocator.Error] = kept(f, operands);
+    if (sel res_owned.err) { ret res[Instruction, Error].err{Error.alloc{res_owned.err}}; }
+    ret put(f, b, at, op, res_owned.ok, metadata, declassifies, state);
+}
+
+# an instruction holding operands `held`, storage the function keeps, made
+# and placed at position `at` of block `b`
+fun put(f: *Function, b: Block, at: usize, op: Opcode, held: Slice[Operand], metadata: Metadata, declassifies: bool, state: opt[vstate.State]) res[Instruction, Error] {
+    val res_room: res[usize, allocator.Error] = vector.reserve[Instruction](?f.blocks.data[b].instructions, 1);
+    if (sel res_room.err) { ret res[Instruction, Error].err{Error.alloc{res_room.err}}; }
+    val res_pushed: res[usize, allocator.Error] = vector.push[InstructionData](?f.instructions, InstructionData{opcode: op, operands: held, metadata: metadata, declassifies: declassifies, implicit: Slice[Implicit]{data: nil, size: 0}, label: instruction.NO_LABEL, state: state, places: Slice[Placed]{data: nil, size: 0}});
+    if (sel res_pushed.err) { ret res[Instruction, Error].err{Error.alloc{res_pushed.err}}; }
+    val id: Instruction = ((f.instructions.len - 1)::u32);
+    vector.insert[Instruction](?f.blocks.data[b].instructions, at, id);
+    ret res[Instruction, Error].ok{id};
+}
+
+# append an instruction's record to a block, with these operands in place of
+# its own, and state its implicit locations, its label, its vector state and
+# its call's places there
+# ---
+# f:        the function
+# b:        the block
+# d:        the record, of this function or another of the same set
+# operands: the operands, copied
+# ret:      the instruction, or why it was refused
+pub fun carry(f: *Function, b: Block, d: *InstructionData, operands: Slice[Operand]) res[Instruction, Error] {
+    val res_made: res[Instruction, Error] = append(f, b, d.opcode, operands, d.metadata, d.declassifies, d.state);
+    if (sel res_made.err) { ret res_made; }
+    ret restate(f, res_made.ok, d);
+}
+
+# append an instruction's record to a block as `carry` does, holding the
+# operands the record holds in place of a copy of them. they stay the storage
+# of the function the record is of until `adopt` gives it to this function,
+# which must come before that one goes back
+# ---
+# f:   the function
+# b:   the block
+# d:   the record, of another function of the same set
+# ret: the instruction, or why it was refused
+pub fun carry_held(f: *Function, b: Block, d: *InstructionData) res[Instruction, Error] {
+    if (b::usize >= f.blocks.len) { ret res[Instruction, Error].err{Error.refused{instruction.Error{operand: instruction.NO_OPERAND, what: instruction.UNKNOWN_BLOCK}}}; }
+    if (f.checked) {
+        val err_checked: err[instruction.Error] = check(f, d.opcode, d.operands, d.state);
+        if (sel err_checked.err) { ret res[Instruction, Error].err{Error.refused{err_checked.err}}; }
+    }
+    val res_made: res[Instruction, Error] = put(f, b, f.blocks.data[b].instructions.len, d.opcode, d.operands, d.metadata, d.declassifies, d.state);
+    if (sel res_made.err) { ret res_made; }
+    ret restate(f, res_made.ok, d);
+}
+
+# the implicit locations, the label and the call's places of record `d`
+# stated for instruction `made`
+fun restate(f: *Function, made: Instruction, d: *InstructionData) res[Instruction, Error] {
+    if (d.implicit.size != 0) {
+        val err_implied: err[Error] = imply(f, made, d.implicit);
+        if (sel err_implied.err) { ret res[Instruction, Error].err{err_implied.err}; }
+    }
+    label(f, made, d.label);
+    if (d.places.size != 0) {
+        val err_placed: err[allocator.Error] = place(f, made, d.places);
+        if (sel err_placed.err) { ret res[Instruction, Error].err{Error.alloc{err_placed.err}}; }
+    }
+    ret res[Instruction, Error].ok{made};
+}
+
+# state the locations an instruction reads and writes beyond its operands and
+# row, reads first, in place of any it had
+# ---
+# f:    the function
+# i:    the instruction
+# list: the locations, copied, each a register of the function's file or a
+#       cell of a memory class
+# ret:  ok, or why it was refused
+pub fun imply(f: *Function, i: Instruction, list: Slice[Implicit]) err[Error] {
+    if (i::usize >= f.instructions.len) { ret err[Error].err{Error.refused{instruction.Error{operand: instruction.NO_OPERAND, what: instruction.UNKNOWN_INSTRUCTION}}}; }
+    var k: usize = 0;
+    for (k < list.size) {
+        val at: Physical = list.data[k].location;
+        if (sel at.register) {
+            if (file(f) == nil) { ret err[Error].err{Error.refused{instruction.Error{operand: instruction.NO_OPERAND, what: instruction.UNFILED_REGISTER}}}; }
+            val opt_row: opt[*rf.Register] = rf.row_of(file(f), at.register);
+            if (sel opt_row.none) { ret err[Error].err{Error.refused{instruction.Error{operand: instruction.NO_OPERAND, what: instruction.UNKNOWN_REGISTER}}}; }
+        }
+        k = k + 1;
+    }
+    val res_owned: res[Slice[Implicit], allocator.Error] = slice.copy[Implicit](f.a, list);
+    if (sel res_owned.err) { ret err[Error].err{Error.alloc{res_owned.err}}; }
+    val d: *InstructionData = ?f.instructions.data[i];
+    slice.free[Implicit](f.a, d.implicit);
+    d.implicit = res_owned.ok;
+    ret err[Error].ok{};
+}
+
+# mark an instruction with the label partner operands name it by, unique in
+# the function, or NO_LABEL for none
+pub fun label(f: *Function, i: Instruction, n: u32) {
+    f.instructions.data[i].label = n;
+}
+
+# an instruction's record
+pub fun data(f: *Function, i: Instruction) *InstructionData {
+    ret ?f.instructions.data[i];
+}
+
+# the source location instruction `i` was built for, none for none or for an
+# id the function did not give out
+pub fun location(f: *Function, i: Instruction) opt[Location] {
+    if (i::usize >= f.instructions.len) { ret opt[Location].none{}; }
+    ret f.instructions.data[i].metadata.location;
+}
+
+# the instructions of a block, in order
+pub fun instructions(f: *Function, b: Block) Slice[Instruction] {
+    val list: *vector.Vector[Instruction] = ?f.blocks.data[b].instructions;
+    ret Slice[Instruction]{data: list.data, size: list.len};
+}
+
+# the instructions placed in a function's blocks
+pub fun placed(f: *Function) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < f.blocks.len) {
+        n = n + f.blocks.data[i].instructions.len;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the register an instruction's row fixes operand `at` to, none when it is not fixed
+pub fun fixed(f: *Function, i: Instruction, at: u32) opt[rf.Id] {
+    ret instruction.fixed(f.set, data(f, i).opcode, at);
+}
+
+# the graph of a function's blocks, valid until its blocks next change
+pub fun graph_of(f: *Function) res[Graph, allocator.Error] {
+    ret view.of(f.a, Slice[BlockData]{data: f.blocks.data, size: f.blocks.len}, Slice[InstructionData]{data: f.instructions.data, size: f.instructions.len});
+}

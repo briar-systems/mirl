@@ -1,0 +1,756 @@
+# the shape of a structured graph: its tree of regions, or the first flaw that
+# keeps it from having one
+#
+# it reads only the graph view, its dominance and its loops, so any form of
+# code with numbered blocks is structured by it. a region is a set of blocks
+# whose entry dominates them all and that edges from outside enter only at its
+# entry. the function is one, a loop's body and its continue sequence are
+# each one, a selection's arm is every block of the region its head
+# dominates, and what is left of a region after a selection or a loop is the
+# rest of its sequence, entered only at that construct's merge.
+#
+# a graph is structured when it is reducible, every loop has one latch and
+# leaves only to one block of the region around it, and every selection's
+# arms leave only to one block of its region, which is its merge, besides a
+# break, a continue or a return. a selection one of whose arms alone goes on
+# to the merge around it, the others ending, has that arm's head as its merge,
+# as `if (c) { ret; } rest`: the arm is the rest of its sequence, so the
+# selection's merge is a block of its own and the edge a block's to take. a
+# flaw names where this first fails, and the edges a rewrite moves to mend it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice.fill;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.structure.region;
+use mirl.structure.region.Kind;
+use mirl.structure.region.Structure;
+
+# an edge, as its source and its position among the source's successors
+# ---
+# from: the source
+# edge: the position
+pub rec Site {
+    from: u32;
+    edge: u32;
+}
+
+# what keeps a graph from being structured
+# ---
+# twin:    a block that branches to one block by two edges, the second named
+# tangle:  a cycle entered at more than one block, an irreducible region
+# latches: a loop, by its header, entered back by more than one edge
+# exits:   a loop, by its header, left to more than one block or to a block
+#          outside the region around it
+# merge:   a selection, by its header, whose arms reconverge on more than one
+#          block or on the merge of a construct around it
+# stray:   an edge from this block to a block of no region it may reach, a
+#          defect of the shape
+pub tag Flaw: u8 {
+    twin: Site;
+    tangle;
+    latches: u32;
+    exits:   u32;
+    merge:   u32;
+    stray:   u32;
+}
+
+# the edges a flaw is mended by moving
+# ---
+# edges:   the edges to move
+# targets: the blocks they enter, each once, in the order a dispatch tests
+#          them: by first edge, and a tangle's entries in reverse postorder
+# blocks:  a tangle's blocks, and otherwise the blocks whose branches choose
+#          among the edges
+pub rec Work {
+    edges:   vector.Vector[Site];
+    targets: vector.Vector[u32];
+    blocks:  vector.Vector[u32];
+}
+
+# empty work
+pub fun init(a: *allocator.Allocator) Work {
+    ret Work{edges: vector.init[Site](a), targets: vector.init[u32](a), blocks: vector.init[u32](a)};
+}
+
+# give back the storage of work
+pub fun dnit(w: *Work) err[allocator.Error] {
+    var err_failed: err[allocator.Error] = vector.dnit[Site](?w.edges);
+    keep(?err_failed, vector.dnit[u32](?w.targets));
+    keep(?err_failed, vector.dnit[u32](?w.blocks));
+    ret err_failed;
+}
+
+# empty work of its edges, targets and blocks, keeping its storage
+fun reset(w: *Work) {
+    vector.truncate[Site](?w.edges, 0);
+    vector.truncate[u32](?w.targets, 0);
+    vector.truncate[u32](?w.blocks, 0);
+}
+
+# what a flaw is, in a few words
+pub fun why(f: Flaw) str {
+    if (sel f.twin)    { ret "a block branches to one block twice"; }
+    if (sel f.tangle)  { ret "a cycle is entered at more than one block"; }
+    if (sel f.latches) { ret "a loop is entered back by more than one edge"; }
+    if (sel f.exits)   { ret "a loop leaves other than through one block"; }
+    if (sel f.merge)   { ret "a selection reconverges other than on one block"; }
+    ret "an edge reaches a block outside every region it may reach";
+}
+
+# where a region goes on to: a merge, a break or a continue
+# ---
+# merge: the merge of the construct around it, NONE at the top of a loop body
+#        or of the function
+# brk:   the merge of the innermost loop around it
+# cont:  the latch of the innermost loop around it, and the header within
+#        that loop's continue sequence
+rec Context {
+    merge: u32;
+    brk:   u32;
+    cont:  u32;
+}
+
+# one region of a sequence, and the block the sequence goes on at
+rec Step {
+    item: u32;
+    next: u32;
+}
+
+# one search for a graph's shape
+# ---
+# a:     the allocator its storage takes
+# g:     the graph
+# d:     its dominance
+# l:     its loops
+# s:     the structure being filled
+# w:     the work a flaw is mended by
+# owner: per block, the id of the region that holds it, NONE for a block the
+#        entry does not reach
+# stack: scratch for claiming a region's blocks
+# ids:   the next region id to give out
+# flaw:  the first flaw found, none while there is none
+rec Walk {
+    a:     *allocator.Allocator;
+    g:     *Graph;
+    d:     *Dominance;
+    l:     *Loops;
+    s:     *Structure;
+    w:     *Work;
+    owner: vector.Vector[u32];
+    stack: vector.Vector[u32];
+    ids:   u32;
+    flaw:  opt[Flaw];
+}
+
+fun push(v: *vector.Vector[u32], x: u32) err[allocator.Error] {
+    val res_pushed: res[usize, allocator.Error] = vector.push[u32](v, x);
+    if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+fun holds(v: *vector.Vector[u32], x: u32) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == x) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# an edge to move, and its target once among the targets
+fun moves(w: *Work, from: u32, edge: u32, to: u32) err[allocator.Error] {
+    val res_pushed: res[usize, allocator.Error] = vector.push[Site](?w.edges, Site{from: from, edge: edge});
+    if (sel res_pushed.err)    { ret err[allocator.Error].err{res_pushed.err}; }
+    if (holds(?w.targets, to)) { ret err[allocator.Error].ok{}; }
+    ret push(?w.targets, to);
+}
+
+# the position of an edge from one node to another, NONE when there is none
+fun position(g: *Graph, from: u32, to: u32) u32 {
+    val succs: Slice[u32] = graph.successors(g, from);
+    var i:     usize      = 0;
+    for (i < succs.size) {
+        if (succs.data[i] == to) { ret i::u32; }
+        i = i + 1;
+    }
+    ret NONE;
+}
+
+# note the flaw the walk stops at
+fun found(k: *Walk, f: Flaw) err[allocator.Error] {
+    k.flaw = opt[Flaw].some{f};
+    ret err[allocator.Error].ok{};
+}
+
+# whether the walk has found a flaw
+fun stopped(k: *Walk) bool {
+    ret sel k.flaw.some;
+}
+
+# a block that names one successor twice
+fun twins(k: *Walk) {
+    val order: Slice[u32] = dominance.order(k.d);
+    var i:     usize      = 0;
+    for (i < order.size) {
+        val succs: Slice[u32] = graph.successors(k.g, order.data[i]);
+        var e:     usize      = 1;
+        for (e < succs.size) {
+            var j: usize = 0;
+            for (j < e) {
+                if (succs.data[j] == succs.data[e]) {
+                    k.flaw = opt[Flaw].some{Flaw.twin{Site{from: order.data[i], edge: e::u32}}};
+                    ret;
+                }
+                j = j + 1;
+            }
+            e = e + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# an edge that is no back edge, its target not dominating its source
+fun forward(d: *Dominance, from: u32, to: u32) bool {
+    ret !dominance.dominates(d, to, from);
+}
+
+# the blocks of a tangle, its entries in reverse postorder, and every edge
+# into an entry from a reachable block
+fun entered(k: *Walk, inside: *vector.Vector[u32]) err[allocator.Error] {
+    val order: Slice[u32] = dominance.order(k.d);
+    var i:     usize      = 0;
+    for (i < order.size) {
+        val n: u32 = order.data[i];
+        if (inside.data[n] != 0) {
+            val err_kept: err[allocator.Error] = push(?k.w.blocks, n);
+            if (sel err_kept.err) { ret err_kept; }
+            val preds: Slice[u32] = graph.predecessors(k.g, n);
+            var entry: bool       = false;
+            var j:     usize      = 0;
+            for (j < preds.size) {
+                val p: u32 = preds.data[j];
+                if (dominance.reachable(k.d, p) && inside.data[p] == 0 && forward(k.d, p, n)) { entry = true; }
+                j = j + 1;
+            }
+            if (entry) {
+                val err_target: err[allocator.Error] = push(?k.w.targets, n);
+                if (sel err_target.err) { ret err_target; }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < k.w.targets.len) {
+        val n:     u32        = k.w.targets.data[i];
+        val preds: Slice[u32] = graph.predecessors(k.g, n);
+        var j:     usize      = 0;
+        for (j < preds.size) {
+            val p: u32 = preds.data[j];
+            if (dominance.reachable(k.d, p)) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Site](?k.w.edges, Site{from: p, edge: position(k.g, p, n)});
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the first strongly connected set of more than one block over the forward
+# edges, which tarjan's walk finds, and which only an irreducible graph has
+fun tangles(k: *Walk) err[allocator.Error] {
+    val n:     u32                = k.g.count;
+    var index: vector.Vector[u32] = vector.init[u32](k.a);
+    var low:   vector.Vector[u32] = vector.init[u32](k.a);
+    var next:  vector.Vector[u32] = vector.init[u32](k.a);
+    var on:    vector.Vector[u32] = vector.init[u32](k.a);
+    var stack: vector.Vector[u32] = vector.init[u32](k.a);
+    var calls: vector.Vector[u32] = vector.init[u32](k.a);
+    fin {
+        vector.dnit[u32](?index);
+        vector.dnit[u32](?low);
+        vector.dnit[u32](?next);
+        vector.dnit[u32](?on);
+        vector.dnit[u32](?stack);
+        vector.dnit[u32](?calls);
+    }
+    var err_failed: err[allocator.Error] = fill[u32](?index, n::usize, NONE);
+    keep(?err_failed, fill[u32](?low, n::usize, 0));
+    keep(?err_failed, fill[u32](?next, n::usize, 0));
+    keep(?err_failed, fill[u32](?on, n::usize, 0));
+    if (sel err_failed.err) { ret err_failed; }
+    if (n == 0)             { ret err_failed; }
+
+    var counter: u32 = 0;
+    val root:    u32 = k.g.entry;
+    index.data[root] = counter;
+    low.data[root]   = counter;
+    counter          = counter + 1;
+    on.data[root]    = 1;
+    keep(?err_failed, push(?stack, root));
+    keep(?err_failed, push(?calls, root));
+    if (sel err_failed.err) { ret err_failed; }
+    for (calls.len > 0) {
+        val x:     u32        = calls.data[calls.len - 1];
+        val succs: Slice[u32] = graph.successors(k.g, x);
+        if (next.data[x]::usize < succs.size) {
+            val y: u32 = succs.data[next.data[x]];
+            next.data[x] = next.data[x] + 1;
+            if (!forward(k.d, x, y)) { cnt; }
+            if (index.data[y] == NONE) {
+                index.data[y] = counter;
+                low.data[y]   = counter;
+                counter       = counter + 1;
+                on.data[y]    = 1;
+                keep(?err_failed, push(?stack, y));
+                keep(?err_failed, push(?calls, y));
+                if (sel err_failed.err) { ret err_failed; }
+            }
+            or (on.data[y] != 0 && index.data[y] < low.data[x]) { low.data[x] = index.data[y]; }
+            cnt;
+        }
+        vector.truncate[u32](?calls, calls.len - 1);
+        if (calls.len > 0) {
+            val p: u32 = calls.data[calls.len - 1];
+            if (low.data[x] < low.data[p]) { low.data[p] = low.data[x]; }
+        }
+        if (low.data[x] == index.data[x]) {
+            var size: usize = 0;
+            for (stack.data[stack.len - 1 - size] != x) { size = size + 1; }
+            size = size + 1;
+            if (size >= 2) {
+                # the set's blocks stay marked on for the walk of its entries
+                var j: usize = 0;
+                for (j < stack.len) {
+                    on.data[stack.data[j]] = 0;
+                    j                      = j + 1;
+                }
+                j = stack.len - size;
+                for (j < stack.len) {
+                    on.data[stack.data[j]] = 1;
+                    j                      = j + 1;
+                }
+                reset(k.w);
+                val err_walked: err[allocator.Error] = entered(k, ?on);
+                if (sel err_walked.err) { ret err_walked; }
+                ret found(k, Flaw.tangle{});
+            }
+            vector.truncate[u32](?stack, stack.len - 1);
+            on.data[x] = 0;
+        }
+    }
+    ret err_failed;
+}
+
+# whether s heads an arm of the selection at x: a block of its region that
+# x alone enters, besides the back edges of a loop s heads
+fun heads(k: *Walk, x: u32, s: u32, rid: u32) bool {
+    if (s == x || k.owner.data[s] != rid) { ret false; }
+    val opt_idom: opt[u32] = dominance.idom(k.d, s);
+    if (sel opt_idom.none)  { ret false; }
+    if (opt_idom.some != x) { ret false; }
+    val preds: Slice[u32] = graph.predecessors(k.g, s);
+    var i:     usize      = 0;
+    for (i < preds.size) {
+        val p: u32 = preds.data[i];
+        if (p != x && dominance.reachable(k.d, p) && !dominance.dominates(k.d, s, p)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# give every block of region from that root dominates the region to, and
+# list it in members
+fun claim(k: *Walk, root: u32, from: u32, to: u32, members: *vector.Vector[u32]) err[allocator.Error] {
+    vector.truncate[u32](?k.stack, 0);
+    val err_first: err[allocator.Error] = push(?k.stack, root);
+    if (sel err_first.err) { ret err_first; }
+    for (k.stack.len > 0) {
+        val n: u32 = k.stack.data[k.stack.len - 1];
+        vector.truncate[u32](?k.stack, k.stack.len - 1);
+        if (k.owner.data[n] != from) { cnt; }
+        k.owner.data[n] = to;
+        val err_listed: err[allocator.Error] = push(members, n);
+        if (sel err_listed.err) { ret err_listed; }
+        val below: Slice[u32] = dominance.children(k.d, n);
+        var i:     usize      = 0;
+        for (i < below.size) {
+            val err_pushed: err[allocator.Error] = push(?k.stack, below.data[i]);
+            if (sel err_pushed.err) { ret err_pushed; }
+            i = i + 1;
+        }
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# a plain block's region, going on at its one successor when that is a block of
+# the same region, ending at a merge, break or continue, and a stray flaw at
+# any other block
+fun block(k: *Walk, x: u32, rid: u32, c: Context) res[Step, allocator.Error] {
+    val res_item: res[u32, allocator.Error] = region.add(k.s, Kind.block{}, x);
+    if (sel res_item.err) { ret res[Step, allocator.Error].err{res_item.err}; }
+    val succs: Slice[u32] = graph.successors(k.g, x);
+    if (succs.size == 0) { ret res[Step, allocator.Error].ok{Step{item: res_item.ok, next: NONE}}; }
+    val y: u32 = succs.data[0];
+    if (y == c.merge || y == c.brk || y == c.cont) { ret res[Step, allocator.Error].ok{Step{item: res_item.ok, next: NONE}}; }
+    if (k.owner.data[y] == rid)                    { ret res[Step, allocator.Error].ok{Step{item: res_item.ok, next: y}}; }
+    found(k, Flaw.stray{x});
+    ret res[Step, allocator.Error].ok{Step{item: res_item.ok, next: NONE}};
+}
+
+# sort one edge out of a selection's header or arm: kept inside an arm, a
+# break or a continue, or an edge to a block the arms reconverge on
+fun sort(k: *Walk, u: u32, e: u32, y: u32, x: u32, rid: u32, base: u32, arms: u32, c: Context) err[allocator.Error] {
+    val at: u32 = k.owner.data[u];
+    val to: u32 = k.owner.data[y];
+    if (to >= base && to < base + arms) {
+        if (u == x || to == at) { ret err[allocator.Error].ok{}; }
+        ret found(k, Flaw.stray{u});
+    }
+    if (y == c.brk || y == c.cont) { ret err[allocator.Error].ok{}; }
+    if (to == rid || y == c.merge) { ret moves(k.w, u, e, y); }
+    ret found(k, Flaw.stray{u});
+}
+
+# the arm of a selection every edge of the work leaves from, NONE when they
+# leave from more than one or from its header
+fun lone_arm(k: *Walk, rid: u32, base: u32) u32 {
+    val at: u32   = k.owner.data[k.w.edges.data[0].from];
+    var i:  usize = 1;
+    for (i < k.w.edges.len) {
+        if (k.owner.data[k.w.edges.data[i].from] != at) { ret NONE; }
+        i = i + 1;
+    }
+    if (at == rid) { ret NONE; }
+    ret at - base;
+}
+
+# a selection's region at header x: claims each arm, sorts every edge out of
+# them, finds the one merge and walks each arm, or notes the flaw
+fun selection(k: *Walk, x: u32, rid: u32, c: Context) res[Step, allocator.Error] {
+    val succs: Slice[u32] = graph.successors(k.g, x);
+    val arms:  u32        = succs.size::u32;
+    val base:  u32        = k.ids;
+    k.ids = k.ids + arms;
+    var members: vector.Vector[u32] = vector.init[u32](k.a);
+    var head:    vector.Vector[u32] = vector.init[u32](k.a);
+    fin {
+        vector.dnit[u32](?members);
+        vector.dnit[u32](?head);
+    }
+    var err_failed: err[allocator.Error] = push(?members, x);
+    var i:          u32                  = 0;
+    for (i < arms) {
+        val s: u32 = succs.data[i];
+        if (heads(k, x, s, rid)) {
+            keep(?err_failed, push(?head, 1));
+            keep(?err_failed, claim(k, s, rid, base + i, ?members));
+        }
+        or { keep(?err_failed, push(?head, 0)); }
+        i = i + 1;
+    }
+    if (sel err_failed.err) { ret res[Step, allocator.Error].err{err_failed.err}; }
+
+    reset(k.w);
+    var m: usize = 0;
+    for (m < members.len) {
+        val u:  u32        = members.data[m];
+        val us: Slice[u32] = graph.successors(k.g, u);
+        var e:  usize      = 0;
+        for (e < us.size) {
+            keep(?err_failed, sort(k, u, e::u32, us.data[e], x, rid, base, arms, c));
+            if (sel err_failed.err) { ret res[Step, allocator.Error].err{err_failed.err}; }
+            if (stopped(k))         { ret res[Step, allocator.Error].ok{Step{item: NONE, next: NONE}}; }
+            e = e + 1;
+        }
+        keep(?err_failed, push(?k.w.blocks, u));
+        m = m + 1;
+    }
+    if (sel err_failed.err) { ret res[Step, allocator.Error].err{err_failed.err}; }
+    val joins: usize = k.w.targets.len;
+    var merge: u32   = NONE;
+    if (joins == 1) { merge = k.w.targets.data[0]; }
+    if (joins == 1 && merge == c.merge) {
+        val lone: u32 = lone_arm(k, rid, base);
+        if (lone != NONE) {
+            keep(?err_failed, claim(k, succs.data[lone], base + lone, rid, ?members));
+            if (sel err_failed.err) { ret res[Step, allocator.Error].err{err_failed.err}; }
+            head.data[lone] = 0;
+            merge           = succs.data[lone];
+        }
+    }
+    if (joins >= 2 || (joins == 1 && merge == c.merge)) {
+        found(k, Flaw.merge{x});
+        ret res[Step, allocator.Error].ok{Step{item: NONE, next: NONE}};
+    }
+
+    val res_made: res[u32, allocator.Error] = region.add(k.s, Kind.selection{}, x);
+    if (sel res_made.err) { ret res[Step, allocator.Error].err{res_made.err}; }
+    val item: u32 = res_made.ok;
+    k.s.regions.data[item].merge = merge;
+    var last: u32 = NONE;
+    i = 0;
+    for (i < arms) {
+        var res_arm: res[u32, allocator.Error];
+        if (head.data[i] != 0) { res_arm = sequence(k, succs.data[i], base + i, Context{merge: merge, brk: c.brk, cont: c.cont}, NONE); }
+        or                     { res_arm = region.add(k.s, Kind.sequence{}, NONE); }
+        if (sel res_arm.err)   { ret res[Step, allocator.Error].err{res_arm.err}; }
+        if (stopped(k))        { ret res[Step, allocator.Error].ok{Step{item: item, next: NONE}}; }
+        region.append(k.s, item, last, res_arm.ok);
+        last = res_arm.ok;
+        i    = i + 1;
+    }
+    ret res[Step, allocator.Error].ok{Step{item: item, next: merge}};
+}
+
+# returns 1 (body) or 2 (cont) if t is a single-predecessor, single-successor
+# block in rid outside the loop that can be absorbed without adding exits
+fun exit_arm_part(k: *Walk, in_loop: *vector.Vector[u32], rid: u32, c: Context, t: u32) u32 {
+    if (t == NONE || !dominance.reachable(k.d, t))      { ret 0; }
+    if (in_loop.data[t] != 0 || k.owner.data[t] != rid) { ret 0; }
+    if (t == c.merge || t == c.brk || t == c.cont)      { ret 0; }
+    val preds: Slice[u32] = graph.predecessors(k.g, t);
+    var part:  u32        = 0;
+    var j:     usize      = 0;
+    for (j < preds.size) {
+        val p: u32 = preds.data[j];
+        if (!dominance.reachable(k.d, p)) {
+            j = j + 1;
+            cnt;
+        }
+        if (part != 0) { ret 0; }
+        part = in_loop.data[p];
+        if (part == 0) { ret 0; }
+        j = j + 1;
+    }
+    if (part == 0) { ret 0; }
+    val succs: Slice[u32] = graph.successors(k.g, t);
+    if (succs.size != 1) { ret 0; }
+    val s: u32 = succs.data[0];
+    if (s == NONE || k.owner.data[s] != rid) { ret 0; }
+    ret part;
+}
+
+fun loop_exits(k: *Walk, members: *vector.Vector[u32], in_loop: *vector.Vector[u32]) err[allocator.Error] {
+    var j: usize = 0;
+    for (j < members.len) {
+        val u:     u32        = members.data[j];
+        val succs: Slice[u32] = graph.successors(k.g, u);
+        var e:     usize      = 0;
+        for (e < succs.size) {
+            val to: u32 = succs.data[e];
+            if (to != NONE && dominance.reachable(k.d, to) && in_loop.data[to] == 0) {
+                val err_moved: err[allocator.Error] = moves(k.w, u, e::u32, to);
+                if (sel err_moved.err) { ret err_moved; }
+            }
+            e = e + 1;
+        }
+        j = j + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# a loop's region at header x, loop i: checks it has one latch and leaves to
+# one block of the region around it, then walks its body and continue
+# sequence, or notes the flaw
+fun round(k: *Walk, x: u32, i: u32, rid: u32, c: Context) res[Step, allocator.Error] {
+    val none:    Step       = Step{item: NONE, next: NONE};
+    val latches: Slice[u32] = loops.latches(k.l, i);
+    val nodes:   Slice[u32] = loops.body(k.l, i);
+    reset(k.w);
+    if (latches.size != 1) {
+        var j: usize = 0;
+        for (j < latches.size) {
+            val p:         u32                  = latches.data[j];
+            val err_moved: err[allocator.Error] = moves(k.w, p, position(k.g, p, x), x);
+            if (sel err_moved.err) { ret res[Step, allocator.Error].err{err_moved.err}; }
+            j = j + 1;
+        }
+        found(k, Flaw.latches{x});
+        ret res[Step, allocator.Error].ok{none};
+    }
+
+    var members: vector.Vector[u32] = vector.init[u32](k.a);
+    var in_loop: vector.Vector[u32] = vector.init[u32](k.a);
+    fin {
+        vector.dnit[u32](?members);
+        vector.dnit[u32](?in_loop);
+    }
+    val err_filled: err[allocator.Error] = fill[u32](?in_loop, k.owner.len, 0);
+    if (sel err_filled.err) { ret res[Step, allocator.Error].err{err_filled.err}; }
+
+    val latch: u32   = latches.data[0];
+    var stray: bool  = false;
+    var j:     usize = 0;
+    for (j < nodes.size) {
+        val n: u32 = nodes.data[j];
+        if (k.owner.data[n] != rid) { stray = true; }
+        var tag: u32 = 1;
+        if (latch != x && dominance.dominates(k.d, latch, n)) { tag = 2; }
+        in_loop.data[n] = tag;
+        val err_pushed: err[allocator.Error] = push(?members, n);
+        if (sel err_pushed.err) { ret res[Step, allocator.Error].err{err_pushed.err}; }
+        j = j + 1;
+    }
+
+    # absorb single-predecessor straight-line exit arms (including split
+    # funnel trampolines) so repeated rounds do not re-trigger exits <-> twin
+    j = 0;
+    for (j < members.len) {
+        val u:     u32        = members.data[j];
+        val succs: Slice[u32] = graph.successors(k.g, u);
+        var e:     usize      = 0;
+        for (e < succs.size) {
+            val part: u32 = exit_arm_part(k, ?in_loop, rid, c, succs.data[e]);
+            if (part != 0) {
+                val to: u32 = succs.data[e];
+                in_loop.data[to] = part;
+                val err_pushed: err[allocator.Error] = push(?members, to);
+                if (sel err_pushed.err) { ret res[Step, allocator.Error].err{err_pushed.err}; }
+            }
+            e = e + 1;
+        }
+        j = j + 1;
+    }
+
+    val err_exited: err[allocator.Error] = loop_exits(k, ?members, ?in_loop);
+    if (sel err_exited.err) { ret res[Step, allocator.Error].err{err_exited.err}; }
+    val leaves: usize = k.w.targets.len;
+    if (leaves >= 2 || (leaves == 1 && k.owner.data[k.w.targets.data[0]] != rid)) {
+        j = 0;
+        for (j < members.len) {
+            val err_kept: err[allocator.Error] = push(?k.w.blocks, members.data[j]);
+            if (sel err_kept.err) { ret res[Step, allocator.Error].err{err_kept.err}; }
+            j = j + 1;
+        }
+        found(k, Flaw.exits{x});
+        ret res[Step, allocator.Error].ok{none};
+    }
+    if (stray) {
+        found(k, Flaw.stray{x});
+        ret res[Step, allocator.Error].ok{none};
+    }
+    var merge: u32 = NONE;
+    if (leaves == 1) { merge = k.w.targets.data[0]; }
+
+    val body: u32 = k.ids;
+    val cont: u32 = k.ids + 1;
+    k.ids = k.ids + 2;
+    j     = 0;
+    for (j < members.len) {
+        val n: u32 = members.data[j];
+        if (in_loop.data[n] == 2) { k.owner.data[n] = cont; }
+        or                        { k.owner.data[n] = body; }
+        j = j + 1;
+    }
+
+    val res_made: res[u32, allocator.Error] = region.add(k.s, Kind.loop{}, x);
+    if (sel res_made.err) { ret res[Step, allocator.Error].err{res_made.err}; }
+    val item: u32 = res_made.ok;
+    k.s.regions.data[item].merge = merge;
+    k.s.regions.data[item].latch = latch;
+    val res_inner: res[u32, allocator.Error] = sequence(k, x, body, Context{merge: NONE, brk: merge, cont: latch}, x);
+    if (sel res_inner.err) { ret res[Step, allocator.Error].err{res_inner.err}; }
+    if (stopped(k))        { ret res[Step, allocator.Error].ok{none}; }
+    region.append(k.s, item, NONE, res_inner.ok);
+    if (latch != x) {
+        val res_back: res[u32, allocator.Error] = sequence(k, latch, cont, Context{merge: NONE, brk: merge, cont: x}, NONE);
+        if (sel res_back.err) { ret res[Step, allocator.Error].err{res_back.err}; }
+        if (stopped(k))       { ret res[Step, allocator.Error].ok{none}; }
+        region.append(k.s, item, res_inner.ok, res_back.ok);
+    }
+    ret res[Step, allocator.Error].ok{Step{item: item, next: merge}};
+}
+
+# the loop a block heads, NONE when it heads none
+fun header(k: *Walk, x: u32) u32 {
+    val opt_innermost: opt[u32] = loops.innermost(k.l, x);
+    if (sel opt_innermost.none)                          { ret NONE; }
+    if (loops.loop(k.l, opt_innermost.some).header != x) { ret NONE; }
+    ret opt_innermost.some;
+}
+
+# the sequence of a region from its entry, the loop whose body it is not
+# taken for that loop again
+fun sequence(k: *Walk, first: u32, rid: u32, c: Context, body: u32) res[u32, allocator.Error] {
+    val res_made: res[u32, allocator.Error] = region.add(k.s, Kind.sequence{}, NONE);
+    if (sel res_made.err) { ret res_made; }
+    val seq:  u32 = res_made.ok;
+    var last: u32 = NONE;
+    var x:    u32 = first;
+    var skip: u32 = body;
+    for (x != NONE) {
+        var res_step: res[Step, allocator.Error];
+        val i:        u32 = header(k, x);
+        if (i != NONE && x != skip)             { res_step = round(k, x, i, rid, c); }
+        or (graph.successors(k.g, x).size >= 2) { res_step = selection(k, x, rid, c); }
+        or                                      { res_step = block(k, x, rid, c); }
+        skip = NONE;
+        if (sel res_step.err) { ret res[u32, allocator.Error].err{res_step.err}; }
+        if (stopped(k))       { ret res_made; }
+        region.append(k.s, seq, last, res_step.ok.item);
+        last = res_step.ok.item;
+        x    = res_step.ok.next;
+    }
+    ret res_made;
+}
+
+# the structure of a graph, or the first flaw that keeps it from having one
+# ---
+# a:   the allocator the walk's storage takes
+# g:   the graph
+# d:   its dominance
+# l:   its loops
+# w:   the work a flaw is mended by, filled when one is found
+# s:   an empty structure, filled with the regions when none is
+# ret: none when the graph is structured, the flaw, or the allocator's refusal
+pub fun find(a: *allocator.Allocator, g: *Graph, d: *Dominance, l: *Loops, w: *Work, s: *Structure) res[opt[Flaw], allocator.Error] {
+    reset(w);
+    var k: Walk = Walk{a: a, g: g, d: d, l: l, s: s, w: w, owner: vector.init[u32](a), stack: vector.init[u32](a), ids: 1, flaw: opt[Flaw].none{}};
+    fin {
+        vector.dnit[u32](?k.owner);
+        vector.dnit[u32](?k.stack);
+    }
+    val err_owned: err[allocator.Error] = fill[u32](?k.owner, g.count::usize, NONE);
+    if (sel err_owned.err) { ret res[opt[Flaw], allocator.Error].err{err_owned.err}; }
+    val order: Slice[u32] = dominance.order(d);
+    var i:     usize      = 0;
+    for (i < order.size) {
+        k.owner.data[order.data[i]] = 0;
+        i                           = i + 1;
+    }
+    if (g.count == 0) {
+        val res_root: res[u32, allocator.Error] = region.add(s, Kind.sequence{}, NONE);
+        if (sel res_root.err) { ret res[opt[Flaw], allocator.Error].err{res_root.err}; }
+        ret res[opt[Flaw], allocator.Error].ok{opt[Flaw].none{}};
+    }
+    twins(?k);
+    if (stopped(?k)) { ret res[opt[Flaw], allocator.Error].ok{k.flaw}; }
+    val err_tangled: err[allocator.Error] = tangles(?k);
+    if (sel err_tangled.err) { ret res[opt[Flaw], allocator.Error].err{err_tangled.err}; }
+    if (stopped(?k))         { ret res[opt[Flaw], allocator.Error].ok{k.flaw}; }
+    val top:          Context                   = Context{merge: NONE, brk: NONE, cont: NONE};
+    val res_sequence: res[u32, allocator.Error] = sequence(?k, g.entry, 0, top, NONE);
+    if (sel res_sequence.err) { ret res[opt[Flaw], allocator.Error].err{res_sequence.err}; }
+    ret res[opt[Flaw], allocator.Error].ok{k.flaw};
+}

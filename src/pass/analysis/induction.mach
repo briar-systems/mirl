@@ -1,0 +1,302 @@
+# inductions: the header parameters of each loop that step by a constant on every trip, and the loops a compare of one
+# against a bound that does not change in the loop counts
+#
+# a header parameter steps when every edge into the header from inside its loop passes it the sum of itself and one
+# constant: `add` or `sub` of an integer constant, or `ptr.add` of one in bytes, the same constant on every such edge.
+# the step is that constant, at the parameter's width, and a reader asks the ranges whether it wraps: the row states
+# the shape alone. a loop is counted when it holds no loop, has one latch, and its header ends in a `cbr` on an integer
+# compare of a stepping parameter, or of the sum the latch passes it, with a value the loop does not define, one target
+# in the loop and the other out of it, and the header is the loop's only way out. the row then states which compare,
+# the operands' order, the bound and the target that leaves, from which a reader forms the number of trips.
+#
+# cost: one walk over each loop's header parameters and the edges into the header, and one look at its terminator.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use constants: mirl.ct.global;
+use mirl.ir.block.BlockData;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.table;
+use mirl.ir.value.Def;
+use mirl.pass.analysis.read;
+
+# a header parameter that steps by a constant on every trip
+# ---
+# loop:  the loop, by its index in the loops analysis
+# index: the parameter's position among the header's
+# value: the parameter
+# next:  the value one in-loop edge passes it, the sum, the first such edge's where several pass the same step
+# step:  what each trip adds, a signed count of the parameter's units: an integer's, or bytes for a pointer
+pub rec Step {
+    loop:  u32;
+    index: u32;
+    value: Value;
+    next:  Value;
+    step:  i64;
+}
+
+# a loop a compare of a stepping parameter against a bound counts
+# ---
+# loop:    the loop
+# step:    the stepping parameter, by its position among `steps`
+# compare: the compare's opcode, an integer compare
+# next:    the compare reads the sum the latch passes, not the parameter
+# left:    the stepping operand is the compare's first, the bound its second
+# bound:   the value the loop does not define that the parameter is compared with
+# leaves:  the loop is left when the compare is true, else when it is false
+# start:   the value the one edge into the header from outside the loop passes, none when several do
+pub rec Counted {
+    loop:    u32;
+    step:    u32;
+    compare: u32;
+    next:    bool;
+    left:    bool;
+    bound:   Value;
+    leaves:  bool;
+    start:   opt[Value];
+}
+
+# the inductions of a function
+# ---
+# steps:   every stepping parameter, loop by loop in the loops analysis's order
+# counted: every counted loop
+pub rec Inductions {
+    steps:   vector.Vector[Step];
+    counted: vector.Vector[Counted];
+}
+
+# give back the storage of a function's inductions
+pub fun dnit(n: *Inductions) err[allocator.Error] {
+    var err_failed:  err[allocator.Error] = vector.dnit[Step](?n.steps);
+    val err_counted: err[allocator.Error] = vector.dnit[Counted](?n.counted);
+    if (sel err_counted.err) { err_failed = err_counted; }
+    ret err_failed;
+}
+
+# the block an instruction stands in, none for one that is not placed
+fun block_of(b: *Body, i: Instruction) opt[Block] {
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (sel d.place.placed) { ret opt[Block].some{d.place.placed}; }
+    ret opt[Block].none{};
+}
+
+# the constant `v` adds to parameter `p`, none when `v` is not `p` plus or minus one
+fun stepped(m: *Module, b: *Body, p: Value, v: Value) opt[i64] {
+    val opt_made: opt[*InstructionData] = read.made(b, v);
+    if (sel opt_made.none) { ret opt[i64].none{}; }
+    val d: *InstructionData = opt_made.some;
+    if (d.operands.len != 2 || d.operands.data[0] != p)                              { ret opt[i64].none{}; }
+    if (d.opcode != table.ADD && d.opcode != table.SUB && d.opcode != table.PTR_ADD) { ret opt[i64].none{}; }
+    val opt_by: opt[i64] = constants.constant_of(m, b, d.operands.data[1]);
+    if (sel opt_by.none) { ret opt_by; }
+    if (d.opcode == table.SUB) {
+        if (opt_by.some == -9223372036854775807 - 1) { ret opt[i64].none{}; }
+        ret opt[i64].some{0 - opt_by.some};
+    }
+    ret opt_by;
+}
+
+# whether value `v` stands outside loop `lp`: a constant, or a parameter or result of a block the loop does not hold
+fun outside(b: *Body, l: *Loops, lp: u32, v: Value) bool {
+    val def: Def = b.values.data[v].def;
+    if (sel def.constant)  { ret true; }
+    if (sel def.parameter) { ret !loops.contains(l, lp, def.parameter.block); }
+    if (sel def.result) {
+        val opt_block_of: opt[Block] = block_of(b, def.result.instruction);
+        if (sel opt_block_of.some) { ret !loops.contains(l, lp, opt_block_of.some); }
+    }
+    ret false;
+}
+
+# the stepping parameters of loop `lp` onto `n.steps`
+fun steps_of(m: *Module, b: *Body, l: *Loops, lp: u32, n: *Inductions) err[allocator.Error] {
+    val h:  u32        = loops.loop(l, lp).header;
+    val hd: *BlockData = ?b.blocks.data[h];
+    var k:  usize      = 0;
+    for (k < hd.parameters.len) {
+        val p:     Value = hd.parameters.data[k];
+        var has:   bool  = false;
+        var by:    i64   = 0;
+        var next:  Value = p;
+        var whole: bool  = true;
+        var q:     usize = 0;
+        for (q < hd.predecessors.len && whole) {
+            val t:            Instruction = hd.predecessors.data[q];
+            val opt_block_of: opt[Block]  = block_of(b, t);
+            if (sel opt_block_of.some) {
+                if (loops.contains(l, lp, opt_block_of.some)) {
+                    val d: *InstructionData = ?b.instructions.data[t];
+                    var e: usize            = 0;
+                    for (e < d.edges.len) {
+                        val edge: *Edge = ?d.edges.data[e];
+                        if (edge.block == h) {
+                            val passed: Value    = edge.arguments.data[k];
+                            val opt_by: opt[i64] = stepped(m, b, p, passed);
+                            if (sel opt_by.some) {
+                                if (!has) {
+                                    has  = true;
+                                    by   = opt_by.some;
+                                    next = passed;
+                                }
+                                or (by != opt_by.some) { whole = false; }
+                            }
+                            or { whole = false; }
+                        }
+                        e = e + 1;
+                    }
+                }
+            }
+            q = q + 1;
+        }
+        if (whole && has) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Step](?n.steps, Step{loop: lp, index: k::u32, value: p, next: next, step: by});
+            if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether an opcode is an integer compare a counted loop may end on
+fun comparing(op: u32) bool {
+    ret op == table.EQ || op == table.NE || op == table.LT_S || op == table.LE_S || op == table.GT_S || op == table.GE_S || op == table.LT_U || op == table.LE_U || op == table.GT_U || op == table.GE_U;
+}
+
+# whether loop `lp` holds another loop
+fun holds_loop(l: *Loops, lp: u32) bool {
+    var i: u32 = 0;
+    for (i < loops.count(l)) {
+        if (loops.loop(l, i).parent == lp) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the count of loop `lp` onto `n.counted` when it is counted, its steps `from` onward in `n.steps`
+fun count_of(b: *Body, l: *Loops, lp: u32, from: usize, n: *Inductions) err[allocator.Error] {
+    if (loops.latches(l, lp).size != 1 || holds_loop(l, lp)) { ret err[allocator.Error].ok{}; }
+    val h:     u32               = loops.loop(l, lp).header;
+    val exits: Slice[graph.Edge] = loops.exits(l, lp);
+    if (exits.size != 1 || exits.data[0].from != h) { ret err[allocator.Error].ok{}; }
+    val t: Instruction      = b.blocks.data[h].last;
+    val d: *InstructionData = ?b.instructions.data[t];
+    if (d.opcode != table.CBR || d.edges.len != 2 || d.operands.len != 1) { ret err[allocator.Error].ok{}; }
+    val inside0: bool = loops.contains(l, lp, d.edges.data[0].block);
+    val inside1: bool = loops.contains(l, lp, d.edges.data[1].block);
+    if (inside0 == inside1) { ret err[allocator.Error].ok{}; }
+    val opt_made: opt[*InstructionData] = read.made(b, d.operands.data[0]);
+    if (sel opt_made.none) { ret err[allocator.Error].ok{}; }
+    val c: *InstructionData = opt_made.some;
+    if (!comparing(c.opcode) || c.operands.len != 2) { ret err[allocator.Error].ok{}; }
+    var start: opt[Value] = opt[Value].none{};
+    var s:     usize      = from;
+    for (s < n.steps.len) {
+        val st:   Step = n.steps.data[s];
+        var side: u32  = 2;
+        var next: bool = false;
+        if (c.operands.data[0] == st.value || c.operands.data[0] == st.next) {
+            side = 0;
+            next = c.operands.data[0] == st.next;
+        }
+        or (c.operands.data[1] == st.value || c.operands.data[1] == st.next) {
+            side = 1;
+            next = c.operands.data[1] == st.next;
+        }
+        if (side != 2) {
+            val bound: Value = c.operands.data[1 - side];
+            if (outside(b, l, lp, bound)) {
+                start = entered(b, l, lp, st.index);
+                val res_pushed: res[usize, allocator.Error] = vector.push[Counted](?n.counted, Counted{loop: lp, step: s::u32, compare: c.opcode, next: next, left: side == 0, bound: bound, leaves: inside1, start: start});
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+                ret err[allocator.Error].ok{};
+            }
+        }
+        s = s + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# the value parameter `k` of loop `lp`'s header takes from the one edge into it from outside the loop, none when there
+# are several
+fun entered(b: *Body, l: *Loops, lp: u32, k: u32) opt[Value] {
+    val h:     u32        = loops.loop(l, lp).header;
+    val hd:    *BlockData = ?b.blocks.data[h];
+    var found: Value      = 0;
+    var many:  u32        = 0;
+    var q:     usize      = 0;
+    for (q < hd.predecessors.len) {
+        val t:            Instruction = hd.predecessors.data[q];
+        val opt_block_of: opt[Block]  = block_of(b, t);
+        var inside:       bool        = false;
+        if (sel opt_block_of.some) { inside = loops.contains(l, lp, opt_block_of.some); }
+        if (!inside) {
+            val d: *InstructionData = ?b.instructions.data[t];
+            var e: usize            = 0;
+            for (e < d.edges.len) {
+                if (d.edges.data[e].block == h) {
+                    found = d.edges.data[e].arguments.data[k::usize];
+                    many  = many + 1;
+                }
+                e = e + 1;
+            }
+        }
+        q = q + 1;
+    }
+    if (many != 1) { ret opt[Value].none{}; }
+    ret opt[Value].some{found};
+}
+
+# the inductions of body `b` of `m` over its loops
+pub fun compute(a: *allocator.Allocator, m: *Module, b: *Body, l: *Loops) res[Inductions, allocator.Error] {
+    var n:  Inductions = Inductions{steps: vector.init[Step](a), counted: vector.init[Counted](a)};
+    var lp: u32        = 0;
+    for (lp < loops.count(l)) {
+        val from:      usize                = n.steps.len;
+        var err_found: err[allocator.Error] = steps_of(m, b, l, lp, ?n);
+        if (!(sel err_found.err)) { err_found = count_of(b, l, lp, from, ?n); }
+        if (sel err_found.err) {
+            dnit(?n);
+            ret res[Inductions, allocator.Error].err{err_found.err};
+        }
+        lp = lp + 1;
+    }
+    ret res[Inductions, allocator.Error].ok{n};
+}
+
+# the stepping parameters of loop `lp`
+pub fun steps(n: *Inductions, lp: u32) Slice[Step] {
+    var first: usize = 0;
+    for (first < n.steps.len && n.steps.data[first].loop != lp) { first = first + 1; }
+    var end: usize = first;
+    for (end < n.steps.len && n.steps.data[end].loop == lp) { end = end + 1; }
+    ret Slice[Step]{data: ?n.steps.data[first], size: end - first};
+}
+
+# the count of loop `lp`, none when it is not counted
+pub fun counted(n: *Inductions, lp: u32) opt[Counted] {
+    var i: usize = 0;
+    for (i < n.counted.len) {
+        if (n.counted.data[i].loop == lp) { ret opt[Counted].some{n.counted.data[i]}; }
+        i = i + 1;
+    }
+    ret opt[Counted].none{};
+}

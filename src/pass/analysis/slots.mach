@@ -1,0 +1,846 @@
+# the slots analysis: what each stack slot of a function is, the one rule every reader of a slot's facts takes
+#
+# per alloca it holds whether the slot escapes, whether a secret offset moves its address, the parts its accesses
+# cut it into, whether a kept or volatile access touches it, whether it holds a byte not stated public, and whether
+# some path from the entry reads it before any store writes it. the analysis cache holds it in a schedule, the
+# memory analysis reads which slots escape, and the constant-time checks compute it afresh at emission
+# (`mirl.ct.fresh`), so a slot is judged by one rule wherever it is asked about.
+#
+# a function's walk follows the stores it makes to its own frame, below its
+# caller's stack pointer, so a read of a slot holds what the function stored
+# there. three things break that. a slot whose address escapes, as an operand
+# of anything but a load's or a store's address or the base of a `ptr.add`,
+# `ptr.member` or `ptr.index`, or as the argument of an edge, may be written by
+# another party unseen: that slot is escaped, and nothing but the accesses
+# whose address is formed from it through those moves reaches it while it is
+# not. a secret offset moving its address is a secret address as any other:
+# that slot is moved. a read no store reaches on some path from the entry reads
+# stale stack an earlier frame may have left a secret in, while the walk seeds
+# no frame memory: that slot is stale. a slot any of the three holds of is not
+# readable, so a callee reading one may read its caller's secrets, and a
+# constant-time function whose own frame has a stale slot is refused, as its
+# walk takes the stale read as public.
+#
+# the stale part is a backward problem over the graph view, of the bytes of
+# each slot that is not escaped, in parts: the runs between the first and
+# last byte of each access whose bytes it knows, so a slot of any size takes
+# as many parts as its accesses make. an access reaches its slot at a byte
+# offset where every step moving the address is constant: a `ptr.add` of a
+# constant, a `ptr.member` at its member's offset or a `ptr.index` of a
+# constant index at its stride, as the front end and the legalisations that
+# take an aggregate apart form them. a store writes the bytes of its value's
+# type there and a load reads the bytes of its result's, a fill of a constant
+# length writes that many and a copy of one reads that many of its source
+# before it writes as many of its destination, so a fill a front end makes
+# before it writes a secret aggregate's members covers the aggregate's padding
+# (the ir spec's rule that a secret aggregate's padding is zero, mirl#560),
+# while padding no fill or whole store writes is read stale by a load of the
+# whole. a load or store that states a frame extent (`mirl.ir.metadata.Extent`)
+# reads or writes the whole range it states, as each access of the loop the
+# bulk legalisation makes of a copy or fill stands for the copy or fill: a
+# load reads every byte of it and a store writes every byte of it before the
+# loop leaves, which is the statement trusted. a load at an offset not known
+# reads every byte, a store at one writes none, and a slot of no size the
+# layout states is written by none. a byte live into the entry is read stale.
+#
+# a `slot.begin` or `slot.end` of a slot makes its bytes unwritten again, as
+# its storage may have held another slot's: a read of a byte no store reaches
+# since the slot's last marker reads stale. in a block, a marker kills every
+# part of its slot and marks it begun, a read of a begun part written since by
+# no store is stale where it stands, and a part begun and not written again
+# by the block's end that is live out of the block is stale. a marker is a
+# use that keeps its slot's address within the body.
+#
+# cost: two scans of the body's operands and edges, each address traced back through its moves, a sort of the cuts,
+# and one backward problem over the graph of as many bits per block as the parts of every slot.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.base.slice;
+use secret_globals: mirl.ct.global;
+use mirl.ir.cfg.flow;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.view;
+use mirl.ir.function.Body;
+use mirl.ir.global;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Edge;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata;
+use mirl.ir.module;
+use mirl.ir.module.Error;
+use mirl.ir.module.Module;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.table;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Def;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record;
+
+# the slots of one function, one bit per instruction of its body in each set, set where the instruction is an alloca
+# whose slot is so. a slot of the escaped, moved or stale set is not readable
+# ---
+# words:   the words of each set
+# escaped: the slots whose address escapes
+# moved:   the slots a secret offset moves the address of
+# stale:   the slots neither escaped nor moved that some path from the entry reads before any store writes them
+# touched: the slots a kept or volatile access reaches
+# secret:  the slots holding a byte their alloca does not state public, every slot that states nothing among them
+# parts:   the parts each slot's accesses cut it into
+pub rec Slots {
+    words:   u32;
+    escaped: vector.Vector[u64];
+    moved:   vector.Vector[u64];
+    stale:   vector.Vector[u64];
+    touched: vector.Vector[u64];
+    secret:  vector.Vector[u64];
+    parts:   Parts;
+}
+
+# the alloca address `v` of body `b` is formed from and whether every offset
+# moving it is public
+rec Traced {
+    slot:   u32;
+    public: bool;
+}
+
+# the bytes of its slot an access reaches, from `at`, `len` of them, none where its offset is not known
+rec Span {
+    at:  u64;
+    len: u64;
+}
+
+# the parts of every slot of a body, the first bit of each alloca's, their count and its size, by instruction, and the
+# offsets the parts run between
+# ---
+# words: the words of a block's set of parts
+# first: the first part of each alloca
+# count: the parts of each alloca, none for any other instruction: one fewer than its cuts, or 1 for a slot of no size
+#        the layout states
+# size:  the bytes of each alloca, 0 where the layout states none
+# base:  where each alloca's cuts start in `cuts`
+# cuts:  each alloca's offsets in ascending order, 0, its size and each first and one past the last byte of an access
+#        within it, part `k` running from cut `k` to cut `k + 1`
+pub rec Parts {
+    words: u32;
+    first: vector.Vector[u32];
+    count: vector.Vector[u32];
+    size:  vector.Vector[u64];
+    base:  vector.Vector[u32];
+    cuts:  vector.Vector[u64];
+}
+
+# an offset of a slot a part starts or ends at
+rec Cut {
+    slot: u32;
+    at:   u64;
+}
+
+# what a scan of a body gathers: in `cutting`, the offsets each access's bytes start and end at, else each block's
+# stale reads and writes, the slots that escape, those a secret offset moves and those a kept or volatile access
+# reaches. `since` holds the parts the block at `base` wrote since the block's start or their slot's last marker,
+# `begun` the parts a marker in it began, `unset` each block's parts begun and not written again by its end, and
+# `direct` the slots a read of a begun part no store wrote reads stale
+rec Scan {
+    m:       *Module;
+    l:       *Layout;
+    b:       *Body;
+    p:       *Parts;
+    cutting: bool;
+    found:   vector.Vector[Cut];
+    escaped: *vector.Vector[u64];
+    moved:   *vector.Vector[u64];
+    touched: *vector.Vector[u64];
+    gen:     *vector.Vector[u64];
+    kill:    *vector.Vector[u64];
+    since:   *vector.Vector[u64];
+    begun:   *vector.Vector[u64];
+    unset:   *vector.Vector[u64];
+    direct:  *vector.Vector[u64];
+    base:    usize;
+    failed:  err[allocator.Error];
+}
+
+fun bit(s: *vector.Vector[u64], base: usize, n: u32) bool {
+    ret ((s.data[base + (n / 64)::usize] >> (n % 64)::u64) & 1) != 0;
+}
+
+fun set(s: *vector.Vector[u64], base: usize, n: u32) {
+    val at: usize = base + (n / 64)::usize;
+    s.data[at] = s.data[at] | (1u64 << (n % 64)::u64);
+}
+
+# whether `d` moves an address, a `ptr.add`, `ptr.member` or `ptr.index`
+fun moves(d: *InstructionData) bool {
+    ret d.opcode == table.PTR_ADD || d.opcode == table.PTR_MEMBER || d.opcode == table.PTR_INDEX;
+}
+
+# the slot address `v` of body `b` is formed from, moved by a `ptr.add`,
+# `ptr.member` or `ptr.index`, none for an address of no alloca of the body
+fun traced(b: *Body, v: Value) opt[Traced] {
+    var at:     Value = v;
+    var public: bool  = true;
+    var steps:  usize = 0;
+    for (steps <= b.values.len) {
+        val def: Def = b.values.data[at].def;
+        if (!(sel def.result)) { ret opt[Traced].none{}; }
+        val d: *InstructionData = ?b.instructions.data[def.result.instruction];
+        if (d.opcode == table.ALLOCA)         { ret opt[Traced].some{Traced{slot: def.result.instruction, public: public}}; }
+        if (!moves(d) || d.operands.len == 0) { ret opt[Traced].none{}; }
+        var k: usize = 1;
+        for (k < d.operands.len) {
+            if (b.values.data[d.operands.data[k]].secret) { public = false; }
+            k = k + 1;
+        }
+        at    = d.operands.data[0];
+        steps = steps + 1;
+    }
+    ret opt[Traced].none{};
+}
+
+# the alloca address `v` of body `b` is formed from through moves, none for an address of no alloca of the body
+pub fun slot_of(b: *Body, v: Value) opt[Instruction] {
+    val opt_traced: opt[Traced] = traced(b, v);
+    if (sel opt_traced.none) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{opt_traced.some.slot};
+}
+
+# the bytes the slot of alloca `slot` of body `b` takes under layout `l`, none where the layout states none
+pub fun slot_size(l: *Layout, b: *Body, slot: Instruction) opt[u64] {
+    val opt_allocated: opt[Type] = allocated(b, slot);
+    if (sel opt_allocated.none) { ret opt[u64].none{}; }
+    ret size_of(l, opt_allocated.some);
+}
+
+# the bytes a value of type `ty` takes under layout `l`, none where the layout states none
+pub fun bytes_of(l: *Layout, ty: Type) opt[u64] {
+    ret size_of(l, ty);
+}
+
+# the type immediate `i` of instruction `d` holds, none for none
+fun type_at(d: *InstructionData, i: usize) opt[Type] {
+    if (i >= d.immediates.len) { ret opt[Type].none{}; }
+    val imm: Immediate = d.immediates.data[i];
+    if (sel imm.ty) { ret opt[Type].some{imm.ty}; }
+    ret opt[Type].none{};
+}
+
+# the type alloca `slot` allocates, none where its immediate states none
+fun allocated(b: *Body, slot: u32) opt[Type] {
+    ret type_at(?b.instructions.data[slot::usize], 0);
+}
+
+# the bytes a value of type `ty` takes, none where the layout states none
+fun size_of(l: *Layout, ty: Type) opt[u64] {
+    val res_size: res[u64, record.Error] = layout.size(l, ty, type_table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret opt[u64].none{}; }
+    ret opt[u64].some{res_size.ok};
+}
+
+# the byte offset from its slot address `v` of body `b` of `m` is at under layout `l`, none where a step moving it is
+# not constant or it is formed from no alloca
+pub fun offset_in(m: *Module, l: *Layout, b: *Body, v: Value) opt[u64] {
+    ret offset_of(m, l, b, v);
+}
+
+# the byte offset from its slot address `v` of body `b` is at, none where a step moving it is not constant
+fun offset_of(m: *Module, l: *Layout, b: *Body, v: Value) opt[u64] {
+    var at:    Value = v;
+    var off:   i64   = 0;
+    var steps: usize = 0;
+    for (steps <= b.values.len) {
+        val def: Def = b.values.data[at].def;
+        if (!(sel def.result)) { ret opt[u64].none{}; }
+        val d: *InstructionData = ?b.instructions.data[def.result.instruction];
+        if (d.opcode == table.ALLOCA) {
+            if (off < 0) { ret opt[u64].none{}; }
+            ret opt[u64].some{off::u64};
+        }
+        if (d.operands.len == 0) { ret opt[u64].none{}; }
+        if (d.opcode == table.PTR_ADD && d.operands.len == 2) {
+            val opt_constant_of: opt[i64] = secret_globals.constant_of(m, b, d.operands.data[1]);
+            if (sel opt_constant_of.none) { ret opt[u64].none{}; }
+            off = off + opt_constant_of.some;
+        }
+        or (d.opcode == table.PTR_MEMBER && d.immediates.len > 1) {
+            val opt_type_at: opt[Type] = type_at(d, 0);
+            val imm:         Immediate = d.immediates.data[1];
+            if (sel opt_type_at.none) { ret opt[u64].none{}; }
+            if (!(sel imm.member))    { ret opt[u64].none{}; }
+            val res_offset: res[u64, record.Error] = layout.offset(l, opt_type_at.some, type_table.DEFAULT_SPACE, imm.member::u32);
+            if (sel res_offset.err) { ret opt[u64].none{}; }
+            off = off + res_offset.ok::i64;
+        }
+        or (d.opcode == table.PTR_INDEX && d.operands.len == 2) {
+            val opt_type_at:     opt[Type] = type_at(d, 0);
+            val opt_constant_of: opt[i64]  = secret_globals.constant_of(m, b, d.operands.data[1]);
+            if (sel opt_type_at.none)     { ret opt[u64].none{}; }
+            if (sel opt_constant_of.none) { ret opt[u64].none{}; }
+            val res_stride: res[u64, record.Error] = layout.stride(l, opt_type_at.some, type_table.DEFAULT_SPACE);
+            if (sel res_stride.err) { ret opt[u64].none{}; }
+            off = off + opt_constant_of.some * res_stride.ok::i64;
+        }
+        or { ret opt[u64].none{}; }
+        at    = d.operands.data[0];
+        steps = steps + 1;
+    }
+    ret opt[u64].none{};
+}
+
+# the bytes of its slot access `d` reaches through address `v`, `len` of them, none where their offset is not known
+fun span(m: *Module, l: *Layout, b: *Body, v: Value, len: opt[u64]) opt[Span] {
+    if (sel len.none) { ret opt[Span].none{}; }
+    val opt_offset_of: opt[u64] = offset_of(m, l, b, v);
+    if (sel opt_offset_of.none) { ret opt[Span].none{}; }
+    ret opt[Span].some{Span{at: opt_offset_of.some, len: len.some}};
+}
+
+# the bytes load `d` reads, by its result's type
+fun loaded(l: *Layout, b: *Body, d: *InstructionData) opt[u64] {
+    if (d.results.len == 0) { ret opt[u64].none{}; }
+    ret size_of(l, b.values.data[d.results.data[0]].type);
+}
+
+# the bytes store `d` writes, by its value's type
+fun stored(l: *Layout, b: *Body, d: *InstructionData) opt[u64] {
+    if (d.operands.len < 2) { ret opt[u64].none{}; }
+    ret size_of(l, b.values.data[d.operands.data[1]].type);
+}
+
+# the bytes fill `d` writes, its length where it is constant
+fun filled(m: *Module, b: *Body, d: *InstructionData) opt[u64] {
+    if (d.operands.len < 3) { ret opt[u64].none{}; }
+    val opt_constant_of: opt[i64] = secret_globals.constant_of(m, b, d.operands.data[2]);
+    if (sel opt_constant_of.none) { ret opt[u64].none{}; }
+    if (opt_constant_of.some < 0) { ret opt[u64].none{}; }
+    ret opt[u64].some{opt_constant_of.some::u64};
+}
+
+# the bytes copy `d` moves, its length where it is constant
+fun copied(m: *Module, b: *Body, d: *InstructionData) opt[u64] {
+    ret filled(m, b, d);
+}
+
+# the bytes of its slot the load or store `d` reaches through address `v`: the range it states where it states a frame
+# extent, else the bytes of `len` at the offset it is at
+fun reached(m: *Module, l: *Layout, b: *Body, d: *InstructionData, v: Value, len: opt[u64]) opt[Span] {
+    if (metadata.states_extent(?d.metadata)) { ret opt[Span].some{Span{at: d.metadata.extent.offset, len: d.metadata.extent.length}}; }
+    ret span(m, l, b, v, len);
+}
+
+fun compare_cuts(x: *Cut, y: *Cut) i64 {
+    if (x.slot != y.slot) {
+        if (x.slot < y.slot) { ret -1; }
+        ret 1;
+    }
+    if (x.at < y.at) { ret -1; }
+    if (x.at > y.at) { ret 1; }
+    ret 0;
+}
+
+# note a cut of `slot` at `at`, a refused push kept as the scan's failure
+fun cut(sc: *Scan, slot: u32, at: u64) {
+    val res_pushed: res[usize, allocator.Error] = vector.push[Cut](?sc.found, Cut{slot: slot, at: at});
+    if (sel res_pushed.err) { sc.failed = err[allocator.Error].err{res_pushed.err}; }
+}
+
+# the size of every alloca of body `b` of `m`, as the parts of a slot of no access, and the cuts at 0 and its size
+fun sized(sc: *Scan) err[allocator.Error] {
+    val b:          *Body                = sc.b;
+    var err_failed: err[allocator.Error] = slice.fill[u32](?sc.p.first, b.instructions.len, 0);
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u32](?sc.p.count, b.instructions.len, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?sc.p.size, b.instructions.len, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u32](?sc.p.base, b.instructions.len, 0); }
+    if (sel err_failed.err)    { ret err_failed; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val n: u32 = i;
+                if (b.instructions.data[n].opcode == table.ALLOCA) {
+                    val opt_slot_size: opt[u64] = slot_size(sc.l, b, n);
+                    sc.p.count.data[n] = 1;
+                    if (sel opt_slot_size.some) {
+                        if (opt_slot_size.some > 0) {
+                            sc.p.size.data[n] = opt_slot_size.some;
+                            cut(sc, n, 0);
+                            cut(sc, n, opt_slot_size.some);
+                        }
+                    }
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret sc.failed;
+}
+
+# the parts of every alloca of `sc.b` from the cuts its scan found: one between each two cuts of a slot of known size,
+# else one
+fun parted(sc: *Scan) err[allocator.Error] {
+    val p: *Parts = sc.p;
+    sort.sort_by[Cut](sc.found.data, sc.found.len, compare_cuts);
+    var total: u32   = 0;
+    var i:     usize = 0;
+    for (i < sc.found.len) {
+        val c: Cut = sc.found.data[i];
+        if (p.size.data[c.slot::usize] == 0) {
+            i = i + 1;
+            cnt;
+        }
+        if (p.cuts.len == 0 || i == 0 || sc.found.data[i - 1].slot != c.slot) { p.base.data[c.slot::usize] = p.cuts.len::u32; }
+        or (sc.found.data[i - 1].at == c.at) {
+            i = i + 1;
+            cnt;
+        }
+        val res_pushed: res[usize, allocator.Error] = vector.push[u64](?p.cuts, c.at);
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        i = i + 1;
+    }
+    val b: *Body = sc.b;
+    var n: usize = 0;
+    for (n < b.instructions.len) {
+        if (p.count.data[n] != 0) {
+            if (p.size.data[n] != 0) {
+                var end: usize = p.base.data[n]::usize + 1;
+                for (end < p.cuts.len && p.cuts.data[end] < p.size.data[n]) { end = end + 1; }
+                p.count.data[n] = (end - p.base.data[n]::usize)::u32;
+            }
+            p.first.data[n] = total;
+            total           = total + p.count.data[n];
+        }
+        n = n + 1;
+    }
+    p.words = (total + 63) / 64;
+    ret err[allocator.Error].ok{};
+}
+
+# the index among `slot`'s cuts of the cut at `at`, which the scan made one
+fun cut_at(p: *Parts, slot: u32, at: u64) u32 {
+    val from: usize = p.base.data[slot::usize]::usize;
+    var lo:   u32   = 0;
+    var hi:   u32   = p.count.data[slot::usize];
+    for (lo < hi) {
+        val mid: u32 = (lo + hi) / 2;
+        if (p.cuts.data[from + mid::usize] < at) { lo = mid + 1; }
+        or                                       { hi = mid; }
+    }
+    ret lo;
+}
+
+# the parts of `slot` a span covers, as the first and one past the last, none for a span of no byte within a slot of
+# known size
+fun covered(p: *Parts, slot: u32, s: Span, first: *u32, last: *u32) bool {
+    val size: u64 = p.size.data[slot::usize];
+    if (size == 0 || s.len == 0 || s.at >= size) { ret false; }
+    var end: u64 = s.at + s.len;
+    if (end > size || end < s.at) { end = size; }
+    @first = cut_at(p, slot, s.at);
+    @last  = cut_at(p, slot, end);
+    ret @first < @last;
+}
+
+# a read of `slot` by the block at `sc.base` of the bytes `s` names, every byte where it names none: each part it
+# reads that the block has not written yet, stale at once where a marker in the block began it
+fun read(sc: *Scan, s: opt[Span], slot: u32) {
+    val p:     *Parts = sc.p;
+    val first: u32    = p.first.data[slot::usize];
+    var from:  u32    = 0;
+    var to:    u32    = p.count.data[slot::usize];
+    if (sel s.some) {
+        if (p.size.data[slot::usize] != 0) {
+            var a: u32 = 0;
+            var z: u32 = 0;
+            if (!covered(p, slot, s.some, ?a, ?z)) { ret; }
+            from = a;
+            to   = z;
+        }
+    }
+    var n: u32 = from;
+    for (n < to) {
+        if (!bit(sc.since, 0, first + n)) {
+            if (bit(sc.begun, 0, first + n)) { set(sc.direct, 0, slot); }
+            or                               { set(sc.gen, sc.base, first + n); }
+        }
+        n = n + 1;
+    }
+}
+
+# a write of `slot` by the block at `sc.base` of the bytes `s` names, none where it names none
+fun wrote(sc: *Scan, s: opt[Span], slot: u32) {
+    if (sel s.none) { ret; }
+    val p:     *Parts = sc.p;
+    val first: u32    = p.first.data[slot::usize];
+    var a:     u32    = 0;
+    var z:     u32    = 0;
+    if (!covered(p, slot, s.some, ?a, ?z)) { ret; }
+    var n: u32 = a;
+    for (n < z) {
+        set(sc.kill, sc.base, first + n);
+        set(sc.since, 0, first + n);
+        n = n + 1;
+    }
+}
+
+# a marker of `slot` by the block at `sc.base`: every part killed, begun and unwritten
+fun marked(sc: *Scan, slot: u32) {
+    val p:     *Parts = sc.p;
+    val first: u32    = p.first.data[slot::usize];
+    var n:     u32    = 0;
+    for (n < p.count.data[slot::usize]) {
+        val at: usize = ((first + n) / 64)::usize;
+        set(sc.kill, sc.base, first + n);
+        set(sc.begun, 0, first + n);
+        sc.since.data[at] = sc.since.data[at] & ~(1u64 << ((first + n) % 64)::u64);
+        n                 = n + 1;
+    }
+}
+
+# whether operand `k` of `d` is a use of a slot's address that keeps it within the body: an address a load or store
+# reaches through, a base a move moves, the slot a marker names, the destination of a fill of a constant length, or
+# either address of a copy of one
+fun kept(m: *Module, b: *Body, d: *InstructionData, row: *Row, k: usize) bool {
+    if (moves(d) || table.marks(d.opcode)) { ret k == 0; }
+    if (d.opcode == table.MEM_FILL) {
+        val opt_filled: opt[u64] = filled(m, b, d);
+        ret k == 0 && (sel opt_filled.some);
+    }
+    if (d.opcode == table.MEM_COPY) {
+        val opt_copied: opt[u64] = copied(m, b, d);
+        ret k < 2 && (sel opt_copied.some);
+    }
+    if (d.opcode != table.LOAD && d.opcode != table.STORE) { ret false; }
+    if (k >= $length_of(opcode_row.Operands))              { ret false; }
+    ret sel row.operands[k].role.address;
+}
+
+# an access through address `v` of the bytes `s` names, a write where `writes`: in a scan cutting, the offsets they start
+# and end at, else a read or write of the block's set. none of a slot a secret offset moves
+fun access(sc: *Scan, v: Value, s: opt[Span], writes: bool) {
+    val opt_traced: opt[Traced] = traced(sc.b, v);
+    if (sel opt_traced.none)     { ret; }
+    if (!opt_traced.some.public) { ret; }
+    if (sc.cutting) {
+        if (sel s.some) {
+            if (s.some.len != 0) {
+                cut(sc, opt_traced.some.slot, s.some.at);
+                cut(sc, opt_traced.some.slot, s.some.at + s.some.len);
+            }
+        }
+        ret;
+    }
+    if (writes) { wrote(sc, s, opt_traced.some.slot); }
+    or          { read(sc, s, opt_traced.some.slot); }
+}
+
+# the accesses of instruction `d` to the slots, what a copy reads before what it writes, and the parts a marker begins
+# again
+fun accesses(sc: *Scan, d: *InstructionData) {
+    val m: *Module = sc.m;
+    val l: *Layout = sc.l;
+    val b: *Body   = sc.b;
+    if (d.opcode == table.LOAD && d.operands.len > 0)     { access(sc, d.operands.data[0], reached(m, l, b, d, d.operands.data[0], loaded(l, b, d)), false); }
+    or (d.opcode == table.STORE && d.operands.len > 0)    { access(sc, d.operands.data[0], reached(m, l, b, d, d.operands.data[0], stored(l, b, d)), true); }
+    or (d.opcode == table.MEM_FILL && d.operands.len > 0) { access(sc, d.operands.data[0], span(m, l, b, d.operands.data[0], filled(m, b, d)), true); }
+    or (d.opcode == table.MEM_COPY && d.operands.len > 1) {
+        access(sc, d.operands.data[1], span(m, l, b, d.operands.data[1], copied(m, b, d)), false);
+        access(sc, d.operands.data[0], span(m, l, b, d.operands.data[0], copied(m, b, d)), true);
+    }
+    or (table.marks(d.opcode) && d.operands.len == 1 && !sc.cutting) {
+        val opt_traced: opt[Traced] = traced(b, d.operands.data[0]);
+        if (sel opt_traced.some) { marked(sc, opt_traced.some.slot); }
+    }
+}
+
+# mark the slot of each operand and edge argument of `d` that lets its address escape, that a secret offset moves or
+# that a kept or volatile access reaches
+fun uses(sc: *Scan, d: *InstructionData, row: opt[*Row]) {
+    val b:      *Body = sc.b;
+    val marked: bool  = d.metadata.flags.kept || d.metadata.flags.volatile;
+    var j:      usize = 0;
+    for (j < d.operands.len) {
+        val opt_traced: opt[Traced] = traced(b, d.operands.data[j]);
+        if (sel opt_traced.some) {
+            var held: bool = false;
+            if (sel row.some)            { held = kept(sc.m, b, d, row.some, j); }
+            if (!held)                   { set(sc.escaped, 0, opt_traced.some.slot); }
+            if (!opt_traced.some.public) { set(sc.moved, 0, opt_traced.some.slot); }
+            if (marked)                  { set(sc.touched, 0, opt_traced.some.slot); }
+        }
+        j = j + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val edge: *Edge = ?d.edges.data[e];
+        var n:    usize = 0;
+        for (n < edge.arguments.len) {
+            val opt_traced: opt[Traced] = traced(b, edge.arguments.data[n]);
+            if (sel opt_traced.some) { set(sc.escaped, 0, opt_traced.some.slot); }
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+}
+
+# mark every slot an escaping or secretly moved address reaches, and gather each block's stale reads and writes of
+# the parts of the slots, or in a scan cutting the offsets the parts run between
+fun scan(sc: *Scan) {
+    val b: *Body = sc.b;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            sc.base = k * sc.p.words::usize;
+            var w: usize = 0;
+            for (!sc.cutting && w < sc.p.words::usize) {
+                sc.since.data[w] = 0;
+                sc.begun.data[w] = 0;
+                w                = w + 1;
+            }
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d:       *InstructionData = ?b.instructions.data[i];
+                val opt_row: opt[*Row]        = table.at(d.opcode);
+                if (!sc.cutting) { uses(sc, d, opt_row); }
+                accesses(sc, d);
+                i = b.instructions.data[i].next;
+            }
+            w = 0;
+            for (!sc.cutting && w < sc.p.words::usize) {
+                sc.unset.data[sc.base + w] = sc.begun.data[w] & ~sc.since.data[w];
+                w                          = w + 1;
+            }
+        }
+        k = k + 1;
+    }
+}
+
+# give back the storage of a function's slots
+pub fun dnit(s: *Slots) {
+    vector.dnit[u64](?s.escaped);
+    vector.dnit[u64](?s.moved);
+    vector.dnit[u64](?s.stale);
+    vector.dnit[u64](?s.touched);
+    vector.dnit[u64](?s.secret);
+    parts_dnit(?s.parts);
+}
+
+fun parts_dnit(p: *Parts) {
+    vector.dnit[u32](?p.first);
+    vector.dnit[u32](?p.count);
+    vector.dnit[u64](?p.size);
+    vector.dnit[u32](?p.base);
+    vector.dnit[u64](?p.cuts);
+}
+
+# the slots of function `f` of `m`, computed afresh over a graph view of its own
+# ---
+# a:   the allocator the result takes
+# m:   the module
+# l:   the module's layout, which sizes each slot and access and places each member and element
+# f:   the function, which has a body
+# ret: its slots, or why they could not be found
+pub fun of(a: *allocator.Allocator, m: *Module, l: *Layout, f: Function) res[Slots, Error] {
+    val res_made: res[Graph, Error] = view.of(m, f);
+    if (sel res_made.err) { ret res[Slots, Error].err{res_made.err}; }
+    var g: Graph = res_made.ok;
+    fin { graph.dnit(?g); }
+    ret compute(a, m, l, f, ?g);
+}
+
+# the slots of function `f` of `m` over `g`, the graph view of its body, the one compute of the analysis
+pub fun compute(a: *allocator.Allocator, m: *Module, l: *Layout, f: Function, g: *Graph) res[Slots, Error] {
+    val res_body: res[*Body, Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[Slots, Error].err{res_body.err}; }
+    val b:     *Body              = res_body.ok;
+    val words: u32                = (b.instructions.len::u32 + 63) / 64;
+    var s:     Slots              = Slots{words: words, escaped: vector.init[u64](a), moved: vector.init[u64](a), stale: vector.init[u64](a), touched: vector.init[u64](a), secret: vector.init[u64](a), parts: Parts{words: 0, first: vector.init[u32](a), count: vector.init[u32](a), size: vector.init[u64](a), base: vector.init[u32](a), cuts: vector.init[u64](a)}};
+    var gen:   vector.Vector[u64] = vector.init[u64](a);
+    var kill:  vector.Vector[u64] = vector.init[u64](a);
+    var into:  vector.Vector[u64] = vector.init[u64](a);
+    var out:   vector.Vector[u64] = vector.init[u64](a);
+    var order: vector.Vector[u32] = vector.init[u32](a);
+    var since: vector.Vector[u64] = vector.init[u64](a);
+    var begun: vector.Vector[u64] = vector.init[u64](a);
+    var unset: vector.Vector[u64] = vector.init[u64](a);
+    var dirs:  vector.Vector[u64] = vector.init[u64](a);
+    var owner: vector.Vector[u32] = vector.init[u32](a);
+    fin {
+        vector.dnit[u64](?gen);
+        vector.dnit[u64](?kill);
+        vector.dnit[u64](?into);
+        vector.dnit[u64](?out);
+        vector.dnit[u32](?order);
+        vector.dnit[u64](?since);
+        vector.dnit[u64](?begun);
+        vector.dnit[u64](?unset);
+        vector.dnit[u64](?dirs);
+        vector.dnit[u32](?owner);
+    }
+    var sc: Scan = Scan{m: m, l: l, b: b, p: ?s.parts, cutting: true, found: vector.init[Cut](a), escaped: ?s.escaped, moved: ?s.moved, touched: ?s.touched, gen: ?gen, kill: ?kill, since: ?since, begun: ?begun, unset: ?unset, direct: ?dirs, base: 0, failed: err[allocator.Error].ok{}};
+    fin { vector.dnit[Cut](?sc.found); }
+    var err_failed: err[allocator.Error] = sized(?sc);
+    if (!(sel err_failed.err)) {
+        scan(?sc);
+        err_failed = sc.failed;
+    }
+    if (!(sel err_failed.err)) { err_failed = parted(?sc); }
+    val size: usize = b.blocks.len * s.parts.words::usize;
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?s.escaped, words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?s.moved, words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?s.stale, words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?s.touched, words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?s.secret, words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?gen, size, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?kill, size, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?into, size, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?out, size, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u32](?order, b.blocks.len, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?since, s.parts.words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?begun, s.parts.words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?unset, size, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u64](?dirs, words::usize, 0); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[u32](?owner, s.parts.words::usize * 64, 0); }
+    if (sel err_failed.err) {
+        dnit(?s);
+        ret res[Slots, Error].err{Error.alloc{err_failed.err}};
+    }
+    sc.cutting = false;
+    scan(?sc);
+    var n: usize = 0;
+    for (n < b.blocks.len) {
+        order.data[n] = n::u32;
+        n             = n + 1;
+    }
+    flow.backward(g, Slice[u32]{data: order.data, size: order.len}, flow.Sets{words: s.parts.words, gen: ?gen, kill: ?kill, live_in: ?into, live_out: ?out});
+    val p: *Parts = ?s.parts;
+    var i: usize  = 0;
+    for (i < b.instructions.len) {
+        var k: u32 = 0;
+        for (k < p.count.data[i]) {
+            owner.data[(p.first.data[i] + k)::usize] = i::u32;
+            k                                        = k + 1;
+        }
+        i = i + 1;
+    }
+    n = 0;
+    for (n < size) {
+        var x:  u64 = unset.data[n] & out.data[n];
+        var at: u32 = 0;
+        for (x != 0) {
+            if ((x & 1) != 0) { set(?dirs, 0, owner.data[((n % p.words::usize) * 64) + at::usize]); }
+            x  = x >> 1;
+            at = at + 1;
+        }
+        n = n + 1;
+    }
+    i = 0;
+    for (i < b.instructions.len) {
+        val slot: u32 = i::u32;
+        if (p.count.data[i] != 0) {
+            if (holds_secret(m, ?b.instructions.data[i], p.size.data[i])) { set(?s.secret, 0, slot); }
+        }
+        val free: bool = p.count.data[i] != 0 && !bit(?s.escaped, 0, slot) && !bit(?s.moved, 0, slot);
+        if (free && bit(?dirs, 0, slot)) { set(?s.stale, 0, slot); }
+        or (b.blocks.len != 0 && free) {
+            var k: u32 = 0;
+            for (k < p.count.data[i]) {
+                if (bit(?into, 0, p.first.data[i] + k)) {
+                    set(?s.stale, 0, slot);
+                    k = p.count.data[i];
+                }
+                or { k = k + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    ret res[Slots, Error].ok{s};
+}
+
+# whether alloca `d` of a slot of `size` bytes, 0 where the layout states none, holds a byte it does not state public
+fun holds_secret(m: *Module, d: *InstructionData, size: u64) bool {
+    val id: u32 = d.metadata.publics;
+    if (id == metadata.NO_PUBLICS || id::usize >= m.publics.len) { ret true; }
+    val ranges: Slice[global.Range] = m.publics.data[id::usize];
+    var at:     u64                 = 0;
+    var k:      usize               = 0;
+    for (k < ranges.size) {
+        if (ranges.data[k].offset != at) { ret true; }
+        at = at + ranges.data[k].length;
+        k  = k + 1;
+    }
+    ret size == 0 || at < size;
+}
+
+# whether address `v` of body `b` reads a readable slot of `s`, at public offsets: one neither escaped, moved nor stale
+pub fun readable(s: *Slots, b: *Body, v: Value) bool {
+    val opt_traced: opt[Traced] = traced(b, v);
+    if (sel opt_traced.none)     { ret false; }
+    if (!opt_traced.some.public) { ret false; }
+    val slot: u32 = opt_traced.some.slot;
+    ret !bit(?s.escaped, 0, slot) && !bit(?s.moved, 0, slot) && !bit(?s.stale, 0, slot);
+}
+
+# whether the address of the slot of alloca `i` escapes, so something other than an access formed from it through
+# moves may reach it
+pub fun escaped(s: *Slots, i: Instruction) bool {
+    ret bit(?s.escaped, 0, i);
+}
+
+# whether a secret offset moves the address of the slot of alloca `i`
+pub fun moved(s: *Slots, i: Instruction) bool {
+    ret bit(?s.moved, 0, i);
+}
+
+# whether a kept or volatile access reaches the slot of alloca `i`
+pub fun touched(s: *Slots, i: Instruction) bool {
+    ret bit(?s.touched, 0, i);
+}
+
+# whether the slot of alloca `i` holds a byte its alloca does not state public
+pub fun secret(s: *Slots, i: Instruction) bool {
+    ret bit(?s.secret, 0, i);
+}
+
+# the offsets the parts of the slot of alloca `i` run between, ascending from 0 to its size, part `k` from offset `k`
+# to offset `k + 1`, empty for a slot of no size the layout states, which is one part
+pub fun cuts(s: *Slots, i: Instruction) Slice[u64] {
+    val p: *Parts = ?s.parts;
+    if (p.size.data[i::usize] == 0) { ret Slice[u64]{data: nil, size: 0}; }
+    ret Slice[u64]{data: ?p.cuts.data[p.base.data[i::usize]::usize], size: p.count.data[i::usize]::usize + 1};
+}
+
+# the first alloca of `s` whose slot is stale, by its instruction, none when no slot is
+pub fun stale(s: *Slots) opt[u32] {
+    var w: usize = 0;
+    for (w < s.words::usize) {
+        val word: u64 = s.stale.data[w];
+        if (word != 0) {
+            var n: u32 = 0;
+            for (((word >> n::u64) & 1) == 0) { n = n + 1; }
+            ret opt[u32].some{(w::u32 * 64) + n};
+        }
+        w = w + 1;
+    }
+    ret opt[u32].none{};
+}

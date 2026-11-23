@@ -1,0 +1,267 @@
+# demanded bits: an `and`, `or` or `xor` with a constant that changes no bit any reader of its result reads becomes
+# its other operand
+#
+# each integer value of at most 64 bits is given the bits its readers demand, a mask grown from nothing until no
+# mask grows: `trunc` and `ext.u` demand of their operand the bits of the narrower type the result demands, `and`
+# with a constant demands the result's bits within the constant, `or` with a constant those outside it, `xor` the
+# result's bits, a left shift by a constant the result's bits shifted right and a logical right shift by a constant
+# those shifted left (the count all of its bits), `add`, `sub` and `mul` every bit up to the highest the result
+# demands, since a carry only moves up, and an edge's argument what its parameter demands. every other reader
+# demands every bit of every operand, so a store, a call, a compare, a branch, a return and an operation the pass
+# does not model each read the whole value. then `and(x, k)` whose demanded bits lie within k, and `or(x, k)` or
+# `xor(x, k)` whose demanded bits miss k, read as x wherever the result is read, and the result is replaced by x.
+#
+# the rule by which an operation is left alone: its type is no scalar integer of at most 64 bits, neither operand is
+# a constant, a demanded bit is one the constant changes, or the operation or its operand is secret, kept or
+# volatile. a value no reader demands anything of is left to dead code removal.
+#
+# it costs the function's operands times the rounds until no mask grows, at most a value's bits each. it reads
+# nothing an analysis gives. it removes operations, so it is held to no constant-time proof and breaks constant
+# time: every function that requires it is skipped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.function.Body;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.table;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.pass.analysis;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it replaces results in place and changes no edge
+pub val DEMANDED: Pass = Pass{name: "demanded", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: 0, preserves: analysis.FLOW, time: Time.breaks{}};
+
+# the masks of one function
+# ---
+# m:      the module
+# b:      the body
+# widths: each value's width, 0 for one the pass does not follow
+# masks:  the bits each value's readers demand
+# grew:   a mask grew in the round
+rec Demand {
+    m:      *Module;
+    b:      *Body;
+    widths: vector.Vector[u32];
+    masks:  vector.Vector[u64];
+    grew:   bool;
+}
+
+fun ones(width: u32) u64 {
+    if (width >= 64) { ret 0xffffffffffffffff; }
+    ret (1::u64 << width::u64) - 1;
+}
+
+# every bit up to the highest of `x`
+fun up_to(x: u64) u64 {
+    var y: u64 = x;
+    y = y | (y >> 1);
+    y = y | (y >> 2);
+    y = y | (y >> 4);
+    y = y | (y >> 8);
+    y = y | (y >> 16);
+    y = y | (y >> 32);
+    ret y;
+}
+
+# the demand of value `v`, every bit of a value the pass does not follow
+fun mask_of(w: *Demand, v: Value) u64 {
+    if (w.widths.data[v] == 0) { ret 0xffffffffffffffff; }
+    ret w.masks.data[v];
+}
+
+# value `v` is read for bits `bits`
+fun demand(w: *Demand, v: Value, bits: u64) {
+    val width: u32 = w.widths.data[v];
+    if (width == 0) { ret; }
+    val grown: u64 = w.masks.data[v] | (bits & ones(width));
+    if (grown != w.masks.data[v]) {
+        w.masks.data[v] = grown;
+        w.grew          = true;
+    }
+}
+
+# whether an instruction is plain: not volatile, kept or secret
+fun plain(d: *InstructionData) bool {
+    ret !d.metadata.flags.volatile && !d.metadata.flags.kept && !d.metadata.secret;
+}
+
+# the constant operand of a two operand instruction and the other one's place, none where neither is a constant
+fun constant_of(w: *Demand, d: *InstructionData) opt[u64] {
+    if (d.operands.len != 2) { ret opt[u64].none{}; }
+    val opt_right: opt[u64] = emit.known_in(w.m, w.b, d.operands.data[1]);
+    if (sel opt_right.some) { ret opt_right; }
+    ret emit.known_in(w.m, w.b, d.operands.data[0]);
+}
+
+# the bits instruction `d` demands of its operand at place `k`
+fun demanded_of(w: *Demand, d: *InstructionData, k: usize) u64 {
+    if (!plain(d) || d.results.len != 1) { ret 0xffffffffffffffff; }
+    val r:     Value = d.results.data[0];
+    val width: u32   = w.widths.data[r];
+    if (width == 0) { ret 0xffffffffffffffff; }
+    val out: u64 = w.masks.data[r];
+    val op:  u32 = d.opcode;
+    if (op == table.TRUNC || op == table.EXT_U)                { ret out; }
+    if (op == table.XOR)                                       { ret out; }
+    if (op == table.ADD || op == table.SUB || op == table.MUL) { ret up_to(out); }
+    if (op == table.AND || op == table.OR) {
+        val opt_k: opt[u64] = constant_of(w, d);
+        if (sel opt_k.none)  { ret 0xffffffffffffffff; }
+        if (op == table.AND) { ret out & opt_k.some; }
+        ret out & ~opt_k.some;
+    }
+    if (op == table.SHL || op == table.SHR_U) {
+        if (k != 0) { ret 0xffffffffffffffff; }
+        val opt_count: opt[u64] = emit.known_in(w.m, w.b, d.operands.data[1]);
+        if (sel opt_count.none) { ret 0xffffffffffffffff; }
+        val count: u64 = opt_count.some;
+        if (count >= width::u64) { ret 0xffffffffffffffff; }
+        if (op == table.SHL)     { ret out >> count; }
+        ret (out << count) & ones(width);
+    }
+    ret 0xffffffffffffffff;
+}
+
+# one round over every instruction, from the last block to the first
+fun round(w: *Demand) {
+    w.grew = false;
+    val b: *Body = w.b;
+    var k: usize = b.blocks.len;
+    for (k > 0) {
+        k = k - 1;
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].last;
+            for (i != NO_INSTRUCTION) {
+                val d: *InstructionData = ?b.instructions.data[i];
+                var n: usize            = 0;
+                for (n < d.operands.len) {
+                    demand(w, d.operands.data[n], demanded_of(w, d, n));
+                    n = n + 1;
+                }
+                var e: usize = 0;
+                for (e < d.edges.len) {
+                    val params: *vector.Vector[Value] = ?b.blocks.data[d.edges.data[e].block].parameters;
+                    var a:      usize                 = 0;
+                    for (a < d.edges.data[e].arguments.len && a < params.len) {
+                        demand(w, d.edges.data[e].arguments.data[a], mask_of(w, params.data[a]));
+                        a = a + 1;
+                    }
+                    e = e + 1;
+                }
+                i = d.prev;
+            }
+        }
+    }
+}
+
+# replace instruction `i`'s result by its operand where the demand allows, answering whether it did
+fun simplify(w: *Demand, f: Function, i: Instruction) res[bool, refusal.Error] {
+    val d:  *InstructionData = ?w.b.instructions.data[i];
+    val op: u32              = d.opcode;
+    if (op != table.AND && op != table.OR && op != table.XOR)   { ret res[bool, refusal.Error].ok{false}; }
+    if (!plain(d) || d.results.len != 1 || d.operands.len != 2) { ret res[bool, refusal.Error].ok{false}; }
+    val r: Value = d.results.data[0];
+    if (w.widths.data[r] == 0) { ret res[bool, refusal.Error].ok{false}; }
+    var x:         Value    = d.operands.data[0];
+    var k_bits:    u64      = 0;
+    val opt_right: opt[u64] = emit.known_in(w.m, w.b, d.operands.data[1]);
+    val opt_left:  opt[u64] = emit.known_in(w.m, w.b, d.operands.data[0]);
+    if (sel opt_right.some) { k_bits = opt_right.some; }
+    or (sel opt_left.some) {
+        x      = d.operands.data[1];
+        k_bits = opt_left.some;
+    }
+    or                             { ret res[bool, refusal.Error].ok{false}; }
+    if (w.b.values.data[x].secret) { ret res[bool, refusal.Error].ok{false}; }
+    val out:   u64  = w.masks.data[r];
+    val k:     u64  = k_bits & ones(w.widths.data[r]);
+    var takes: bool = (out & k) == 0;
+    if (op == table.AND) { takes = (out & ~k) == 0; }
+    if (!takes)          { ret res[bool, refusal.Error].ok{false}; }
+    val err_replaced: err[refusal.Error] = edit(body.replace(w.m, f, r, x, Records.follow{}));
+    if (sel err_replaced.err) { ret res[bool, refusal.Error].err{err_replaced.err}; }
+    val err_erased: err[refusal.Error] = edit(body.erase(w.m, f, i));
+    if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# the width of each value the pass follows, a scalar integer of at most 64 bits, 0 for every other
+fun widths(w: *Demand) err[refusal.Error] {
+    val b: *Body = w.b;
+    var v: usize = 0;
+    for (v < b.values.len) {
+        var width: u32 = 0;
+        if (!b.values.data[v].secret) {
+            val res_lane: res[opt[Lane], refusal.Error] = emit.lane_of(w.m, b.values.data[v].type);
+            if (sel res_lane.err) { ret err[refusal.Error].err{res_lane.err}; }
+            if (sel res_lane.ok.some) {
+                val lane: Lane = res_lane.ok.some;
+                if (lane.lanes == 0 && lane.bits <= 64) { width = lane.bits; }
+            }
+        }
+        val res_width: res[usize, allocator.Error] = vector.push[u32](?w.widths, width);
+        if (sel res_width.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_width.err}}; }
+        val res_mask: res[usize, allocator.Error] = vector.push[u64](?w.masks, 0);
+        if (sel res_mask.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_mask.err}}; }
+        v = v + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# give each value its demand, then take every operation whose constant changes no demanded bit
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    var w: Demand = Demand{m: c.m, b: res_body.ok, widths: vector.init[u32](c.m.a), masks: vector.init[u64](c.m.a), grew: false};
+    fin {
+        vector.dnit[u32](?w.widths);
+        vector.dnit[u64](?w.masks);
+    }
+    val err_widths: err[refusal.Error] = widths(?w);
+    if (sel err_widths.err) { ret res[bool, refusal.Error].err{err_widths.err}; }
+    round(?w);
+    for (w.grew) { round(?w); }
+    val b:       *Body = w.b;
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val next:     Instruction              = b.instructions.data[i].next;
+                val res_took: res[bool, refusal.Error] = simplify(?w, u.f, i);
+                if (sel res_took.err) { ret res_took; }
+                if (res_took.ok)      { changed = true; }
+                i = next;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

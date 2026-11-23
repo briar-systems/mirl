@@ -1,0 +1,3411 @@
+# calls, entries and returns lowered to the pieces the calling convention
+# places them in
+#
+# the target's convention classifies every call at its signature and the
+# number of its named arguments, every function's entry and every return at
+# the function's own signature, once, and the pass rewrites each into piece
+# form. a call becomes `call.placed`, a return `ret.placed` and the entry's
+# parameters become its pieces, the body recording where each arrives. every
+# operand of piece form is a scalar of at most a register's width, its place,
+# scale and fill held as immediates, so nothing after the pass classifies
+# again and no later legalisation of types touches it.
+#
+# an aggregate by value whose leaves each lie whole in one of its pieces, as
+# the passage states (`Direct`), and which is not marked secret, crosses with
+# no memory between. at the entry or after the call it is built from its
+# pieces by `insert` from a zero of its type, each leaf read out of its piece
+# by a shift, a truncation and a conversion to its type, and a byte of a piece
+# no leaf holds, its padding, is read by nothing. where it travels out and is
+# not loaded from memory, each piece is formed from the leaves `extract` takes
+# out of it, each leaf's bits moved to its offset in the piece and joined by
+# `or`, so its padding is zero. the aggregates legalisation reduces the chains
+# to the leaves after the pass.
+#
+# memory carries the rest of what is not a scalar. a by-value aggregate is
+# read piece by piece from the memory it was loaded from, at the point it was loaded, or
+# from a stack slot it is stored to before the call. it is read at the call
+# instead when nothing between the load and the call in one block writes
+# memory but the argument area or the storage markers of another slot whose
+# address never escapes, as a call's result slot begun ahead of it is. one that lies whole in
+# the argument area, every piece a stack place one after the other, travels as
+# one block instead: the caller copies
+# it to the area once, at the address `arg.outgoing` gives, and the callee
+# reads it where it lies, at the address `arg.incoming` gives, so it has no
+# piece in the signature and no register carries its words. a value passed by
+# reference is copied to a stack slot the caller owns, and the piece is its
+# address. a result returned by reference lands in a slot whose address the
+# caller passes, and the callee rebuilds an incoming aggregate in a slot of
+# its own, or reads the caller's copy of one by reference, at each use, so a
+# store of a parameter is a copy between memories, and a slot it is stored to
+# that nothing else writes is read in that memory with no copy. the copies move whole
+# words up to the target's bound and are one bulk copy past it, and a piece
+# whose size no integer has is read and written in the widest words that fit
+# it. a float piece of a size no format has travels as the narrowest format
+# that holds it, its bytes read and written as an integer's and reinterpreted,
+# as are a float's of a format the build holds no unit for, in a register or
+# in memory, which the half precision legalisation has already made its
+# encoding everywhere else. the reinterpretations into such a float that meet
+# that encoding are taken out after the pass (mirl.legal.recast). a
+# vector no unit holds travels as an aggregate does, so the run of the vector
+# legalisation after this pass takes apart its loads and stores and no vector
+# it cannot hold is left at a boundary. a bulk copy the target has no
+# instruction for is a loop the bulk legalisation makes after the pass
+# (mirl.legal.bulk), and a function that requires constant time copies in
+# words at any size there (mirl.legal.moves).
+#
+# a result returned by reference is built in place where nothing can tell. in
+# the callee, a stack slot every return hands back whole, read just before it,
+# whose address goes nowhere but its own loads and stores, is the memory the
+# carrier addresses, so no return copies it. in the caller, a result whose one
+# use stores it whole is passed that store's destination as its address when
+# the destination is memory the callee cannot name by any other route: a part
+# of a stack slot whose address goes nowhere but its own accesses and storage
+# markers, or of the function's own carrier while the function has handed it
+# to nothing, since its caller gave it as such memory. any other keeps its slot
+# and the copy, since the callee may read the destination through an argument,
+# a global or a pointer it holds while it writes the result. every call's
+# destination is judged before any call is rewritten, since a callee handed
+# memory as its result address keeps that address nowhere. a copy between the
+# carrier's memory and memory of another root runs in either order, since the
+# caller gave the carrier as memory nothing else of the function reaches.
+#
+# a copy by reference is made each time the call or return it serves runs,
+# since a callee may write its copy and a return's path may pass the copy
+# another return makes to the result's slot: an aggregate is copied from the memory it was loaded from,
+# at the load, when the load is in the call's or return's block and so runs
+# once for each time that does, and any other value is stored whole just
+# ahead of the call or return. every piece is made where it dominates the
+# instruction it travels at.
+#
+# the pass reads no value to decide anything: every load, store and copy it
+# makes follows from types and the convention alone, so it keeps constant
+# time. every piece of a secret value is marked secret, and every address the
+# pass forms, a slot, a pointer a value travels by reference through and an
+# offset past either, is as secret as its base alone, so a secret value moved
+# through memory forms no address from a secret.
+#
+# a rebuilt value stands at every point the value it replaces did, so the
+# records that read the old one read it. an aggregate load the pass leaves
+# unused goes, and each variable bound to it is bound to the storage it read,
+# on the instruction that addresses that storage.
+#
+# a variadic call under a row whose unnamed arguments are x64's words, as
+# arm64ec's, hands its callee the bytes of its stack words as one more piece,
+# in the row's size register. the address of the first word is no value of
+# the ir, so the call keeps its named count for the selection to set it.
+#
+# what it refuses: a piece extended by a signedness the ir does not state, a
+# scalar split across pieces, and a piece in a register no piece type is made
+# for, each naming its value.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use rf: masc.core.register;
+use mink.model.symbol;
+
+use mink.base.intern.Name;
+use mink.base.table.Id;
+
+use mirl.build.builder;
+use mirl.build.builder.Builder;
+use mirl.build.failure;
+use mirl.ct.contract;
+use mirl.fold.word;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.record.Binding;
+use mirl.ir.function.Body;
+use mirl.ir.function.ConstantTime;
+use mirl.ir.function.FunctionData;
+use mirl.ir.function.NO_EXTENSIONS;
+use mirl.ir.function.in_constant_time;
+use mirl.ir.function.parameter_secrecy;
+use mirl.ir.global.GlobalData;
+use mirl.ir.global.Range;
+use mirl.ir.global.Secrecy;
+use mirl.ir.global.Section;
+use mirl.ir.global.Tls;
+use mirl.ir.id;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Global;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use Spot: mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.linkage.Linkage;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.metadata.NO_PUBLICS;
+use mirl.ir.metadata.Publics;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.place.Fill;
+use mirl.ir.place.Named;
+use mirl.ir.place.Place;
+use mirl.ir.place.Placed;
+use mirl.ir.place.Scale;
+use mirl.ir.place.stacked;
+use mirl.ir.type.calling.Calling;
+use type_format: mirl.ir.type.format;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.legal.helper.deliver;
+use mirl.legal.leaves;
+use mirl.legal.leaves.Leaf;
+use mirl.legal.moves;
+use mirl.legal.overlap;
+use mirl.legal.recast;
+use mirl.legal.vector.lanes;
+use mirl.pass.analysis;
+use mirl.pass.record;
+use mirl.pass.record.Changed;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Lowered;
+use mirl.pass.record.Lowering;
+use mirl.pass.record.Time;
+use mirl.pass.refusal;
+use mirl.target.abi.call;
+use mirl.target.abi.call.Aggregates;
+use mirl.target.abi.call.Statement;
+use mirl.target.abi.convention;
+use mirl.target.abi.convention.Declared;
+use mirl.target.abi.convention.Registers;
+use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.convention.Stack;
+use mirl.target.abi.convention.Unnamed;
+use mirl.target.abi.convention.held;
+use mirl.target.abi.piece;
+use mirl.target.abi.piece.Assignment;
+use mirl.target.abi.piece.Passed;
+use mirl.target.abi.piece.Piece;
+use mirl.target.abi.piece.Side;
+use mirl.target.abi.piece.Uncarried;
+use addressing: mirl.target.address;
+use mirl.target.address.Addresses;
+use mirl.target.basis;
+use mirl.target.basis.Basis;
+use build_record: mirl.target.build;
+use mirl.target.build.Build;
+use mirl.target.capability.Held;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use target_record: mirl.target.record;
+use mirl.target.record.Target;
+
+# the pass: it adds and removes instructions and entry parameters and never
+# touches the graph. it classifies through the build's convention, so it is
+# a lowering, which only a family's rows run
+pub val ABI: Lowering = Lowering{name: "abi", kind: Kind.legalise{}, scope: Lowered.module{run}, preserves: analysis.FLOW, time: Time.keeps{}, applies: convened};
+
+# a target's calls are lowered where its convention is a row
+fun convened(g: *Ground) bool {
+    ret sel g.t.convention.rows;
+}
+
+# one function's lowering
+# ---
+# m:          the module
+# t:          the target, whose capabilities bound the words a copy moves
+# basis:      the build's selection, which says which float formats it holds
+# build:      the build
+# passages:   the module's signatures placed under the build's rows
+# convention: the row the entry, return or call being lowered is under, the
+#             one its signature names, set as it is classified
+# l:          the module's data layout
+# f:          the function
+# entry:      its entry block
+# slots:      the first stack slot made at the entry's head, the last of the
+#             head, `NO_INSTRUCTION` before one is made
+# ptr:        the pointer type an address has
+# slot:       the pointer type a stack slot's address has, into the target's
+#             slot space
+# offset:     the integer type an address offset has
+# unused:     aggregate loads the pass read pieces from, which go once unused
+# carrier:    the parameter the caller's result address arrives in, when a
+#             result travels by reference
+# storage:    the instruction that addresses the result's memory through the
+#             carrier, made once a variable is bound to that memory
+rec Work {
+    m:          *Module;
+    t:          *Target;
+    basis:      opt[*Basis];
+    build:      *Build;
+    passages:   *Passages;
+    convention: *Resolved;
+    l:          *Layout;
+    f:          Function;
+    entry:      Block;
+    slots:      Instruction;
+    ptr:        Type;
+    slot:       Type;
+    offset:     Type;
+    unused:     Vector[Instruction];
+    carrier:    opt[Value];
+    storage:    opt[Instruction];
+}
+
+fun body_of(w: *Work) *Body {
+    ret ?w.m.functions.data[w.f].body;
+}
+
+fun ir(r: err[module.Error]) err[refusal.Error] {
+    ret refusal.edit(r);
+}
+
+fun shape_of(w: *Work, ty: Type) res[table.Shape, refusal.Error] {
+    val res_shape: res[table.Shape, table.Error] = table.shape(?w.m.types, ty);
+    if (sel res_shape.err) { ret res[table.Shape, refusal.Error].err{refusal.Error.ir{module.Error.types{res_shape.err}}}; }
+    ret res[table.Shape, refusal.Error].ok{res_shape.ok};
+}
+
+fun intern(w: *Work, s: table.Shape) res[Type, refusal.Error] {
+    val res_intern: res[Type, table.Error] = table.intern(?w.m.types, s);
+    if (sel res_intern.err) { ret res[Type, refusal.Error].err{refusal.Error.ir{module.Error.types{res_intern.err}}}; }
+    ret res[Type, refusal.Error].ok{res_intern.ok};
+}
+
+fun integer_type(w: *Work, width: u32) res[Type, refusal.Error] {
+    ret intern(w, table.Shape.integer{table.Integer{width: width}});
+}
+
+# whether a type is held in memory rather than as one scalar
+fun aggregate(s: table.Shape) bool {
+    ret sel s.array || sel s.structure || sel s.union;
+}
+
+# whether a value travels through memory: an aggregate, a vector in more than
+# one piece, or a vector no unit of the build holds whole on a target that
+# states its units
+fun through_memory(w: *Work, s: *table.Shape, pieces: u32) res[bool, refusal.Error] {
+    if (sel s.array || sel s.structure || sel s.union) { ret res[bool, refusal.Error].ok{true}; }
+    if (!(sel s.vector))                               { ret res[bool, refusal.Error].ok{false}; }
+    if (pieces > 1)                                    { ret res[bool, refusal.Error].ok{true}; }
+    if (sel w.t.caps.vectors.unstated)                 { ret res[bool, refusal.Error].ok{false}; }
+    val res_whole: res[bool, refusal.Error] = lanes.whole(?w.m.types, basis.context_of(w.basis), ?w.t.caps, s.vector);
+    if (sel res_whole.err) { ret res[bool, refusal.Error].err{res_whole.err}; }
+    ret res[bool, refusal.Error].ok{!res_whole.ok};
+}
+
+# the bits of a float of a type read or written as its encoding, for a piece
+# of a size: none where the format has that size and the build holds it, so
+# it moves as it is
+fun encoded(w: *Work, ty: Type, size: u64) res[opt[Type], refusal.Error] {
+    val res_own: res[u64, refusal.Error] = size_of(w, ty);
+    if (sel res_own.err)                                                   { ret res[opt[Type], refusal.Error].err{res_own.err}; }
+    if (res_own.ok == size && !recast.unheld(w.m, w.basis, ?w.t.caps, ty)) { ret res[opt[Type], refusal.Error].ok{opt[Type].none{}}; }
+    val res_bits: res[Type, refusal.Error] = integer_type(w, (res_own.ok * 8)::u32);
+    if (sel res_bits.err) { ret res[opt[Type], refusal.Error].err{res_bits.err}; }
+    ret res[opt[Type], refusal.Error].ok{opt[Type].some{res_bits.ok}};
+}
+
+fun size_of(w: *Work, ty: Type) res[u64, refusal.Error] {
+    val res_size: res[u64, target_record.Error] = layout.size(w.l, ty, table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret res[u64, refusal.Error].err{refusal.Error.reason{"a value of a call with no size in memory"}}; }
+    ret res[u64, refusal.Error].ok{res_size.ok};
+}
+
+fun align_of(w: *Work, ty: Type) res[u64, refusal.Error] {
+    val res_align: res[u64, target_record.Error] = layout.align(w.l, ty, table.DEFAULT_SPACE);
+    if (sel res_align.err) { ret res[u64, refusal.Error].err{refusal.Error.reason{"a value of a call with no alignment in memory"}}; }
+    ret res[u64, refusal.Error].ok{res_align.ok};
+}
+
+# the widest access a copy makes, in bytes
+val WORD: u64 = 8;
+
+# the alignment an access at an offset from storage aligned to align has
+fun aligned_at(align: u64, offset: u64) u64 {
+    ret moves.aligned_at(align, offset);
+}
+
+# the least legal integer width that holds this many bytes
+fun width_for(bytes: u64) u32 {
+    var i: usize = 0;
+    for (i < $length_of(table.Widths)) {
+        if (table.WIDTHS[i]::u64 >= bytes * 8) { ret table.WIDTHS[i]; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a constant integer of a type in the function
+fun integer(w: *Work, ty: Type, x: u64) res[Value, refusal.Error] {
+    val res_width: res[u32, table.Error] = table.width(?w.m.types, ty);
+    if (sel res_width.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{module.Error.types{res_width.err}}}; }
+    val n:        usize                      = word.words_for(res_width.ok)::usize;
+    val res_room: res[*u64, allocator.Error] = allocator.zallocate[u64](w.m.a, n);
+    if (sel res_room.err) { ret res[Value, refusal.Error].err{refusal.Error.alloc{res_room.err}}; }
+    res_room.ok[0] = x;
+    val res_made: res[Constant, module.Error] = module.add_constant(w.m, ConstantData.integer{Bits{type: ty, words: Slice[u64]{data: res_room.ok, size: n}}});
+    allocator.deallocate[u64](w.m.a, res_room.ok, n);
+    if (sel res_made.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    val res_constant: res[Value, module.Error] = body.constant(w.m, w.f, res_made.ok);
+    if (sel res_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_constant.err}}; }
+    ret res[Value, refusal.Error].ok{res_constant.ok};
+}
+
+fun no_immediates() Slice[Immediate] {
+    ret Slice[Immediate]{data: nil, size: 0};
+}
+
+fun no_targets() Slice[Branch] {
+    ret Slice[Branch]{data: nil, size: 0};
+}
+
+fun make(bld: *Builder, code: Opcode, operands: Slice[Value], immediates: Slice[Immediate]) Value {
+    ret builder.value(bld, Request{opcode: code, operands: operands, immediates: immediates, targets: no_targets()});
+}
+
+fun unary(bld: *Builder, code: Opcode, v: Value, to: Type) Value {
+    var ops: [1]Value     = [1]Value{v};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{to}};
+    ret make(bld, code, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+fun binary(bld: *Builder, code: Opcode, a: Value, b: Value) Value {
+    var ops: [2]Value = [2]Value{a, b};
+    ret make(bld, code, Slice[Value]{data: ?ops[0], size: 2}, no_immediates());
+}
+
+fun load(bld: *Builder, address: Value, ty: Type, align: u64) Value {
+    var ops: [1]Value     = [1]Value{address};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{align}};
+    ret make(bld, opcode_table.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+}
+
+fun store(bld: *Builder, address: Value, v: Value, align: u64) {
+    var ops: [2]Value     = [2]Value{address, v};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+    builder.emit(bld, Request{opcode: opcode_table.STORE, operands: Slice[Value]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+}
+
+# the address an offset past another, as secret as the base alone: the
+# offset follows from types, so a piece of a secret value has a public address
+fun address(w: *Work, bld: *Builder, base: Value, offset: u64) res[Value, refusal.Error] {
+    if (offset == 0) { ret res[Value, refusal.Error].ok{base}; }
+    val res_integer: res[Value, refusal.Error] = integer(w, w.offset, offset);
+    if (sel res_integer.err) { ret res_integer; }
+    val kept: bool = bld.secret;
+    builder.secret(bld, body_of(w).values.data[base].secret);
+    val v: Value = binary(bld, opcode_table.PTR_ADD, base, res_integer.ok);
+    builder.secret(bld, kept);
+    ret res[Value, refusal.Error].ok{v};
+}
+
+fun built(bld: *Builder) err[refusal.Error] {
+    val err_done: err[failure.Error] = builder.done(bld);
+    if (sel err_done.err) { ret err[refusal.Error].err{refusal.Error.build{err_done.err}}; }
+    ret err[refusal.Error].ok{};
+}
+
+# a stack slot of a type at the entry's head, where every slot the pass makes
+# stands, so it dominates every use, stating public the bytes a declaration
+# `held` of what it keeps leaves (`publics_of`), none stating nothing
+fun slot(w: *Work, ty: Type, align: u64, held: opt[Secrecy]) res[Value, refusal.Error] {
+    val res_publics: res[Publics, refusal.Error] = publics_of(w, ty, held);
+    if (sel res_publics.err) { ret res[Value, refusal.Error].err{res_publics.err}; }
+    var bld: Builder = builder.make(w.m);
+    builder.enter(?bld, w.f);
+    builder.at_start(?bld, w.entry);
+    var imm:       [3]Immediate       = [3]Immediate{Immediate.ty{ty}, Immediate.ty{w.slot}, Immediate.alignment{align}};
+    val v:         Value              = make(?bld, opcode_table.ALLOCA, Slice[Value]{data: nil, size: 0}, Slice[Immediate]{data: ?imm[0], size: 3});
+    val err_built: err[refusal.Error] = built(?bld);
+    if (sel err_built.err) { ret res[Value, refusal.Error].err{err_built.err}; }
+    val def: Def = body_of(w).values.data[v].def;
+    if (sel def.result) {
+        body_of(w).instructions.data[def.result.instruction].metadata.publics = res_publics.ok;
+        if (w.slots == NO_INSTRUCTION) { w.slots = def.result.instruction; }
+    }
+    ret res[Value, refusal.Error].ok{v};
+}
+
+# the public ranges of a slot of type `ty` whose bytes a declaration `stated`
+# states the secrecy of, as a callee's declaration states its parameters'
+# and its result's from their source types: every byte of it no secret range
+# covers, none for one secret whole. no statement for no declaration
+fun publics_of(w: *Work, ty: Type, stated: opt[Secrecy]) res[Publics, refusal.Error] {
+    if (sel stated.none) { ret res[Publics, refusal.Error].ok{NO_PUBLICS}; }
+    val held:     Secrecy                 = stated.some;
+    val res_size: res[u64, refusal.Error] = size_of(w, ty);
+    if (sel res_size.err) { ret res[Publics, refusal.Error].err{res_size.err}; }
+    var list: Vector[Range] = vector.init[Range](w.m.a);
+    fin { vector.dnit[Range](?list); }
+    var at: u64 = res_size.ok;
+    if (!(sel held.whole)) { at = 0; }
+    if (sel held.ranges) {
+        var i: usize = 0;
+        for (i < held.ranges.size) {
+            val r: Range = held.ranges.data[i];
+            if (r.offset > at && at < res_size.ok) {
+                var end: u64 = r.offset;
+                if (end > res_size.ok) { end = res_size.ok; }
+                val res_pushed: res[usize, allocator.Error] = vector.push[Range](?list, Range{offset: at, length: end - at});
+                if (sel res_pushed.err) { ret res[Publics, refusal.Error].err{refusal.Error.reason{"no room for a slot's public ranges"}}; }
+            }
+            if (r.offset + r.length > at) { at = r.offset + r.length; }
+            i = i + 1;
+        }
+    }
+    if (at < res_size.ok) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Range](?list, Range{offset: at, length: res_size.ok - at});
+        if (sel res_pushed.err) { ret res[Publics, refusal.Error].err{refusal.Error.reason{"no room for a slot's public ranges"}}; }
+    }
+    val res_made: res[Publics, module.Error] = module.publics(w.m, Slice[Range]{data: list.data, size: list.len});
+    if (sel res_made.err) { ret res[Publics, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    ret res[Publics, refusal.Error].ok{res_made.ok};
+}
+
+# what declaration `d` states of the secrecy of its result, none for none, as
+# a call through a value states nothing
+fun result_held(d: opt[*FunctionData]) opt[Secrecy] {
+    if (sel d.some) { ret opt[Secrecy].some{d.some.result}; }
+    ret opt[Secrecy].none{};
+}
+
+# what declaration `d` states of the secrecy of its parameter `k`, none for
+# none
+fun parameter_held(d: opt[*FunctionData], k: usize) opt[Secrecy] {
+    if (sel d.some) { ret opt[Secrecy].some{parameter_secrecy(d.some, k)}; }
+    ret opt[Secrecy].none{};
+}
+
+# the declaration call `c` trusts its callee to keep, of the function it names by its address or stated for a callee
+# it reaches through a value, none for a call that states none
+fun declared_callee(w: *Work, c: Instruction) opt[*FunctionData] {
+    val b:            *Body            = body_of(w);
+    val opt_declared: opt[id.Declared] = contract.declared_of(w.m, b, ?b.instructions.data[c]);
+    if (sel opt_declared.none) { ret opt[*FunctionData].none{}; }
+    ret opt[*FunctionData].some{module.declaration(w.m, opt_declared.some)};
+}
+
+# whether placed instruction `x` stands after instruction `a` in a's block
+fun after(b: *Body, a: Instruction, x: Instruction) bool {
+    var p: Instruction = b.instructions.data[a].next;
+    for (p != NO_INSTRUCTION) {
+        if (p == x) { ret true; }
+        p = b.instructions.data[p].next;
+    }
+    ret false;
+}
+
+# build at the entry's head, past the stack slots made there
+fun at_head(w: *Work, bld: *Builder) {
+    if (w.slots == NO_INSTRUCTION) { builder.at_start(bld, w.entry); }
+    or                             { builder.after(bld, w.slots); }
+}
+
+fun block_of(b: *Body, i: Instruction) Block {
+    val at: Spot = b.instructions.data[i].place;
+    if (sel at.placed) { ret at.placed; }
+    ret 0;
+}
+
+# the kind of register a place is in, none for a place that is no register
+fun kind_of(w: *Work, p: Place) opt[rf.Kind] {
+    ret kind_under(w.convention, p);
+}
+
+# the kind of register a place is in under a row
+fun kind_under(row: *Resolved, p: Place) opt[rf.Kind] {
+    if (!(sel p.register)) { ret opt[rf.Kind].none{}; }
+    val regs: *Registers = held(row);
+    if (regs == nil) { ret opt[rf.Kind].none{}; }
+    val file: *rf.File = regs.context.view.file;
+    val c:    u16      = rf.class_of(p.register);
+    if (file == nil || c::u32 >= file.class_count) { ret opt[rf.Kind].none{}; }
+    ret opt[rf.Kind].some{file.classes[c].kind};
+}
+
+# whether a scalar of a shape travels in a place as it is: a float in a float
+# or vector register, a vector in a vector register, as aarch64's v registers
+# take both, an integer or a pointer in a general one, and in memory any but a
+# float of a format the build holds no unit for, which no register loads or
+# stores as itself and which travels as its encoding
+fun fits(w: *Work, s: table.Shape, p: Place) bool {
+    val opt_kind_of: opt[rf.Kind] = kind_of(w, p);
+    if (sel opt_kind_of.none) {
+        if (sel s.float) { ret !recast.unheld_format(w.basis, ?w.t.caps, s.float.format); }
+        ret true;
+    }
+    if (opt_kind_of.some == rf.FLOAT)   { ret sel s.float; }
+    if (opt_kind_of.some == rf.VECTOR)  { ret sel s.float || sel s.vector; }
+    if (opt_kind_of.some == rf.GENERAL) { ret sel s.integer || sel s.pointer; }
+    ret false;
+}
+
+# the type of a piece: the value's own when it carries the scalar whole in a
+# place that holds it as it is, the narrowest float that holds its bytes in a
+# float or vector register, the place's other bytes undefined, or two 64 bit
+# lanes for 16 bytes in a vector register, and otherwise the integer that
+# holds its bytes
+fun piece_type(w: *Work, side: Side, p: Piece, of: Type, whole: bool) res[Type, refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, of);
+    if (sel res_shape_of.err)                       { ret res[Type, refusal.Error].err{res_shape_of.err}; }
+    if (whole && fits(w, res_shape_of.ok, p.place)) { ret res[Type, refusal.Error].ok{of}; }
+    val opt_kind_of: opt[rf.Kind] = kind_of(w, p.place);
+    if (sel opt_kind_of.some) {
+        if (opt_kind_of.some == rf.FLOAT || opt_kind_of.some == rf.VECTOR) {
+            if (p.size <= 2) { ret intern(w, table.Shape.float{table.Float{format: type_format.BINARY16}}); }
+            if (p.size <= 4) { ret intern(w, table.Shape.float{table.Float{format: type_format.BINARY32}}); }
+            if (p.size <= 8) { ret intern(w, table.Shape.float{table.Float{format: type_format.BINARY64}}); }
+            if (opt_kind_of.some == rf.VECTOR && p.size == 16) {
+                val res_lane: res[Type, refusal.Error] = integer_type(w, 64);
+                if (sel res_lane.err) { ret res_lane; }
+                ret intern(w, table.Shape.vector{table.Vector{lanes: 2, element: res_lane.ok}});
+            }
+            ret res[Type, refusal.Error].err{refusal.Error.pieces{Uncarried.size{side}}};
+        }
+        if (opt_kind_of.some != rf.GENERAL) { ret res[Type, refusal.Error].err{refusal.Error.pieces{Uncarried.kind{side}}}; }
+    }
+    if (sel p.place.operand) {
+        val opt_member: opt[Type] = carried(w.l, of, p.offset, p.size);
+        if (sel opt_member.some) { ret res[Type, refusal.Error].ok{opt_member.some}; }
+    }
+    val width: u32 = width_for(p.size);
+    if (width == 0) { ret res[Type, refusal.Error].err{refusal.Error.pieces{Uncarried.size{side}}}; }
+    ret integer_type(w, width);
+}
+
+# the scalar member of a value that lies at an offset with a size, found
+# through its structures, unions and arrays, none when no one scalar does:
+# under stack evaluation an operand is one of the machine's own values, so a
+# piece carrying a scalar member whole travels as that member's type, as
+# wasm's basic c abi passes a struct of one float as an f32
+# ---
+# l:      the layout
+# ty:     the value's type
+# offset: the bytes into the value the piece starts at
+# size:   the bytes it carries
+pub fun carried(l: *Layout, ty: Type, offset: u64, size: u64) opt[Type] {
+    val res_shape: res[table.Shape, table.Error] = table.shape(l.types, ty);
+    if (sel res_shape.err) { ret opt[Type].none{}; }
+    val shape: table.Shape = res_shape.ok;
+    if (sel shape.integer || sel shape.float || sel shape.pointer) {
+        val res_own: res[u64, target_record.Error] = layout.size(l, ty, table.DEFAULT_SPACE);
+        if (sel res_own.err)                   { ret opt[Type].none{}; }
+        if (offset == 0 && res_own.ok == size) { ret opt[Type].some{ty}; }
+        ret opt[Type].none{};
+    }
+    if (sel shape.structure) {
+        var i: usize = 0;
+        for (i < shape.structure.members.size) {
+            val res_offset: res[u64, target_record.Error] = layout.offset(l, ty, table.DEFAULT_SPACE, i::u32);
+            val res_room:   res[u64, target_record.Error] = layout.size(l, shape.structure.members.data[i], table.DEFAULT_SPACE);
+            if (sel res_offset.err)                                                      { ret opt[Type].none{}; }
+            if (sel res_room.err)                                                        { ret opt[Type].none{}; }
+            if (offset >= res_offset.ok && offset + size <= res_offset.ok + res_room.ok) { ret carried(l, shape.structure.members.data[i], offset - res_offset.ok, size); }
+            i = i + 1;
+        }
+        ret opt[Type].none{};
+    }
+    if (sel shape.union) {
+        var j: usize = 0;
+        for (j < shape.union.members.size) {
+            val opt_member: opt[Type] = carried(l, shape.union.members.data[j], offset, size);
+            if (sel opt_member.some) { ret opt_member; }
+            j = j + 1;
+        }
+        ret opt[Type].none{};
+    }
+    if (sel shape.array) {
+        val res_step: res[u64, target_record.Error] = layout.stride(l, ty, table.DEFAULT_SPACE);
+        if (sel res_step.err) { ret opt[Type].none{}; }
+        if (res_step.ok == 0) { ret opt[Type].none{}; }
+        ret carried(l, shape.array.element, offset % res_step.ok, size);
+    }
+    ret opt[Type].none{};
+}
+
+# an instruction forming a piece from bytes the pass moves, which carries no secrecy mark: a mark would declare the
+# register it writes secret whatever the bytes hold (`machine/emit/handover.seed_results`), where the walk takes the
+# secrecy of what it computes from the loads, each marked as the value is
+fun derived_unary(bld: *Builder, code: Opcode, v: Value, to: Type) Value {
+    val marked: bool = bld.secret;
+    builder.secret(bld, false);
+    val x: Value = unary(bld, code, v, to);
+    builder.secret(bld, marked);
+    ret x;
+}
+
+fun derived_binary(bld: *Builder, code: Opcode, a: Value, b: Value) Value {
+    val marked: bool = bld.secret;
+    builder.secret(bld, false);
+    val x: Value = binary(bld, code, a, b);
+    builder.secret(bld, marked);
+    ret x;
+}
+
+# a load stated public where `public`, as the access the bytes it reads were loaded by states them
+fun stated_load(bld: *Builder, address: Value, ty: Type, align: u64, public: bool) Value {
+    var f: Flags = NO_FLAGS;
+    f.public = public;
+    builder.flags(bld, f);
+    val x: Value = load(bld, address, ty, align);
+    builder.flags(bld, NO_FLAGS);
+    ret x;
+}
+
+# a value by reference at `from` copied into its home slot and loaded from there, each word's read stated as `held`
+# states its bytes, so a public piece of a value secret elsewhere reads as public
+fun stated_copy(w: *Work, bld: *Builder, from: Value, home: Value, ty: Type, align: u64, held: Secrecy) res[Value, refusal.Error] {
+    val res_size: res[u64, refusal.Error] = size_of(w, ty);
+    if (sel res_size.err) { ret res[Value, refusal.Error].err{res_size.err}; }
+    val kept: bool = bld.secret;
+    var done: u64  = 0;
+    for (done < res_size.ok) {
+        val at:       u64                      = aligned_at(align, done);
+        val step:     u64                      = moves.step(res_size.ok - done, at, WORD);
+        val res_part: res[Type, refusal.Error] = integer_type(w, (step * 8)::u32);
+        if (sel res_part.err) { ret res[Value, refusal.Error].err{res_part.err}; }
+        val res_src: res[Value, refusal.Error] = address(w, bld, from, done);
+        if (sel res_src.err) { ret res_src; }
+        val res_dst: res[Value, refusal.Error] = address(w, bld, home, done);
+        if (sel res_dst.err) { ret res_dst; }
+        val secret: bool = contract.range_secret(held, done, step);
+        builder.secret(bld, secret);
+        store(bld, res_dst.ok, stated_load(bld, res_src.ok, res_part.ok, at, !secret), at);
+        done = done + step;
+    }
+    builder.secret(bld, kept);
+    ret res[Value, refusal.Error].ok{load(bld, home, ty, align)};
+}
+
+# read a piece of a size from memory into a type, in the widest words that
+# fit it when no integer has its size, a float it moves as its encoding
+# reinterpreted, each load stated public where `public`. an access below its
+# type's alignment is the unaligned legalisation's (mirl.legal.unaligned)
+fun read(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u64, ty: Type, public: bool) res[Value, refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[Value, refusal.Error].err{res_shape_of.err}; }
+    if (sel res_shape_of.ok.float) {
+        val res_bits: res[opt[Type], refusal.Error] = encoded(w, ty, size);
+        if (sel res_bits.err) { ret res[Value, refusal.Error].err{res_bits.err}; }
+        if (sel res_bits.ok.some) {
+            val res_raw: res[Value, refusal.Error] = read(w, bld, base, offset, size, align, res_bits.ok.some, public);
+            if (sel res_raw.err) { ret res_raw; }
+            ret res[Value, refusal.Error].ok{derived_unary(bld, opcode_table.BITCAST, res_raw.ok, ty)};
+        }
+    }
+    var exact: bool = true;
+    if (sel res_shape_of.ok.integer) { exact = res_shape_of.ok.integer.width::u64 == size * 8; }
+    if (exact) {
+        val res_address: res[Value, refusal.Error] = address(w, bld, base, offset);
+        if (sel res_address.err) { ret res_address; }
+        ret res[Value, refusal.Error].ok{stated_load(bld, res_address.ok, ty, aligned_at(align, offset), public)};
+    }
+    var acc:  Value = 0;
+    var any:  bool  = false;
+    var done: u64   = 0;
+    for (done < size) {
+        val word:       u64                      = moves.step(size - done, WORD, WORD);
+        val res_narrow: res[Type, refusal.Error] = integer_type(w, (word * 8)::u32);
+        if (sel res_narrow.err) { ret res[Value, refusal.Error].err{res_narrow.err}; }
+        val res_address: res[Value, refusal.Error] = address(w, bld, base, offset + done);
+        if (sel res_address.err) { ret res_address; }
+        var part: Value = derived_unary(bld, opcode_table.EXT_U, stated_load(bld, res_address.ok, res_narrow.ok, aligned_at(align, offset + done), public), ty);
+        if (done > 0) {
+            val res_integer: res[Value, refusal.Error] = integer(w, ty, done * 8);
+            if (sel res_integer.err) { ret res_integer; }
+            part = derived_binary(bld, opcode_table.SHL, part, res_integer.ok);
+        }
+        if (any) { acc = derived_binary(bld, opcode_table.OR, acc, part); }
+        or       { acc = part; }
+        any  = true;
+        done = done + word;
+    }
+    if (!any) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a piece of no bytes"}}; }
+    ret res[Value, refusal.Error].ok{acc};
+}
+
+# the bytes of `[lo, lo + n)` of a value's memory image that a member of type `ty` laid at `at` holds, one bit for each
+# from bit 0, none where the layout states no size or place. a byte no member holds is padding, which nothing need
+# ever write
+fun held_bytes(l: *Layout, ty: Type, at: u64, lo: u64, n: u64) opt[u64] {
+    val res_shape: res[table.Shape, table.Error] = table.shape(l.types, ty);
+    if (sel res_shape.err) { ret opt[u64].none{}; }
+    val shape: table.Shape = res_shape.ok;
+    if (sel shape.structure) {
+        var mask: u64   = 0;
+        var i:    usize = 0;
+        for (i < shape.structure.members.size) {
+            val res_at: res[u64, target_record.Error] = layout.offset(l, ty, table.DEFAULT_SPACE, i::u32);
+            if (sel res_at.err) { ret opt[u64].none{}; }
+            val opt_member: opt[u64] = held_bytes(l, shape.structure.members.data[i], at + res_at.ok, lo, n);
+            if (sel opt_member.none) { ret opt_member; }
+            mask = mask | opt_member.some;
+            i    = i + 1;
+        }
+        ret opt[u64].some{mask};
+    }
+    if (sel shape.union) {
+        var mask: u64   = 0;
+        var j:    usize = 0;
+        for (j < shape.union.members.size) {
+            val opt_member: opt[u64] = held_bytes(l, shape.union.members.data[j], at, lo, n);
+            if (sel opt_member.none) { ret opt_member; }
+            mask = mask | opt_member.some;
+            j    = j + 1;
+        }
+        ret opt[u64].some{mask};
+    }
+    if (sel shape.array) {
+        val res_step: res[u64, target_record.Error] = layout.stride(l, ty, table.DEFAULT_SPACE);
+        if (sel res_step.err) { ret opt[u64].none{}; }
+        var mask: u64 = 0;
+        var k:    u64 = 0;
+        for (k < shape.array.count) {
+            val start: u64 = at + k * res_step.ok;
+            if (start >= lo + n) { brk; }
+            val opt_element: opt[u64] = held_bytes(l, shape.array.element, start, lo, n);
+            if (sel opt_element.none) { ret opt_element; }
+            mask = mask | opt_element.some;
+            k    = k + 1;
+        }
+        ret opt[u64].some{mask};
+    }
+    val res_size: res[u64, target_record.Error] = layout.size(l, ty, table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret opt[u64].none{}; }
+    var mask: u64 = 0;
+    var b:    u64 = at;
+    for (b < at + res_size.ok) {
+        if (b >= lo && b < lo + n) { mask = mask | (1::u64 << (b - lo)); }
+        b = b + 1;
+    }
+    ret opt[u64].some{mask};
+}
+
+# read a piece of a value of type `of` from memory into a type: an integer piece reads only the bytes the value's
+# members hold, its bits over padding zero, so no piece reads memory a store of the value need not have written and
+# no register carries stale padding out. any other piece, or one with no padding, is `read`. each load is stated public
+# where `public`, as the access the value was loaded by states its bytes
+fun read_piece(w: *Work, bld: *Builder, base: Value, of: Type, p: Piece, align: u64, ty: Type, public: bool) res[Value, refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[Value, refusal.Error].err{res_shape_of.err}; }
+    val plain: bool = !(sel res_shape_of.ok.integer) || p.size > 8 || p.size == 0;
+    if (plain) { ret read(w, bld, base, p.offset, p.size, align, ty, public); }
+    val opt_held: opt[u64] = held_bytes(w.l, of, 0, p.offset, p.size);
+    if (sel opt_held.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a piece of a value whose layout states no place for a member"}}; }
+    val held: u64 = opt_held.some;
+    val full: u64 = (1::u64 << p.size) - 1;
+    if (held == full) { ret read(w, bld, base, p.offset, p.size, align, ty, public); }
+    var acc:   Value = 0;
+    var any:   bool  = false;
+    var start: u64   = 0;
+    for (start < p.size) {
+        if (((held >> start) & 1) == 0) {
+            start = start + 1;
+            cnt;
+        }
+        var end: u64 = start;
+        for (end < p.size && ((held >> end) & 1) != 0) { end = end + 1; }
+        val res_run: res[Value, refusal.Error] = read(w, bld, base, p.offset + start, end - start, align, ty, public);
+        if (sel res_run.err) { ret res_run; }
+        var part: Value = res_run.ok;
+        if (start > 0) {
+            val res_integer: res[Value, refusal.Error] = integer(w, ty, start * 8);
+            if (sel res_integer.err) { ret res_integer; }
+            part = derived_binary(bld, opcode_table.SHL, part, res_integer.ok);
+        }
+        if (any) { acc = derived_binary(bld, opcode_table.OR, acc, part); }
+        or       { acc = part; }
+        any   = true;
+        start = end;
+    }
+    if (!any) { ret integer(w, ty, 0); }
+    ret res[Value, refusal.Error].ok{acc};
+}
+
+# write a piece of a size to memory, in the widest words that fit it when no
+# integer has its size, a float it moves as its encoding reinterpreted. an
+# access below its type's alignment is the unaligned legalisation's
+fun write(w: *Work, bld: *Builder, base: Value, offset: u64, size: u64, align: u64, v: Value, ty: Type) err[refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret err[refusal.Error].err{res_shape_of.err}; }
+    if (sel res_shape_of.ok.float) {
+        val res_bits: res[opt[Type], refusal.Error] = encoded(w, ty, size);
+        if (sel res_bits.err)     { ret err[refusal.Error].err{res_bits.err}; }
+        if (sel res_bits.ok.some) { ret write(w, bld, base, offset, size, align, derived_unary(bld, opcode_table.BITCAST, v, res_bits.ok.some), res_bits.ok.some); }
+    }
+    var exact: bool = true;
+    if (sel res_shape_of.ok.integer) { exact = res_shape_of.ok.integer.width::u64 == size * 8; }
+    if (exact) {
+        val res_address: res[Value, refusal.Error] = address(w, bld, base, offset);
+        if (sel res_address.err) { ret err[refusal.Error].err{res_address.err}; }
+        store(bld, res_address.ok, v, aligned_at(align, offset));
+        ret err[refusal.Error].ok{};
+    }
+    var done: u64 = 0;
+    for (done < size) {
+        val word:       u64                      = moves.step(size - done, WORD, WORD);
+        val res_narrow: res[Type, refusal.Error] = integer_type(w, (word * 8)::u32);
+        if (sel res_narrow.err) { ret err[refusal.Error].err{res_narrow.err}; }
+        var part: Value = v;
+        if (done > 0) {
+            val res_integer: res[Value, refusal.Error] = integer(w, ty, done * 8);
+            if (sel res_integer.err) { ret err[refusal.Error].err{res_integer.err}; }
+            part = derived_binary(bld, opcode_table.SHR_U, part, res_integer.ok);
+        }
+        part = derived_unary(bld, opcode_table.TRUNC, part, res_narrow.ok);
+        val res_address: res[Value, refusal.Error] = address(w, bld, base, offset + done);
+        if (sel res_address.err) { ret err[refusal.Error].err{res_address.err}; }
+        store(bld, res_address.ok, part, aligned_at(align, offset + done));
+        done = done + word;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# copy bytes from one storage to another, nothing when they are one storage,
+# as a result built in place is. the copy is in words or one `mem.copy`, as
+# mirl.legal.moves decides. the storage copied to is a slot the pass makes, the
+# outgoing area or the result's memory the caller passes, none of which the
+# memory copied from can be, so the copy runs in either order. its reads are
+# stated public where `public`, as the load the copy stands for states its bytes
+fun copy(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64, public: bool) err[refusal.Error] {
+    if (from == to) { ret err[refusal.Error].ok{}; }
+    ret copy_at(w, bld, from, to, 0, size, align, public);
+}
+
+# `copy` of the bytes `offset` to `offset + size` of storage at `from` of alignment `align` to the same bytes at `to`,
+# each word addressed off `from` and `to` at its own offset
+fun copy_at(w: *Work, bld: *Builder, from: Value, to: Value, offset: u64, size: u64, align: u64, public: bool) err[refusal.Error] {
+    val first: u64 = aligned_at(align, offset);
+    if (!moves.in_words(?w.t.caps, size, first, WORD)) {
+        val res_length: res[Value, refusal.Error] = integer(w, w.offset, size);
+        if (sel res_length.err) { ret err[refusal.Error].err{res_length.err}; }
+        val res_src: res[Value, refusal.Error] = address(w, bld, from, offset);
+        if (sel res_src.err) { ret err[refusal.Error].err{res_src.err}; }
+        val res_dst: res[Value, refusal.Error] = address(w, bld, to, offset);
+        if (sel res_dst.err) { ret err[refusal.Error].err{res_dst.err}; }
+        var ops:   [3]Value     = [3]Value{res_dst.ok, res_src.ok, res_length.ok};
+        var imm:   [1]Immediate = [1]Immediate{Immediate.alignment{first}};
+        var apart: Flags        = NO_FLAGS;
+        apart.ascending  = true;
+        apart.descending = true;
+        apart.public     = public;
+        builder.flags(bld, apart);
+        builder.emit(bld, Request{opcode: opcode_table.MEM_COPY, operands: Slice[Value]{data: ?ops[0], size: 3}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+        builder.flags(bld, NO_FLAGS);
+        ret err[refusal.Error].ok{};
+    }
+    var done: u64 = offset;
+    for (done < offset + size) {
+        val at:               u64                      = aligned_at(align, done);
+        val step:             u64                      = moves.step(offset + size - done, at, WORD);
+        val res_integer_type: res[Type, refusal.Error] = integer_type(w, (step * 8)::u32);
+        if (sel res_integer_type.err) { ret err[refusal.Error].err{res_integer_type.err}; }
+        val res_src: res[Value, refusal.Error] = address(w, bld, from, done);
+        if (sel res_src.err) { ret err[refusal.Error].err{res_src.err}; }
+        val res_dst: res[Value, refusal.Error] = address(w, bld, to, done);
+        if (sel res_dst.err) { ret err[refusal.Error].err{res_dst.err}; }
+        store(bld, res_dst.ok, stated_load(bld, res_src.ok, res_integer_type.ok, at, public), at);
+        done = done + step;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# copy as `copy` does a value its declaration `held` states the secret ranges of, stated public whole where
+# `public`: each secret range first, as the copy's own secrecy mark states it, then each public range, its reads stated
+# public, as the type of the storage the value was loaded from states those bytes, and its writes unmarked. so a
+# public byte is written by a store the walk places exactly after every store a secret range's copy makes, which may
+# be one it places nowhere, as a loop's is. a byte of a word that holds a secret byte is moved as secret
+fun ranged_copy(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64, public: bool, held: Secrecy) err[refusal.Error] {
+    if (from == to || public) { ret copy(w, bld, from, to, size, align, public); }
+    if (sel held.ranges)      { ret copy_ranges(w, bld, from, to, size, align, held.ranges); }
+    ret copy(w, bld, from, to, size, align, false);
+}
+
+# `ranged_copy` of a value whose secret ranges are `secrets`, ascending
+fun copy_ranges(w: *Work, bld: *Builder, from: Value, to: Value, size: u64, align: u64, secrets: Slice[Range]) err[refusal.Error] {
+    val kept: bool  = bld.secret;
+    var i:    usize = 0;
+    for (i < secrets.size) {
+        val r: Range = secrets.data[i];
+        if (r.offset < size) {
+            var length: u64 = r.length;
+            if (r.offset + length > size) { length = size - r.offset; }
+            val err_part: err[refusal.Error] = copy_at(w, bld, from, to, r.offset, length, align, false);
+            if (sel err_part.err) { ret err_part; }
+        }
+        i = i + 1;
+    }
+    builder.secret(bld, false);
+    var at: u64 = 0;
+    i = 0;
+    for (i <= secrets.size) {
+        var end: u64 = size;
+        if (i < secrets.size && secrets.data[i].offset < size) { end = secrets.data[i].offset; }
+        if (end > at) {
+            val err_part: err[refusal.Error] = copy_at(w, bld, from, to, at, end - at, align, true);
+            if (sel err_part.err) { ret err_part; }
+        }
+        if (i < secrets.size) { at = secrets.data[i].offset + secrets.data[i].length; }
+        i = i + 1;
+    }
+    builder.secret(bld, kept);
+    ret err[refusal.Error].ok{};
+}
+
+# whether the copy of value `x` from the memory load `from` read may state its reads public: the load states its
+# access public and the value holds no secret
+fun copy_public(w: *Work, x: Sent, from: Instruction) bool {
+    ret body_of(w).instructions.data[from].metadata.flags.public && !x.secret;
+}
+
+# the load a value is, when the pass may read its memory in its place: one
+# neither volatile nor kept, so its memory is the value's at its point
+fun loaded(w: *Work, v: Value) opt[Instruction] {
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[v].def;
+    if (!(sel def.result)) { ret opt[Instruction].none{}; }
+    val i: Instruction      = def.result.instruction;
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (d.opcode != opcode_table.LOAD)                      { ret opt[Instruction].none{}; }
+    if (d.metadata.flags.volatile || d.metadata.flags.kept) { ret opt[Instruction].none{}; }
+    if (!(sel d.place.placed))                              { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{i};
+}
+
+# the load a value that travels by reference is copied from, at the load: an
+# aggregate's, when it is in the block of the instruction the value travels
+# at and so runs once for each time that instruction does. none when the value
+# is stored whole just ahead of that instruction
+fun copied_from(w: *Work, x: Sent, at: Instruction) opt[Instruction] {
+    if (!aggregate(x.shape)) { ret opt[Instruction].none{}; }
+    val opt_from: opt[Instruction] = loaded(w, x.value);
+    if (sel opt_from.none) { ret opt_from; }
+    val b: *Body = body_of(w);
+    if (block_of(b, opt_from.some) != block_of(b, at)) { ret opt[Instruction].none{}; }
+    ret opt_from;
+}
+
+fun note_unused(w: *Work, i: Instruction) err[refusal.Error] {
+    var k: usize = 0;
+    for (k < w.unused.len) {
+        if (w.unused.data[k] == i) { ret err[refusal.Error].ok{}; }
+        k = k + 1;
+    }
+    val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?w.unused, i);
+    if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+# where a value by value lies whole in the argument area: an aggregate every
+# piece of which is a fixed stack place, one after the other from its first
+# byte to its last, so its bytes there are its memory image. such a value
+# travels as one block on every target, copied to the area once by the caller
+# and read in place by the callee, with no piece in the signature. the copy is
+# `copy`'s: word moves, or one `mem.copy` of a known length the bulk
+# legalisation makes a line or a loop of where the target has no instruction
+# for it. either may stand between the area's address and the call, its
+# blocks too: the area lies at the stack pointer, which nothing between them
+# moves, and what writes it besides the call's own argument moves is another
+# call, which the pass places none of there and which a copy of a known length
+# never becomes (mirl.legal.bulk)
+# ---
+# ret: the offset of its first byte in the area, or none when it travels in
+#      pieces
+fun laid(w: *Work, ty: Type, passed: Passed, asg: *Assignment) res[opt[u64], refusal.Error] {
+    val res_none: res[opt[u64], refusal.Error] = res[opt[u64], refusal.Error].ok{opt[u64].none{}};
+    if (!(sel passed.passing.value) || passed.count < 2) { ret res_none; }
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err)        { ret res[opt[u64], refusal.Error].err{res_shape_of.err}; }
+    if (!aggregate(res_shape_of.ok)) { ret res_none; }
+    val res_size: res[u64, refusal.Error] = size_of(w, ty);
+    if (sel res_size.err) { ret res[opt[u64], refusal.Error].err{res_size.err}; }
+    val head: Place = piece.piece(asg, passed.first).place;
+    if (!(sel head.stack)) { ret res_none; }
+    val base: u64 = head.stack.offset;
+    var done: u64 = 0;
+    var n:    u32 = 0;
+    for (n < passed.count) {
+        val p:     Piece = piece.piece(asg, passed.first + n);
+        val place: Place = p.place;
+        if (!(sel place.stack))                                     { ret res_none; }
+        if (!(sel p.scale.fixed) || !(sel place.stack.scale.fixed)) { ret res_none; }
+        if (p.offset != done || place.stack.offset != base + done)  { ret res_none; }
+        done = done + p.size;
+        n    = n + 1;
+    }
+    if (done != res_size.ok) { ret res_none; }
+    ret res[opt[u64], refusal.Error].ok{opt[u64].some{base}};
+}
+
+# the address of a value laid whole in the argument area at an offset, the
+# function's own incoming one or the outgoing one of the call the builder
+# stands ahead of
+fun area(w: *Work, bld: *Builder, ty: Type, offset: u64, incoming: bool) Value {
+    var places: [1]Placed    = [1]Placed{Placed{place: stacked(offset), scale: Scale.fixed{}, fill: Fill.exact{}}};
+    var imm:    [3]Immediate = [3]Immediate{Immediate.ty{ty}, Immediate.ty{w.slot}, Immediate.places{Slice[Placed]{data: ?places[0], size: 1}}};
+    var code:   Opcode       = opcode_table.ARG_OUTGOING;
+    if (incoming) { code = opcode_table.ARG_INCOMING; }
+    ret make(bld, code, Slice[Value]{data: nil, size: 0}, Slice[Immediate]{data: ?imm[0], size: 3});
+}
+
+# whether an instruction writes the outgoing argument area alone: a copy or a
+# store whose address is the area's
+fun fills_area(w: *Work, i: Instruction) bool {
+    val b: *Body            = body_of(w);
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (d.opcode != opcode_table.MEM_COPY && d.opcode != opcode_table.STORE) { ret false; }
+    if (d.operands.len == 0)                                                 { ret false; }
+    val opt_made: opt[Instruction] = made_by(w, overlap.root_of(body_of(w), d.operands.data[0]), opcode_table.ARG_OUTGOING);
+    ret sel opt_made.some;
+}
+
+# whether the memory a load read still holds what it read at a later
+# instruction of its block: nothing between the two writes memory but into
+# the outgoing argument area, which no load the pass reads in place addresses,
+# or marks the storage of another slot whose address goes nowhere but its own
+# accesses and markers (`marks_apart`)
+fun stands_until(w: *Work, l: Instruction, at: Instruction) bool {
+    val b: *Body = body_of(w);
+    val k: Block = block_of(b, l);
+    if (block_of(b, at) != k) { ret false; }
+    if (!after(b, l, at))     { ret false; }
+    var i: Instruction = b.instructions.data[l].next;
+    for (i != at) {
+        val opt_row: opt[*opcode_row.Row] = opcode_table.at(b.instructions.data[i].opcode);
+        if (sel opt_row.none)                                                          { ret false; }
+        if (opt_row.some.effects.writes && !fills_area(w, i) && !marks_apart(w, i, l)) { ret false; }
+        i = b.instructions.data[i].next;
+    }
+    ret true;
+}
+
+# whether instruction `i` marks where the storage of a slot begins or ends that the load `l` cannot read: a slot other
+# than the root of the load's address, whose address goes nowhere but its own accesses and markers
+# (`overlap.contained`), so no address the load is formed from reaches it. a marker is the write of its own slot's
+# storage alone, as a statement's temporary begun ahead of the call it serves is (mach's lowering)
+fun marks_apart(w: *Work, i: Instruction, l: Instruction) bool {
+    val b: *Body            = body_of(w);
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (!opcode_table.marks(d.opcode) || d.operands.len != 1) { ret false; }
+    val slot: Value = d.operands.data[0];
+    if (slot == overlap.root_of(b, b.instructions.data[l].operands.data[0])) { ret false; }
+    val opt_slot: opt[Instruction] = made_by(w, slot, opcode_table.ALLOCA);
+    if (sel opt_slot.none) { ret false; }
+    ret overlap.contained(b, slot);
+}
+
+# a value about to travel and what it travels from
+# ---
+# value:  the value
+# ty:     its type
+# shape:  its shape
+# secret: whether it is secret
+rec Sent {
+    value:  Value;
+    ty:     Type;
+    shape:  table.Shape;
+    secret: bool;
+}
+
+fun sent(w: *Work, v: Value) res[Sent, refusal.Error] {
+    val b:            *Body                           = body_of(w);
+    val ty:           Type                            = b.values.data[v].type;
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[Sent, refusal.Error].err{res_shape_of.err}; }
+    ret res[Sent, refusal.Error].ok{Sent{value: v, ty: ty, shape: res_shape_of.ok, secret: b.values.data[v].secret}};
+}
+
+# the pieces of one value that travels out, at the end of out, with their
+# places
+# ---
+# w:      the lowering
+# bld:    the builder, ahead of the instruction the value travels at
+# at:     that instruction
+# side:   which value it is, for a refusal
+# x:      the value
+# passed: how it travels
+# asg:    the assignment
+# out:    the piece values
+# places: where each travels
+# direct: whether it travels with no memory between, as `Direct` states
+# held:   what a declaration states of its secrecy, which a slot it is laid in
+#         states where the value is not secret (`slot`), none for none
+fun send(w: *Work, bld: *Builder, at: Instruction, side: Side, x: Sent, passed: Passed, asg: *Assignment, out: *Vector[Value], places: *Vector[Placed], direct: bool, held: opt[Secrecy]) err[refusal.Error] {
+    var opt_slotted: opt[Secrecy] = held;
+    if (x.secret) { opt_slotted = opt[Secrecy].none{}; }
+    if (sel passed.passing.reference) {
+        if (passed.count != 1) { ret err[refusal.Error].err{refusal.Error.reason{"a value by reference that travels in other than one piece"}}; }
+        val c:        piece.Copy                = passed.passing.reference;
+        val res_made: res[Value, refusal.Error] = slot(w, x.ty, c.align, opt_slotted);
+        if (sel res_made.err) { ret err[refusal.Error].err{res_made.err}; }
+        val opt_from: opt[Instruction] = copied_from(w, x, at);
+        if (sel opt_from.some) {
+            val b:    *Body   = body_of(w);
+            val k:    Block   = block_of(b, opt_from.some);
+            var near: Builder = builder.make(w.m);
+            builder.enter(?near, w.f);
+            builder.derive(?near, opt_from.some);
+            builder.secret(?near, x.secret);
+            builder.after(?near, opt_from.some);
+            val err_copied: err[refusal.Error] = copy(w, ?near, b.instructions.data[opt_from.some].operands.data[0], res_made.ok, c.size, c.align, copy_public(w, x, opt_from.some));
+            if (sel err_copied.err) { ret err_copied; }
+            val err_done: err[refusal.Error] = built(?near);
+            if (sel err_done.err) { ret err_done; }
+            val err_noted: err[refusal.Error] = note_unused(w, opt_from.some);
+            if (sel err_noted.err) { ret err_noted; }
+        }
+        or {
+            val res_align_of: res[u64, refusal.Error] = align_of(w, x.ty);
+            if (sel res_align_of.err) { ret err[refusal.Error].err{res_align_of.err}; }
+            store(bld, res_made.ok, x.value, res_align_of.ok);
+        }
+        ret push(w, bld, out, places, res_made.ok, piece.piece(asg, passed.first));
+    }
+    if (passed.count == 0) { ret err[refusal.Error].ok{}; }
+    if (sel side.argument) {
+        val res_block: res[opt[u64], refusal.Error] = laid(w, x.ty, passed, asg);
+        if (sel res_block.err) { ret err[refusal.Error].err{res_block.err}; }
+        if (sel res_block.ok.some) {
+            val res_size: res[u64, refusal.Error] = size_of(w, x.ty);
+            if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
+            val res_align_of: res[u64, refusal.Error] = align_of(w, x.ty);
+            if (sel res_align_of.err) { ret err[refusal.Error].err{res_align_of.err}; }
+            var source:   Value            = x.value;
+            var placed:   bool             = false;
+            var public:   bool             = false;
+            val opt_from: opt[Instruction] = loaded(w, x.value);
+            if (sel opt_from.some) {
+                if (stands_until(w, opt_from.some, at)) {
+                    source = body_of(w).instructions.data[opt_from.some].operands.data[0];
+                    placed = true;
+                    public = copy_public(w, x, opt_from.some);
+                    val err_noted: err[refusal.Error] = note_unused(w, opt_from.some);
+                    if (sel err_noted.err) { ret err_noted; }
+                }
+            }
+            if (!placed) {
+                val res_home: res[Value, refusal.Error] = slot(w, x.ty, res_align_of.ok, opt_slotted);
+                if (sel res_home.err) { ret err[refusal.Error].err{res_home.err}; }
+                val opt_read: opt[Instruction] = copied_from(w, x, at);
+                if (sel opt_read.some) {
+                    val b:    *Body   = body_of(w);
+                    val k:    Block   = block_of(b, opt_read.some);
+                    var near: Builder = builder.make(w.m);
+                    builder.enter(?near, w.f);
+                    builder.derive(?near, opt_read.some);
+                    builder.secret(?near, x.secret);
+                    builder.after(?near, opt_read.some);
+                    val err_copied: err[refusal.Error] = copy(w, ?near, b.instructions.data[opt_read.some].operands.data[0], res_home.ok, res_size.ok, res_align_of.ok, copy_public(w, x, opt_read.some));
+                    if (sel err_copied.err) { ret err_copied; }
+                    val err_done: err[refusal.Error] = built(?near);
+                    if (sel err_done.err) { ret err_done; }
+                    val err_noted: err[refusal.Error] = note_unused(w, opt_read.some);
+                    if (sel err_noted.err) { ret err_noted; }
+                }
+                or { store(bld, res_home.ok, x.value, res_align_of.ok); }
+                source = res_home.ok;
+            }
+            ret copy(w, bld, source, area(w, bld, x.ty, res_block.ok.some, false), res_size.ok, res_align_of.ok, public);
+        }
+    }
+    val res_memory: res[bool, refusal.Error] = through_memory(w, ?x.shape, passed.count);
+    if (sel res_memory.err) { ret err[refusal.Error].err{res_memory.err}; }
+    if (!res_memory.ok) {
+        val res_size: res[u64, refusal.Error] = size_of(w, x.ty);
+        if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
+        val p: Piece = piece.piece(asg, passed.first);
+        if (passed.count == 1 && p.offset == 0 && p.size == res_size.ok) {
+            val res_piece_type: res[Type, refusal.Error] = piece_type(w, side, p, x.ty, true);
+            if (sel res_piece_type.err) { ret err[refusal.Error].err{res_piece_type.err}; }
+            val res_convert: res[Value, refusal.Error] = convert(w, bld, x.value, x.ty, res_piece_type.ok);
+            if (sel res_convert.err) { ret err[refusal.Error].err{res_convert.err}; }
+            ret push(w, bld, out, places, res_convert.ok, p);
+        }
+        val res_bits: res[Type, refusal.Error] = integer_type(w, (res_size.ok * 8)::u32);
+        if (sel res_bits.err) { ret err[refusal.Error].err{res_bits.err}; }
+        val res_whole: res[Value, refusal.Error] = convert(w, bld, x.value, x.ty, res_bits.ok);
+        if (sel res_whole.err) { ret err[refusal.Error].err{res_whole.err}; }
+        var n: u32 = 0;
+        for (n < passed.count) {
+            val q: Piece = piece.piece(asg, passed.first + n);
+            if (q.offset + q.size > res_size.ok) { ret err[refusal.Error].err{refusal.Error.pieces{Uncarried.partial{side}}}; }
+            var part: Value = res_whole.ok;
+            if (q.offset > 0) {
+                val res_integer: res[Value, refusal.Error] = integer(w, res_bits.ok, q.offset * 8);
+                if (sel res_integer.err) { ret err[refusal.Error].err{res_integer.err}; }
+                part = binary(bld, opcode_table.SHR_U, part, res_integer.ok);
+            }
+            val res_narrow: res[Type, refusal.Error] = integer_type(w, width_for(q.size));
+            if (sel res_narrow.err)                      { ret err[refusal.Error].err{res_narrow.err}; }
+            if (!table.same(res_narrow.ok, res_bits.ok)) { part = unary(bld, opcode_table.TRUNC, part, res_narrow.ok); }
+            val res_piece_type: res[Type, refusal.Error] = piece_type(w, side, q, x.ty, false);
+            if (sel res_piece_type.err) { ret err[refusal.Error].err{res_piece_type.err}; }
+            val res_convert: res[Value, refusal.Error] = convert(w, bld, part, res_narrow.ok, res_piece_type.ok);
+            if (sel res_convert.err) { ret err[refusal.Error].err{res_convert.err}; }
+            val err_pushed: err[refusal.Error] = push(w, bld, out, places, res_convert.ok, q);
+            if (sel err_pushed.err) { ret err_pushed; }
+            n = n + 1;
+        }
+        ret err[refusal.Error].ok{};
+    }
+    val res_align_of: res[u64, refusal.Error] = align_of(w, x.ty);
+    if (sel res_align_of.err) { ret err[refusal.Error].err{res_align_of.err}; }
+    val opt_from: opt[Instruction] = loaded(w, x.value);
+    if (direct && sel opt_from.none) { ret send_direct(w, bld, side, x, passed, asg, out, places); }
+    if (sel opt_from.some) {
+        val b:    *Body   = body_of(w);
+        val k:    Block   = block_of(b, opt_from.some);
+        var near: Builder = builder.make(w.m);
+        builder.enter(?near, w.f);
+        builder.derive(?near, opt_from.some);
+        builder.secret(?near, x.secret);
+        builder.after(?near, opt_from.some);
+        val base:   Value         = b.instructions.data[opt_from.some].operands.data[0];
+        val stated: bool          = b.instructions.data[opt_from.some].metadata.flags.public && !x.secret;
+        var reads:  Vector[Value] = vector.init[Value](w.m.a);
+        fin { vector.dnit[Value](?reads); }
+        var n: u32 = 0;
+        for (n < passed.count) {
+            val p:              Piece                    = piece.piece(asg, passed.first + n);
+            val res_piece_type: res[Type, refusal.Error] = piece_type(w, side, p, x.ty, false);
+            if (sel res_piece_type.err) { ret err[refusal.Error].err{res_piece_type.err}; }
+            val res_read_piece: res[Value, refusal.Error] = read_piece(w, ?near, base, x.ty, p, res_align_of.ok, res_piece_type.ok, stated);
+            if (sel res_read_piece.err) { ret err[refusal.Error].err{res_read_piece.err}; }
+            val res_kept: res[usize, allocator.Error] = vector.push[Value](?reads, res_read_piece.ok);
+            if (sel res_kept.err) { ret refusal.lost(res_kept.err); }
+            n = n + 1;
+        }
+        val err_done: err[refusal.Error] = built(?near);
+        if (sel err_done.err) { ret err_done; }
+        n = 0;
+        for (n < passed.count) {
+            val err_pushed: err[refusal.Error] = push(w, bld, out, places, reads.data[n], piece.piece(asg, passed.first + n));
+            if (sel err_pushed.err) { ret err_pushed; }
+            n = n + 1;
+        }
+        ret note_unused(w, opt_from.some);
+    }
+    val res_home: res[Value, refusal.Error] = slot(w, x.ty, res_align_of.ok, opt_slotted);
+    if (sel res_home.err) { ret err[refusal.Error].err{res_home.err}; }
+    store(bld, res_home.ok, x.value, res_align_of.ok);
+    var n: u32 = 0;
+    for (n < passed.count) {
+        val p:              Piece                    = piece.piece(asg, passed.first + n);
+        val res_piece_type: res[Type, refusal.Error] = piece_type(w, side, p, x.ty, false);
+        if (sel res_piece_type.err) { ret err[refusal.Error].err{res_piece_type.err}; }
+        val res_read_piece: res[Value, refusal.Error] = read_piece(w, bld, res_home.ok, x.ty, p, res_align_of.ok, res_piece_type.ok, false);
+        if (sel res_read_piece.err) { ret err[refusal.Error].err{res_read_piece.err}; }
+        val err_pushed: err[refusal.Error] = push(w, bld, out, places, res_read_piece.ok, p);
+        if (sel err_pushed.err) { ret err_pushed; }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# a leaf of a value that travels out with no memory between, taken out of it
+# by `extract`
+# ---
+# offset: its byte offset in the value
+# size:   its bytes
+# value:  the leaf
+rec Taken {
+    offset: u64;
+    size:   u64;
+    value:  Value;
+}
+
+# the pieces of a value that travels out with no memory between, each formed
+# from the leaves it holds, which `extract` takes out of the value, so a value
+# built of leaves is never stored to be read. a value loaded from memory reads
+# its pieces from that memory instead, one load for each
+fun send_direct(w: *Work, bld: *Builder, side: Side, x: Sent, passed: Passed, asg: *Assignment, out: *Vector[Value], places: *Vector[Placed]) err[refusal.Error] {
+    var parts: Vector[Taken] = vector.init[Taken](w.m.a);
+    fin { vector.dnit[Taken](?parts); }
+    val err_taken: err[refusal.Error] = taken(w, bld, x.value, x.ty, 0, ?parts);
+    if (sel err_taken.err) { ret err_taken; }
+    var n: u32 = 0;
+    for (n < passed.count) {
+        val p:              Piece                    = piece.piece(asg, passed.first + n);
+        val res_piece_type: res[Type, refusal.Error] = piece_type(w, side, p, x.ty, false);
+        if (sel res_piece_type.err) { ret err[refusal.Error].err{res_piece_type.err}; }
+        val res_formed: res[Value, refusal.Error] = formed(w, bld, ?parts, p, res_piece_type.ok);
+        if (sel res_formed.err) { ret err[refusal.Error].err{res_formed.err}; }
+        val err_pushed: err[refusal.Error] = push(w, bld, out, places, res_formed.ok, p);
+        if (sel err_pushed.err) { ret err_pushed; }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+fun extract(bld: *Builder, whole: Value, index: u32) Value {
+    var ops: [1]Value     = [1]Value{whole};
+    var imm: [1]Immediate = [1]Immediate{Immediate.member{index}};
+    ret make(bld, opcode_table.EXTRACT, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+# the leaves of v, a value of a type made of leaves at an offset in the value
+# that travels, taken out by `extract` at the end of out. a union's leaf is its
+# cover (mirl.legal.leaves) and a member of no bytes has none
+fun taken(w: *Work, bld: *Builder, v: Value, ty: Type, base: u64, out: *Vector[Taken]) err[refusal.Error] {
+    val opt_one: opt[u64] = leaves.scalar(w.l, w.basis, ty);
+    if (sel opt_one.some) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Taken](out, Taken{offset: base, size: opt_one.some, value: v});
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        ret err[refusal.Error].ok{};
+    }
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret err[refusal.Error].err{res_shape_of.err}; }
+    val shape: table.Shape = res_shape_of.ok;
+    if (sel shape.union) {
+        val opt_cover: opt[u32] = leaves.cover(w.l, w.basis, ty, WORD);
+        if (sel opt_cover.none) { ret err[refusal.Error].err{refusal.Error.reason{"a union that travels with no memory between with no cover"}}; }
+        ret taken(w, bld, extract(bld, v, opt_cover.some), shape.union.members.data[opt_cover.some], base, out);
+    }
+    var i: usize = 0;
+    for (i < member_count(?shape)) {
+        val mt:       Type                    = member_type(?shape, i);
+        val res_size: res[u64, refusal.Error] = size_of(w, mt);
+        if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
+        if (res_size.ok > 0) {
+            val res_member_offset: res[u64, refusal.Error] = member_offset(w, ty, ?shape, i);
+            if (sel res_member_offset.err) { ret err[refusal.Error].err{res_member_offset.err}; }
+            val err_member: err[refusal.Error] = taken(w, bld, extract(bld, v, i::u32), mt, base + res_member_offset.ok, out);
+            if (sel err_member.err) { ret err_member; }
+        }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# a piece of a value that travels with no memory between, of a type, formed
+# from the leaves it holds: a leaf that is the whole piece as it is, and
+# otherwise each leaf's bits moved up to its offset in the piece and joined
+# by `or`, so a byte of the piece no leaf holds is zero
+fun formed(w: *Work, bld: *Builder, parts: *Vector[Taken], p: Piece, ty: Type) res[Value, refusal.Error] {
+    val res_narrow: res[Type, refusal.Error] = integer_type(w, width_for(p.size));
+    if (sel res_narrow.err) { ret res[Value, refusal.Error].err{res_narrow.err}; }
+    var acc:  Value = 0;
+    var some: bool  = false;
+    var i:    usize = 0;
+    for (i < parts.len) {
+        val part: Taken = parts.data[i];
+        if (part.offset >= p.offset && part.offset + part.size <= p.offset + p.size) {
+            if (part.offset == p.offset && part.size == p.size && table.same(body_of(w).values.data[part.value].type, ty)) {
+                ret res[Value, refusal.Error].ok{part.value};
+            }
+            val res_raw: res[Value, refusal.Error] = as_bits(w, bld, part.value);
+            if (sel res_raw.err) { ret res_raw; }
+            var bits: Value = res_raw.ok;
+            if (!table.same(body_of(w).values.data[bits].type, res_narrow.ok)) { bits = unary(bld, opcode_table.EXT_U, bits, res_narrow.ok); }
+            if (part.offset > p.offset) {
+                val res_integer: res[Value, refusal.Error] = integer(w, res_narrow.ok, (part.offset - p.offset) * 8);
+                if (sel res_integer.err) { ret res_integer; }
+                bits = binary(bld, opcode_table.SHL, bits, res_integer.ok);
+            }
+            if (some) { acc = binary(bld, opcode_table.OR, acc, bits); }
+            or        { acc = bits; }
+            some = true;
+        }
+        i = i + 1;
+    }
+    if (!some) {
+        val res_nothing: res[Value, refusal.Error] = integer(w, res_narrow.ok, 0);
+        if (sel res_nothing.err) { ret res_nothing; }
+        acc = res_nothing.ok;
+    }
+    ret convert(w, bld, acc, res_narrow.ok, ty);
+}
+
+# how many members a structure or elements an array has, zero for any other
+fun member_count(s: *table.Shape) usize {
+    if (sel s.structure) { ret s.structure.members.size; }
+    if (sel s.array)     { ret s.array.count::usize; }
+    ret 0;
+}
+
+# the type of member i of a structure or element i of an array
+fun member_type(s: *table.Shape, i: usize) Type {
+    if (sel s.structure) { ret s.structure.members.data[i]; }
+    if (sel s.array)     { ret s.array.element; }
+    ret 0;
+}
+
+# the byte offset of member i of a structure or element i of an array of type ty
+fun member_offset(w: *Work, ty: Type, s: *table.Shape, i: usize) res[u64, refusal.Error] {
+    if (sel s.array) {
+        val res_step: res[u64, target_record.Error] = layout.stride(w.l, ty, table.DEFAULT_SPACE);
+        if (sel res_step.err) { ret res[u64, refusal.Error].err{refusal.Error.reason{"a value of a call with no size in memory"}}; }
+        ret res[u64, refusal.Error].ok{res_step.ok * i::u64};
+    }
+    val res_offset: res[u64, target_record.Error] = layout.offset(w.l, ty, table.DEFAULT_SPACE, i::u32);
+    if (sel res_offset.err) { ret res[u64, refusal.Error].err{refusal.Error.reason{"a value of a call with no size in memory"}}; }
+    ret res[u64, refusal.Error].ok{res_offset.ok};
+}
+
+fun insert(bld: *Builder, whole: Value, part: Value, index: u32) Value {
+    var ops: [2]Value     = [2]Value{whole, part};
+    var imm: [1]Immediate = [1]Immediate{Immediate.member{index}};
+    ret make(bld, opcode_table.INSERT, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 1});
+}
+
+# a zero of a type in the function
+fun zero(w: *Work, ty: Type) res[Value, refusal.Error] {
+    val res_made: res[Constant, module.Error] = module.add_constant(w.m, ConstantData.zero{ty});
+    if (sel res_made.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    val res_constant: res[Value, module.Error] = body.constant(w.m, w.f, res_made.ok);
+    if (sel res_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_constant.err}}; }
+    ret res[Value, refusal.Error].ok{res_constant.ok};
+}
+
+# the bits of a scalar as the integer of its width: an integer as it is, a
+# pointer by its conversion and a float by its encoding
+fun as_bits(w: *Work, bld: *Builder, v: Value) res[Value, refusal.Error] {
+    val ty:           Type                            = body_of(w).values.data[v].type;
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err)        { ret res[Value, refusal.Error].err{res_shape_of.err}; }
+    if (sel res_shape_of.ok.integer) { ret res[Value, refusal.Error].ok{v}; }
+    val res_size: res[u64, refusal.Error] = size_of(w, ty);
+    if (sel res_size.err) { ret res[Value, refusal.Error].err{res_size.err}; }
+    val res_bits: res[Type, refusal.Error] = integer_type(w, (res_size.ok * 8)::u32);
+    if (sel res_bits.err) { ret res[Value, refusal.Error].err{res_bits.err}; }
+    ret convert(w, bld, v, ty, res_bits.ok);
+}
+
+# a leaf at an offset with a size read out of the piece value that holds it
+# whole: the piece's bits moved down from the leaf's offset in it, cut to the
+# leaf's bytes and read as its type. a piece of the leaf's own type at its
+# offset is the leaf
+fun leaf_from(w: *Work, bld: *Builder, v: Value, p: Piece, offset: u64, size: u64, ty: Type) res[Value, refusal.Error] {
+    if (offset == p.offset && table.same(body_of(w).values.data[v].type, ty)) { ret res[Value, refusal.Error].ok{v}; }
+    val res_raw: res[Value, refusal.Error] = as_bits(w, bld, v);
+    if (sel res_raw.err) { ret res_raw; }
+    val from: Type  = body_of(w).values.data[res_raw.ok].type;
+    var bits: Value = res_raw.ok;
+    if (offset > p.offset) {
+        val res_integer: res[Value, refusal.Error] = integer(w, from, (offset - p.offset) * 8);
+        if (sel res_integer.err) { ret res_integer; }
+        bits = binary(bld, opcode_table.SHR_U, bits, res_integer.ok);
+    }
+    val res_narrow: res[Type, refusal.Error] = integer_type(w, (size * 8)::u32);
+    if (sel res_narrow.err) { ret res[Value, refusal.Error].err{res_narrow.err}; }
+    val res_cut: res[Value, refusal.Error] = convert(w, bld, bits, from, res_narrow.ok);
+    if (sel res_cut.err) { ret res_cut; }
+    ret convert(w, bld, res_cut.ok, res_narrow.ok, ty);
+}
+
+# a value that arrives with no memory between built from its pieces: each
+# member from a zero of the type by `insert`, a leaf read out of the piece that
+# holds it whole and a member of no bytes left zero. a union is its cover's
+# leaf put in the cover (mirl.legal.leaves)
+# ---
+# base:   the byte offset of the value being built in the whole that traveled
+# pieces: the piece values, one per piece of passed
+fun assemble(w: *Work, bld: *Builder, ty: Type, base: u64, asg: *Assignment, passed: Passed, pieces: Slice[Value]) res[Value, refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[Value, refusal.Error].err{res_shape_of.err}; }
+    val shape:    table.Shape               = res_shape_of.ok;
+    val res_made: res[Value, refusal.Error] = zero(w, ty);
+    if (sel res_made.err) { ret res_made; }
+    if (sel shape.union) {
+        val opt_cover: opt[u32] = leaves.cover(w.l, w.basis, ty, WORD);
+        if (sel opt_cover.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a union that arrives with no memory between with no cover"}}; }
+        val mt:       Type                    = shape.union.members.data[opt_cover.some];
+        val res_size: res[u64, refusal.Error] = size_of(w, mt);
+        if (sel res_size.err) { ret res[Value, refusal.Error].err{res_size.err}; }
+        val opt_held_in: opt[u32] = holding(asg, passed, base, res_size.ok);
+        if (sel opt_held_in.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a leaf of a value that arrives with no memory between that no piece holds whole"}}; }
+        val res_leaf_from: res[Value, refusal.Error] = leaf_from(w, bld, pieces.data[(opt_held_in.some - passed.first)::usize], piece.piece(asg, opt_held_in.some), base, res_size.ok, mt);
+        if (sel res_leaf_from.err) { ret res_leaf_from; }
+        ret res[Value, refusal.Error].ok{insert(bld, res_made.ok, res_leaf_from.ok, opt_cover.some)};
+    }
+    var acc: Value = res_made.ok;
+    var i:   usize = 0;
+    for (i < member_count(?shape)) {
+        val mt:       Type                    = member_type(?shape, i);
+        val res_size: res[u64, refusal.Error] = size_of(w, mt);
+        if (sel res_size.err) { ret res[Value, refusal.Error].err{res_size.err}; }
+        if (res_size.ok > 0) {
+            val res_member_offset: res[u64, refusal.Error] = member_offset(w, ty, ?shape, i);
+            if (sel res_member_offset.err) { ret res[Value, refusal.Error].err{res_member_offset.err}; }
+            val offset:        u64                       = base + res_member_offset.ok;
+            val opt_one:       opt[u64]                  = leaves.scalar(w.l, w.basis, mt);
+            var res_leaf_from: res[Value, refusal.Error] = res[Value, refusal.Error].ok{0};
+            if (sel opt_one.some) {
+                val opt_holding: opt[u32] = holding(asg, passed, offset, opt_one.some);
+                if (sel opt_holding.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"a leaf of a value that arrives with no memory between that no piece holds whole"}}; }
+                res_leaf_from = leaf_from(w, bld, pieces.data[(opt_holding.some - passed.first)::usize], piece.piece(asg, opt_holding.some), offset, opt_one.some, mt);
+            }
+            or                         { res_leaf_from = assemble(w, bld, mt, offset, asg, passed, pieces); }
+            if (sel res_leaf_from.err) { ret res_leaf_from; }
+            acc = insert(bld, acc, res_leaf_from.ok, i::u32);
+        }
+        i = i + 1;
+    }
+    ret res[Value, refusal.Error].ok{acc};
+}
+
+# a scalar as another scalar of the same size: an integer and a pointer by
+# their conversion, any other pair by its bits
+fun convert(w: *Work, bld: *Builder, v: Value, from: Type, to: Type) res[Value, refusal.Error] {
+    if (table.same(from, to)) { ret res[Value, refusal.Error].ok{v}; }
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, from);
+    if (sel res_shape_of.err) { ret res[Value, refusal.Error].err{res_shape_of.err}; }
+    val res_to_shape: res[table.Shape, refusal.Error] = shape_of(w, to);
+    if (sel res_to_shape.err) { ret res[Value, refusal.Error].err{res_to_shape.err}; }
+    if (sel res_shape_of.ok.integer) {
+        if (sel res_to_shape.ok.integer) {
+            if (res_shape_of.ok.integer.width > res_to_shape.ok.integer.width) { ret res[Value, refusal.Error].ok{unary(bld, opcode_table.TRUNC, v, to)}; }
+            ret res[Value, refusal.Error].ok{unary(bld, opcode_table.EXT_U, v, to)};
+        }
+    }
+    if (sel res_shape_of.ok.pointer && sel res_to_shape.ok.integer) { ret res[Value, refusal.Error].ok{unary(bld, opcode_table.PTRTOINT, v, to)}; }
+    if (sel res_shape_of.ok.integer && sel res_to_shape.ok.pointer) { ret res[Value, refusal.Error].ok{unary(bld, opcode_table.INTTOPTR, v, to)}; }
+    ret res[Value, refusal.Error].ok{unary(bld, opcode_table.BITCAST, v, to)};
+}
+
+# the bits of a place, the width a piece extended to fill it is made, 0 for
+# a place no extension fills
+fun place_bits(w: *Work, p: Place) u32 {
+    if (sel p.register) {
+        val regs: *Registers = held(w.convention);
+        if (regs == nil) { ret 0; }
+        val res_bits: res[opt[u64], rf.Absent] = rf.width(regs.context.view, p.register);
+        if (sel res_bits.ok) {
+            if (sel res_bits.ok.some) { ret res_bits.ok.some::u32; }
+        }
+        ret 0;
+    }
+    if (sel p.stack) {
+        val res_bits: res[u32, table.Error] = table.width(?w.m.types, w.offset);
+        if (sel res_bits.ok) { ret res_bits.ok; }
+    }
+    if (sel p.operand) {
+        if (sel w.convention.row.word.bits) { ret w.convention.row.word.bits; }
+    }
+    ret 0;
+}
+
+# the width an integer piece of a width is extended to, which its fill says
+# how to fill, none when it travels as it is
+fun widened(w: *Work, p: Piece, width: u32) opt[u32] {
+    if (!(sel p.fill.sign) && !(sel p.fill.zero)) { ret opt[u32].none{}; }
+    val bits: u32 = place_bits(w, p.place);
+    if (bits <= width) { ret opt[u32].none{}; }
+    ret opt[u32].some{bits};
+}
+
+# a piece's place, its fill exact once the pass made the extension it states
+fun placed_as(p: Piece, extended: bool) Placed {
+    if (extended) { ret Placed{place: p.place, scale: p.scale, fill: Fill.exact{}}; }
+    ret Placed{place: p.place, scale: p.scale, fill: p.fill};
+}
+
+# a piece and its place at the end of the lists, an integer the fill extends
+# made the place's width by the extension, so its place holds it exact
+fun push(w: *Work, bld: *Builder, out: *Vector[Value], places: *Vector[Placed], v: Value, p: Piece) err[refusal.Error] {
+    var given:        Value                           = v;
+    var extended:     bool                            = false;
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, body_of(w).values.data[v].type);
+    if (sel res_shape_of.err) { ret err[refusal.Error].err{res_shape_of.err}; }
+    if (sel res_shape_of.ok.integer) {
+        val opt_widened: opt[u32] = widened(w, p, res_shape_of.ok.integer.width);
+        if (sel opt_widened.some) {
+            val res_integer_type: res[Type, refusal.Error] = integer_type(w, opt_widened.some);
+            if (sel res_integer_type.err) { ret err[refusal.Error].err{res_integer_type.err}; }
+            if (sel p.fill.sign)          { given = unary(bld, opcode_table.EXT_S, v, res_integer_type.ok); }
+            or                            { given = unary(bld, opcode_table.EXT_U, v, res_integer_type.ok); }
+            extended = true;
+        }
+    }
+    val res_out_pushed: res[usize, allocator.Error] = vector.push[Value](out, given);
+    if (sel res_out_pushed.err) { ret refusal.lost(res_out_pushed.err); }
+    val res_places_pushed: res[usize, allocator.Error] = vector.push[Placed](places, placed_as(p, extended));
+    if (sel res_places_pushed.err) { ret refusal.lost(res_places_pushed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+fun place_of(places: *Vector[Placed], p: Piece) err[refusal.Error] {
+    val res_places_pushed: res[usize, allocator.Error] = vector.push[Placed](places, Placed{place: p.place, scale: p.scale, fill: p.fill});
+    if (sel res_places_pushed.err) { ret refusal.lost(res_places_pushed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+# the types of the pieces of one value that travels in, at the end of out,
+# with their places
+fun receive_types(w: *Work, side: Side, ty: Type, passed: Passed, asg: *Assignment, out: *Vector[Type], places: *Vector[Placed]) err[refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret err[refusal.Error].err{res_shape_of.err}; }
+    val res_memory: res[bool, refusal.Error] = through_memory(w, ?res_shape_of.ok, passed.count);
+    if (sel res_memory.err) { ret err[refusal.Error].err{res_memory.err}; }
+    var whole: bool = false;
+    if (!(sel passed.passing.reference) && !res_memory.ok && passed.count == 1) {
+        val res_size: res[u64, refusal.Error] = size_of(w, ty);
+        if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
+        val p: Piece = piece.piece(asg, passed.first);
+        whole = p.offset == 0 && p.size == res_size.ok;
+    }
+    if (sel passed.passing.reference && passed.count > 1) { ret err[refusal.Error].err{refusal.Error.reason{"a value by reference that travels in more than one piece"}}; }
+    var n: u32 = 0;
+    for (n < passed.count) {
+        val p:        Piece = piece.piece(asg, passed.first + n);
+        var t:        Type  = w.ptr;
+        var extended: bool  = false;
+        if (!(sel passed.passing.reference)) {
+            val res_piece_type: res[Type, refusal.Error] = piece_type(w, side, p, ty, whole);
+            if (sel res_piece_type.err) { ret err[refusal.Error].err{res_piece_type.err}; }
+            t = res_piece_type.ok;
+            val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, t);
+            if (sel res_shape_of.err) { ret err[refusal.Error].err{res_shape_of.err}; }
+            if (sel res_shape_of.ok.integer) {
+                val opt_widened: opt[u32] = widened(w, p, res_shape_of.ok.integer.width);
+                if (sel opt_widened.some) {
+                    val res_wide: res[Type, refusal.Error] = integer_type(w, opt_widened.some);
+                    if (sel res_wide.err) { ret err[refusal.Error].err{res_wide.err}; }
+                    t        = res_wide.ok;
+                    extended = true;
+                }
+            }
+        }
+        val res_pushed: res[usize, allocator.Error] = vector.push[Type](out, t);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        val res_placed: res[usize, allocator.Error] = vector.push[Placed](places, placed_as(p, extended));
+        if (sel res_placed.err) { ret refusal.lost(res_placed.err); }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# rebuild one value that traveled in from its pieces, at the builder
+# ---
+# direct: whether it arrives with no memory between, built by `insert`
+# home:   the slot an aggregate by value is rebuilt in otherwise
+# pieces: its piece values, one per piece of passed
+# held:   how the reads of a copy by reference are stated, as the declaration states the parameter it carries,
+#         whose copy the caller made of a value of its type
+fun rebuild(w: *Work, bld: *Builder, ty: Type, passed: Passed, direct: bool, asg: *Assignment, home: opt[Value], pieces: Slice[Value], held: Secrecy) res[Value, refusal.Error] {
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[Value, refusal.Error].err{res_shape_of.err}; }
+    val res_align_of: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_align_of.err) { ret res[Value, refusal.Error].err{res_align_of.err}; }
+    if (sel passed.passing.reference) {
+        if (sel home.some) { ret stated_copy(w, bld, pieces.data[0], home.some, ty, res_align_of.ok, held); }
+        ret res[Value, refusal.Error].ok{stated_load(bld, pieces.data[0], ty, res_align_of.ok, sel held.public)};
+    }
+    if (direct) { ret assemble(w, bld, ty, 0, asg, passed, pieces); }
+    val res_memory: res[bool, refusal.Error] = through_memory(w, ?res_shape_of.ok, passed.count);
+    if (sel res_memory.err) { ret res[Value, refusal.Error].err{res_memory.err}; }
+    if (!res_memory.ok) {
+        val res_size: res[u64, refusal.Error] = size_of(w, ty);
+        if (sel res_size.err) { ret res[Value, refusal.Error].err{res_size.err}; }
+        val first: Piece = piece.piece(asg, passed.first);
+        if (pieces.size == 1 && first.offset == 0 && first.size == res_size.ok) {
+            val v: Value = pieces.data[0];
+            ret convert(w, bld, v, body_of(w).values.data[v].type, ty);
+        }
+        val res_bits: res[Type, refusal.Error] = integer_type(w, (res_size.ok * 8)::u32);
+        if (sel res_bits.err) { ret res[Value, refusal.Error].err{res_bits.err}; }
+        var acc: Value = 0;
+        var k:   u32   = 0;
+        for (k::usize < pieces.size) {
+            val q:          Piece                    = piece.piece(asg, passed.first + k);
+            val v:          Value                    = pieces.data[k];
+            val res_narrow: res[Type, refusal.Error] = integer_type(w, width_for(q.size));
+            if (sel res_narrow.err) { ret res[Value, refusal.Error].err{res_narrow.err}; }
+            val res_raw: res[Value, refusal.Error] = convert(w, bld, v, body_of(w).values.data[v].type, res_narrow.ok);
+            if (sel res_raw.err) { ret res_raw; }
+            var part: Value = res_raw.ok;
+            if (!table.same(res_narrow.ok, res_bits.ok)) { part = unary(bld, opcode_table.EXT_U, part, res_bits.ok); }
+            if (q.offset > 0) {
+                val res_integer: res[Value, refusal.Error] = integer(w, res_bits.ok, q.offset * 8);
+                if (sel res_integer.err) { ret res_integer; }
+                part = binary(bld, opcode_table.SHL, part, res_integer.ok);
+            }
+            if (k > 0) { acc = binary(bld, opcode_table.OR, acc, part); }
+            or         { acc = part; }
+            k = k + 1;
+        }
+        ret convert(w, bld, acc, res_bits.ok, ty);
+    }
+    if (sel home.none) { ret res[Value, refusal.Error].err{refusal.Error.reason{"an aggregate rebuilt with no slot"}}; }
+    var n: u32 = 0;
+    for (n::usize < pieces.size) {
+        val p:         Piece              = piece.piece(asg, passed.first + n);
+        val v:         Value              = pieces.data[n];
+        val pt:        Type               = body_of(w).values.data[v].type;
+        val err_write: err[refusal.Error] = write(w, bld, home.some, p.offset, p.size, res_align_of.ok, v, pt);
+        if (sel err_write.err) { ret res[Value, refusal.Error].err{err_write.err}; }
+        n = n + 1;
+    }
+    ret res[Value, refusal.Error].ok{load(bld, home.some, ty, res_align_of.ok)};
+}
+
+# the slot a value that travels in is rebuilt in, or none when it needs none,
+# as one that arrives with no memory between or one by reference whose
+# declaration `held` states it public or secret whole
+fun home_for(w: *Work, ty: Type, passed: Passed, direct: bool, held: Secrecy) res[opt[Value], refusal.Error] {
+    if (sel passed.passing.reference && !(sel held.ranges)) { ret res[opt[Value], refusal.Error].ok{opt[Value].none{}}; }
+    if (direct)                                             { ret res[opt[Value], refusal.Error].ok{opt[Value].none{}}; }
+    if (sel passed.passing.reference) {
+        val res_align_of: res[u64, refusal.Error] = align_of(w, ty);
+        if (sel res_align_of.err) { ret res[opt[Value], refusal.Error].err{res_align_of.err}; }
+        val res_made: res[Value, refusal.Error] = slot(w, ty, res_align_of.ok, opt[Secrecy].some{held});
+        if (sel res_made.err) { ret res[opt[Value], refusal.Error].err{res_made.err}; }
+        ret res[opt[Value], refusal.Error].ok{opt[Value].some{res_made.ok}};
+    }
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err) { ret res[opt[Value], refusal.Error].err{res_shape_of.err}; }
+    val res_memory: res[bool, refusal.Error] = through_memory(w, ?res_shape_of.ok, passed.count);
+    if (sel res_memory.err) { ret res[opt[Value], refusal.Error].err{res_memory.err}; }
+    if (!res_memory.ok)     { ret res[opt[Value], refusal.Error].ok{opt[Value].none{}}; }
+    val res_align_of: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_align_of.err) { ret res[opt[Value], refusal.Error].err{res_align_of.err}; }
+    val res_made: res[Value, refusal.Error] = slot(w, ty, res_align_of.ok, opt[Secrecy].none{});
+    if (sel res_made.err) { ret res[opt[Value], refusal.Error].err{res_made.err}; }
+    ret res[opt[Value], refusal.Error].ok{opt[Value].some{res_made.ok}};
+}
+
+# where a signature's values travel, as the row it names places them. the
+# abi legalisation lowers every call, entry and return through this query, so
+# a front end that asks it reads the placement the pass makes
+# ---
+# row:        the resolved row the signature names
+# assignment: each argument's and result's passing and pieces, the piece the
+#             address of a result by reference travels in, and the bytes of
+#             the outgoing argument area the arguments take
+# named:      how many of the arguments are named, the rest placed as the
+#             row places unnamed values
+# align:      the stack's alignment at a call, 0 for a row with no stack in
+#             memory
+# direct:     which arguments and results arrive with no memory between
+pub rec Passage {
+    row:        *Resolved;
+    assignment: Assignment;
+    named:      Named;
+    align:      u64;
+    direct:     Direct;
+}
+
+# which values of a signature arrive with no memory between, at the entry for
+# an argument and after the call for a result: one by value whose type is made
+# of leaves (mirl.legal.leaves), each of which lies whole in one of its pieces,
+# every piece of at most a word and fixed, in a general register or a stack or
+# operand place as an integer, or in a float or vector register as a float of
+# a format the build holds. the pass builds such a value from its pieces by
+# `insert`, and where it travels out forms each piece from its leaves, unless
+# it is loaded from memory, which reads a piece in one load. a value marked
+# secret takes the memory path, whatever the signature says
+# ---
+# arguments: one per argument, in order
+# results:   one per result, in order
+pub rec Direct {
+    arguments: Vector[bool];
+    results:   Vector[bool];
+}
+
+# why a signature was not placed
+# ---
+# signature: the type is no function type of the layout's table
+# row:       the signature names a convention row the target does not state,
+#            none for the default
+# classify:  the row refused to classify it, or the target carries no row
+pub tag Error: u8 {
+    signature: table.Error;
+    row:       opt[Calling];
+    classify:  call.Error;
+}
+
+# place a signature's arguments and results under the row it names, the one
+# classification of a call, an entry or a return
+# ---
+# a:         the allocator the passage's storage comes from
+# b:         the build, whose resolved rows classify
+# l:         the layout of the module the signature is in
+# signature: the function type
+# named:     how many of its arguments a call names, `all` for an entry
+# ret:       the passage, given back with `dnit`, or why it was not placed
+pub fun placement(a: *allocator.Allocator, b: *Build, l: *Layout, signature: Type, named: Named) res[Passage, Error] {
+    var d: call.Described = call.described(a);
+    fin { call.forget(?d); }
+    ret placed_through(a, b, l, ?d, signature, named);
+}
+
+# place a signature as `placement` does, reading its types from the views
+# described over the layout so far
+fun placed_through(a: *allocator.Allocator, b: *Build, l: *Layout, d: *call.Described, signature: Type, named: Named) res[Passage, Error] {
+    val res_signature: res[table.Function, table.Error] = table.signature(l.types, signature);
+    if (sel res_signature.err) { ret res[Passage, Error].err{Error.signature{res_signature.err}}; }
+    val stated: Declared = b.basis.target.convention;
+    if (sel stated.uncarried) { ret res[Passage, Error].err{Error.classify{call.Error.uncarried{}}}; }
+    if (!(sel stated.rows))   { ret res[Passage, Error].err{Error.classify{call.Error.unstated{}}}; }
+    val opt_row: opt[*Resolved] = build_record.under(b, res_signature.ok.convention);
+    if (sel opt_row.none) { ret res[Passage, Error].err{Error.row{res_signature.ok.convention}}; }
+    val res_classify_in: res[Assignment, call.Error] = call.classify_in(a, l, d, opt_row.some, signature, Statement{aggregates: Aggregates.platform{}, named: named});
+    if (sel res_classify_in.err) { ret res[Passage, Error].err{Error.classify{res_classify_in.err}}; }
+    var align: u64   = 0;
+    val stack: Stack = opt_row.some.row.stack;
+    if (sel stack.memory) { align = stack.memory.align; }
+    var asg:        Assignment                   = res_classify_in.ok;
+    val res_direct: res[Direct, allocator.Error] = directs(a, b, l, opt_row.some, res_signature.ok, ?asg);
+    if (sel res_direct.err) {
+        piece.dnit(?asg);
+        ret res[Passage, Error].err{Error.classify{call.Error.alloc{res_direct.err}}};
+    }
+    ret res[Passage, Error].ok{Passage{row: opt_row.some, assignment: asg, named: named, align: align, direct: res_direct.ok}};
+}
+
+# which of a signature's values cross its boundary with no memory between
+fun directs(a: *allocator.Allocator, b: *Build, l: *Layout, row: *Resolved, f: table.Function, asg: *Assignment) res[Direct, allocator.Error] {
+    var d:         Direct       = Direct{arguments: vector.init[bool](a), results: vector.init[bool](a)};
+    var leaves_of: Vector[Leaf] = vector.init[Leaf](a);
+    fin { vector.dnit[Leaf](?leaves_of); }
+    var i: usize = 0;
+    for (i < asg.arguments.len) {
+        var res_one: res[bool, allocator.Error] = res[bool, allocator.Error].ok{false};
+        if (i < f.params.size) { res_one = crosses(b, l, row, f.params.data[i], asg.arguments.data[i], asg, ?leaves_of); }
+        if (sel res_one.err) {
+            forget_direct(?d);
+            ret res[Direct, allocator.Error].err{res_one.err};
+        }
+        val res_pushed: res[usize, allocator.Error] = vector.push[bool](?d.arguments, res_one.ok);
+        if (sel res_pushed.err) {
+            forget_direct(?d);
+            ret res[Direct, allocator.Error].err{res_pushed.err};
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < asg.results.len) {
+        var res_one: res[bool, allocator.Error] = res[bool, allocator.Error].ok{false};
+        if (i < f.results.size) { res_one = crosses(b, l, row, f.results.data[i], asg.results.data[i], asg, ?leaves_of); }
+        if (sel res_one.err) {
+            forget_direct(?d);
+            ret res[Direct, allocator.Error].err{res_one.err};
+        }
+        val res_pushed: res[usize, allocator.Error] = vector.push[bool](?d.results, res_one.ok);
+        if (sel res_pushed.err) {
+            forget_direct(?d);
+            ret res[Direct, allocator.Error].err{res_pushed.err};
+        }
+        i = i + 1;
+    }
+    ret res[Direct, allocator.Error].ok{d};
+}
+
+fun forget_direct(d: *Direct) err[allocator.Error] {
+    val err_dnit:         err[allocator.Error] = vector.dnit[bool](?d.arguments);
+    val err_results_dnit: err[allocator.Error] = vector.dnit[bool](?d.results);
+    if (sel err_dnit.err) { ret err_dnit; }
+    ret err_results_dnit;
+}
+
+# whether one value arrives with no memory between, as `Direct` states
+# ---
+# found: room for its leaves, emptied first
+fun crosses(b: *Build, l: *Layout, row: *Resolved, ty: Type, passed: Passed, asg: *Assignment, found: *Vector[Leaf]) res[bool, allocator.Error] {
+    val res_crosses: res[bool, allocator.Error] = res[bool, allocator.Error].ok{false};
+    if (!(sel passed.passing.value) || passed.count == 0) { ret res_crosses; }
+    val opt_selection: opt[*Basis] = opt[*Basis].some{?b.basis};
+    found.len = 0;
+    val res_made: res[bool, allocator.Error] = leaves.scalars(l, opt_selection, ty, 0, WORD, found);
+    if (sel res_made.err)               { ret res_made; }
+    if (!res_made.ok || found.len == 0) { ret res_crosses; }
+    var n: u32 = 0;
+    for (n < passed.count) {
+        val p: Piece = piece.piece(asg, passed.first + n);
+        if (!(sel p.scale.fixed) || p.size == 0 || p.size > WORD) { ret res_crosses; }
+        val opt_kind_under: opt[rf.Kind] = kind_under(row, p.place);
+        if (sel opt_kind_under.some) {
+            if (opt_kind_under.some == rf.FLOAT || opt_kind_under.some == rf.VECTOR) {
+                var f: type_format.Format = type_format.BINARY64;
+                if (p.size <= 2) { f = type_format.BINARY16; }
+                or (p.size <= 4) { f = type_format.BINARY32; }
+                val res_held: res[opt[*Held], basis.Error] = basis.held(opt_selection, ?b.basis.target.caps, f);
+                if (sel res_held.err)     { ret res_crosses; }
+                if (sel res_held.ok.none) { ret res_crosses; }
+            }
+            or (opt_kind_under.some != rf.GENERAL) { ret res_crosses; }
+        }
+        n = n + 1;
+    }
+    var i: usize = 0;
+    for (i < found.len) {
+        val opt_held_in: opt[u32] = holding(asg, passed, found.data[i].offset, found.data[i].size);
+        if (sel opt_held_in.none) { ret res_crosses; }
+        i = i + 1;
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# the piece of a value that holds the bytes at an offset with a size whole,
+# by its index in the assignment
+fun holding(asg: *Assignment, passed: Passed, offset: u64, size: u64) opt[u32] {
+    var n: u32 = 0;
+    for (n < passed.count) {
+        val p: Piece = piece.piece(asg, passed.first + n);
+        if (offset >= p.offset && offset + size <= p.offset + p.size) { ret opt[u32].some{passed.first + n}; }
+        n = n + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# give back a passage's storage
+pub fun dnit(p: *Passage) err[allocator.Error] {
+    val err_direct: err[allocator.Error] = forget_direct(?p.direct);
+    val err_pieces: err[allocator.Error] = piece.dnit(?p.assignment);
+    if (sel err_direct.err) { ret err_direct; }
+    ret err_pieces;
+}
+
+# the passages of one layout's signatures under a build, each placed once. a
+# passage is a function of its signature, its named count, the build's rows
+# and the layout alone, and an interned type never changes, so each stands as
+# long as the layout it was placed through
+# ---
+# a:         the allocator the passages' storage comes from
+# b:         the build, whose resolved rows classify
+# l:         the layout of the module the signatures are in
+# described: the type view of every type the signatures name
+# index:     each placed signature and named count, by its key, to its passage
+# placed:    the passages, owned until `forget`
+pub rec Passages {
+    a:         *allocator.Allocator;
+    b:         *Build;
+    l:         *Layout;
+    described: call.Described;
+    index:     map.Map[u64, u32];
+    placed:    Vector[Passage];
+}
+
+# no passages yet of a layout's signatures under a build
+pub fun passages(a: *allocator.Allocator, b: *Build, l: *Layout) Passages {
+    ret Passages{a: a, b: b, l: l, described: call.described(a), index: map.init[u64, u32](a), placed: vector.init[Passage](a)};
+}
+
+# give back every passage's storage
+pub fun forget(p: *Passages) err[allocator.Error] {
+    var err_kept: err[allocator.Error] = err[allocator.Error].ok{};
+    var i:        usize                = 0;
+    for (i < p.placed.len) {
+        val err_release: err[allocator.Error] = dnit(?p.placed.data[i]);
+        if (sel err_release.err) { err_kept = err_release; }
+        i = i + 1;
+    }
+    vector.dnit[Passage](?p.placed);
+    map.dnit[u64, u32](?p.index);
+    val err_views: err[allocator.Error] = call.forget(?p.described);
+    if (sel err_views.err) { ret err_views; }
+    ret err_kept;
+}
+
+# where a signature's values travel when a call names a count of them, placed
+# the first time it is asked and read from then on. the passage stays owned by
+# the store, so it is never released by the caller
+pub fun passage(p: *Passages, signature: Type, named: Named) res[Passage, Error] {
+    var count: u64 = 0xffffffff;
+    if (sel named.first)    { count = named.first::u64; }
+    or (sel named.unstated) { ret placed_through(p.a, p.b, p.l, ?p.described, signature, named); }
+    val key:       u64       = (signature::u64 << 32) | count;
+    val opt_found: opt[*u32] = map.get[u64, u32](?p.index, ?key);
+    if (sel opt_found.some) { ret res[Passage, Error].ok{p.placed.data[@opt_found.some]}; }
+    val res_placed_through: res[Passage, Error] = placed_through(p.a, p.b, p.l, ?p.described, signature, named);
+    if (sel res_placed_through.err) { ret res_placed_through; }
+    val at:         u32                         = p.placed.len::u32;
+    val res_pushed: res[usize, allocator.Error] = vector.push[Passage](?p.placed, res_placed_through.ok);
+    if (sel res_pushed.err) {
+        var lost: Passage = res_placed_through.ok;
+        dnit(?lost);
+        ret res[Passage, Error].err{Error.classify{call.Error.alloc{res_pushed.err}}};
+    }
+    val res_linked: res[bool, allocator.Error] = map.insert[u64, u32](?p.index, key, at);
+    if (sel res_linked.err) { ret res[Passage, Error].err{Error.classify{call.Error.alloc{res_linked.err}}}; }
+    ret res_placed_through;
+}
+
+# classify a call or a function through the row its signature names, which
+# the work is under from then on. the passage is the store's
+fun classify(w: *Work, signature: Type, named: Named) res[Passage, refusal.Error] {
+    val res_passage: res[Passage, Error] = passage(w.passages, signature, named);
+    if (sel res_passage.err) {
+        val e: Error = res_passage.err;
+        if (sel e.signature) { ret res[Passage, refusal.Error].err{refusal.Error.ir{module.Error.types{e.signature}}}; }
+        if (sel e.classify)  { ret res[Passage, refusal.Error].err{refusal.Error.convention{e.classify}}; }
+        ret res[Passage, refusal.Error].err{refusal.Error.reason{"a signature names a convention row the target does not state"}};
+    }
+    w.convention = res_passage.ok.row;
+    ret res[Passage, refusal.Error].ok{res_passage.ok};
+}
+
+# whether the value v at a position arrives with no memory between: its type and pieces allow it, as `Direct`
+# states, and it is not marked secret, so a secret's bytes keep the memory path the walk reads
+fun direct_for(w: *Work, list: *Vector[bool], i: usize, v: Value) bool {
+    ret i < list.len && list.data[i] && !body_of(w).values.data[v].secret;
+}
+
+fun signature_of(w: *Work, ty: Type) res[table.Function, refusal.Error] {
+    val res_signature: res[table.Function, table.Error] = table.signature(?w.m.types, ty);
+    if (sel res_signature.err) { ret res[table.Function, refusal.Error].err{refusal.Error.ir{module.Error.types{res_signature.err}}}; }
+    ret res[table.Function, refusal.Error].ok{res_signature.ok};
+}
+
+# the function type of a piece form
+fun piece_signature(w: *Work, params: Slice[Type], results: Slice[Type], convention: opt[Calling]) res[Type, refusal.Error] {
+    var f: table.Function = table.plain(params, results);
+    f.convention = convention;
+    ret intern(w, table.Shape.function{f});
+}
+
+# the piece the convention returns a result's address in, when it does
+fun returned_place(w: *Work) opt[Placed] {
+    val regs: *Registers = held(w.convention);
+    if (regs == nil) { ret opt[Placed].none{}; }
+    val opt_returned: opt[rf.Id] = regs.returned;
+    if (sel opt_returned.none) { ret opt[Placed].none{}; }
+    ret opt[Placed].some{Placed{place: Place.register{opt_returned.some}, scale: Scale.fixed{}, fill: Fill.exact{}}};
+}
+
+fun by_reference(asg: *Assignment) bool {
+    var i: usize = 0;
+    for (i < asg.results.len) {
+        if (sel asg.results.data[i].passing.reference) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the entry, rewritten so its parameters are its pieces
+# ---
+# ret: the parameter the caller's result address arrives in, when a result
+#      travels by reference
+fun lower_entry(w: *Work, asg: *Assignment, direct: *Direct) res[opt[Value], refusal.Error] {
+    val b:      *Body              = body_of(w);
+    val old:    usize              = b.blocks.data[w.entry].parameters.len;
+    var olds:   Vector[Value]      = vector.init[Value](w.m.a);
+    var homes:  Vector[opt[Value]] = vector.init[opt[Value]](w.m.a);
+    var tys:    Vector[Type]       = vector.init[Type](w.m.a);
+    var places: Vector[Placed]     = vector.init[Placed](w.m.a);
+    var params: Vector[Value]      = vector.init[Value](w.m.a);
+    var lays:   Vector[opt[u64]]   = vector.init[opt[u64]](w.m.a);
+    var counts: Vector[u32]        = vector.init[u32](w.m.a);
+    fin {
+        vector.dnit[opt[u64]](?lays);
+        vector.dnit[u32](?counts);
+        vector.dnit[Value](?olds);
+        vector.dnit[opt[Value]](?homes);
+        vector.dnit[Type](?tys);
+        vector.dnit[Placed](?places);
+        vector.dnit[Value](?params);
+    }
+    if (old != asg.arguments.len) { ret res[opt[Value], refusal.Error].err{refusal.Error.reason{"an entry whose parameters are not its signature's"}}; }
+    var i: usize = 0;
+    for (i < old) {
+        val v:          Value                       = b.blocks.data[w.entry].parameters.data[i];
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?olds, v);
+        if (sel res_pushed.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        val res_lay: res[opt[u64], refusal.Error] = laid(w, body_of(w).values.data[v].type, asg.arguments.data[i], asg);
+        if (sel res_lay.err) { ret res[opt[Value], refusal.Error].err{res_lay.err}; }
+        val res_lain: res[usize, allocator.Error] = vector.push[opt[u64]](?lays, res_lay.ok);
+        if (sel res_lain.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{res_lain.err}}; }
+        var count: u32 = asg.arguments.data[i].count;
+        if (sel res_lay.ok.some) { count = 0; }
+        val res_counted: res[usize, allocator.Error] = vector.push[u32](?counts, count);
+        if (sel res_counted.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{res_counted.err}}; }
+        var res_home_for: res[opt[Value], refusal.Error] = res[opt[Value], refusal.Error].ok{opt[Value].none{}};
+        if (sel res_lay.ok.none)  { res_home_for = home_for(w, body_of(w).values.data[v].type, asg.arguments.data[i], direct_for(w, ?direct.arguments, i, v), parameter_secrecy(?w.m.functions.data[w.f].data, i)); }
+        if (sel res_home_for.err) { ret res[opt[Value], refusal.Error].err{res_home_for.err}; }
+        val res_kept: res[usize, allocator.Error] = vector.push[opt[Value]](?homes, res_home_for.ok);
+        if (sel res_kept.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{res_kept.err}}; }
+        i = i + 1;
+    }
+    var opt_carrier: opt[Value] = opt[Value].none{};
+    if (sel asg.address.some) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Type](?tys, w.ptr);
+        if (sel res_pushed.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        val err_placed: err[refusal.Error] = place_of(?places, asg.address.some);
+        if (sel err_placed.err) { ret res[opt[Value], refusal.Error].err{err_placed.err}; }
+    }
+    i = 0;
+    for (i < old) {
+        val ty:                Type               = body_of(w).values.data[olds.data[i]].type;
+        var err_receive_types: err[refusal.Error] = err[refusal.Error].ok{};
+        if (sel lays.data[i].none)     { err_receive_types = receive_types(w, Side.argument{i::u32}, ty, asg.arguments.data[i], asg, ?tys, ?places); }
+        if (sel err_receive_types.err) { ret res[opt[Value], refusal.Error].err{err_receive_types.err}; }
+        i = i + 1;
+    }
+    var first: u32 = 0;
+    i = 0;
+    for (i < tys.len) {
+        var secret:   bool      = false;
+        var opt_name: opt[View] = opt[View].none{};
+        if (!(sel asg.address.some) || i != 0) {
+            val opt_owner: opt[usize] = owner_of(?counts, sel asg.address.some, i);
+            if (sel opt_owner.some) {
+                val old_value: Value  = olds.data[opt_owner.some];
+                val passed:    Passed = asg.arguments.data[opt_owner.some];
+                if (sel passed.passing.value) {
+                    val one: Piece = asg.pieces.data[passed.first::usize + piece_within(?counts, sel asg.address.some, i, opt_owner.some)];
+                    secret = contract.piece_secret(parameter_secrecy(?w.m.functions.data[w.f].data, opt_owner.some), one);
+                }
+                if (passed.count == 1 && sel passed.passing.value) { opt_name = body_of(w).values.data[old_value].name; }
+            }
+        }
+        val res_added: res[Value, module.Error] = body.add_parameter(w.m, w.f, w.entry, Declaration{type: tys.data[i], secret: secret, name: opt_name}, Slice[Value]{data: nil, size: 0});
+        if (sel res_added.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.ir{res_added.err}}; }
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?params, res_added.ok);
+        if (sel res_pushed.err) { ret res[opt[Value], refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        i = i + 1;
+    }
+    if (sel asg.address.some) {
+        opt_carrier = opt[Value].some{params.data[0]};
+        first       = 1;
+    }
+    var bld: Builder = builder.make(w.m);
+    builder.enter(?bld, w.f);
+    at_head(w, ?bld);
+    var at: u32 = first;
+    i = 0;
+    for (i < old) {
+        val v:      Value  = olds.data[i];
+        val passed: Passed = asg.arguments.data[i];
+        builder.secret(?bld, body_of(w).values.data[v].secret);
+        var res_rebuild: res[Value, refusal.Error] = res[Value, refusal.Error].ok{v};
+        if (sel lays.data[i].some) {
+            val ty:           Type                    = body_of(w).values.data[v].type;
+            val res_align_of: res[u64, refusal.Error] = align_of(w, ty);
+            if (sel res_align_of.err) { ret res[opt[Value], refusal.Error].err{res_align_of.err}; }
+            res_rebuild = res[Value, refusal.Error].ok{load(?bld, area(w, ?bld, ty, lays.data[i].some, true), ty, res_align_of.ok)};
+        }
+        or                       { res_rebuild = rebuild(w, ?bld, body_of(w).values.data[v].type, passed, direct_for(w, ?direct.arguments, i, v), asg, homes.data[i], Slice[Value]{data: ?params.data[at], size: passed.count::usize}, parameter_secrecy(?w.m.functions.data[w.f].data, i)); }
+        if (sel res_rebuild.err) { ret res[opt[Value], refusal.Error].err{res_rebuild.err}; }
+        val err_done: err[refusal.Error] = built(?bld);
+        if (sel err_done.err) { ret res[opt[Value], refusal.Error].err{err_done.err}; }
+        val err_moved: err[refusal.Error] = ir(body.replace(w.m, w.f, v, res_rebuild.ok, Records.follow{}));
+        if (sel err_moved.err) { ret res[opt[Value], refusal.Error].err{err_moved.err}; }
+        val err_spread: err[refusal.Error] = at_uses(w, res_rebuild.ok, parameter_secrecy(?w.m.functions.data[w.f].data, i));
+        if (sel err_spread.err) { ret res[opt[Value], refusal.Error].err{err_spread.err}; }
+        at = at + counts.data[i];
+        i  = i + 1;
+    }
+    val err_after: err[refusal.Error] = handed(w, ?bld);
+    if (sel err_after.err) { ret res[opt[Value], refusal.Error].err{err_after.err}; }
+    i = 0;
+    for (i < old) {
+        val err_gone: err[refusal.Error] = ir(body.remove_parameter(w.m, w.f, w.entry, 0));
+        if (sel err_gone.err) { ret res[opt[Value], refusal.Error].err{err_gone.err}; }
+        i = i + 1;
+    }
+    val err_placed: err[refusal.Error] = ir(body.place_entry(w.m, w.f, Slice[Placed]{data: places.data, size: places.len}));
+    if (sel err_placed.err) { ret res[opt[Value], refusal.Error].err{err_placed.err}; }
+    ret res[opt[Value], refusal.Error].ok{opt_carrier};
+}
+
+# an aggregate that traveled in read where it is used: a load of the memory it
+# was rebuilt from, the caller's copy for one by reference and the entry's own
+# slot for one by value, just before each instruction that uses it, stated as
+# the load at the entry is. nothing in the callee writes that memory after the
+# entry, so each load reads what the entry's would have, and a store of the
+# value is a copy between memories with no aggregate held across the body. a
+# slot the value is stored to and only read from otherwise is that memory
+# (`read_in_place`), with no copy. the load at the entry goes once unused,
+# unless a variable is bound to it. `held` is what the declaration states of
+# the parameter's bytes
+fun at_uses(w: *Work, v: Value, held: Secrecy) err[refusal.Error] {
+    val ty:           Type                            = body_of(w).values.data[v].type;
+    val res_shape_of: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape_of.err)        { ret err[refusal.Error].err{res_shape_of.err}; }
+    if (!aggregate(res_shape_of.ok)) { ret err[refusal.Error].ok{}; }
+    val def: Def = body_of(w).values.data[v].def;
+    if (!(sel def.result)) { ret err[refusal.Error].ok{}; }
+    val l: Instruction = def.result.instruction;
+    if (body_of(w).instructions.data[l].opcode != opcode_table.LOAD) { ret err[refusal.Error].ok{}; }
+    val address:      Value                   = body_of(w).instructions.data[l].operands.data[0];
+    val public:       bool                    = body_of(w).instructions.data[l].metadata.flags.public;
+    val res_align_of: res[u64, refusal.Error] = align_of(w, ty);
+    if (sel res_align_of.err) { ret err[refusal.Error].err{res_align_of.err}; }
+    var k: usize = 0;
+    for (k < body_of(w).values.data[v].uses.len) {
+        val u:            Instruction              = body_of(w).values.data[v].uses.data[k];
+        val res_in_place: res[bool, refusal.Error] = read_in_place(w, u, v, address, res_align_of.ok, held);
+        if (sel res_in_place.err) { ret err[refusal.Error].err{res_in_place.err}; }
+        if (!res_in_place.ok)     { k = k + 1; }
+    }
+    for (body_of(w).values.data[v].uses.len > 0) {
+        val u:   Instruction = body_of(w).values.data[v].uses.data[0];
+        var bld: Builder     = builder.make(w.m);
+        builder.enter(?bld, w.f);
+        builder.derive(?bld, u);
+        builder.secret(?bld, body_of(w).values.data[v].secret);
+        builder.before(?bld, u);
+        val here:     Value              = stated_load(?bld, address, ty, res_align_of.ok, public);
+        val err_done: err[refusal.Error] = built(?bld);
+        if (sel err_done.err) { ret err_done; }
+        val err_put: err[refusal.Error] = ir(body.substitute(w.m, w.f, u, v, here));
+        if (sel err_put.err) { ret err_put; }
+    }
+    if (body_of(w).values.data[v].bound.len != 0) { ret err[refusal.Error].ok{}; }
+    ret note_unused(w, l);
+}
+
+# read a slot in the memory a parameter was rebuilt from, when `u` stores the
+# parameter whole to a slot that nothing else writes: its other uses are loads
+# at it, copies from it, markers of its storage and `ptr.add`s past it used the
+# same way (`overlap.read_only`), it is not kept, and it is aligned no higher
+# than that memory. the callee's copy of a parameter is its own under every
+# convention, laid in its incoming area, by reference to a copy its caller
+# makes for the call, or rebuilt in a slot of the entry's, and nothing writes
+# it after the entry, so wherever the slot is read it holds the bytes that
+# memory holds: each use addresses the memory, and the store, the markers and
+# the slot go. a read of the slot that states nothing, as one a legalisation
+# made of its own slot, which the walk followed in the frame, states what it
+# reads as the declaration states the parameter's bytes (`stated_reads`), since
+# the memory it now reads may be the caller's, which the walk takes as stated.
+# a slot a variable is bound to stays, since the debug information states no
+# location in the incoming memory. whether it did
+fun read_in_place(w: *Work, u: Instruction, v: Value, address: Value, align: u64, secrecy: Secrecy) res[bool, refusal.Error] {
+    val b:  *Body            = body_of(w);
+    val ud: *InstructionData = ?b.instructions.data[u];
+    if (ud.opcode != opcode_table.STORE || ud.operands.len != 2) { ret res[bool, refusal.Error].ok{false}; }
+    if (ud.operands.data[1] != v || ud.operands.data[0] == v)    { ret res[bool, refusal.Error].ok{false}; }
+    if (ud.metadata.flags.volatile || ud.metadata.flags.kept)    { ret res[bool, refusal.Error].ok{false}; }
+    val slot:     Value            = ud.operands.data[0];
+    val opt_slot: opt[Instruction] = made_by(w, slot, opcode_table.ALLOCA);
+    if (sel opt_slot.none) { ret res[bool, refusal.Error].ok{false}; }
+    val sd: *InstructionData = ?b.instructions.data[opt_slot.some];
+    if (sd.immediates.len == 0 || sd.metadata.flags.kept) { ret res[bool, refusal.Error].ok{false}; }
+    val held: Immediate = sd.immediates.data[0];
+    if (!(sel held.ty))                              { ret res[bool, refusal.Error].ok{false}; }
+    if (!table.same(held.ty, b.values.data[v].type)) { ret res[bool, refusal.Error].ok{false}; }
+    if (!overlap.read_only(b, slot, u))              { ret res[bool, refusal.Error].ok{false}; }
+    val res_held_align: res[u64, refusal.Error] = align_of(w, held.ty);
+    if (sel res_held_align.err) { ret res[bool, refusal.Error].err{res_held_align.err}; }
+    var slot_align: u64   = res_held_align.ok;
+    var i:          usize = 0;
+    for (i < sd.immediates.len) {
+        val imm: Immediate = sd.immediates.data[i];
+        if (sel imm.alignment) { slot_align = imm.alignment; }
+        i = i + 1;
+    }
+    if (slot_align > align) { ret res[bool, refusal.Error].ok{false}; }
+    val res_bound: res[Slice[Binding], module.Error] = module.bound(w.m, sd.metadata.bindings);
+    if (sel res_bound.err)     { ret res[bool, refusal.Error].err{refusal.Error.ir{res_bound.err}}; }
+    if (res_bound.ok.size > 0) { ret res[bool, refusal.Error].ok{false}; }
+    val res_statable: res[bool, refusal.Error] = stated_reads(w, slot, opt[u64].some{0}, secrecy, false);
+    if (sel res_statable.err) { ret res_statable; }
+    if (!res_statable.ok)     { ret res[bool, refusal.Error].ok{false}; }
+    val res_stated: res[bool, refusal.Error] = stated_reads(w, slot, opt[u64].some{0}, secrecy, true);
+    if (sel res_stated.err) { ret res_stated; }
+    val err_store: err[refusal.Error] = ir(body.erase(w.m, w.f, u));
+    if (sel err_store.err) { ret res[bool, refusal.Error].err{err_store.err}; }
+    val err_unmarked: err[refusal.Error] = unmark(w, slot);
+    if (sel err_unmarked.err) { ret res[bool, refusal.Error].err{err_unmarked.err}; }
+    val err_replaced: err[refusal.Error] = ir(body.replace(w.m, w.f, slot, address, Records.follow{}));
+    if (sel err_replaced.err) { ret res[bool, refusal.Error].err{err_replaced.err}; }
+    val err_gone: err[refusal.Error] = ir(body.erase(w.m, w.f, opt_slot.some));
+    if (sel err_gone.err) { ret res[bool, refusal.Error].err{err_gone.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# state each read of the memory at `v`, `base` bytes into a parameter, that
+# states nothing, a load or a copy's read, as the declaration states the bytes
+# it reads (`contract.range_secret`): secret with the secret mark, its result
+# secret, and public with the public flag otherwise. a read at an offset or of
+# a length not known is stated where the declaration states the parameter
+# public or secret whole, and where it states ranges the answer is false and
+# nothing is stated. a load of bytes stated secret whose result the ir holds
+# public answers false too, since a pass cannot change what the ir holds of a
+# value its uses follow. only with `apply` is anything changed
+fun stated_reads(w: *Work, v: Value, base: opt[u64], secrecy: Secrecy, apply: bool) res[bool, refusal.Error] {
+    val b: *Body = body_of(w);
+    var k: usize = 0;
+    for (k < b.values.data[v].uses.len) {
+        val u: Instruction      = b.values.data[v].uses.data[k];
+        val d: *InstructionData = ?b.instructions.data[u];
+        k = k + 1;
+        var length: opt[u64] = opt[u64].none{};
+        if (d.opcode == opcode_table.PTR_ADD && d.operands.data[0] == v) {
+            var at:     opt[u64] = opt[u64].none{};
+            val opt_by: opt[i64] = emit.signed_in(w.m, b, d.operands.data[1]);
+            if (sel base.some) {
+                val base_off: u64 = base.some;
+                if (sel opt_by.some) {
+                    val by: i64 = opt_by.some;
+                    if (by >= 0) {
+                        val step: u64 = by::u64;
+                        if (base_off <= ~(0::u64) - step) { at = opt[u64].some{base_off + step}; }
+                    }
+                    or {
+                        val back: u64 = 0 - by::u64;
+                        if (base_off >= back) { at = opt[u64].some{base_off - back}; }
+                    }
+                }
+            }
+            val res_inner: res[bool, refusal.Error] = stated_reads(w, d.results.data[0], at, secrecy, apply);
+            if (sel res_inner.err) { ret res_inner; }
+            if (!res_inner.ok)     { ret res_inner; }
+            cnt;
+        }
+        or (d.opcode == opcode_table.LOAD && d.operands.data[0] == v) {
+            val res_size: res[u64, refusal.Error] = size_of(w, b.values.data[d.results.data[0]].type);
+            if (sel res_size.err) { ret res[bool, refusal.Error].err{res_size.err}; }
+            length = opt[u64].some{res_size.ok};
+        }
+        or (d.opcode == opcode_table.MEM_COPY && d.operands.len == 3 && d.operands.data[1] == v) {
+            length = emit.known_in(w.m, b, d.operands.data[2]);
+        }
+        or                                                { cnt; }
+        if (d.metadata.secret || d.metadata.flags.public) { cnt; }
+        var secret: bool = sel secrecy.whole;
+        var known:  bool = false;
+        if (sel base.some) {
+            if (sel length.some) {
+                secret = contract.range_secret(secrecy, base.some, length.some);
+                known  = true;
+            }
+        }
+        if (!known && sel secrecy.ranges) { ret res[bool, refusal.Error].ok{false}; }
+        # a load whose result the ir holds public cannot read bytes stated secret: its result's secrecy is the ir's,
+        # which every use follows, so the slot keeps the copy the walk follows in the frame
+        if (secret && d.opcode == opcode_table.LOAD && !b.values.data[d.results.data[0]].secret) { ret res[bool, refusal.Error].ok{false}; }
+        if (apply) {
+            if (secret) {
+                d.metadata.secret = true;
+                var r: usize = 0;
+                for (r < d.results.len) {
+                    b.values.data[d.results.data[r]].secret = true;
+                    r                                       = r + 1;
+                }
+            }
+            or { d.metadata.flags.public = true; }
+        }
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# move the records at the entry's head to where the parameters are rebuilt,
+# the builder's cursor, so a variable of a parameter reads its rebuilt value
+# from its first point
+fun handed(w: *Work, bld: *Builder) err[refusal.Error] {
+    val c: builder.Cursor = builder.cursor(bld);
+    if (!(sel c.after)) { ret err[refusal.Error].ok{}; }
+    val b:  *Body       = body_of(w);
+    val to: Instruction = b.instructions.data[c.after].next;
+    if (to == NO_INSTRUCTION) { ret err[refusal.Error].ok{}; }
+    ret ir(body.hand(w.m, w.f, b.blocks.data[w.entry].first, to));
+}
+
+# the argument a piece type of the entry's list belongs to, by how many pieces
+# of each argument the list carries, none for one laid whole in the argument area
+fun owner_of(carried: *Vector[u32], addressed: bool, at: usize) opt[usize] {
+    var k: usize = at;
+    if (addressed) { k = k - 1; }
+    var i: usize = 0;
+    var n: usize = 0;
+    for (i < carried.len) {
+        n = n + carried.data[i]::usize;
+        if (k < n) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# which piece of its argument `owner` the entry parameter `at` is, as `owner_of` counts them
+fun piece_within(carried: *Vector[u32], addressed: bool, at: usize, owner: usize) usize {
+    var k: usize = at;
+    if (addressed) { k = k - 1; }
+    var i: usize = 0;
+    for (i < owner) {
+        k = k - carried.data[i]::usize;
+        i = i + 1;
+    }
+    ret k;
+}
+
+# whether an instruction reads or writes memory, as its opcode row states,
+# an opcode with no row taken to do both
+fun touches(w: *Work, i: Instruction) bool {
+    val opt_row: opt[*opcode_row.Row] = opcode_table.at(body_of(w).instructions.data[i].opcode);
+    if (sel opt_row.none) { ret true; }
+    ret opt_row.some.effects.reads || opt_row.some.effects.writes;
+}
+
+# the instruction a value is the result of, of this opcode, none for another
+fun made_by(w: *Work, v: Value, code: Opcode) opt[Instruction] {
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[v].def;
+    if (!(sel def.result))                                          { ret opt[Instruction].none{}; }
+    if (b.instructions.data[def.result.instruction].opcode != code) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{def.result.instruction};
+}
+
+# whether nothing between two instructions of one block, the first before the
+# second, reads or writes memory
+fun untouched_between(w: *Work, first: Instruction, last: Instruction) bool {
+    val b: *Body = body_of(w);
+    val k: Block = block_of(b, first);
+    if (block_of(b, last) != k) { ret false; }
+    if (!after(b, first, last)) { ret false; }
+    var p: Instruction = b.instructions.data[first].next;
+    for (p != last) {
+        if (touches(w, p)) { ret false; }
+        p = b.instructions.data[p].next;
+    }
+    ret true;
+}
+
+# the one result by reference, none when no result or more than one travels
+# by reference
+fun referenced(asg: *Assignment) opt[usize] {
+    var count: usize = 0;
+    var at:    usize = 0;
+    var i:     usize = 0;
+    for (i < asg.results.len) {
+        if (sel asg.results.data[i].passing.reference) {
+            count = count + 1;
+            at    = i;
+        }
+        i = i + 1;
+    }
+    if (count != 1) { ret opt[usize].none{}; }
+    ret opt[usize].some{at};
+}
+
+# build a result returned by reference in place: a stack slot every return
+# hands back whole, read just before it with nothing touching memory in
+# between, and whose address goes nowhere else, is the memory the carrier
+# addresses, so no return copies it there
+fun in_place(w: *Work, asg: *Assignment, carrier: opt[Value], rets: *Vector[Instruction]) err[refusal.Error] {
+    if (sel carrier.none) { ret err[refusal.Error].ok{}; }
+    if (rets.len == 0)    { ret err[refusal.Error].ok{}; }
+    val opt_referenced: opt[usize] = referenced(asg);
+    if (sel opt_referenced.none) { ret err[refusal.Error].ok{}; }
+    var opt_home: opt[Value] = opt[Value].none{};
+    var ty:       Type       = w.ptr;
+    var i:        usize      = 0;
+    for (i < rets.len) {
+        val r:  Instruction      = rets.data[i];
+        val rd: *InstructionData = ?body_of(w).instructions.data[r];
+        if (opt_referenced.some >= rd.operands.len) { ret err[refusal.Error].ok{}; }
+        val opt_loaded: opt[Instruction] = loaded(w, rd.operands.data[opt_referenced.some]);
+        if (sel opt_loaded.none)                       { ret err[refusal.Error].ok{}; }
+        if (!untouched_between(w, opt_loaded.some, r)) { ret err[refusal.Error].ok{}; }
+        val at: Value = body_of(w).instructions.data[opt_loaded.some].operands.data[0];
+        if (sel opt_home.some) {
+            if (opt_home.some != at) { ret err[refusal.Error].ok{}; }
+        }
+        opt_home = opt[Value].some{at};
+        ty       = body_of(w).values.data[rd.operands.data[opt_referenced.some]].type;
+        i        = i + 1;
+    }
+    if (sel opt_home.none) { ret err[refusal.Error].ok{}; }
+    val opt_slot: opt[Instruction] = made_by(w, opt_home.some, opcode_table.ALLOCA);
+    if (sel opt_slot.none) { ret err[refusal.Error].ok{}; }
+    val sd: *InstructionData = ?body_of(w).instructions.data[opt_slot.some];
+    if (sd.immediates.len == 0 || sd.metadata.flags.kept) { ret err[refusal.Error].ok{}; }
+    val held: Immediate = sd.immediates.data[0];
+    if (!(sel held.ty))                                { ret err[refusal.Error].ok{}; }
+    if (!table.same(held.ty, ty))                      { ret err[refusal.Error].ok{}; }
+    if (!overlap.contained(body_of(w), opt_home.some)) { ret err[refusal.Error].ok{}; }
+    val bindings:  Bindings                          = sd.metadata.bindings;
+    val res_bound: res[Slice[Binding], module.Error] = module.bound(w.m, bindings);
+    if (sel res_bound.err) { ret ir(err[module.Error].err{res_bound.err}); }
+    if (res_bound.ok.size > 0) {
+        val res_storage_of: res[Instruction, refusal.Error] = storage_of(w);
+        if (sel res_storage_of.err) { ret err[refusal.Error].err{res_storage_of.err}; }
+        body_of(w).instructions.data[res_storage_of.ok].metadata.bindings = bindings;
+        body_of(w).instructions.data[res_storage_of.ok].metadata.piece    = sd.metadata.piece;
+    }
+    val err_unmarked: err[refusal.Error] = unmark(w, opt_home.some);
+    if (sel err_unmarked.err) { ret err_unmarked; }
+    val err_replaced: err[refusal.Error] = ir(body.replace(w.m, w.f, opt_home.some, carrier.some, Records.follow{}));
+    if (sel err_replaced.err) { ret err_replaced; }
+    ret ir(body.erase(w.m, w.f, opt_slot.some));
+}
+
+# take out the markers of a slot's storage, before memory that is no slot of
+# the function stands in for it for the whole function
+fun unmark(w: *Work, slot: Value) err[refusal.Error] {
+    var k: usize = 0;
+    for (k < body_of(w).values.data[slot].uses.len) {
+        val u: Instruction = body_of(w).values.data[slot].uses.data[k];
+        if (opcode_table.marks(body_of(w).instructions.data[u].opcode)) {
+            val err_gone: err[refusal.Error] = ir(body.erase(w.m, w.f, u));
+            if (sel err_gone.err) { ret err_gone; }
+        }
+        or { k = k + 1; }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the instruction that addresses the result's memory through the carrier, at
+# the entry after the stack slots, which a variable bound to that memory is
+# bound on, made the first time one is
+fun storage_of(w: *Work) res[Instruction, refusal.Error] {
+    val opt_had: opt[Instruction] = w.storage;
+    if (sel opt_had.some) { ret res[Instruction, refusal.Error].ok{opt_had.some}; }
+    val opt_carrier: opt[Value] = w.carrier;
+    if (sel opt_carrier.none) { ret res[Instruction, refusal.Error].err{refusal.Error.reason{"storage of a result by reference with no carrier"}}; }
+    val res_zero: res[Value, refusal.Error] = integer(w, w.offset, 0);
+    if (sel res_zero.err) { ret res[Instruction, refusal.Error].err{res_zero.err}; }
+    var bld: Builder = builder.make(w.m);
+    builder.enter(?bld, w.f);
+    at_head(w, ?bld);
+    val v:        Value              = binary(?bld, opcode_table.PTR_ADD, opt_carrier.some, res_zero.ok);
+    val err_done: err[refusal.Error] = built(?bld);
+    if (sel err_done.err) { ret res[Instruction, refusal.Error].err{err_done.err}; }
+    val made: Def = body_of(w).values.data[v].def;
+    if (!(sel made.result)) { ret res[Instruction, refusal.Error].err{refusal.Error.reason{"storage of a result by reference no instruction makes"}}; }
+    w.storage = opt[Instruction].some{made.result.instruction};
+    ret res[Instruction, refusal.Error].ok{made.result.instruction};
+}
+
+# one return, rewritten into the pieces of its values
+fun lower_return(w: *Work, asg: *Assignment, direct: *Direct, r: Instruction, carrier: opt[Value]) err[refusal.Error] {
+    val b:     *Body = body_of(w);
+    val count: usize = b.instructions.data[r].operands.len;
+    if (count != asg.results.len) { ret err[refusal.Error].err{refusal.Error.reason{"a return whose values are not its function's results"}}; }
+    var given:  Vector[Value]  = vector.init[Value](w.m.a);
+    var out:    Vector[Value]  = vector.init[Value](w.m.a);
+    var places: Vector[Placed] = vector.init[Placed](w.m.a);
+    fin {
+        vector.dnit[Value](?given);
+        vector.dnit[Value](?out);
+        vector.dnit[Placed](?places);
+    }
+    var i: usize = 0;
+    for (i < count) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?given, b.instructions.data[r].operands.data[i]);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        i = i + 1;
+    }
+    var bld: Builder = builder.make(w.m);
+    builder.enter(?bld, w.f);
+    builder.derive(?bld, r);
+    builder.before(?bld, r);
+    i = 0;
+    for (i < count) {
+        val res_sent: res[Sent, refusal.Error] = sent(w, given.data[i]);
+        if (sel res_sent.err) { ret err[refusal.Error].err{res_sent.err}; }
+        val passed: Passed = asg.results.data[i];
+        builder.secret(?bld, res_sent.ok.secret);
+        if (sel passed.passing.reference) {
+            if (sel carrier.none) { ret err[refusal.Error].err{refusal.Error.reason{"a result by reference with no address to return it at"}}; }
+            val c:        piece.Copy       = passed.passing.reference;
+            val opt_from: opt[Instruction] = copied_from(w, res_sent.ok, r);
+            if (sel opt_from.some) {
+                val bb:   *Body   = body_of(w);
+                val kk:   Block   = block_of(bb, opt_from.some);
+                var near: Builder = builder.make(w.m);
+                builder.enter(?near, w.f);
+                builder.derive(?near, opt_from.some);
+                builder.secret(?near, res_sent.ok.secret);
+                builder.after(?near, opt_from.some);
+                val err_copied: err[refusal.Error] = ranged_copy(w, ?near, bb.instructions.data[opt_from.some].operands.data[0], carrier.some, c.size, c.align, copy_public(w, res_sent.ok, opt_from.some), w.m.functions.data[w.f].data.result);
+                if (sel err_copied.err) { ret err_copied; }
+                val err_done: err[refusal.Error] = built(?near);
+                if (sel err_done.err) { ret err_done; }
+                val err_noted: err[refusal.Error] = note_unused(w, opt_from.some);
+                if (sel err_noted.err) { ret err_noted; }
+            }
+            or {
+                val res_align_of: res[u64, refusal.Error] = align_of(w, res_sent.ok.ty);
+                if (sel res_align_of.err) { ret err[refusal.Error].err{res_align_of.err}; }
+                store(?bld, carrier.some, res_sent.ok.value, res_align_of.ok);
+            }
+        }
+        or {
+            val err_send: err[refusal.Error] = send(w, ?bld, r, Side.result{i::u32}, res_sent.ok, passed, asg, ?out, ?places, direct_for(w, ?direct.results, i, res_sent.ok.value), opt[Secrecy].some{w.m.functions.data[w.f].data.result});
+            if (sel err_send.err) { ret err_send; }
+        }
+        i = i + 1;
+    }
+    val opt_returned: opt[Placed] = returned_place(w);
+    if (sel carrier.some) {
+        if (sel opt_returned.some) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Value](?out, carrier.some);
+            if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+            val res_placed: res[usize, allocator.Error] = vector.push[Placed](?places, opt_returned.some);
+            if (sel res_placed.err) { ret refusal.lost(res_placed.err); }
+        }
+    }
+    builder.secret(?bld, false);
+    builder.replacing(?bld, r);
+    var imm: [1]Immediate = [1]Immediate{Immediate.places{Slice[Placed]{data: places.data, size: places.len}}};
+    builder.emit(?bld, Request{opcode: opcode_table.RET_PLACED, operands: Slice[Value]{data: out.data, size: out.len}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: no_targets()});
+    ret built(?bld);
+}
+
+# whether a value stands before an instruction it is used at in that
+# instruction's block: a parameter or constant, a result of another block,
+# which dominates every use there, or one earlier in the block
+fun stands_before(w: *Work, v: Value, at: Instruction) bool {
+    val b:   *Body = body_of(w);
+    val def: Def   = b.values.data[v].def;
+    if (!(sel def.result)) { ret true; }
+    val i: Instruction = def.result.instruction;
+    val k: Block       = block_of(b, at);
+    if (block_of(b, i) != k) { ret true; }
+    ret after(b, i, at);
+}
+
+# the store a call's result by reference is passed the destination of: its
+# one use, a store of it whole into memory aligned as its copy is, with
+# nothing touching memory between the call and the store, an address that
+# stands before the call, and a destination the callee cannot name by any
+# other route (`unreached`). none keeps the copy. it is judged for every call
+# before any is rewritten (`lower`), so a slot or carrier one call is handed
+# as its result address is still judged by its accesses for the next: a
+# callee writes its result there and keeps the address nowhere, mirl's own by
+# `returned` and any other because its source cannot name it, so a call handed
+# it leaves it as unreached as the store it replaces did
+fun destination(w: *Work, c: Instruction, asg: *Assignment) opt[Instruction] {
+    val opt_referenced: opt[usize] = referenced(asg);
+    if (sel opt_referenced.none) { ret opt[Instruction].none{}; }
+    val b: *Body = body_of(w);
+    if (opt_referenced.some >= b.instructions.data[c].results.len) { ret opt[Instruction].none{}; }
+    val old: Value = b.instructions.data[c].results.data[opt_referenced.some];
+    if (b.values.data[old].uses.len != 1 || b.values.data[old].bound.len != 0) { ret opt[Instruction].none{}; }
+    val s:  Instruction      = b.values.data[old].uses.data[0];
+    val sd: *InstructionData = ?b.instructions.data[s];
+    if (sd.opcode != opcode_table.STORE || sd.operands.len != 2)  { ret opt[Instruction].none{}; }
+    if (sd.operands.data[1] != old || sd.operands.data[0] == old) { ret opt[Instruction].none{}; }
+    if (sd.metadata.flags.volatile || sd.metadata.flags.kept)     { ret opt[Instruction].none{}; }
+    var align: u64   = 0;
+    var i:     usize = 0;
+    for (i < sd.immediates.len) {
+        val imm: Immediate = sd.immediates.data[i];
+        if (sel imm.alignment) { align = imm.alignment; }
+        i = i + 1;
+    }
+    val passing: piece.Passing = asg.results.data[opt_referenced.some].passing;
+    if (!(sel passing.reference))        { ret opt[Instruction].none{}; }
+    if (align < passing.reference.align) { ret opt[Instruction].none{}; }
+    if (!untouched_between(w, c, s))     { ret opt[Instruction].none{}; }
+    val dest: Value = sd.operands.data[0];
+    if (!stands_before(w, dest, c))                       { ret opt[Instruction].none{}; }
+    if (!unreached(w, overlap.root_of(body_of(w), dest))) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{s};
+}
+
+# the store whose destination call `c` is handed as its result address (`destination`), none for a call that keeps
+# its own slot
+fun decided(w: *Work, c: Instruction) res[opt[Instruction], refusal.Error] {
+    val d: *InstructionData = ?body_of(w).instructions.data[c];
+    if (d.immediates.len < 2) { ret res[opt[Instruction], refusal.Error].err{refusal.Error.reason{"a call with no signature or named count"}}; }
+    val stated_signature: Immediate = d.immediates.data[0];
+    val stated_named:     Immediate = d.immediates.data[1];
+    if (!(sel stated_signature.ty)) { ret res[opt[Instruction], refusal.Error].err{refusal.Error.reason{"a call with no signature"}}; }
+    if (!(sel stated_named.named))  { ret res[opt[Instruction], refusal.Error].err{refusal.Error.reason{"a call with no named count"}}; }
+    val res_classify: res[Passage, refusal.Error] = classify(w, stated_signature.ty, stated_named.named);
+    if (sel res_classify.err) { ret res[opt[Instruction], refusal.Error].err{res_classify.err}; }
+    var asg: Assignment = res_classify.ok.assignment;
+    if (body_of(w).instructions.data[c].results.len != asg.results.len) { ret res[opt[Instruction], refusal.Error].ok{opt[Instruction].none{}}; }
+    ret res[opt[Instruction], refusal.Error].ok{destination(w, c, ?asg)};
+}
+
+# mark every copy between the carrier's memory and memory of another root as one that may run in either order. the
+# caller hands the carrier as memory this function cannot name by any other route, so no address from another root
+# reaches it while every address formed from the carrier is a `ptr.add` past it, which `overlap.returned` checks: the
+# carrier goes nowhere but its own accesses and the returns that hand it back. judged before any call is rewritten, so
+# a call handed it as its result address (`destination`) is still its store. this takes out the run time test of
+# overlap a copy from a parameter's memory into the result would otherwise get: the caller makes that memory, its
+# argument area or its copy by reference, as storage of its own beside the result's
+fun apart_at_carrier(w: *Work) {
+    if (sel w.carrier.none) { ret; }
+    val b:       *Body = body_of(w);
+    val carrier: Value = w.carrier.some;
+    if (!overlap.returned(b, carrier)) { ret; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var p: Instruction = b.blocks.data[k].first;
+            for (p != NO_INSTRUCTION) {
+                val d: *InstructionData = ?b.instructions.data[p];
+                if (d.opcode == opcode_table.MEM_COPY && d.operands.len == 3) {
+                    val to:   bool = overlap.root_of(b, d.operands.data[0]) == carrier;
+                    val from: bool = overlap.root_of(b, d.operands.data[1]) == carrier;
+                    if (to != from) {
+                        d.metadata.flags.ascending  = true;
+                        d.metadata.flags.descending = true;
+                    }
+                }
+                p = d.next;
+            }
+        }
+        k = k + 1;
+    }
+}
+
+# whether a callee cannot name the memory at `root` by any route but the
+# result address it is passed, so it may write its result there: a stack slot
+# of the function's whose address goes nowhere but its own accesses and storage
+# markers, which no argument, global or pointer reaches, or the function's own
+# carrier, handed to nothing but its own accesses and the returns that hand it
+# back, which the caller that made it gave as memory this function cannot
+# otherwise name
+fun unreached(w: *Work, root: Value) bool {
+    val opt_local: opt[Instruction] = made_by(w, root, opcode_table.ALLOCA);
+    if (sel opt_local.some) { ret overlap.contained(body_of(w), root); }
+    if (sel w.carrier.some) {
+        if (w.carrier.some == root) { ret overlap.returned(body_of(w), root); }
+    }
+    ret false;
+}
+
+# the padding of a result by reference at `to`, written zero after the call, stated public: a callee writes its
+# result's members, and the whole store of the result the ir states, which a result built in its destination replaces
+# and a copy from its slot makes, writes its padding zero (mirl.legal.aggregate), so a slot it writes is never read
+# stale through its padding (`mirl.pass.analysis.slots`). only a function that requires constant time is checked so, and only
+# its calls pay for it
+fun pad_result(w: *Work, bld: *Builder, to: Value, asg: *Assignment, olds: *Vector[Value]) err[refusal.Error] {
+    var i: usize = 0;
+    for (i < olds.len) {
+        val passing: piece.Passing = asg.results.data[i].passing;
+        if (sel passing.reference) {
+            var gaps: Vector[Range] = vector.init[Range](w.m.a);
+            fin { vector.dnit[Range](?gaps); }
+            val err_found: err[refusal.Error] = holes(w, body_of(w).values.data[olds.data[i]].type, 0, ?gaps);
+            if (sel err_found.err) { ret err_found; }
+            var g: usize = 0;
+            for (g < gaps.len) {
+                val err_zeroed: err[refusal.Error] = zero_at(w, bld, to, gaps.data[g], passing.reference.align);
+                if (sel err_zeroed.err) { ret err_zeroed; }
+                g = g + 1;
+            }
+            ret built(bld);
+        }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the runs of bytes of `ty`, at `base` within what holds it, that no member holds, in order, into `out`: a structure's
+# between and after its members and an array's within its elements, a union and a scalar having none
+fun holes(w: *Work, ty: Type, base: u64, out: *Vector[Range]) err[refusal.Error] {
+    val res_shape: res[table.Shape, refusal.Error] = shape_of(w, ty);
+    if (sel res_shape.err) { ret err[refusal.Error].err{res_shape.err}; }
+    var shape: table.Shape = res_shape.ok;
+    if (!(sel shape.structure) && !(sel shape.array)) { ret err[refusal.Error].ok{}; }
+    val res_size: res[u64, refusal.Error] = size_of(w, ty);
+    if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
+    var end: u64   = 0;
+    var i:   usize = 0;
+    for (i < member_count(?shape)) {
+        val member:            Type                    = member_type(?shape, i);
+        val res_member_offset: res[u64, refusal.Error] = member_offset(w, ty, ?shape, i);
+        if (sel res_member_offset.err) { ret err[refusal.Error].err{res_member_offset.err}; }
+        val res_width: res[u64, refusal.Error] = size_of(w, member);
+        if (sel res_width.err) { ret err[refusal.Error].err{res_width.err}; }
+        if (res_member_offset.ok > end) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Range](out, Range{offset: base + end, length: res_member_offset.ok - end});
+            if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        }
+        val err_inner: err[refusal.Error] = holes(w, member, base + res_member_offset.ok, out);
+        if (sel err_inner.err)                         { ret err_inner; }
+        if (res_member_offset.ok + res_width.ok > end) { end = res_member_offset.ok + res_width.ok; }
+        i = i + 1;
+    }
+    if (res_size.ok > end) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Range](out, Range{offset: base + end, length: res_size.ok - end});
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# zero over `gap` of the storage at `to`, aligned to `align`, in the widest words each offset allows, stated public
+fun zero_at(w: *Work, bld: *Builder, to: Value, gap: Range, align: u64) err[refusal.Error] {
+    val kept: bool = bld.secret;
+    builder.secret(bld, false);
+    fin { builder.secret(bld, kept); }
+    var public: Flags = NO_FLAGS;
+    public.public = true;
+    var done: u64 = 0;
+    for (done < gap.length) {
+        val at:               u64                      = aligned_at(align, gap.offset + done);
+        val n:                u64                      = moves.step(gap.length - done, at, WORD);
+        val res_integer_type: res[Type, refusal.Error] = integer_type(w, (n * 8)::u32);
+        if (sel res_integer_type.err) { ret err[refusal.Error].err{res_integer_type.err}; }
+        val res_zero: res[Value, refusal.Error] = integer(w, res_integer_type.ok, 0);
+        if (sel res_zero.err) { ret err[refusal.Error].err{res_zero.err}; }
+        val res_place: res[Value, refusal.Error] = address(w, bld, to, gap.offset + done);
+        if (sel res_place.err) { ret err[refusal.Error].err{res_place.err}; }
+        # the public flag states the store alone, never the address it is made at
+        builder.flags(bld, public);
+        store(bld, res_place.ok, res_zero.ok, at);
+        builder.flags(bld, NO_FLAGS);
+        done = done + n;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# one call, rewritten into the pieces of its arguments and results
+fun lower_call(w: *Work, c: Instruction, opt_into: opt[Instruction]) err[refusal.Error] {
+    val b: *Body            = body_of(w);
+    val d: *InstructionData = ?b.instructions.data[c];
+    if (d.immediates.len < 2) { ret err[refusal.Error].err{refusal.Error.reason{"a call with no signature or named count"}}; }
+    val stated_signature: Immediate = d.immediates.data[0];
+    val stated_named:     Immediate = d.immediates.data[1];
+    if (!(sel stated_signature.ty)) { ret err[refusal.Error].err{refusal.Error.reason{"a call with no signature"}}; }
+    if (!(sel stated_named.named))  { ret err[refusal.Error].err{refusal.Error.reason{"a call with no named count"}}; }
+    val signature:    Type                        = stated_signature.ty;
+    val named:        Named                       = stated_named.named;
+    val res_classify: res[Passage, refusal.Error] = classify(w, signature, named);
+    if (sel res_classify.err) { ret err[refusal.Error].err{res_classify.err}; }
+    var asg:    Assignment = res_classify.ok.assignment;
+    var direct: Direct     = res_classify.ok.direct;
+
+    var given:   Vector[Value]      = vector.init[Value](w.m.a);
+    var olds:    Vector[Value]      = vector.init[Value](w.m.a);
+    var homes:   Vector[opt[Value]] = vector.init[opt[Value]](w.m.a);
+    var out:     Vector[Value]      = vector.init[Value](w.m.a);
+    var places:  Vector[Placed]     = vector.init[Placed](w.m.a);
+    var params:  Vector[Type]       = vector.init[Type](w.m.a);
+    var results: Vector[Type]       = vector.init[Type](w.m.a);
+    var after:   Vector[Placed]     = vector.init[Placed](w.m.a);
+    fin {
+        vector.dnit[Value](?given);
+        vector.dnit[Value](?olds);
+        vector.dnit[opt[Value]](?homes);
+        vector.dnit[Value](?out);
+        vector.dnit[Placed](?places);
+        vector.dnit[Type](?params);
+        vector.dnit[Type](?results);
+        vector.dnit[Placed](?after);
+    }
+    val callee: Value = d.operands.data[0];
+    var i:      usize = 1;
+    for (i < d.operands.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?given, d.operands.data[i]);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.results.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?olds, d.results.data[i]);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        i = i + 1;
+    }
+    if (given.len != asg.arguments.len || olds.len != asg.results.len) { ret err[refusal.Error].err{refusal.Error.reason{"a call whose operands are not its signature's"}}; }
+    val opt_declared: opt[*FunctionData] = declared_callee(w, c);
+    var opt_address:  opt[Value]         = opt[Value].none{};
+    if (sel opt_into.some) { opt_address = opt[Value].some{body_of(w).instructions.data[opt_into.some].operands.data[0]}; }
+    or (sel asg.address.some) {
+        var ty:    Type = w.ptr;
+        var align: u64  = 1;
+        i = 0;
+        for (i < olds.len) {
+            if (sel asg.results.data[i].passing.reference) {
+                ty    = body_of(w).values.data[olds.data[i]].type;
+                align = asg.results.data[i].passing.reference.align;
+            }
+            i = i + 1;
+        }
+        val res_made: res[Value, refusal.Error] = slot(w, ty, align, result_held(opt_declared));
+        if (sel res_made.err) { ret err[refusal.Error].err{res_made.err}; }
+        opt_address = opt[Value].some{res_made.ok};
+    }
+    i = 0;
+    for (i < olds.len) {
+        val res_home_for: res[opt[Value], refusal.Error] = home_for(w, body_of(w).values.data[olds.data[i]].type, asg.results.data[i], direct_for(w, ?direct.results, i, olds.data[i]), Secrecy.whole{});
+        if (sel res_home_for.err) { ret err[refusal.Error].err{res_home_for.err}; }
+        val res_kept: res[usize, allocator.Error] = vector.push[opt[Value]](?homes, res_home_for.ok);
+        if (sel res_kept.err) { ret refusal.lost(res_kept.err); }
+        i = i + 1;
+    }
+
+    var bld: Builder = builder.make(w.m);
+    builder.enter(?bld, w.f);
+    builder.derive(?bld, c);
+    builder.before(?bld, c);
+    val secret:      bool       = body_of(w).instructions.data[c].metadata.secret;
+    val opt_carried: opt[Piece] = asg.address;
+    if (sel opt_address.some) {
+        if (sel opt_carried.some) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Value](?out, opt_address.some);
+            if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+            val err_placed: err[refusal.Error] = place_of(?places, opt_carried.some);
+            if (sel err_placed.err) { ret err_placed; }
+        }
+    }
+    i = 0;
+    for (i < given.len) {
+        val res_sent: res[Sent, refusal.Error] = sent(w, given.data[i]);
+        if (sel res_sent.err) { ret err[refusal.Error].err{res_sent.err}; }
+        builder.secret(?bld, res_sent.ok.secret);
+        val err_send: err[refusal.Error] = send(w, ?bld, c, Side.argument{i::u32}, res_sent.ok, asg.arguments.data[i], ?asg, ?out, ?places, direct_for(w, ?direct.arguments, i, res_sent.ok.value), parameter_held(opt_declared, i));
+        if (sel err_send.err) { ret err_send; }
+        i = i + 1;
+    }
+    val res_count: res[opt[Value], refusal.Error] = counted(w, named, ?asg);
+    if (sel res_count.err) { ret err[refusal.Error].err{res_count.err}; }
+    val opt_counter: opt[rf.Id] = count_register(w);
+    if (sel res_count.ok.some) {
+        if (sel opt_counter.some) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Value](?out, res_count.ok.some);
+            if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+            val res_placed: res[usize, allocator.Error] = vector.push[Placed](?places, Placed{place: Place.register{opt_counter.some}, scale: Scale.fixed{}, fill: Fill.exact{}});
+            if (sel res_placed.err) { ret refusal.lost(res_placed.err); }
+        }
+    }
+    val err_worded: err[refusal.Error] = words_size(w, named, ?asg, ?out, ?places);
+    if (sel err_worded.err) { ret err_worded; }
+    i = 0;
+    for (i < out.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Type](?params, body_of(w).values.data[out.data[i]].type);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < olds.len) {
+        val ty:                Type               = body_of(w).values.data[olds.data[i]].type;
+        val err_receive_types: err[refusal.Error] = receive_types(w, Side.result{i::u32}, ty, asg.results.data[i], ?asg, ?results, ?after);
+        if (sel err_receive_types.err) { ret err_receive_types; }
+        i = i + 1;
+    }
+    val opt_returned: opt[Placed] = returned_place(w);
+    if (sel opt_address.some) {
+        if (sel opt_returned.some) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Type](?results, w.ptr);
+            if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+            val res_placed: res[usize, allocator.Error] = vector.push[Placed](?after, opt_returned.some);
+            if (sel res_placed.err) { ret refusal.lost(res_placed.err); }
+        }
+    }
+    i = 0;
+    for (i < after.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Placed](?places, after.data[i]);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        i = i + 1;
+    }
+    val res_stated: res[table.Function, refusal.Error] = signature_of(w, signature);
+    if (sel res_stated.err) { ret err[refusal.Error].err{res_stated.err}; }
+    val res_sig: res[Type, refusal.Error] = piece_signature(w, Slice[Type]{data: params.data, size: params.len}, Slice[Type]{data: results.data, size: results.len}, res_stated.ok.convention);
+    if (sel res_sig.err) { ret err[refusal.Error].err{res_sig.err}; }
+
+    builder.secret(?bld, secret);
+    builder.state_callee(?bld, body_of(w).instructions.data[c].metadata.stated);
+    var operands: Vector[Value] = vector.init[Value](w.m.a);
+    fin { vector.dnit[Value](?operands); }
+    val res_first: res[usize, allocator.Error] = vector.push[Value](?operands, callee);
+    if (sel res_first.err) { ret refusal.lost(res_first.err); }
+    i = 0;
+    for (i < out.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?operands, out.data[i]);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        i = i + 1;
+    }
+    var imm:      [3]Immediate       = [3]Immediate{Immediate.ty{res_sig.ok}, Immediate.places{Slice[Placed]{data: places.data, size: places.len}}, Immediate.named{named}};
+    val placed:   Instruction        = builder.emit(?bld, Request{opcode: opcode_table.CALL_PLACED, operands: Slice[Value]{data: operands.data, size: operands.len}, immediates: Slice[Immediate]{data: ?imm[0], size: 3}, targets: no_targets()});
+    val err_made: err[refusal.Error] = built(?bld);
+    if (sel err_made.err) { ret err_made; }
+    if (in_constant_time(w.m.functions.data[w.f].data.constant_time)) {
+        if (sel opt_address.some) {
+            val err_padded: err[refusal.Error] = pad_result(w, ?bld, opt_address.some, ?asg, ?olds);
+            if (sel err_padded.err) { ret err_padded; }
+        }
+    }
+
+    if (sel opt_into.some) {
+        val err_stored: err[refusal.Error] = ir(body.erase(w.m, w.f, opt_into.some));
+        if (sel err_stored.err) { ret err_stored; }
+    }
+    var at: u32 = 0;
+    i = 0;
+    for (i < olds.len) {
+        val passed:       Passed = asg.results.data[i];
+        val old:          Value  = olds.data[i];
+        var placed_whole: bool   = false;
+        if (sel opt_into.some && sel passed.passing.reference) { placed_whole = true; }
+        # a result built in its destination is never loaded
+        if (!placed_whole) {
+            val ty:     Type          = body_of(w).values.data[old].type;
+            var pieces: Vector[Value] = vector.init[Value](w.m.a);
+            fin { vector.dnit[Value](?pieces); }
+            if (sel passed.passing.reference) {
+                if (sel opt_address.none) { ret err[refusal.Error].err{refusal.Error.reason{"a result by reference with no address"}}; }
+                val res_pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, opt_address.some);
+                if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+            }
+            or {
+                var n: u32 = 0;
+                for (n < passed.count) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Value](?pieces, builder.result(?bld, placed, at + n));
+                    if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+                    n = n + 1;
+                }
+                at = at + passed.count;
+            }
+            val res_rebuild: res[Value, refusal.Error] = rebuild(w, ?bld, ty, passed, direct_for(w, ?direct.results, i, old), ?asg, homes.data[i], Slice[Value]{data: pieces.data, size: pieces.len}, Secrecy.whole{});
+            if (sel res_rebuild.err) { ret err[refusal.Error].err{res_rebuild.err}; }
+            val err_done: err[refusal.Error] = built(?bld);
+            if (sel err_done.err) { ret err_done; }
+            val err_moved: err[refusal.Error] = ir(body.replace(w.m, w.f, old, res_rebuild.ok, Records.follow{}));
+            if (sel err_moved.err) { ret err_moved; }
+        }
+        i = i + 1;
+    }
+    ret ir(body.erase(w.m, w.f, c));
+}
+
+# the register a variadic caller sets its count in under the work's row
+fun count_register(w: *Work) opt[rf.Id] {
+    val regs: *Registers = held(w.convention);
+    if (regs == nil) { ret opt[rf.Id].none{}; }
+    ret regs.count;
+}
+
+# the count a variadic call states in the convention's count register: how
+# many of its argument pieces travel in vector or float registers, none when
+# the convention has no count or the call is not variadic
+fun counted(w: *Work, named: Named, asg: *Assignment) res[opt[Value], refusal.Error] {
+    val opt_count_register: opt[rf.Id] = count_register(w);
+    if (sel opt_count_register.none || !(sel named.first)) { ret res[opt[Value], refusal.Error].ok{opt[Value].none{}}; }
+    var n: u64   = 0;
+    var a: usize = 0;
+    for (a < asg.arguments.len) {
+        val passed: Passed = asg.arguments.data[a];
+        var k:      u32    = 0;
+        for (k < passed.count) {
+            val opt_kind_of: opt[rf.Kind] = kind_of(w, asg.pieces.data[(passed.first + k)::usize].place);
+            if (sel opt_kind_of.some) {
+                if (opt_kind_of.some == rf.FLOAT || opt_kind_of.some == rf.VECTOR) { n = n + 1; }
+            }
+            k = k + 1;
+        }
+        a = a + 1;
+    }
+    val res_integer_type: res[Type, refusal.Error] = integer_type(w, 8);
+    if (sel res_integer_type.err) { ret res[opt[Value], refusal.Error].err{res_integer_type.err}; }
+    val res_integer: res[Value, refusal.Error] = integer(w, res_integer_type.ok, n);
+    if (sel res_integer.err) { ret res[opt[Value], refusal.Error].err{res_integer.err}; }
+    ret res[opt[Value], refusal.Error].ok{opt[Value].some{res_integer.ok}};
+}
+
+# the bytes of a variadic call's stack words as the piece a row whose unnamed
+# arguments are x64's words hands its callee them in, as arm64ec's x5. the
+# address of the first word, x4, is no value of the ir, so the selection
+# sets it from the call's named count and the row
+fun words_size(w: *Work, named: Named, asg: *Assignment, out: *Vector[Value], places: *Vector[Placed]) err[refusal.Error] {
+    val unnamed: Unnamed = w.convention.row.variadic.unnamed;
+    if (!(sel named.first))   { ret err[refusal.Error].ok{}; }
+    if (!(sel unnamed.words)) { ret err[refusal.Error].ok{}; }
+    val res_integer_type: res[Type, refusal.Error] = integer_type(w, 64);
+    if (sel res_integer_type.err) { ret err[refusal.Error].err{res_integer_type.err}; }
+    val res_integer: res[Value, refusal.Error] = integer(w, res_integer_type.ok, asg.stack);
+    if (sel res_integer.err) { ret err[refusal.Error].err{res_integer.err}; }
+    val res_pushed: res[usize, allocator.Error] = vector.push[Value](out, res_integer.ok);
+    if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+    val res_placed: res[usize, allocator.Error] = vector.push[Placed](places, Placed{place: Place.register{unnamed.words.size}, scale: Scale.fixed{}, fill: Fill.exact{}});
+    if (sel res_placed.err) { ret refusal.lost(res_placed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+# take out an aggregate load the pass left unused, each variable bound to its
+# value bound from then on to the storage it read, on the instruction that
+# addresses that storage, so the variable keeps a description
+fun retire(w: *Work, l: Instruction) err[refusal.Error] {
+    val b: *Body            = body_of(w);
+    val d: *InstructionData = ?b.instructions.data[l];
+    if (!(sel d.place.placed)) { ret err[refusal.Error].ok{}; }
+    val v: Value = d.results.data[0];
+    if (b.values.data[v].uses.len != 0) { ret err[refusal.Error].ok{}; }
+    val address:   Value            = d.operands.data[0];
+    val base:      Def              = b.values.data[address].def;
+    var opt_owner: opt[Instruction] = opt[Instruction].none{};
+    if (sel base.result) { opt_owner = opt[Instruction].some{base.result.instruction}; }
+    if (b.values.data[v].bound.len != 0 && sel opt_owner.none) {
+        var carried: bool = false;
+        if (sel w.carrier.some) { carried = w.carrier.some == address; }
+        if (!carried)           { ret err[refusal.Error].err{refusal.Error.reason{"a bound aggregate loaded through an address no instruction makes"}}; }
+        val res_storage_of: res[Instruction, refusal.Error] = storage_of(w);
+        if (sel res_storage_of.err) { ret err[refusal.Error].err{res_storage_of.err}; }
+        opt_owner = opt[Instruction].some{res_storage_of.ok};
+    }
+    if (sel opt_owner.some) {
+        for (body_of(w).values.data[v].bound.len > 0) {
+            val r:      u32                = body_of(w).values.data[v].bound.data[0];
+            val err_ir: err[refusal.Error] = ir(body.store_binding(w.m, w.f, r, opt_owner.some));
+            if (sel err_ir.err) { ret err_ir; }
+        }
+    }
+    ret ir(body.erase(w.m, w.f, l));
+}
+
+# lower one function's entry, returns and calls
+fun lower(w: *Work) err[refusal.Error] {
+    val b:     *Body               = body_of(w);
+    var calls: Vector[Instruction] = vector.init[Instruction](w.m.a);
+    var rets:  Vector[Instruction] = vector.init[Instruction](w.m.a);
+    fin {
+        vector.dnit[Instruction](?calls);
+        vector.dnit[Instruction](?rets);
+    }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var p: Instruction = b.blocks.data[k].first;
+            for (p != NO_INSTRUCTION) {
+                val i:    Instruction = p;
+                val code: Opcode      = b.instructions.data[i].opcode;
+                if (code == opcode_table.CALL) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?calls, i);
+                    if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+                }
+                if (code == opcode_table.RET) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?rets, i);
+                    if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+                }
+                p = b.instructions.data[p].next;
+            }
+        }
+        k = k + 1;
+    }
+    val signature:    Type                        = w.m.functions.data[w.f].data.signature;
+    val res_classify: res[Passage, refusal.Error] = classify(w, signature, Named.all{});
+    if (sel res_classify.err) { ret err[refusal.Error].err{res_classify.err}; }
+    var asg:         Assignment                     = res_classify.ok.assignment;
+    var direct:      Direct                         = res_classify.ok.direct;
+    val res_entered: res[opt[Value], refusal.Error] = lower_entry(w, ?asg, ?direct);
+    if (sel res_entered.err) { ret err[refusal.Error].err{res_entered.err}; }
+    w.carrier = res_entered.ok;
+    val err_built_in: err[refusal.Error] = in_place(w, ?asg, res_entered.ok, ?rets);
+    if (sel err_built_in.err) { ret err_built_in; }
+    var i: usize = 0;
+    for (i < rets.len) {
+        val err_lower_return: err[refusal.Error] = lower_return(w, ?asg, ?direct, rets.data[i], res_entered.ok);
+        if (sel err_lower_return.err) { ret err_lower_return; }
+        i = i + 1;
+    }
+    apart_at_carrier(w);
+    var intos: Vector[opt[Instruction]] = vector.init[opt[Instruction]](w.m.a);
+    fin { vector.dnit[opt[Instruction]](?intos); }
+    i = 0;
+    for (i < calls.len) {
+        val res_decided: res[opt[Instruction], refusal.Error] = decided(w, calls.data[i]);
+        if (sel res_decided.err) { ret err[refusal.Error].err{res_decided.err}; }
+        val res_pushed: res[usize, allocator.Error] = vector.push[opt[Instruction]](?intos, res_decided.ok);
+        if (sel res_pushed.err) { ret refusal.lost(res_pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < calls.len) {
+        val err_lower_call: err[refusal.Error] = lower_call(w, calls.data[i], intos.data[i]);
+        if (sel err_lower_call.err) { ret err_lower_call; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.unused.len) {
+        val err_retire: err[refusal.Error] = retire(w, w.unused.data[i]);
+        if (sel err_retire.err) { ret err_retire; }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# declare the runtime function general dynamic thread-local access calls,
+# when the module has a variable the target reaches that way and does not
+# declare it, so selection names it as a call does
+fun declare_lookup(c: *Context, ptr: Type) res[bool, refusal.Error] {
+    val model: Addresses = c.t.addresses;
+    if (!(sel model.model)) { ret res[bool, refusal.Error].ok{false}; }
+    var wanted: bool  = false;
+    var i:      usize = 0;
+    for (i < c.m.globals.len) {
+        val opt_tls: opt[Tls] = c.m.globals.data[i].data.tls;
+        if (sel opt_tls.some) {
+            val reached: addressing.Access = addressing.access(?model.model, opt_tls.some);
+            if (sel reached.general_dynamic) { wanted = true; }
+        }
+        i = i + 1;
+    }
+    if (!wanted) { ret res[bool, refusal.Error].ok{false}; }
+    val name:      str         = model.model.threads.lookup;
+    val as:        View        = View{data: name, len: str_len(name)};
+    val opt_found: opt[Symbol] = module.find(c.m, as);
+    if (sel opt_found.some) { ret res[bool, refusal.Error].ok{false}; }
+    var one:     [1]Type                = [1]Type{ptr};
+    val res_sig: res[Type, table.Error] = table.intern(?c.m.types, table.Shape.function{table.plain(Slice[Type]{data: ?one[0], size: 1}, Slice[Type]{data: ?one[0], size: 1})});
+    if (sel res_sig.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_sig.err}}}; }
+    val res_symbol_as: res[Id[Name], module.Error] = module.intern_name(c.m, as);
+    if (sel res_symbol_as.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_symbol_as.err}}; }
+    val res_made: res[Function, module.Error] = module.add_function(c.m, FunctionData{name: res_symbol_as.ok, signature: res_sig.ok, linkage: Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT}, constant_time: ConstantTime.none{}, extensions: NO_EXTENSIONS, alignment: opt[u64].none{}, section: opt[Section].none{}});
+    if (sel res_made.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# declare the 32-bit cell indexed thread-local access reads the module's
+# index from, as windows' _tls_index, as an external global when the module
+# has a variable the target reaches that way and does not declare it, so
+# selection names it as an address does. the image's link defines it beside
+# its tls directory, and only the loader writes it
+fun declare_cell(c: *Context) res[bool, refusal.Error] {
+    val model: Addresses = c.t.addresses;
+    if (!(sel model.model)) { ret res[bool, refusal.Error].ok{false}; }
+    val name: str = model.model.threads.index;
+    if (str_len(name) == 0) { ret res[bool, refusal.Error].ok{false}; }
+    var wanted: bool  = false;
+    var i:      usize = 0;
+    for (i < c.m.globals.len) {
+        val opt_tls: opt[Tls] = c.m.globals.data[i].data.tls;
+        if (sel opt_tls.some) {
+            val reached: addressing.Access = addressing.access(?model.model, opt_tls.some);
+            if (sel reached.indexed) { wanted = true; }
+        }
+        i = i + 1;
+    }
+    if (!wanted) { ret res[bool, refusal.Error].ok{false}; }
+    val as:        View        = View{data: name, len: str_len(name)};
+    val opt_found: opt[Symbol] = module.find(c.m, as);
+    if (sel opt_found.some) { ret res[bool, refusal.Error].ok{false}; }
+    val res_cell: res[Type, table.Error] = table.intern(?c.m.types, table.Shape.integer{table.Integer{width: 32}});
+    if (sel res_cell.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_cell.err}}}; }
+    val res_symbol_as: res[Id[Name], module.Error] = module.intern_name(c.m, as);
+    if (sel res_symbol_as.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_symbol_as.err}}; }
+    val res_made: res[Global, module.Error] = module.add_global(c.m, GlobalData{name: res_symbol_as.ok, type: res_cell.ok, initial: opt[Constant].none{}, alignment: opt[u64].none{}, section: opt[Section].none{}, tls: opt[Tls].none{}, linkage: Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT}, constant: true, secret: Secrecy.public{}, debug: opt[Binding].none{}});
+    if (sel res_made.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# deliver the routine the convention's prologues call to probe a frame's
+# pages, as windows x64's __chkstk, for each row a function the module
+# defines is under, when the module does not define it, so the frame names
+# it as a call does. it takes and returns nothing a convention places, its
+# own contract keeping every register but those the frame code's probe
+# states, and mirl writes it, as the toolchain links no C run time that would
+fun declare_probe(c: *Context, b: *Build) res[bool, refusal.Error] {
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < c.m.functions.len) {
+        if (record.touches(c, (i::u32))) {
+            val res_signature: res[table.Function, table.Error] = table.signature(?c.m.types, c.m.functions.data[i].data.signature);
+            if (sel res_signature.ok) {
+                val opt_row: opt[*Resolved] = build_record.under(b, res_signature.ok.convention);
+                if (sel opt_row.some) {
+                    val res_delivered: res[bool, refusal.Error] = delivered_probe(c, convention.probe_helper(opt_row.some.row), in_constant_time(c.m.functions.data[i].data.constant_time));
+                    if (sel res_delivered.err) { ret res_delivered; }
+                    if (res_delivered.ok)      { changed = true; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# deliver a probe routine by its name, none for a row with none, when the
+# module does not define it already, local to the module where `local` says a
+# constant-time function's frame calls it
+fun delivered_probe(c: *Context, name: opt[str], local: bool) res[bool, refusal.Error] {
+    if (sel name.none) { ret res[bool, refusal.Error].ok{false}; }
+    val as:        View        = View{data: name.some, len: str_len(name.some)};
+    val opt_found: opt[Symbol] = module.find(c.m, as);
+    val held:      bool        = sel opt_found.some;
+    if (held && !local) { ret res[bool, refusal.Error].ok{false}; }
+    var ar:        arena.Arena;
+    val err_arena: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_arena.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_arena.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    val res_probe: res[Function, refusal.Error] = deliver.probe(c.m, c.t, c.basis, ?scratch, name.some, local);
+    if (sel res_probe.err) { ret res[bool, refusal.Error].err{res_probe.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# declare the global holding the routine a row's returns leave through, as
+# arm64ec's __os_arm64x_dispatch_ret, for each row a function the module
+# defines is under, when the module does not declare it, so the frame names
+# it as a load does
+fun declare_exit(c: *Context, b: *Build, ptr: Type) res[bool, refusal.Error] {
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < c.m.functions.len) {
+        if (record.touches(c, (i::u32))) {
+            val res_signature: res[table.Function, table.Error] = table.signature(?c.m.types, c.m.functions.data[i].data.signature);
+            if (sel res_signature.ok) {
+                val opt_row: opt[*Resolved] = build_record.under(b, res_signature.ok.convention);
+                if (sel opt_row.some) {
+                    val opt_name: opt[str] = convention.exit_routine(opt_row.some.row);
+                    if (sel opt_name.some) {
+                        val as:        View        = View{data: opt_name.some, len: str_len(opt_name.some)};
+                        val opt_found: opt[Symbol] = module.find(c.m, as);
+                        if (sel opt_found.none) {
+                            val res_symbol_as: res[Id[Name], module.Error] = module.intern_name(c.m, as);
+                            if (sel res_symbol_as.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_symbol_as.err}}; }
+                            val res_made: res[Global, module.Error] = module.add_global(c.m, GlobalData{name: res_symbol_as.ok, type: ptr, initial: opt[Constant].none{}, alignment: opt[u64].none{}, section: opt[Section].none{}, tls: opt[Tls].none{}, linkage: Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT}, constant: false, secret: Secrecy.public{}, debug: opt[Binding].none{}});
+                            if (sel res_made.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# the convention classifies through the build's, never one of the pass's own
+fun run(c: *Context, b: *Build, marks: *Changed) res[bool, refusal.Error] {
+    var l:       Layout                 = layout.of(c.t, ?c.m.types, basis.context_of(c.basis));
+    val res_ptr: res[Type, table.Error] = table.intern(?c.m.types, table.Shape.pointer{table.Pointer{space: 0}});
+    if (sel res_ptr.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_ptr.err}}}; }
+    val res_space: res[u32, target_record.Error] = target_record.slot_space(c.t);
+    if (sel res_space.err) { ret res[bool, refusal.Error].err{refusal.Error.reason{"a target that states no address space for its stack slots"}}; }
+    val res_slot: res[Type, table.Error] = table.intern(?c.m.types, table.Shape.pointer{table.Pointer{space: res_space.ok}});
+    if (sel res_slot.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_slot.err}}}; }
+    val res_bytes: res[u64, target_record.Error] = layout.size(?l, res_ptr.ok, table.DEFAULT_SPACE);
+    if (sel res_bytes.err) { ret res[bool, refusal.Error].err{refusal.Error.reason{"a pointer with no size in memory"}}; }
+    val res_word: res[Type, table.Error] = table.intern(?c.m.types, table.Shape.integer{table.Integer{width: (res_bytes.ok * 8)::u32}});
+    if (sel res_word.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{module.Error.types{res_word.err}}}; }
+    val res_declared: res[bool, refusal.Error] = declare_lookup(c, res_ptr.ok);
+    if (sel res_declared.err) { ret res_declared; }
+    val res_celled: res[bool, refusal.Error] = declare_cell(c);
+    if (sel res_celled.err) { ret res_celled; }
+    val res_probed: res[bool, refusal.Error] = declare_probe(c, b);
+    if (sel res_probed.err) { ret res_probed; }
+    val res_exits: res[bool, refusal.Error] = declare_exit(c, b, res_ptr.ok);
+    if (sel res_exits.err) { ret res_exits; }
+    var placed: Passages = passages(c.m.a, b, ?l);
+    fin { forget(?placed); }
+    var changed: bool  = res_declared.ok || res_celled.ok || res_probed.ok || res_exits.ok;
+    var i:       usize = 0;
+    for (i < c.m.functions.len) {
+        val f: Function = (i::u32);
+        if (record.touches(c, f)) {
+            var w:         Work               = Work{m: c.m, t: c.t, basis: c.basis, build: b, passages: ?placed, convention: build_record.default_row(b), l: ?l, f: f, entry: 0, slots: NO_INSTRUCTION, ptr: res_ptr.ok, slot: res_slot.ok, offset: res_word.ok, unused: vector.init[Instruction](c.m.a), carrier: opt[Value].none{}, storage: opt[Instruction].none{}};
+            val err_lower: err[refusal.Error] = lower(?w);
+            vector.dnit[Instruction](?w.unused);
+            if (sel err_lower.err) { ret res[bool, refusal.Error].err{err_lower.err}; }
+            changed = true;
+            record.changed(marks, f);
+        }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

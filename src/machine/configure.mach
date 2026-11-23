@@ -1,0 +1,605 @@
+# the insertion of the instructions that establish a configuration state
+#
+# an instruction whose register groups turn on a configuration state states
+# the one it runs under, as a vector add states the element width and
+# grouping that form its groups. this runs after allocation and the frame, where
+# every operand is a location, and inserts the set's establishing
+# instructions before each instruction whose state differs from the one in
+# force, of the first of the set's forms that fits that state. the
+# state in force is unknown at a block's start and after a call, and an
+# instruction masc's hooks say sets a state leaves that one in force, while
+# one whose state its operands decide leaves it unknown. a part of the
+# establishing instruction the set leaves to a scratch register takes an
+# allowed register the convention clobbers or the frame saves that holds no
+# value there. where none is free, an allowed register of the stack
+# pointer's class the part admits is saved to one of the frame's emergency
+# slots before the establishing instructions and restored after them. every
+# other instruction is copied, and the call frame facts and origins follow
+# the instructions they name.
+#
+# nothing here names a set: the forms, their rows and their parts are the
+# set's StateRules, read as data, and the states are masc's.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.metadata;
+use mirl.ir.metadata.Metadata;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Segment;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class;
+use mirl.machine.class.Physical;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Admitted;
+use mirl.machine.frame.code.Emit;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Fact;
+use mirl.machine.frame.record.Framed;
+use mirl.machine.frame.scavenge;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Virtual;
+use mirl.machine.vstate;
+
+use core_config: masc.core.config;
+use masc.core.effect;
+use mo: masc.core.operand;
+use masc.core.query;
+use rf:         masc.core.register;
+use rows:       masc.core.row;
+use core_state: masc.core.state;
+
+# an immediate of an establishing instruction, computed from the state it
+# establishes, as rvv's vector type or vector length
+pub def Field: fun(vstate.State) i64;
+
+# what an operand of an establishing instruction holds
+# ---
+# scratch: the free register of this index, which one instruction of the form
+#          writes and a later one may read, and nothing after the form
+# fixed:   this register
+# field:   an immediate computed from the state established
+pub tag Part: u8 {
+    scratch: u8;
+    fixed:   rf.Id;
+    field:   Field;
+}
+
+# the parts of an establishing instruction, one per operand of its row
+pub rec Parts {
+    at:  *Part;
+    len: u32;
+}
+
+# one instruction of a form
+# ---
+# row:   its row
+# parts: what each of its operands holds
+pub rec Step {
+    row:   *rows.Row;
+    parts: Parts;
+}
+
+# the instructions of a form, in order
+pub rec Steps {
+    at:  *Step;
+    len: u32;
+}
+
+# one way a set establishes a state
+# ---
+# fits:  whether the form establishes the state, as an immediate it needs fits
+#        its operand
+# steps: its instructions
+pub rec Form {
+    fits:  fun(vstate.State) bool;
+    steps: Steps;
+}
+
+# how a set establishes its configuration state: the first of its forms that
+# fits the state
+pub rec StateRules {
+    at:  *Form;
+    len: u32;
+}
+
+# the most scratch registers a form names
+val MOST_SCRATCH: u32 = 4;
+
+# what the insertion reads beside the framed function
+# ---
+# at:        the locations of the target
+# context:   the selection's context
+# clobbered: the registers a call clobbers, which a function writes freely
+# allowed:   the locations the allocator was allowed to assign
+# rules:     how the set establishes its state, nil for a set with none
+# code:      the target's frame code bound to the selection, which saves and
+#            restores a register scavenged for a scratch
+pub rec Request {
+    at:        *Locations;
+    context:   *core_state.Context;
+    clobbered: Slice[rf.Id];
+    allowed:   Slice[Physical];
+    rules:     *StateRules;
+    code:      *Admitted;
+}
+
+# why a function's states were not established
+# ---
+# alloc:     the allocator refused storage
+# live:      the liveness of the framed function was refused
+# unlocated: a register the locations do not hold
+# made:      the function's maker refused an instruction or a block
+# code:      the frame code refused the save or restore of a scavenged
+#            register
+# scratch:   an instruction before which no candidate register is free and
+#            none is left to scavenge through the frame's emergency slots
+# shape:     an instruction whose rules state a part their row's operand
+#            does not admit, or parts of another count than its operands
+# hooks:     an instruction that states a state of a set with no
+#            configuration hooks
+pub tag Error: u8 {
+    alloc:     allocator.Error;
+    live:      live.Error;
+    unlocated: location.Unlocated;
+    made:      function.Error;
+    code:      code.Error;
+    scratch:   Instruction;
+    shape:     Instruction;
+    hooks:     Instruction;
+}
+
+# the allocator's refusal `e` stands for, its own or a step's it carries, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc) { ret opt[allocator.Error].some{e.alloc}; }
+    if (sel e.live)  { ret live.starved(e.live); }
+    if (sel e.made)  { ret function.starved(e.made); }
+    if (sel e.code)  { ret code.starved(e.code); }
+    ret opt[allocator.Error].none{};
+}
+
+# what one function's insertion works with
+# ---
+# r:       the request
+# src:     the framed function
+# out:     the function written
+# l:       the liveness of the framed function
+# spares:  the candidate scratch registers, by location, ascending
+# current: the state in force, none where it is unknown
+rec Writer {
+    r:       *Request;
+    src:     *Framed;
+    out:     *Function;
+    l:       *Live;
+    spares:  vector.Vector[u32];
+    current: opt[vstate.State];
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+fun made_err(e: function.Error) err[Error] {
+    ret err[Error].err{Error.made{e}};
+}
+
+# the allowed locations a call clobbers or the frame saves, ascending
+fun candidates(w: *Writer, a: *allocator.Allocator) err[Error] {
+    val at:    *Locations          = w.r.at;
+    var marks: vector.Vector[bool] = vector.init[bool](a);
+    fin { vector.dnit[bool](?marks); }
+    val err_filled: err[allocator.Error] = slice.fill[bool](?marks, location.count(at)::usize, false);
+    if (sel err_filled.err) { ret alloc_err(err_filled.err); }
+    var i: usize = 0;
+    for (i < w.r.clobbered.size) {
+        val res_locate: res[u32, location.Unlocated] = location.locate(at, Physical.register{w.r.clobbered.data[i]});
+        if (sel res_locate.err) { ret err[Error].err{Error.unlocated{res_locate.err}}; }
+        marks.data[res_locate.ok] = true;
+        i                         = i + 1;
+    }
+    i = 0;
+    for (i < w.src.layout.saves.len) {
+        val res_locate: res[u32, location.Unlocated] = location.locate(at, Physical.register{w.src.layout.saves.data[i].register});
+        if (sel res_locate.err) { ret err[Error].err{Error.unlocated{res_locate.err}}; }
+        marks.data[res_locate.ok] = true;
+        i                         = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < location.count(at)) {
+        if (marks.data[k] && allowed(w, k)) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[u32](?w.spares, k);
+            if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun allowed(w: *Writer, loc: u32) bool {
+    var i: usize = 0;
+    for (i < w.r.allowed.size) {
+        val res_locate: res[u32, location.Unlocated] = location.locate(w.r.at, w.r.allowed.data[i]);
+        if (sel res_locate.ok) {
+            if (res_locate.ok == loc) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a candidate register of a class register position `rr` admits that holds
+# no value into or across instruction `at` and shares storage with none of
+# some others, none when every one does
+fun scratch(w: *Writer, rr: *mo.Register, at: Instruction, others: Slice[rf.Id]) opt[rf.Id] {
+    val opt_slot: opt[u32] = live.use_slot(w.l, at);
+    if (sel opt_slot.none) { ret opt[rf.Id].none{}; }
+    var span: [1]Segment = [1]Segment{Segment{from: opt_slot.some, to: opt_slot.some + 1}};
+    var i:    usize      = 0;
+    for (i < w.spares.len) {
+        val p: Physical = location.physical(w.r.at, w.spares.data[i]);
+        if (sel p.register) {
+            if (mo.find(rr.classes, rf.class_of(p.register)) >= 0) {
+                val opt_blocked: opt[u32] = live.blocked_over(w.l, w.r.at, w.spares.data[i], Slice[Segment]{data: ?span[0], size: 1}, Slice[u32]{data: nil, size: 0});
+                if (sel opt_blocked.none && scavenge.apart(w.r.at, p.register, others)) { ret opt[rf.Id].some{p.register}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret opt[rf.Id].none{};
+}
+
+# an allowed register of a class that holds the stack pointer's values (`class.addresses`) register position `rr`
+# admits that shares storage with none of some others, none when every one
+# does
+fun scavenged(w: *Writer, rr: *mo.Register, others: Slice[rf.Id]) opt[rf.Id] {
+    val stack: rf.Id = w.src.layout.stack;
+    if (stack == rf.NONE) { ret opt[rf.Id].none{}; }
+    var i: usize = 0;
+    for (i < w.r.allowed.size) {
+        val p: Physical = w.r.allowed.data[i];
+        if (sel p.register) {
+            val r: rf.Id = p.register;
+            if (class.addresses(w.r.at.file, stack, rf.class_of(r)) && mo.find(rr.classes, rf.class_of(r)) >= 0 && scavenge.apart(w.r.at, r, others)) { ret opt[rf.Id].some{r}; }
+        }
+        i = i + 1;
+    }
+    ret opt[rf.Id].none{};
+}
+
+# the scratch registers the establishing form of a set's rules that takes
+# the most takes
+# ---
+# rules: the rules, nil for a set with none
+# ret:   how many scratches its form that names the most names
+pub fun scratches(rules: *StateRules) u32 {
+    if (rules == nil) { ret 0; }
+    var most: u32 = 0;
+    var f:    u32 = 0;
+    for (f < rules.len) {
+        val n: u32 = named(?rules.at[f]);
+        if (n > most) { most = n; }
+        f = f + 1;
+    }
+    ret most;
+}
+
+# how many scratches a form names: one past the highest index any part names
+fun named(form: *Form) u32 {
+    var n: u32 = 0;
+    var s: u32 = 0;
+    for (s < form.steps.len) {
+        val step: *Step = ?form.steps.at[s];
+        var k:    u32   = 0;
+        for (k < step.parts.len) {
+            val part: Part = step.parts.at[k];
+            if (sel part.scratch) {
+                if (part.scratch::u32 + 1 > n) { n = part.scratch::u32 + 1; }
+            }
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+    ret n;
+}
+
+# the metadata of an instruction the insertion makes, its source position the
+# one of the instruction it stands before
+fun made_for(md: Metadata) Metadata {
+    ret Metadata{location: md.location, site: md.site, flags: metadata.NO_FLAGS, secret: false, bindings: metadata.UNBOUND};
+}
+
+# the establishing instructions for state `st` before instruction `at`, of
+# the first form that fits it, each scratch its own free candidate, or else a
+# register scavenged through the frame's emergency slots, saved before them
+# and restored after them
+fun establish(w: *Writer, b: Block, at: Instruction, d: *InstructionData, st: vstate.State) err[Error] {
+    val rules: *StateRules = w.r.rules;
+    var form:  *Form       = nil;
+    var f:     u32         = 0;
+    for (f < rules.len && form == nil) {
+        if (rules.at[f].fits(st)) { form = ?rules.at[f]; }
+        f = f + 1;
+    }
+    if (form == nil || named(form) > MOST_SCRATCH) { ret err[Error].err{Error.shape{at}}; }
+    # the fixed registers of every step, then the registers given to scratches, which none may share storage with
+    var others: [mo.MAX_OPERANDS * 4]rf.Id;
+    var given:  usize = 0;
+    var s:      u32   = 0;
+    for (s < form.steps.len) {
+        val step: *Step = ?form.steps.at[s];
+        if (step.parts.len != step.row.operands.len || step.row.operands.len > mo.MAX_OPERANDS) { ret err[Error].err{Error.shape{at}}; }
+        var k: u32 = 0;
+        for (k < step.parts.len) {
+            val part: Part = step.parts.at[k];
+            if (sel part.fixed) {
+                others[given] = part.fixed;
+                given         = given + 1;
+            }
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+    var regs:  [MOST_SCRATCH]rf.Id;
+    var held:  [MOST_SCRATCH]bool = [MOST_SCRATCH]bool{false, false, false, false};
+    var spent: [MOST_SCRATCH]rf.Id;
+    var taken: usize              = 0;
+    s = 0;
+    for (s < form.steps.len) {
+        val step: *Step = ?form.steps.at[s];
+        var k:    u32   = 0;
+        for (k < step.parts.len) {
+            val part:  Part = step.parts.at[k];
+            var fresh: bool = false;
+            var index: u8   = 0;
+            if (sel part.scratch) {
+                index = part.scratch;
+                fresh = !held[index];
+            }
+            if (fresh) {
+                val ro: *mo.Operand = ?step.row.operands.at[k];
+                if (!(sel ro.shape.register)) { ret err[Error].err{Error.shape{at}}; }
+                val apart:    Slice[rf.Id] = Slice[rf.Id]{data: ?others[0], size: given};
+                var opt_free: opt[rf.Id]   = scratch(w, ?ro.shape.register, at, apart);
+                if (sel opt_free.none && taken < scavenge.room(?w.src.layout, w.r.at.file, w.src.layout.stack)) {
+                    opt_free = scavenged(w, ?ro.shape.register, apart);
+                    if (sel opt_free.some) {
+                        spent[taken] = opt_free.some;
+                        taken        = taken + 1;
+                    }
+                }
+                if (sel opt_free.none) { ret err[Error].err{Error.scratch{at}}; }
+                regs[index]   = opt_free.some;
+                held[index]   = true;
+                others[given] = opt_free.some;
+                given         = given + 1;
+            }
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+    var e:     Emit         = Emit{admitted: w.r.code, f: w.out, block: b, metadata: made_for(d.metadata), stack: w.src.layout.stack, scratches: code.NO_SCRATCH, scratch: opt[rf.Id].none{}};
+    var saved: Slice[rf.Id] = code.NO_SCRATCH;
+    if (taken > 0) { saved = Slice[rf.Id]{data: ?spent[0], size: taken}; }
+    val err_kept: err[code.Error] = scavenge.preserve(?e, ?w.src.layout, saved, 0, false);
+    if (sel err_kept.err) { ret err[Error].err{Error.code{err_kept.err}}; }
+    s = 0;
+    for (s < form.steps.len) {
+        val step: *Step = ?form.steps.at[s];
+        var ops:  [mo.MAX_OPERANDS]Operand;
+        var k:    u32   = 0;
+        for (k < step.parts.len) {
+            val part: Part = step.parts.at[k];
+            if (sel part.scratch) { ops[k] = Operand.physical{Physical.register{regs[part.scratch]}}; }
+            or (sel part.fixed)   { ops[k] = Operand.physical{Physical.register{part.fixed}}; }
+            or                    { ops[k] = Operand.immediate{part.field(st)}; }
+            k = k + 1;
+        }
+        val res_made: res[Instruction, function.Error] = function.append(w.out, b, Opcode.row{step.row}, Slice[Operand]{data: ?ops[0], size: step.row.operands.len::usize}, made_for(d.metadata), false, vstate.NONE);
+        if (sel res_made.err) { ret made_err(res_made.err); }
+        s = s + 1;
+    }
+    val err_back: err[code.Error] = scavenge.preserve(?e, ?w.src.layout, saved, 0, true);
+    if (sel err_back.err) { ret err[Error].err{Error.code{err_back.err}}; }
+    w.current = opt[vstate.State].some{st};
+    ret err[Error].ok{};
+}
+
+# the state in force after instruction `d`: unknown after a call or an
+# inline block, which may set any, the state a row masc's hooks say sets one
+# leaves, unknown after one its operands decide, and the one before it
+# otherwise
+fun after(w: *Writer, d: *InstructionData) {
+    val file:    *rf.File                     = function.file(?w.src.function);
+    val control: query.Answer[effect.Control] = instruction.transfer(file, d);
+    if (sel control.undecided) {
+        w.current = vstate.NONE;
+        ret;
+    }
+    val op: Opcode = d.opcode;
+    if (control.decided.transfer == effect.CALL || sel op.inline) {
+        w.current = vstate.NONE;
+        ret;
+    }
+    val hooks: *core_config.Hooks = w.src.function.set.config;
+    if (hooks == nil) { ret; }
+    var r: u32 = 0;
+    for (r < instruction.rows_in(op)) {
+        var held: opt[core_config.State] = opt[core_config.State].none{};
+        if (sel w.current.some) { held = opt[core_config.State].some{w.current.some.config}; }
+        val row:    *rows.Row               = instruction.row_in(op, r);
+        var stated: [mo.MAX_OPERANDS]Operand;
+        val given:  Slice[Operand]          = instruction.operands_in(file, op, r, d.operands, ?stated[0]);
+        var values: [instruction.VALUES]mo.Value;
+        val set:    core_config.Established = hooks.establish(row, instruction.values_of(file, row, given, ?values[0]), held);
+        if (sel set.sets)      { w.current = opt[vstate.State].some{vstate.State{config: set.sets}}; }
+        or (sel set.undecided) { w.current = vstate.NONE; }
+        r = r + 1;
+    }
+}
+
+# instruction `at` of block `b`, after the establishing instruction its
+# state needs where the state in force differs
+fun instruction_of(w: *Writer, b: Block, at: Instruction) err[Error] {
+    val d:         *InstructionData  = function.data(?w.src.function, at);
+    val opt_state: opt[vstate.State] = d.state;
+    if (sel opt_state.some) {
+        if (!vstate.same(w.current, opt_state)) {
+            if (w.r.rules == nil || w.src.function.set.config == nil) { ret err[Error].err{Error.hooks{at}}; }
+            val err_set: err[Error] = establish(w, b, at, d, opt_state.some);
+            if (sel err_set.err) { ret err_set; }
+        }
+    }
+    val res_carried: res[Instruction, function.Error] = function.carry(w.out, b, d, d.operands);
+    if (sel res_carried.err) { ret made_err(res_carried.err); }
+    after(w, d);
+    ret err[Error].ok{};
+}
+
+# the framed function's virtuals, slots and blocks copied into the one
+# written and its instructions written with the establishing ones they need,
+# recording per source instruction where its written ones start in `first`
+# and how many there are in `made`, and an origin per written instruction
+fun write(w: *Writer, first: *vector.Vector[u32], made: *vector.Vector[u32], origins: *vector.Vector[u32]) err[Error] {
+    val f: *Function = ?w.src.function;
+    var i: usize     = 0;
+    for (i < f.virtuals.len) {
+        val res_virtual: res[Virtual, function.Error] = function.virtual(w.out, f.virtuals.data[i], f.secret.data[i], f.widths.data[i]);
+        if (sel res_virtual.err) { ret made_err(res_virtual.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.slots.len) {
+        val res_slot: res[Slot, function.Error] = function.slot(w.out, f.slots.data[i]);
+        if (sel res_slot.err) { ret made_err(res_slot.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        val res_block: res[Block, function.Error] = function.block(w.out);
+        if (sel res_block.err) { ret made_err(res_block.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        val b:    Block              = (i::u32);
+        val list: Slice[Instruction] = function.instructions(f, b);
+        w.current = vstate.NONE;
+        var k: usize = 0;
+        for (k < list.size) {
+            val at:       Instruction = list.data[k];
+            val from:     usize       = w.out.instructions.len;
+            val err_done: err[Error]  = instruction_of(w, b, at);
+            if (sel err_done.err) { ret err_done; }
+            first.data[at] = from::u32;
+            made.data[at]  = (w.out.instructions.len - from)::u32;
+            var o: usize = from;
+            for (o < w.out.instructions.len) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](origins, w.src.origins.data[at]);
+                if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+                o = o + 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun per_instruction(v: *vector.Vector[u32], n: usize) err[Error] {
+    val err_filled: err[allocator.Error] = slice.fill[u32](v, n, 0);
+    if (sel err_filled.err) { ret alloc_err(err_filled.err); }
+    ret err[Error].ok{};
+}
+
+# the written framed function in `out`, its facts following the instructions
+# they name and the source function's written state carried over
+fun configured(a: *allocator.Allocator, w: *Writer, out: *Framed) err[Error] {
+    val err_ready: err[Error] = candidates(w, a);
+    if (sel err_ready.err) { ret err_ready; }
+    var first: vector.Vector[u32] = vector.init[u32](a);
+    var made:  vector.Vector[u32] = vector.init[u32](a);
+    fin {
+        vector.dnit[u32](?first);
+        vector.dnit[u32](?made);
+    }
+    val count:      usize      = w.src.function.instructions.len;
+    val err_starts: err[Error] = per_instruction(?first, count);
+    if (sel err_starts.err) { ret err_starts; }
+    val err_counts: err[Error] = per_instruction(?made, count);
+    if (sel err_counts.err) { ret err_counts; }
+    val err_written: err[Error] = write(w, ?first, ?made, ?out.origins);
+    if (sel err_written.err) { ret err_written; }
+    val err_followed: err[allocator.Error] = record.follow(?w.src.facts, Slice[u32]{data: first.data, size: first.len}, Slice[u32]{data: made.data, size: made.len}, ?out.facts);
+    if (sel err_followed.err) { ret alloc_err(err_followed.err); }
+    val err_carried: err[allocator.Error] = function.carry_written(w.out, ?w.src.function, Slice[u32]{data: first.data, size: first.len}, Slice[u32]{data: made.data, size: made.len});
+    if (sel err_carried.err) { ret alloc_err(err_carried.err); }
+    val err_inherited: err[allocator.Error] = function.inherit(w.out, ?w.src.function);
+    if (sel err_inherited.err) { ret alloc_err(err_inherited.err); }
+    ret err[Error].ok{};
+}
+
+# whether an instruction of a function states a configuration state
+fun states(f: *Function) bool {
+    var i: usize = 0;
+    for (i < f.instructions.len) {
+        val opt_state: opt[vstate.State] = f.instructions.data[i].state;
+        if (sel opt_state.some) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# insert the instructions establishing the configuration states the
+# instructions of a framed function run under
+# ---
+# a:   the allocator the written function takes
+# x:   the framed function, every operand a location or a slot, replaced by
+#      the one written when every state is established and unchanged when one
+#      is refused or none is stated
+# r:   what the insertion reads beside it
+# ret: ok, or why a state was not established
+pub fun configure(a: *allocator.Allocator, x: *Framed, r: *Request) err[Error] {
+    if (!states(?x.function)) { ret err[Error].ok{}; }
+    val res_computed: res[Live, live.Error] = live.compute(a, ?x.function, r.context, r.at, live.unclobbered());
+    if (sel res_computed.err) { ret err[Error].err{Error.live{res_computed.err}}; }
+    var l: Live = res_computed.ok;
+    fin { live.dnit(?l); }
+    var out: Framed = Framed{function: function.init(a, x.function.set, x.function.checked), layout: x.layout, facts: vector.init[Fact](a), origins: vector.init[u32](a)};
+    var w:   Writer = Writer{r: r, src: x, out: ?out.function, l: ?l, spares: vector.init[u32](a), current: vstate.NONE};
+    fin { vector.dnit[u32](?w.spares); }
+    val err_done: err[Error] = configured(a, ?w, ?out);
+    if (sel err_done.err) {
+        function.dnit(?out.function);
+        vector.dnit[Fact](?out.facts);
+        vector.dnit[u32](?out.origins);
+        ret err_done;
+    }
+    var err_failed: err[allocator.Error] = function.dnit(?x.function);
+    keep(?err_failed, vector.dnit[Fact](?x.facts));
+    keep(?err_failed, vector.dnit[u32](?x.origins));
+    x.function = out.function;
+    x.facts    = out.facts;
+    x.origins  = out.origins;
+    ret err[Error].ok{};
+}

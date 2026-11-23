@@ -1,0 +1,332 @@
+# accesses below their type's alignment made of accesses the alignment admits
+#
+# a load or store states the alignment its address has, which a member of a
+# packed aggregate, as mach states it, or a piece the abi legalisation reads
+# or writes at an offset of one, puts below the alignment the data layout
+# gives its type. a target whose row says it carries
+# out no such access (`Target.misaligned`) may trap on one, so the pass makes
+# each of them of accesses of integers, each the widest power of two at most
+# the word that the alignment at its offset admits and the bytes left hold,
+# the rule copies of a known length follow (mirl.legal.moves). a load joins
+# its pieces into the integer of the type's size, each extended and shifted to
+# its place by the target's byte order, and a store takes each piece out of
+# that integer. a float or a vector is that integer reinterpreted and a
+# pointer that integer converted. every piece carries the access's flags, so
+# a kept store stays kept in each, and the last instruction made stands in the
+# access's slot.
+#
+# the pass runs before the wide integer legalisation, which splits an integer
+# or a float wider than the target computes at into words, and the narrow one,
+# which widens the arithmetic it makes. nothing made branches or reads a value
+# to decide anything, and every piece reads as the access it stands in for,
+# its secrecy included, so the pass keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+
+use mink.bytes.reader;
+
+use mirl.fold.word;
+use mirl.ir.contents;
+use mirl.ir.function.Body;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
+use mirl.ir.opcode.table;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.legal.moves;
+use mirl.pass.analysis;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.target.basis;
+use target_layout: mirl.target.layout;
+use mirl.target.layout.Layout;
+use target_record: mirl.target.record;
+
+# the pass: it adds instructions in front of the accesses it splits and never
+# touches an edge or a block
+pub val UNALIGNED: Pass = Pass{name: "unaligned accesses", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
+
+# the widest piece, in bytes
+val WORD: u64 = 8;
+
+# whether a target carries out no access below its type's alignment
+fun wanted(g: *Ground) bool {
+    ret !g.t.misaligned;
+}
+
+# one visit
+# ---
+# site:    the function being rewritten
+# layout:  the target's data layout
+# little:  its byte order puts the low byte first
+# changed: the function was changed
+rec Work {
+    site:    Site;
+    layout:  Layout;
+    little:  bool;
+    changed: bool;
+}
+
+# an access below its type's alignment
+# ---
+# ty:    the type it reads or writes
+# align: the alignment it states
+# size:  the type's size in memory
+# flags: the access's flags
+rec Access {
+    ty:    Type;
+    align: u64;
+    size:  u64;
+    flags: Flags;
+}
+
+fun type_of(w: *Work, x: Value) Type {
+    ret w.site.b.values.data[x].type;
+}
+
+fun integer(w: *Work, bytes: u64) res[Type, refusal.Error] {
+    val res_type: res[Type, type_table.Error] = type_table.intern(?w.site.m.types, type_table.Shape.integer{type_table.Integer{width: (bytes * 8)::u32}});
+    if (sel res_type.err) { ret res[Type, refusal.Error].err{refusal.Error.ir{module.Error.types{res_type.err}}}; }
+    ret res[Type, refusal.Error].ok{res_type.ok};
+}
+
+# the access an instruction makes below its type's alignment, none for any
+# other instruction
+fun below(w: *Work, d: *InstructionData) res[opt[Access], refusal.Error] {
+    val load:  bool = d.opcode == table.LOAD;
+    val store: bool = d.opcode == table.STORE;
+    if (!load && !store) { ret res[opt[Access], refusal.Error].ok{opt[Access].none{}}; }
+    var ty:    Type  = 0;
+    var typed: bool  = false;
+    var align: u64   = 0;
+    var k:     usize = 0;
+    for (k < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[k];
+        if (sel imm.ty) {
+            if (!typed) { ty = imm.ty; }
+            typed = true;
+        }
+        if (sel imm.alignment) { align = imm.alignment; }
+        k = k + 1;
+    }
+    if (store && d.operands.len == 2) {
+        ty    = type_of(w, d.operands.data[1]);
+        typed = true;
+    }
+    if (!typed || align == 0) { ret res[opt[Access], refusal.Error].ok{opt[Access].none{}}; }
+    val res_own: res[u64, target_record.Error] = target_layout.align(?w.layout, ty, type_table.DEFAULT_SPACE);
+    if (sel res_own.err)     { ret res[opt[Access], refusal.Error].err{refusal.Error.reason{"an access of a type the data layout states no alignment of"}}; }
+    if (align >= res_own.ok) { ret res[opt[Access], refusal.Error].ok{opt[Access].none{}}; }
+    val res_size: res[u64, target_record.Error] = target_layout.size(?w.layout, ty, type_table.DEFAULT_SPACE);
+    if (sel res_size.err) { ret res[opt[Access], refusal.Error].err{refusal.Error.reason{"an access of a type the data layout states no size of"}}; }
+    var f: Flags = NO_FLAGS;
+    f.volatile = d.metadata.flags.volatile;
+    f.kept     = d.metadata.flags.kept;
+    f.public   = load && d.metadata.flags.public;
+    ret res[opt[Access], refusal.Error].ok{opt[Access].some{Access{ty: ty, align: align, size: res_size.ok, flags: f}}};
+}
+
+# how a value of a type becomes the integer of its size and back: none for an
+# integer, a conversion for a pointer and a reinterpretation for anything else
+fun into(w: *Work, ty: Type) res[opt[Opcode], refusal.Error] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?w.site.m.types, ty);
+    if (sel res_shape.err)        { ret res[opt[Opcode], refusal.Error].err{refusal.Error.ir{module.Error.types{res_shape.err}}}; }
+    if (sel res_shape.ok.integer) { ret res[opt[Opcode], refusal.Error].ok{opt[Opcode].none{}}; }
+    if (sel res_shape.ok.pointer) { ret res[opt[Opcode], refusal.Error].ok{opt[Opcode].some{table.PTRTOINT}}; }
+    ret res[opt[Opcode], refusal.Error].ok{opt[Opcode].some{table.BITCAST}};
+}
+
+# the opcode that makes the integer of `into` back into the type
+fun back(code: Opcode) Opcode {
+    if (code == table.PTRTOINT) { ret table.INTTOPTR; }
+    ret code;
+}
+
+# the address of the piece at an offset from an address
+fun at_offset(w: *Work, address: Value, offset: u64) res[Value, refusal.Error] {
+    if (offset == 0) { ret res[Value, refusal.Error].ok{address}; }
+    var from:     Value          = address;
+    var bytes:    u64            = offset;
+    val opt_past: opt[emit.Past] = emit.past(?w.site, address);
+    if (sel opt_past.some) {
+        from  = opt_past.some.base;
+        bytes = bytes + opt_past.some.bytes;
+    }
+    val res_bytes: res[u64, target_record.Error] = target_layout.size(?w.layout, type_of(w, address), type_table.DEFAULT_SPACE);
+    if (sel res_bytes.err) { ret res[Value, refusal.Error].err{refusal.Error.reason{"an address of a type the data layout states no size of"}}; }
+    val res_index: res[Type, refusal.Error] = integer(w, res_bytes.ok);
+    if (sel res_index.err) { ret res[Value, refusal.Error].err{res_index.err}; }
+    if (res_bytes.ok < 8)  { bytes = bytes & ((1::u64 << (res_bytes.ok * 8)) - 1); }
+    if (bytes == 0)        { ret res[Value, refusal.Error].ok{from}; }
+    val res_by: res[Value, refusal.Error] = emit.word_constant(?w.site, res_index.ok, bytes);
+    if (sel res_by.err) { ret res_by; }
+    ret res[Value, refusal.Error].ok{emit.binary(?w.site, table.PTR_ADD, from, res_by.ok)};
+}
+
+# the shift that puts a piece of `piece` bytes at an offset in place in an
+# integer of `size` bytes, by the target's byte order
+fun shift_of(w: *Work, size: u64, offset: u64, piece: u64) u64 {
+    if (w.little) { ret offset * 8; }
+    ret (size - offset - piece) * 8;
+}
+
+fun load_piece(w: *Work, address: Value, ty: Type, align: u64, f: Flags) Value {
+    var ops: [1]Value     = [1]Value{address};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{align}};
+    emit.flags(?w.site, f);
+    val i: Instruction = emit.emit(?w.site, table.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+    emit.flags(?w.site, NO_FLAGS);
+    ret emit.result(?w.site, i, 0);
+}
+
+fun store_piece(w: *Work, address: Value, x: Value, align: u64, f: Flags) {
+    var ops: [2]Value     = [2]Value{address, x};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align}};
+    emit.flags(?w.site, f);
+    emit.emit(?w.site, table.STORE, Slice[Value]{data: ?ops[0], size: 2}, Slice[Immediate]{data: ?imm[0], size: 1});
+    emit.flags(?w.site, NO_FLAGS);
+}
+
+# a load of pieces, joined into the integer of the type's size and made the
+# type, the last instruction in the load's slot
+fun split_load(w: *Work, i: Instruction, a: Access) err[refusal.Error] {
+    val s:         *Site                    = ?w.site;
+    val address:   Value                    = s.b.instructions.data[i].operands.data[0];
+    val res_whole: res[Type, refusal.Error] = integer(w, a.size);
+    if (sel res_whole.err) { ret err[refusal.Error].err{res_whole.err}; }
+    val res_into: res[opt[Opcode], refusal.Error] = into(w, a.ty);
+    if (sel res_into.err) { ret err[refusal.Error].err{res_into.err}; }
+    var acc:  Value = 0;
+    var done: u64   = 0;
+    for (done < a.size) {
+        val at:        u64                      = moves.aligned_at(a.align, done);
+        val piece:     u64                      = moves.step(a.size - done, at, WORD);
+        val res_piece: res[Type, refusal.Error] = integer(w, piece);
+        if (sel res_piece.err) { ret err[refusal.Error].err{res_piece.err}; }
+        val res_at: res[Value, refusal.Error] = at_offset(w, address, done);
+        if (sel res_at.err) { ret err[refusal.Error].err{res_at.err}; }
+        var part: Value = emit.convert(s, table.EXT_U, load_piece(w, res_at.ok, res_piece.ok, at, a.flags), res_whole.ok);
+        val by:   u64   = shift_of(w, a.size, done, piece);
+        if (by > 0) {
+            val res_by: res[Value, refusal.Error] = emit.constant(s, res_whole.ok, word.small(by));
+            if (sel res_by.err) { ret err[refusal.Error].err{res_by.err}; }
+            part = emit.binary(s, table.SHL, part, res_by.ok);
+        }
+        val last: bool = done + piece == a.size;
+        if (last && sel res_into.ok.none) { emit.end(s, i); }
+        if (done == 0)                    { acc = part; }
+        or                                { acc = emit.binary(s, table.OR, acc, part); }
+        done = done + piece;
+    }
+    if (sel res_into.ok.some) {
+        emit.end(s, i);
+        emit.convert(s, back(res_into.ok.some), acc, a.ty);
+    }
+    ret emit.done(s);
+}
+
+# a store of pieces taken out of the integer of the type's size, the last in
+# the store's slot
+fun split_store(w: *Work, i: Instruction, a: Access) err[refusal.Error] {
+    val s:         *Site                    = ?w.site;
+    val address:   Value                    = s.b.instructions.data[i].operands.data[0];
+    var x:         Value                    = s.b.instructions.data[i].operands.data[1];
+    val res_whole: res[Type, refusal.Error] = integer(w, a.size);
+    if (sel res_whole.err) { ret err[refusal.Error].err{res_whole.err}; }
+    val res_into: res[opt[Opcode], refusal.Error] = into(w, a.ty);
+    if (sel res_into.err)     { ret err[refusal.Error].err{res_into.err}; }
+    if (sel res_into.ok.some) { x = emit.convert(s, res_into.ok.some, x, res_whole.ok); }
+    var done: u64 = 0;
+    for (done < a.size) {
+        val at:        u64                      = moves.aligned_at(a.align, done);
+        val piece:     u64                      = moves.step(a.size - done, at, WORD);
+        val res_piece: res[Type, refusal.Error] = integer(w, piece);
+        if (sel res_piece.err) { ret err[refusal.Error].err{res_piece.err}; }
+        val res_at: res[Value, refusal.Error] = at_offset(w, address, done);
+        if (sel res_at.err) { ret err[refusal.Error].err{res_at.err}; }
+        var part: Value = x;
+        val by:   u64   = shift_of(w, a.size, done, piece);
+        if (by > 0) {
+            val res_by: res[Value, refusal.Error] = emit.constant(s, res_whole.ok, word.small(by));
+            if (sel res_by.err) { ret err[refusal.Error].err{res_by.err}; }
+            part = emit.binary(s, table.SHR_U, part, res_by.ok);
+        }
+        part = emit.convert(s, table.TRUNC, part, res_piece.ok);
+        if (done + piece == a.size) { emit.end(s, i); }
+        store_piece(w, res_at.ok, part, at, a.flags);
+        done = done + piece;
+    }
+    ret emit.done(s);
+}
+
+# split an instruction if it accesses memory below its type's alignment
+fun split(w: *Work, i: Instruction) err[refusal.Error] {
+    val res_below: res[opt[Access], refusal.Error] = below(w, ?w.site.b.instructions.data[i]);
+    if (sel res_below.err)     { ret err[refusal.Error].err{res_below.err}; }
+    if (sel res_below.ok.none) { ret err[refusal.Error].ok{}; }
+    emit.begin(?w.site, i);
+    var err_split: err[refusal.Error] = err[refusal.Error].ok{};
+    if (w.site.b.instructions.data[i].opcode == table.LOAD) { err_split = split_load(w, i, res_below.ok.some); }
+    or                                                      { err_split = split_store(w, i, res_below.ok.some); }
+    if (sel err_split.err)                                  { ret err[refusal.Error].err{err_split.err}; }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# split the accesses below their type's alignment of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b: *Body = res_body.ok;
+    if (!contents.has_opcode(?b.contents, table.LOAD) && !contents.has_opcode(?b.contents, table.STORE)) { ret res[bool, refusal.Error].ok{false}; }
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+
+    var w: Work = Work{site: emit.init(c.m, u.f, b, ?scratch), layout: target_layout.of(c.t, ?c.m.types, basis.context_of(c.basis)), little: c.t.arch.order == reader.LITTLE, changed: false};
+    fin { emit.dnit(?w.site); }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var n: Instruction = b.blocks.data[k].first;
+            for (n != NO_INSTRUCTION) {
+                val i: Instruction = n;
+                n = b.instructions.data[i].next;
+                val err_split: err[refusal.Error] = split(?w, i);
+                if (sel err_split.err) { ret res[bool, refusal.Error].err{err_split.err}; }
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{w.changed};
+}

@@ -1,0 +1,887 @@
+# a module's debug table and its functions' variable ranges as the debug
+# records of the object masc made, see doc/ir/debug.md
+#
+# mirl states the records and mink encodes them: the unit, the source types in
+# debug table order with every size and member offset the layout routine
+# answers, the globals the debug table describes in module order, each
+# function in code order with marks at its start and end, its variables in
+# the order it binds them with a range per run of its spans that each take
+# over where the one before ends, in one place, in address order, where dwarf
+# can state the location and the run covers some code, the sites code was inlined at in table order and the runs of code
+# inlined in each function. a mark is one per label, so two labels at one
+# place stay two addresses and one label named twice is one. the object's
+# format lowers the records, as dwarf 5 for every format with an info row.
+#
+# a location dwarf cannot state is left out of a variable's ranges, and a
+# piece of one is nowhere: a frame slot whose offset scales or that steps
+# read, a webassembly location with steps over it, a constant wider than a
+# word, and a global or ssa location. the steps over a location stop at the
+# first one dwarf cannot state, an add or subtract of something that is not a
+# one-word constant, and a step that names no width is passed over.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use masc.build;
+use build_state: masc.build.state;
+use rf:          masc.core.register;
+use core_state:  masc.core.state;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink_table: mink.base.table;
+use mink.base.table.Id;
+use mink_debug: mink.model.debug;
+use mink.model.line.File;
+use mink.model.object;
+use mink.model.object.Place;
+use mink.model.symbol;
+
+use dloc: mirl.debug.location;
+use mirl.debug.location.Piece;
+use mirl.debug.location.Where;
+use mirl.debug.producer;
+use mirl.debug.rows;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.entry;
+use mirl.ir.debug.place;
+use debug_record: mirl.ir.debug.record;
+use debug_table:  mirl.ir.debug.table;
+use mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use mirl.ir.global.GlobalData;
+use mirl.ir.id;
+use mirl.ir.language.Language;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.point;
+use mirl.ir.point.Expression;
+use mirl.ir.point.Step;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.DEFAULT_SPACE;
+use mirl.ir.type.table.Type;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record;
+
+# where a variable is over part of a function's code
+# ---
+# binding:    the variable
+# start:      the label its range begins at
+# end:        the label its range ends at
+# where:      where it is, never unavailable
+# expression: the salvage steps over a location that is not pieces
+# type:       the ir type of what that location holds
+pub rec Span {
+    binding:    debug_record.Binding;
+    start:      build_state.Label;
+    end:        build_state.Label;
+    where:      Where;
+    expression: Expression;
+    type:       Type;
+}
+
+# a run of code inlined at a site, which every site it was inlined through holds too
+# ---
+# site:  the innermost site the code was inlined at
+# start: the label the run begins at
+# end:   the label it ends at
+pub rec Run {
+    site:  debug_record.Site;
+    start: build_state.Label;
+    end:   build_state.Label;
+}
+
+# one function's code
+# ---
+# function: the function of the module
+# start:    the label of its first instruction
+# end:      the label after its last
+# spans:    where its variables are
+# runs:     its code inlined at sites
+pub rec Subprogram {
+    function: id.Function;
+    start:    build_state.Label;
+    end:      build_state.Label;
+    spans:    Slice[Span];
+    runs:     Slice[Run];
+}
+
+# everything the records are stated from
+# ---
+# a:         the allocator the scratch takes
+# m:         the module, whose debug table is finished
+# l:         the layout every size and offset is asked of
+# b:         the builder that made the object, every label of the request its own
+# context:   the object's context, under which masc numbers a register's dwarf column
+# o:         the object the records are stated on, which holds none yet
+# functions: the functions, in code order
+# globals:   the label of each global of the module by its id, some for every global the module defines
+pub rec Request {
+    a:         *allocator.Allocator;
+    m:         *Module;
+    l:         *Layout;
+    b:         *build_state.Builder;
+    context:   *core_state.Context;
+    o:         *object.Object;
+    functions: Slice[Subprogram];
+    globals:   Slice[opt[build_state.Label]];
+}
+
+# why the records were not stated
+# ---
+# alloc:   the allocator refused storage
+# object:  mink refused a record or a name
+# table:   the debug table refused a read
+# module:  the module refused a read
+# layout:  the layout gave a type no size or offset
+# refused: a location dwarf does not write
+# number:  a register masc's dwarf column numbers none
+# label:   a label the object holds no place or symbol of
+pub tag Error: u8 {
+    alloc:   allocator.Error;
+    object:  Fail;
+    table:   debug_table.Error;
+    module:  module.Error;
+    layout:  record.Error;
+    refused: producer.Error;
+    number:  rf.Id;
+    label:   build_state.Label;
+}
+
+# the allocator's refusal `e` stands for, its own, a table's, the module's or the object's, none
+# for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc)  { ret opt[allocator.Error].some{e.alloc}; }
+    if (sel e.table)  { ret debug_table.starved(e.table); }
+    if (sel e.module) { ret module.starved(e.module); }
+    if (sel e.object) {
+        if (sel e.object.cause.refused) { ret opt[allocator.Error].some{e.object.cause.refused}; }
+    }
+    ret opt[allocator.Error].none{};
+}
+
+# what one statement shares
+# ---
+# r:     the request
+# d:     the object's debug records
+# marks: each label's mark, by its id
+rec Stating {
+    r:     *Request;
+    d:     *object.Debug;
+    marks: map.Map[u32, u32];
+}
+
+fun held[T](r: res[T, Fail]) res[T, Error] {
+    if (sel r.err) { ret res[T, Error].err{Error.object{r.err}}; }
+    ret res[T, Error].ok{r.ok};
+}
+
+fun pushed[T](t: *mink_table.Table[T], v: T) err[Error] {
+    val res_mink_table_pushed: res[Id[T], Fail] = mink_table.push[T](t, v);
+    if (sel res_mink_table_pushed.err) { ret err[Error].err{Error.object{res_mink_table_pushed.err}}; }
+    ret err[Error].ok{};
+}
+
+fun dlayout(e: res[u64, record.Error]) res[u64, Error] {
+    if (sel e.err) { ret res[u64, Error].err{Error.layout{e.err}}; }
+    ret res[u64, Error].ok{e.ok};
+}
+
+fun table[T](r: res[T, debug_table.Error]) res[T, Error] {
+    if (sel r.err) { ret res[T, Error].err{Error.table{r.err}}; }
+    ret res[T, Error].ok{r.ok};
+}
+
+# the object's name of some bytes
+fun name(s: *Stating, v: View) res[Id[Name], Error] {
+    ret held[Id[Name]](object.name(s.r.o, v.data, v.len));
+}
+
+# the count of a table's items
+fun next[T](t: *mink_table.Table[T]) usize {
+    ret mink_table.count[T](t);
+}
+
+# the run of a table's items pushed since it held `first`
+fun since[T](t: *mink_table.Table[T], first: usize) mink_debug.Run {
+    ret mink_debug.Run{first: first, count: mink_table.count[T](t) - first};
+}
+
+# the mark of a label, made at its place the first time it is named
+fun mark(s: *Stating, l: build_state.Label) res[Id[Place], Error] {
+    val opt_known: opt[*u32] = map.get[u32, u32](?s.marks, ?l);
+    if (sel opt_known.some) { ret res[Id[Place], Error].ok{Id[Place]{index: @opt_known.some}}; }
+    val opt_place_of: opt[Place] = build.place_of(s.r.b, l);
+    if (sel opt_place_of.none) { ret res[Id[Place], Error].err{Error.label{l}}; }
+    val res_made: res[Id[Place], Error] = held[Id[Place]](mink_table.push[Place](?s.d.marks, opt_place_of.some));
+    if (sel res_made.err) { ret res_made; }
+    val res_keyed: res[bool, allocator.Error] = map.insert[u32, u32](?s.marks, l, res_made.ok.index);
+    if (sel res_keyed.err) { ret res[Id[Place], Error].err{Error.alloc{res_keyed.err}}; }
+    ret res_made;
+}
+
+fun type_of(t: debug_record.Type) Id[mink_debug.Type] {
+    ret Id[mink_debug.Type]{index: t};
+}
+
+fun position(s: *Stating, l: debug_record.Location) res[mink_debug.Position, Error] {
+    val res_table: res[debug_record.Position, Error] = table[debug_record.Position](place.position(?s.r.m.debug, l));
+    if (sel res_table.err) { ret res[mink_debug.Position, Error].err{res_table.err}; }
+    ret res[mink_debug.Position, Error].ok{mink_debug.Position{file: Id[File]{index: res_table.ok.file}, line: res_table.ok.line, column: res_table.ok.column}};
+}
+
+# one member of an aggregate laid out as `owner`, at its field's offset plus `base`
+fun member(s: *Stating, owner: Type, m: debug_record.Member, base: u64) res[mink_debug.Member, Error] {
+    val res_dlayout: res[u64, Error] = dlayout(layout.offset(s.r.l, owner, DEFAULT_SPACE, m.field));
+    if (sel res_dlayout.err) { ret res[mink_debug.Member, Error].err{res_dlayout.err}; }
+    val res_name: res[Id[Name], Error] = name(s, m.name);
+    if (sel res_name.err) { ret res[mink_debug.Member, Error].err{res_name.err}; }
+    ret res[mink_debug.Member, Error].ok{mink_debug.Member{name: res_name.ok, type: type_of(m.type), offset: base + res_dlayout.ok}};
+}
+
+fun encoding_of(e: debug_record.Encoding) mink_debug.Encoding {
+    if (sel e.signed)    { ret mink_debug.Encoding.signed{}; }
+    if (sel e.unsigned)  { ret mink_debug.Encoding.unsigned{}; }
+    if (sel e.float)     { ret mink_debug.Encoding.float{}; }
+    if (sel e.boolean)   { ret mink_debug.Encoding.boolean{}; }
+    if (sel e.character) { ret mink_debug.Encoding.character{}; }
+    ret mink_debug.Encoding.address{};
+}
+
+# a union a tagged union's payloads are members of and its offset in the owner
+# ---
+# union:  the ir union
+# offset: its byte offset in the owner
+rec Payload {
+    union:  Type;
+    offset: u64;
+}
+
+# the union of cases at `field` of a tagged union's layout
+fun payload_of(s: *Stating, owner: Type, field: u32) res[Payload, Error] {
+    val res_offset: res[u64, Error] = dlayout(layout.offset(s.r.l, owner, DEFAULT_SPACE, field));
+    if (sel res_offset.err) { ret res[Payload, Error].err{res_offset.err}; }
+    val res_fields: res[Slice[Type], type_table.Error] = type_table.members(?s.r.m.types, owner);
+    if (sel res_fields.err)                 { ret res[Payload, Error].err{Error.module{module.Error.types{res_fields.err}}}; }
+    if (field::usize >= res_fields.ok.size) { ret res[Payload, Error].err{Error.table{debug_table.Error.field{field}}}; }
+    ret res[Payload, Error].ok{Payload{union: res_fields.ok.data[field], offset: res_offset.ok}};
+}
+
+# a tagged union: its size, its discriminant and its cases, each case's payload
+# at its offset in the union of cases that holds it
+fun tagged(s: *Stating, owner: Type, size: u64, t: debug_record.Tagged) res[mink_debug.Shape, Error] {
+    val res_disc: res[mink_debug.Member, Error] = member(s, owner, t.discriminant, 0);
+    if (sel res_disc.err) { ret res[mink_debug.Shape, Error].err{res_disc.err}; }
+    val first: usize = next[mink_debug.Case](?s.d.cases);
+    var i:     usize = 0;
+    for (i < t.cases.size) {
+        val k:           debug_record.Case         = t.cases.data[i];
+        var opt_payload: opt[mink_debug.Member]    = opt[mink_debug.Member].none{};
+        val opt_carried: opt[debug_record.Carried] = k.payload;
+        if (sel opt_carried.some) {
+            val res_payload: res[Payload, Error] = payload_of(s, owner, opt_carried.some.union);
+            if (sel res_payload.err) { ret res[mink_debug.Shape, Error].err{res_payload.err}; }
+            val res_member: res[mink_debug.Member, Error] = member(s, res_payload.ok.union, opt_carried.some.member, res_payload.ok.offset);
+            if (sel res_member.err) { ret res[mink_debug.Shape, Error].err{res_member.err}; }
+            opt_payload = opt[mink_debug.Member].some{res_member.ok};
+        }
+        val err_pushed: err[Error] = pushed[mink_debug.Case](?s.d.cases, mink_debug.Case{value: k.value, payload: opt_payload});
+        if (sel err_pushed.err) { ret res[mink_debug.Shape, Error].err{err_pushed.err}; }
+        i = i + 1;
+    }
+    ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.tagged{mink_debug.Tagged{size: size, discriminant: res_disc.ok, cases: since[mink_debug.Case](?s.d.cases, first)}}};
+}
+
+# the kind of a type declared and never defined
+fun declared(s: *Stating, t: debug_record.Type) res[mink_debug.Shape, Error] {
+    val res_table: res[debug_record.Kind, Error] = table[debug_record.Kind](entry.kind(?s.r.m.debug, t));
+    if (sel res_table.err) { ret res[mink_debug.Shape, Error].err{res_table.err}; }
+    val kind: debug_record.Kind   = res_table.ok;
+    var d:    mink_debug.Declared = mink_debug.Declared.other{};
+    if (sel kind.structure || sel kind.tagged) { d = mink_debug.Declared.structure{}; }
+    or (sel kind.union)                        { d = mink_debug.Declared.union{}; }
+    or (sel kind.enumeration)                  { d = mink_debug.Declared.enumeration{}; }
+    ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.declared{d}};
+}
+
+# the members of a structure or union laid out as `owner`
+fun members(s: *Stating, owner: Type, list: Slice[debug_record.Member]) res[mink_debug.Run, Error] {
+    val first: usize = next[mink_debug.Member](?s.d.members);
+    var i:     usize = 0;
+    for (i < list.size) {
+        val res_member: res[mink_debug.Member, Error] = member(s, owner, list.data[i], 0);
+        if (sel res_member.err) { ret res[mink_debug.Run, Error].err{res_member.err}; }
+        val err_pushed: err[Error] = pushed[mink_debug.Member](?s.d.members, res_member.ok);
+        if (sel err_pushed.err) { ret res[mink_debug.Run, Error].err{err_pushed.err}; }
+        i = i + 1;
+    }
+    ret res[mink_debug.Run, Error].ok{since[mink_debug.Member](?s.d.members, first)};
+}
+
+# a structure or a union, laid out as its entry's layout, its size and members the layout routine's
+fun aggregate(s: *Stating, t: debug_record.Type, list: Slice[debug_record.Member], joined: bool) res[mink_debug.Shape, Error] {
+    val res_laid: res[Type, Error] = table[Type](entry.layout(?s.r.m.debug, t));
+    if (sel res_laid.err) { ret res[mink_debug.Shape, Error].err{res_laid.err}; }
+    val res_size: res[u64, Error] = dlayout(layout.size(s.r.l, res_laid.ok, DEFAULT_SPACE));
+    if (sel res_size.err) { ret res[mink_debug.Shape, Error].err{res_size.err}; }
+    val res_run: res[mink_debug.Run, Error] = members(s, res_laid.ok, list);
+    if (sel res_run.err) { ret res[mink_debug.Shape, Error].err{res_run.err}; }
+    val g: mink_debug.Aggregate = mink_debug.Aggregate{size: res_size.ok, members: res_run.ok};
+    if (joined) { ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.union{g}}; }
+    ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.structure{g}};
+}
+
+# a tagged union, laid out as its entry's layout
+fun tagged_of(s: *Stating, t: debug_record.Type, g: debug_record.Tagged) res[mink_debug.Shape, Error] {
+    val res_laid: res[Type, Error] = table[Type](entry.layout(?s.r.m.debug, t));
+    if (sel res_laid.err) { ret res[mink_debug.Shape, Error].err{res_laid.err}; }
+    val res_size: res[u64, Error] = dlayout(layout.size(s.r.l, res_laid.ok, DEFAULT_SPACE));
+    if (sel res_size.err) { ret res[mink_debug.Shape, Error].err{res_size.err}; }
+    ret tagged(s, res_laid.ok, res_size.ok, g);
+}
+
+# an enumeration, its size the bytes of its base type
+fun enumeration(s: *Stating, e: debug_record.Enumeration) res[mink_debug.Shape, Error] {
+    val res_base: res[debug_record.Shape, Error] = table[debug_record.Shape](entry.shape(?s.r.m.debug, e.base));
+    if (sel res_base.err) { ret res[mink_debug.Shape, Error].err{res_base.err}; }
+    var bytes: u64                = 0;
+    val b:     debug_record.Shape = res_base.ok;
+    if (sel b.base) { bytes = ((b.base.width + 7) / 8)::u64; }
+    val first: usize = next[mink_debug.Enumerator](?s.d.enumerators);
+    var i:     usize = 0;
+    for (i < e.enumerators.size) {
+        val v:        debug_record.Enumerator = e.enumerators.data[i];
+        val res_name: res[Id[Name], Error]    = name(s, v.name);
+        if (sel res_name.err) { ret res[mink_debug.Shape, Error].err{res_name.err}; }
+        val err_pushed: err[Error] = pushed[mink_debug.Enumerator](?s.d.enumerators, mink_debug.Enumerator{name: res_name.ok, value: v.value});
+        if (sel err_pushed.err) { ret res[mink_debug.Shape, Error].err{err_pushed.err}; }
+        i = i + 1;
+    }
+    val run: mink_debug.Run = since[mink_debug.Enumerator](?s.d.enumerators, first);
+    ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.enumeration{mink_debug.Enumeration{base: type_of(e.base), size: bytes, enumerators: run}}};
+}
+
+# a pointer, to its target or to nothing stated
+fun pointer(p: debug_record.Pointer) mink_debug.Shape {
+    var opt_target:      opt[Id[mink_debug.Type]] = opt[Id[mink_debug.Type]].none{};
+    val opt_target_type: opt[debug_record.Type]   = p.target;
+    if (sel opt_target_type.some) { opt_target = opt[Id[mink_debug.Type]].some{type_of(opt_target_type.some)}; }
+    ret mink_debug.Shape.pointer{opt_target};
+}
+
+# a function type: its first result and its parameters
+fun routine(s: *Stating, f: debug_record.Function) res[mink_debug.Shape, Error] {
+    var opt_result_type: opt[Id[mink_debug.Type]] = opt[Id[mink_debug.Type]].none{};
+    if (f.results.size > 0) { opt_result_type = opt[Id[mink_debug.Type]].some{type_of(f.results.data[0])}; }
+    val first: usize = next[Id[mink_debug.Type]](?s.d.params);
+    var i:     usize = 0;
+    for (i < f.params.size) {
+        val err_pushed: err[Error] = pushed[Id[mink_debug.Type]](?s.d.params, type_of(f.params.data[i]));
+        if (sel err_pushed.err) { ret res[mink_debug.Shape, Error].err{err_pushed.err}; }
+        i = i + 1;
+    }
+    ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.routine{mink_debug.Routine{result: opt_result_type, params: since[Id[mink_debug.Type]](?s.d.params, first)}}};
+}
+
+# what a type of the debug table is: the kind declared for one another module
+# describes or none defines
+fun shape_of(s: *Stating, t: debug_record.Type, home: debug_record.Home) res[mink_debug.Shape, Error] {
+    val dt:       *debug_table.Table = ?s.r.m.debug;
+    val res_done: res[bool, Error]   = table[bool](entry.defined(dt, t));
+    if (sel res_done.err)                 { ret res[mink_debug.Shape, Error].err{res_done.err}; }
+    if (!res_done.ok || sel home.outside) { ret declared(s, t); }
+    val res_shape: res[debug_record.Shape, Error] = table[debug_record.Shape](entry.shape(dt, t));
+    if (sel res_shape.err) { ret res[mink_debug.Shape, Error].err{res_shape.err}; }
+    val sh: debug_record.Shape = res_shape.ok;
+    if (sel sh.base)        { ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.base{mink_debug.Base{encoding: encoding_of(sh.base.encoding), bits: sh.base.width}}}; }
+    or (sel sh.structure)   { ret aggregate(s, t, sh.structure, false); }
+    or (sel sh.union)       { ret aggregate(s, t, sh.union, true); }
+    or (sel sh.tagged)      { ret tagged_of(s, t, sh.tagged); }
+    or (sel sh.enumeration) { ret enumeration(s, sh.enumeration); }
+    or (sel sh.array)       { ret res[mink_debug.Shape, Error].ok{mink_debug.Shape.array{mink_debug.Array{element: type_of(sh.array.element), count: sh.array.count}}}; }
+    or (sel sh.pointer)     { ret res[mink_debug.Shape, Error].ok{pointer(sh.pointer)}; }
+    ret routine(s, sh.function);
+}
+
+fun home_of(h: debug_record.Home) mink_debug.Home {
+    if (sel h.own)     { ret mink_debug.Home.own{}; }
+    if (sel h.outside) { ret mink_debug.Home.outside{}; }
+    ret mink_debug.Home.shared{};
+}
+
+# every type of the debug table, in table order
+fun types_of(s: *Stating) err[Error] {
+    var i: usize = 0;
+    for (i < s.r.m.debug.nodes.len) {
+        val t:         debug_record.Type = (i::u32);
+        val res_table: res[View, Error]  = table[View](entry.name(?s.r.m.debug, t));
+        if (sel res_table.err) { ret err[Error].err{res_table.err}; }
+        val res_name: res[Id[Name], Error] = name(s, res_table.ok);
+        if (sel res_name.err) { ret err[Error].err{res_name.err}; }
+        val res_table_key: res[View, Error] = table[View](entry.key(?s.r.m.debug, t));
+        if (sel res_table_key.err) { ret err[Error].err{res_table_key.err}; }
+        val res_key: res[Id[Name], Error] = name(s, res_table_key.ok);
+        if (sel res_key.err) { ret err[Error].err{res_key.err}; }
+        val res_table_home: res[debug_record.Home, Error] = table[debug_record.Home](entry.home(?s.r.m.debug, t));
+        if (sel res_table_home.err) { ret err[Error].err{res_table_home.err}; }
+        val res_shape: res[mink_debug.Shape, Error] = shape_of(s, t, res_table_home.ok);
+        if (sel res_shape.err) { ret err[Error].err{res_shape.err}; }
+        val err_pushed: err[Error] = pushed[mink_debug.Type](?s.d.types, mink_debug.Type{name: res_name.ok, key: res_key.ok, home: home_of(res_table_home.ok), shape: res_shape.ok});
+        if (sel err_pushed.err) { ret err_pushed; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the dwarf number of a register under the object's context: its own, or
+# where dwarf numbers it none, the number of the widest register dwarf numbers
+# that lies at its lowest bits, as the x86-64 psabi's vector registers 17 to
+# 32 are xmm0 to xmm15 and the ymm registers each lies within
+fun number_of(s: *Stating, reg: rf.Id) res[u32, Error] {
+    val file:             *rf.File = s.r.context.view.file;
+    val opt_debug_number: opt[u32] = core_state.debug_number(file, reg, rf.DWARF, s.r.context);
+    if (sel opt_debug_number.some) { ret res[u32, Error].ok{opt_debug_number.some}; }
+    val opt_index_of: opt[u32] = rf.index_of(file, reg);
+    if (sel opt_index_of.none) { ret res[u32, Error].err{Error.number{reg}}; }
+    val within: rf.Lyings = rf.lying_in(file, opt_index_of.some);
+    var best:   opt[u32]  = opt[u32].none{};
+    var widest: u32       = 0;
+    var i:      u32       = 0;
+    for (i < within.len) {
+        val l: *rf.Lying = ?within.at[i];
+        if (l.placement.offset.fixed == 0 && l.placement.offset.per == 0 && l.placement.width.fixed > widest) {
+            val opt_part: opt[u32] = core_state.debug_number(file, rf.id_of(?file.registers[l.row]), rf.DWARF, s.r.context);
+            if (sel opt_part.some) {
+                best   = opt_part;
+                widest = l.placement.width.fixed;
+            }
+        }
+        i = i + 1;
+    }
+    if (sel best.none) { ret res[u32, Error].err{Error.number{reg}}; }
+    ret res[u32, Error].ok{best.some};
+}
+
+# the width in bits of an integer ir type, 64 for any other
+fun bits_of(s: *Stating, ty: Type) u32 {
+    val res_width: res[u32, type_table.Error] = type_table.width(?s.r.m.types, ty);
+    if (sel res_width.err) { ret 64; }
+    ret res_width.ok;
+}
+
+# the value of an integer constant, none for one of more than one word or of another kind
+fun word_of(s: *Stating, c: id.Constant) opt[u64] {
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(s.r.m, c);
+    if (sel res_constant_data.err) { ret opt[u64].none{}; }
+    val d: ConstantData = res_constant_data.ok;
+    if (!(sel d.integer))          { ret opt[u64].none{}; }
+    if (d.integer.words.size != 1) { ret opt[u64].none{}; }
+    ret opt[u64].some{d.integer.words.data[0]};
+}
+
+# the steps of an expression over a value of type `from`, up to the first one dwarf cannot state
+fun steps(s: *Stating, e: Expression, from: Type) res[mink_debug.Run, Error] {
+    val res_steps: res[Slice[Step], module.Error] = module.steps(s.r.m, e);
+    if (sel res_steps.err) { ret res[mink_debug.Run, Error].err{Error.module{res_steps.err}}; }
+    val first: usize = next[mink_debug.Step](?s.d.steps);
+    var width: u32   = bits_of(s, from);
+    var i:     usize = 0;
+    for (i < res_steps.ok.size) {
+        val st:      Step                 = res_steps.ok.data[i];
+        val arg:     point.Argument       = st.argument;
+        var opt_one: opt[mink_debug.Step] = opt[mink_debug.Step].none{};
+        if (st.kind == point.ADD || st.kind == point.SUB) {
+            if (!(sel arg.constant)) { brk; }
+            val opt_word_of: opt[u64] = word_of(s, arg.constant);
+            if (sel opt_word_of.none) { brk; }
+            opt_one = opt[mink_debug.Step].some{mink_debug.Step.plus{opt_word_of.some}};
+            if (st.kind == point.SUB) { opt_one = opt[mink_debug.Step].some{mink_debug.Step.minus{opt_word_of.some}}; }
+        }
+        or (sel arg.to) {
+            val w: mink_debug.Widths = mink_debug.Widths{from: width, to: bits_of(s, arg.to)};
+            if (st.kind == point.EXT_S) { opt_one = opt[mink_debug.Step].some{mink_debug.Step.extend_signed{w}}; }
+            or (st.kind == point.EXT_U) { opt_one = opt[mink_debug.Step].some{mink_debug.Step.extend_unsigned{w}}; }
+            or                          { opt_one = opt[mink_debug.Step].some{mink_debug.Step.truncate{w}}; }
+            width = w.to;
+        }
+        if (sel opt_one.some) {
+            val err_pushed: err[Error] = pushed[mink_debug.Step](?s.d.steps, opt_one.some);
+            if (sel err_pushed.err) { ret res[mink_debug.Run, Error].err{err_pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret res[mink_debug.Run, Error].ok{since[mink_debug.Step](?s.d.steps, first)};
+}
+
+# whether an expression has no steps
+fun plain(s: *Stating, e: Expression) bool {
+    val res_steps: res[Slice[Step], module.Error] = module.steps(s.r.m, e);
+    ret sel res_steps.ok && res_steps.ok.size == 0;
+}
+
+# a location that is not pieces and the steps over it, none for one dwarf cannot state
+fun single(s: *Stating, at: Where, e: Expression, from: Type) res[opt[mink_debug.Located], Error] {
+    val bare:      bool                  = plain(s, e);
+    var opt_where: opt[mink_debug.Where] = opt[mink_debug.Where].none{};
+    if (sel at.register) {
+        val res_number_of: res[u32, Error] = number_of(s, at.register);
+        if (sel res_number_of.err) { ret res[opt[mink_debug.Located], Error].err{res_number_of.err}; }
+        opt_where = opt[mink_debug.Where].some{mink_debug.Where.register{res_number_of.ok}};
+    }
+    or (sel at.slot) {
+        if (at.slot.per == 0 && bare) { opt_where = opt[mink_debug.Where].some{mink_debug.Where.frame{at.slot.fixed}}; }
+    }
+    or (sel at.local) {
+        if (bare) { opt_where = opt[mink_debug.Where].some{mink_debug.Where.local{at.local}}; }
+    }
+    or (sel at.operand) {
+        if (bare) { opt_where = opt[mink_debug.Where].some{mink_debug.Where.operand{at.operand}}; }
+    }
+    or (sel at.constant) {
+        val opt_word_of: opt[u64] = word_of(s, at.constant);
+        if (sel opt_word_of.some) { opt_where = opt[mink_debug.Where].some{mink_debug.Where.constant{opt_word_of.some}}; }
+    }
+    if (sel opt_where.none) { ret res[opt[mink_debug.Located], Error].ok{opt[mink_debug.Located].none{}}; }
+    val res_run: res[mink_debug.Run, Error] = steps(s, e, from);
+    if (sel res_run.err) { ret res[opt[mink_debug.Located], Error].err{res_run.err}; }
+    ret res[opt[mink_debug.Located], Error].ok{opt[mink_debug.Located].some{mink_debug.Located{where: opt_where.some, steps: res_run.ok}}};
+}
+
+# where a span says its variable is, none for a location dwarf cannot state
+fun location(s: *Stating, sp: *Span) res[opt[mink_debug.Location], Error] {
+    val err_admitted: err[producer.Error] = producer.admit(?rows.DWARF, sp.where);
+    if (sel err_admitted.err) { ret res[opt[mink_debug.Location], Error].err{Error.refused{err_admitted.err}}; }
+    val at: Where = sp.where;
+    if (!(sel at.pieces)) {
+        val res_one: res[opt[mink_debug.Located], Error] = single(s, at, sp.expression, sp.type);
+        if (sel res_one.err) { ret res[opt[mink_debug.Location], Error].err{res_one.err}; }
+        val opt_one: opt[mink_debug.Located] = res_one.ok;
+        if (sel opt_one.none) { ret res[opt[mink_debug.Location], Error].ok{opt[mink_debug.Location].none{}}; }
+        ret res[opt[mink_debug.Location], Error].ok{opt[mink_debug.Location].some{mink_debug.Location.single{opt_one.some}}};
+    }
+    val first: usize = next[mink_debug.Piece](?s.d.pieces);
+    var i:     usize = 0;
+    for (i < at.pieces.size) {
+        val p:           Piece                   = at.pieces.data[i];
+        val part:        Where                   = p.location;
+        var opt_located: opt[mink_debug.Located] = opt[mink_debug.Located].none{};
+        if (!(sel part.unavailable)) {
+            val res_one: res[opt[mink_debug.Located], Error] = single(s, part, p.expression, p.from);
+            if (sel res_one.err) { ret res[opt[mink_debug.Location], Error].err{res_one.err}; }
+            opt_located = res_one.ok;
+        }
+        val err_put: err[Error] = pushed[mink_debug.Piece](?s.d.pieces, mink_debug.Piece{bits: p.bits, located: opt_located});
+        if (sel err_put.err) { ret res[opt[mink_debug.Location], Error].err{err_put.err}; }
+        i = i + 1;
+    }
+    ret res[opt[mink_debug.Location], Error].ok{opt[mink_debug.Location].some{mink_debug.Location.pieces{since[mink_debug.Piece](?s.d.pieces, first)}}};
+}
+
+fun kept(r: res[usize, allocator.Error]) err[Error] {
+    if (sel r.err) { ret err[Error].err{Error.alloc{r.err}}; }
+    ret err[Error].ok{};
+}
+
+fun keyed(r: res[bool, allocator.Error]) err[Error] {
+    if (sel r.err) { ret err[Error].err{Error.alloc{r.err}}; }
+    ret err[Error].ok{};
+}
+
+# a variable added to the list the first time it is named
+fun note(out_: *vector.Vector[u32], seen: *map.Map[u32, u32], v: u32) err[Error] {
+    if (map.contains[u32, u32](seen, ?v)) { ret err[Error].ok{}; }
+    val err_keyed: err[Error] = keyed(map.insert[u32, u32](seen, v, 0));
+    if (sel err_keyed.err) { ret err_keyed; }
+    ret kept(vector.push[u32](out_, v));
+}
+
+# the variables a function binds, those its records and its storage bindings name, in the order they are first named
+fun bound(s: *Stating, f: id.Function, out_: *vector.Vector[u32]) err[Error] {
+    val res_body: res[*Body, module.Error] = module.body(s.r.m, f);
+    if (sel res_body.err) { ret err[Error].err{Error.module{res_body.err}}; }
+    val b:    *Body             = res_body.ok;
+    var seen: map.Map[u32, u32] = map.init[u32, u32](s.r.a);
+    fin { map.dnit[u32, u32](?seen); }
+    var i: usize = 0;
+    for (i < b.points.len) {
+        val err_noted: err[Error] = note(out_, ?seen, b.points.data[i].binding);
+        if (sel err_noted.err) { ret err_noted; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < b.instructions.len) {
+        val res_list: res[Slice[debug_record.Binding], module.Error] = module.bound(s.r.m, b.instructions.data[i].metadata.bindings);
+        if (sel res_list.ok) {
+            val names: Slice[debug_record.Binding] = res_list.ok;
+            var k:     usize                       = 0;
+            for (k < names.size) {
+                val err_noted: err[Error] = note(out_, ?seen, names.data[k]);
+                if (sel err_noted.err) { ret err_noted; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# a span at the places its labels stand
+# ---
+# span:    the span
+# section: the section of its code
+# start:   the offset its range begins at
+# end:     the offset it ends at
+rec Placed {
+    span:    *Span;
+    section: u32;
+    start:   u64;
+    end:     u64;
+}
+
+# spans by variable, then by where they begin
+fun by_binding(a: *Placed, b: *Placed) i64 {
+    if (a.span.binding < b.span.binding) { ret -1; }
+    if (a.span.binding > b.span.binding) { ret 1; }
+    if (a.section < b.section)           { ret -1; }
+    if (a.section > b.section)           { ret 1; }
+    if (a.start < b.start)               { ret -1; }
+    if (a.start > b.start)               { ret 1; }
+    ret 0;
+}
+
+# a function's spans at their places, by variable and then by address
+fun placed(s: *Stating, p: *Subprogram, out_: *vector.Vector[Placed]) err[Error] {
+    var i: usize = 0;
+    for (i < p.spans.size) {
+        val sp:       *Span      = ?p.spans.data[i];
+        val opt_from: opt[Place] = build.place_of(s.r.b, sp.start);
+        if (sel opt_from.none) { ret err[Error].err{Error.label{sp.start}}; }
+        val opt_place_of: opt[Place] = build.place_of(s.r.b, sp.end);
+        if (sel opt_place_of.none) { ret err[Error].err{Error.label{sp.end}}; }
+        val err_kept: err[Error] = kept(vector.push[Placed](out_, Placed{span: sp, section: opt_from.some.section.index, start: opt_from.some.offset, end: opt_place_of.some.offset}));
+        if (sel err_kept.err) { ret err_kept; }
+        i = i + 1;
+    }
+    sort.sort_by[Placed](out_.data, out_.len, by_binding);
+    ret err[Error].ok{};
+}
+
+# whether the span `y` takes over where `x` ends with the variable where `x` leaves it
+fun continues(x: *Placed, y: *Placed) bool {
+    if (x.section != y.section || x.end != y.start)                           { ret false; }
+    if (x.span.expression != y.span.expression || x.span.type != y.span.type) { ret false; }
+    ret dloc.same(x.span.where, y.span.where);
+}
+
+# one variable of a function and its ranges, in address order, a run of its spans that each take over where the one
+# before ends in one place one range, and each range one whose location dwarf can state and that covers some code
+fun variable(s: *Stating, b: debug_record.Binding, run: Slice[Placed]) err[Error] {
+    val res_table: res[debug_record.Variable, Error] = table[debug_record.Variable](place.variable(?s.r.m.debug, b));
+    if (sel res_table.err) { ret err[Error].err{res_table.err}; }
+    val v:     debug_record.Variable = res_table.ok;
+    val first: usize                 = next[object.Range](?s.d.ranges);
+    var i:     usize                 = 0;
+    for (i < run.size) {
+        var last: usize = i;
+        for (last + 1 < run.size && continues(?run.data[last], ?run.data[last + 1])) { last = last + 1; }
+        val from: *Placed = ?run.data[i];
+        val to:   *Placed = ?run.data[last];
+        i = last + 1;
+        if (from.start == to.end) { cnt; }
+        val res_stated: res[opt[mink_debug.Location], Error] = location(s, from.span);
+        if (sel res_stated.err) { ret err[Error].err{res_stated.err}; }
+        val opt_where: opt[mink_debug.Location] = res_stated.ok;
+        if (sel opt_where.some) {
+            val res_start: res[Id[Place], Error] = mark(s, from.span.start);
+            if (sel res_start.err) { ret err[Error].err{res_start.err}; }
+            val res_end: res[Id[Place], Error] = mark(s, to.span.end);
+            if (sel res_end.err) { ret err[Error].err{res_end.err}; }
+            val err_put: err[Error] = pushed[object.Range](?s.d.ranges, object.Range{start: res_start.ok, end: res_end.ok, location: opt_where.some});
+            if (sel err_put.err) { ret err_put; }
+        }
+    }
+    val ranges:   mink_debug.Run       = since[object.Range](?s.d.ranges, first);
+    val res_name: res[Id[Name], Error] = name(s, v.name);
+    if (sel res_name.err) { ret err[Error].err{res_name.err}; }
+    val res_position: res[mink_debug.Position, Error] = position(s, v.declared);
+    if (sel res_position.err) { ret err[Error].err{res_position.err}; }
+    ret pushed[mink_debug.Variable](?s.d.variables, mink_debug.Variable{name: res_name.ok, type: type_of(v.type), parameter: sel v.parameter.some, declared: res_position.ok, ranges: ranges});
+}
+
+# the symbol a label of the builder became
+fun symbol_of(s: *Stating, l: build_state.Label) res[Id[object.Symbol], Error] {
+    val opt_held: opt[Id[object.Symbol]] = build.symbol_of(s.r.b, l);
+    if (sel opt_held.none) { ret res[Id[object.Symbol], Error].err{Error.label{l}}; }
+    ret res[Id[object.Symbol], Error].ok{opt_held.some};
+}
+
+# one global the debug table describes, at the unit's scope, in module order
+fun global_entry(s: *Stating, g: usize) err[Error] {
+    val res_data: res[GlobalData, module.Error] = module.global_data(s.r.m, (g::u32));
+    if (sel res_data.err) { ret err[Error].err{Error.module{res_data.err}}; }
+    val d:             GlobalData                = res_data.ok;
+    val opt_described: opt[debug_record.Binding] = d.debug;
+    if (sel opt_described.none) { ret err[Error].ok{}; }
+    val res_table: res[debug_record.Variable, Error] = table[debug_record.Variable](place.variable(?s.r.m.debug, opt_described.some));
+    if (sel res_table.err) { ret err[Error].err{res_table.err}; }
+    val v:         debug_record.Variable  = res_table.ok;
+    var opt_label: opt[build_state.Label] = opt[build_state.Label].none{};
+    if (g < s.r.globals.size) { opt_label = s.r.globals.data[g]; }
+    var storage: object.Storage = object.Storage.unknown{};
+    if (sel d.initial.none) { storage = object.Storage.declaration{}; }
+    or (sel opt_label.some) {
+        val res_sym: res[Id[object.Symbol], Error] = symbol_of(s, opt_label.some);
+        if (sel res_sym.err) { ret err[Error].err{res_sym.err}; }
+        if (sel d.tls.some)  { storage = object.Storage.thread{res_sym.ok}; }
+        or                   { storage = object.Storage.address{res_sym.ok}; }
+    }
+    val res_name: res[Id[Name], Error] = name(s, v.name);
+    if (sel res_name.err) { ret err[Error].err{res_name.err}; }
+    val res_position: res[mink_debug.Position, Error] = position(s, v.declared);
+    if (sel res_position.err) { ret err[Error].err{res_position.err}; }
+    ret pushed[object.Global](?s.d.globals, object.Global{name: res_name.ok, type: type_of(v.type), external: d.linkage.binding != ?symbol.LOCAL, declared: res_position.ok, storage: storage});
+}
+
+# every site of the debug table, in table order
+fun sites(s: *Stating) err[Error] {
+    var i: usize = 0;
+    for (i < s.r.m.debug.sites.len) {
+        val res_table: res[debug_record.Inlining, Error] = table[debug_record.Inlining](place.inlining(?s.r.m.debug, (i::u32)));
+        if (sel res_table.err) { ret err[Error].err{res_table.err}; }
+        val res_callee: res[Id[Name], Error] = name(s, res_table.ok.callee);
+        if (sel res_callee.err) { ret err[Error].err{res_callee.err}; }
+        val res_call: res[mink_debug.Position, Error] = position(s, res_table.ok.call);
+        if (sel res_call.err) { ret err[Error].err{res_call.err}; }
+        var opt_parent: opt[Id[mink_debug.Site]] = opt[Id[mink_debug.Site]].none{};
+        val opt_index:  opt[debug_record.Site]   = res_table.ok.parent;
+        if (sel opt_index.some) { opt_parent = opt[Id[mink_debug.Site]].some{Id[mink_debug.Site]{index: opt_index.some}}; }
+        val err_put: err[Error] = pushed[mink_debug.Site](?s.d.sites, mink_debug.Site{callee: res_callee.ok, call: res_call.ok, parent: opt_parent});
+        if (sel err_put.err) { ret err_put; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# one function, its variables and the runs of code inlined in it
+fun subprogram(s: *Stating, p: *Subprogram) err[Error] {
+    val res_data: res[FunctionData, module.Error] = module.function_data(s.r.m, p.function);
+    if (sel res_data.err) { ret err[Error].err{Error.module{res_data.err}}; }
+    val res_start: res[Id[Place], Error] = mark(s, p.start);
+    if (sel res_start.err) { ret err[Error].err{res_start.err}; }
+    val res_end: res[Id[Place], Error] = mark(s, p.end);
+    if (sel res_end.err) { ret err[Error].err{res_end.err}; }
+    var vars:  vector.Vector[u32]    = vector.init[u32](s.r.a);
+    var spans: vector.Vector[Placed] = vector.init[Placed](s.r.a);
+    var runs:  map.Map[u32, u32]     = map.init[u32, u32](s.r.a);
+    fin {
+        vector.dnit[u32](?vars);
+        vector.dnit[Placed](?spans);
+        map.dnit[u32, u32](?runs);
+    }
+    val err_named: err[Error] = bound(s, p.function, ?vars);
+    if (sel err_named.err) { ret err_named; }
+    val err_laid: err[Error] = placed(s, p, ?spans);
+    if (sel err_laid.err) { ret err_laid; }
+    # each variable's first span
+    var i: usize = 0;
+    for (i < spans.len) {
+        if (i == 0 || spans.data[i - 1].span.binding != spans.data[i].span.binding) {
+            val err_keyed: err[Error] = keyed(map.insert[u32, u32](?runs, spans.data[i].span.binding, i::u32));
+            if (sel err_keyed.err) { ret err_keyed; }
+        }
+        i = i + 1;
+    }
+    val first: usize = next[mink_debug.Variable](?s.d.variables);
+    i = 0;
+    for (i < vars.len) {
+        val b:              u32           = vars.data[i];
+        var run:            Slice[Placed] = Slice[Placed]{data: nil, size: 0};
+        val opt_runs_entry: opt[*u32]     = map.get[u32, u32](?runs, ?b);
+        if (sel opt_runs_entry.some) {
+            val from: usize = (@opt_runs_entry.some)::usize;
+            var to:   usize = from;
+            for (to < spans.len && spans.data[to].span.binding == b) { to = to + 1; }
+            run = Slice[Placed]{data: ?spans.data[from], size: to - from};
+        }
+        val err_one: err[Error] = variable(s, b, run);
+        if (sel err_one.err) { ret err_one; }
+        i = i + 1;
+    }
+    val variables: mink_debug.Run = since[mink_debug.Variable](?s.d.variables, first);
+    val from:      usize          = next[object.Inlined](?s.d.inlined);
+    i = 0;
+    for (i < p.runs.size) {
+        val r:        *Run                  = ?p.runs.data[i];
+        val res_mark: res[Id[Place], Error] = mark(s, r.start);
+        if (sel res_mark.err) { ret err[Error].err{res_mark.err}; }
+        val res_mark_end: res[Id[Place], Error] = mark(s, r.end);
+        if (sel res_mark_end.err) { ret err[Error].err{res_mark_end.err}; }
+        val err_put: err[Error] = pushed[object.Inlined](?s.d.inlined, object.Inlined{site: Id[mink_debug.Site]{index: r.site}, start: res_mark.ok, end: res_mark_end.ok});
+        if (sel err_put.err) { ret err_put; }
+        i = i + 1;
+    }
+    ret pushed[object.Subprogram](?s.d.functions, object.Subprogram{name: res_data.ok.name, start: res_start.ok, end: res_end.ok, variables: variables, inlined: since[object.Inlined](?s.d.inlined, from)});
+}
+
+# state every record onto the object: its types, globals, sites and functions, then the unit
+fun state_all(s: *Stating) err[Error] {
+    val res_first: res[View, Error] = table[View](place.path(?s.r.m.debug, 0));
+    if (sel res_first.err) { ret err[Error].err{res_first.err}; }
+    val res_producer: res[Id[Name], Error] = held[Id[Name]](object.name_str(s.r.o, PRODUCER));
+    if (sel res_producer.err) { ret err[Error].err{res_producer.err}; }
+    val res_file: res[Id[Name], Error] = name(s, res_first.ok);
+    if (sel res_file.err) { ret err[Error].err{res_file.err}; }
+    val res_directory: res[Id[Name], Error] = held[Id[Name]](object.name_str(s.r.o, "."));
+    if (sel res_directory.err) { ret err[Error].err{res_directory.err}; }
+    var opt_language: opt[u16]       = opt[u16].none{};
+    val opt_stated:   opt[*Language] = module.language(s.r.m);
+    if (sel opt_stated.some) { opt_language = opt[u16].some{opt_stated.some.dwarf}; }
+    val err_typed: err[Error] = types_of(s);
+    if (sel err_typed.err) { ret err_typed; }
+    var i: usize = 0;
+    for (i < s.r.m.globals.len) {
+        val err_global_entry: err[Error] = global_entry(s, i);
+        if (sel err_global_entry.err) { ret err_global_entry; }
+        i = i + 1;
+    }
+    val err_sited: err[Error] = sites(s);
+    if (sel err_sited.err) { ret err_sited; }
+    i = 0;
+    for (i < s.r.functions.size) {
+        val err_subprogram: err[Error] = subprogram(s, ?s.r.functions.data[i]);
+        if (sel err_subprogram.err) { ret err_subprogram; }
+        i = i + 1;
+    }
+    s.d.unit = opt[mink_debug.Unit].some{mink_debug.Unit{language: opt_language, producer: res_producer.ok, name: res_file.ok, directory: res_directory.ok}};
+    ret err[Error].ok{};
+}
+
+val PRODUCER: str = "mirl";
+
+# state a module's debug records on the object masc made of it
+# ---
+# r:   the request, whose module states at least one source file and whose object holds no debug records
+# ret: ok, or why the records were not stated, the object holding none of them
+pub fun state(r: *Request) err[Error] {
+    var s: Stating = Stating{r: r, d: ?r.o.debug, marks: map.init[u32, u32](r.a)};
+    fin { map.dnit[u32, u32](?s.marks); }
+    val err_done: err[Error] = state_all(?s);
+    if (sel err_done.err) {
+        val err_dropped: err[Fail] = object.debug_dnit(r.o);
+        ret err_done;
+    }
+    ret err[Error].ok{};
+}

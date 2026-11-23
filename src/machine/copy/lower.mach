@@ -1,0 +1,1522 @@
+# the lowering of copies into the target's moves
+#
+# this runs after the frame, where every operand is a location or a placed
+# slot. a spill and a reload are each a copy of one pair, the slot written or
+# read, and a slot's address is the frame code's add of the slot's place to
+# its base, so each of their moves gets its scratch here, where liveness shows
+# which registers are free. a copy to the location it reads disappears. the pairs of a parallel
+# copy are ordered by the storage each pair touches, so that nothing a pair
+# writes shares storage with what another pair still has to read, and a cycle
+# is broken by saving the values its readers need in locations the allocation
+# leaves free across the copy, which liveness of the framed function shows, or
+# else by the set's swap. a move between two registers or
+# cells is the set's move for their classes, between a register and a slot the
+# frame code's load or store at the slot's place, and between two memory
+# locations, slots or cells, of one size, two moves through a free location
+# that holds the whole value: one the set moves a cell into and back out of,
+# or a register the frame code loads and stores at a slot's size. where no
+# location holds it, a copy between two slots is split into exact parts at
+# offsets into both, each part the widest the frame code loads and stores one
+# free register at, so no move takes fewer bytes than the slots hold. where
+# no location is free for either, an allowed register that holds the value
+# or splits it, of a kind the frame reserves an emergency slot of with one
+# left, the stack pointer's kind first, is borrowed through that slot, saved
+# before the moves and restored after them, as a vector register for a copy
+# between two slots of scaled size. its save and restore take the free
+# scratches and scavenge more of the stack pointer's kind where the frame
+# code reaches its slot only through them. a value
+# saved to break a cycle goes to a free location holding it the same way, by
+# the one choice `holds` makes. a free location is one the allocator may
+# assign that a call clobbers or the frame saves, so writing it never reaches
+# a caller, and the one taken is the first, by class and then by location,
+# under which every instruction the moves through it make stands against its
+# row's register constraints, found by making those moves into a function of
+# their own for each in turn. the frame code is offered every free register
+# of a class holding the stack pointer's values (`class.addresses`) as its scratch in the same way, and where it
+# needs more than are free, the fewest allowed registers of that class its
+# move names none of, each saved to one of the frame's emergency slots
+# around the move.
+# every other instruction is copied, and the call frame facts and origins
+# follow the instructions they name.
+#
+# with p pairs in a parallel copy, its order is O(p) beside the storage its
+# locations share, and a free location is found in O(c) of the candidate
+# locations, each a query of the holds and of the moves and widths indexed
+# for the selection.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.base.fail.keep;
+use mirl.base.slice;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Lists;
+use mirl.ir.metadata.Metadata;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Segment;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class;
+use mirl.machine.class.Physical;
+use mirl.machine.constraint;
+use mirl.machine.constraint.Breach;
+use mirl.machine.copy.move;
+use mirl.machine.copy.move.Index;
+use mirl.machine.copy.move.Move;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Access;
+use mirl.machine.frame.code.Add;
+use mirl.machine.frame.code.Admitted;
+use mirl.machine.frame.code.Emit;
+use mirl.machine.frame.code.Step;
+use mirl.machine.frame.code.Width;
+use mirl.machine.frame.record;
+use mirl.machine.frame.record.Fact;
+use mirl.machine.frame.record.Framed;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.frame.record.Place;
+use mirl.machine.frame.scavenge;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.function.SlotData;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.operand.Block;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Slot;
+use mirl.machine.operand.Virtual;
+use mirl.machine.pseudo;
+use mirl.machine.storage;
+use mirl.machine.storage.Storage;
+use mirl.machine.vstate;
+
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+
+# no pair, location or position
+val NONE: u32 = 0xffffffff;
+
+# what the lowering reads beside the framed function
+# ---
+# at:        the locations of the target
+# context:   the selection's context, whose view of the registers fixes each
+#            location's storage
+# clobbered: the registers a call clobbers, which a function writes freely
+# allowed:   the locations the allocator was allowed to assign
+# pool:      the allowed registers of a class holding the stack pointer's
+#            values, which the frame code may scavenge and a move between
+#            memory may borrow
+# code:      the target's frame code bound to the selection, which loads and
+#            stores a slot
+# moves:     the set's moves, indexed for the selection and the locations
+pub rec Request {
+    at:        *Locations;
+    context:   *core_state.Context;
+    clobbered: Slice[rf.Id];
+    allowed:   Slice[Physical];
+    pool:      Slice[rf.Id];
+    code:      *Admitted;
+    moves:     *Index;
+}
+
+# an operand of a copy, by its position
+# ---
+# at:       the copy
+# position: the operand's position
+pub rec At {
+    at:       Instruction;
+    position: u32;
+}
+
+# an operand of a copy the locations refused
+# ---
+# at:      the copy
+# operand: its position
+# why:     why the locations refused it
+pub rec Unnumbered {
+    at:      Instruction;
+    operand: u32;
+    why:     location.Unlocated;
+}
+
+# a copy whose free locations every instruction of the moves through them
+# does not stand under
+# ---
+# at:     the copy
+# breach: the breach under the first free location
+pub rec Breached {
+    at:     Instruction;
+    breach: Breach;
+}
+
+# why a function's copies were not lowered
+# ---
+# alloc:       the allocator refused storage
+# live:        liveness of the framed function was refused
+# made:        the function's maker refused an instruction
+# code:        the frame code refused a load or store
+# unlocated:   a register the frame or the convention names that the
+#              locations refused, and why
+# operand:     an operand of a copy that is no register, cell or slot
+# label:       a copy a partner names, which may make no instruction
+# implied:     a copy that states locations beyond its operands
+# twice:       a pair of a copy writing storage another pair writes, by its
+#              destination's position
+# unmoved:     a pair of a copy the set states no move for, directly or
+#              through a register, by its destination's position
+# scratch:     a pair of memory locations of a copy with no free location
+#              holding its value to go through, no split into parts and no
+#              register to borrow for either, by its destination's position
+# sizes:       a pair of memory locations of a copy of different sizes, whose
+#              value no move between them states, by its destination's
+#              position
+# cycle:       a copy holding a cycle with no free location to break it and
+#              no swap
+# dropped:     a slot the frame dropped, by its operand's position
+# unnumbered:  a register or cell operand the locations refused, and why
+# constrained: a copy whose free locations every instruction of the moves
+#              through them does not stand under, the breach under the first
+pub tag Error: u8 {
+    alloc:       allocator.Error;
+    live:        live.Error;
+    made:        function.Error;
+    code:        code.Error;
+    unlocated:   location.Unlocated;
+    operand:     At;
+    label:       Instruction;
+    implied:     Instruction;
+    twice:       At;
+    unmoved:     At;
+    scratch:     At;
+    sizes:       At;
+    cycle:       Instruction;
+    dropped:     At;
+    unnumbered:  Unnumbered;
+    constrained: Breached;
+}
+
+# the allocator's refusal `e` stands for, its own or a step's it carries, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc) { ret opt[allocator.Error].some{e.alloc}; }
+    if (sel e.live)  { ret live.starved(e.live); }
+    if (sel e.made)  { ret function.starved(e.made); }
+    if (sel e.code)  { ret code.starved(e.code); }
+    ret opt[allocator.Error].none{};
+}
+
+# one end of a pair
+# ---
+# location: a register or cell, by its number
+# slot:     a frame slot, by its index
+tag End: u8 {
+    location: u32;
+    slot:     u32;
+}
+
+# one pair of a parallel copy
+# ---
+# to:       the end written
+# from:     the end read
+# position: the destination's operand position
+# done:     its move is made
+# next:     the next pending pair reading the end this one reads, NONE for none
+# prev:     the one before it, NONE for the first
+# waits:    how many other pending pairs read storage its destination shares
+# held:     it reads a value saved for it in a location taken until its move
+rec Pair {
+    to:       End;
+    from:     End;
+    position: u32;
+    done:     bool;
+    next:     u32;
+    prev:     u32;
+    waits:    u32;
+    held:     bool;
+}
+
+# what lowering one function works with
+# ---
+# l:        the function's liveness, once known
+# known:    whether it is
+# listed:   whether `spares` is made
+# spares:   the free candidates by the key of their class, ascending
+# writer:   by key, a location's number or past the locations a slot's index,
+#           the pair writing it, NONE for none
+# head:     by key, the first pending pair reading it, NONE for none
+# touched:  the keys the copy set, reset after it
+# covered:  by location, how many locations taken for a value of the copy's
+#           own share its storage
+# found:    the pending pairs a cycle's break reads
+# left:     how many pairs are pending
+# lendable: the allowed registers a move between memory may borrow, of a
+#           kind the frame reserves emergency slots of, the pool first
+# lent:     the registers borrowed through emergency slots around the moves
+#           being made, in the order they were
+rec Writer {
+    a:        *allocator.Allocator;
+    r:        *Request;
+    src:      *Framed;
+    out:      *Function;
+    l:        Live;
+    known:    bool;
+    listed:   bool;
+    spares:   Lists[u32];
+    pairs:    vector.Vector[Pair];
+    writer:   vector.Vector[u32];
+    head:     vector.Vector[u32];
+    touched:  vector.Vector[u32];
+    ready:    vector.Vector[u32];
+    covered:  vector.Vector[u32];
+    found:    vector.Vector[u32];
+    ops:      vector.Vector[Operand];
+    frees:    vector.Vector[rf.Id];
+    left:     u32;
+    block:    Block;
+    at:       Instruction;
+    d:        *InstructionData;
+    lendable: vector.Vector[rf.Id];
+    lent:     vector.Vector[rf.Id];
+}
+
+fun lent_now(w: *Writer) Slice[rf.Id] {
+    ret Slice[rf.Id]{data: w.lent.data, size: w.lent.len};
+}
+
+fun alloc_err(e: allocator.Error) err[Error] {
+    ret err[Error].err{Error.alloc{e}};
+}
+
+# operand `k` of the copy being lowered
+fun placed(w: *Writer, k: u32) At {
+    ret At{at: w.at, position: k};
+}
+
+fun refuse(e: Error) err[Error] {
+    ret err[Error].err{e};
+}
+
+# the key of an end: a location's number, or past the locations a slot's index
+fun key(w: *Writer, e: End) u32 {
+    if (sel e.location) { ret e.location; }
+    ret location.count(w.r.at) + e.slot;
+}
+
+fun same(w: *Writer, a: End, b: End) bool {
+    ret key(w, a) == key(w, b);
+}
+
+# whether an end is a memory location, a slot or a cell
+fun memory(w: *Writer, e: End) bool {
+    if (sel e.slot) { ret true; }
+    val p: Physical = location.physical(w.r.at, e.location);
+    ret sel p.cell;
+}
+
+fun operand_of(w: *Writer, e: End) Operand {
+    if (sel e.location) { ret Operand.physical{location.physical(w.r.at, e.location)}; }
+    ret Operand.slot{e.slot};
+}
+
+# the end operand `k` names, or why it names no location or slot
+fun end_of(w: *Writer, o: Operand, k: u32) res[End, Error] {
+    if (sel o.slot)        { ret res[End, Error].ok{End.slot{o.slot}}; }
+    if (!(sel o.physical)) { ret res[End, Error].err{Error.operand{placed(w, k)}}; }
+    val res_locate: res[u32, location.Unlocated] = location.locate(w.r.at, o.physical);
+    if (sel res_locate.err) { ret res[End, Error].err{Error.unnumbered{Unnumbered{at: w.at, operand: k, why: res_locate.err}}}; }
+    ret res[End, Error].ok{End.location{res_locate.ok}};
+}
+
+# the keys of the storage an end takes: every location sharing a location's
+# storage, itself first, or a slot's own key, which `own` holds
+fun sharing(w: *Writer, e: End, own: *u32) Slice[u32] {
+    if (sel e.location) { ret location.shares(w.r.at, e.location); }
+    @own = key(w, e);
+    ret Slice[u32]{data: own, size: 1};
+}
+
+# whether a location shares storage with one taken for a value of the copy's own
+fun is_busy(w: *Writer, loc: u32) bool {
+    ret w.covered.data[loc] > 0;
+}
+
+fun take(w: *Writer, loc: u32) {
+    val alias: Slice[u32] = location.shares(w.r.at, loc);
+    var i:     usize      = 0;
+    for (i < alias.size) {
+        w.covered.data[alias.data[i]] = w.covered.data[alias.data[i]] + 1;
+        i                             = i + 1;
+    }
+}
+
+fun give(w: *Writer, loc: u32) {
+    val alias: Slice[u32] = location.shares(w.r.at, loc);
+    var i:     usize      = 0;
+    for (i < alias.size) {
+        w.covered.data[alias.data[i]] = w.covered.data[alias.data[i]] - 1;
+        i                             = i + 1;
+    }
+}
+
+# the size of a slot
+fun slot_size(w: *Writer, s: u32) Offset {
+    ret record.size_of(w.src.function.slots.data[s]);
+}
+
+# the storage a memory end takes through the selection
+fun extent(w: *Writer, e: End) opt[Storage] {
+    if (sel e.slot) { ret opt[Storage].some{code.bits_of(w.r.context.view, slot_size(w, e.slot))}; }
+    ret move.storage_of(w.r.at, w.r.context.view, location.physical(w.r.at, e.location));
+}
+
+# whether two memory ends take one storage, so a value moves between them whole
+fun alike(w: *Writer, a: End, b: End) bool {
+    val opt_extent: opt[Storage] = extent(w, a);
+    if (sel opt_extent.none) { ret false; }
+    val opt_b_extent: opt[Storage] = extent(w, b);
+    if (sel opt_b_extent.none) { ret false; }
+    ret storage.order(opt_extent.some, opt_b_extent.some) == 0;
+}
+
+# whether a location takes the whole value of an end and gives it back: a
+# register the frame code both loads and stores at a slot's size, or a
+# location the set moves a register or cell into and back out of exactly.
+# this is the one choice of where a value goes, so no class is fixed
+fun holds(w: *Writer, t: u32, e: End) bool {
+    if (sel e.slot) {
+        val p: Physical = location.physical(w.r.at, t);
+        if (!(sel p.register)) { ret false; }
+        val size:     Offset      = slot_size(w, e.slot);
+        val opt_into: opt[*Width] = code.width_of(w.r.code, p.register, size, false);
+        if (sel opt_into.none) { ret false; }
+        val opt_back: opt[*Width] = code.width_of(w.r.code, p.register, size, true);
+        ret sel opt_back.some;
+    }
+    val opt_into: opt[*Move] = move.move_of(w.r.moves, w.r.at, w.r.context.view, t, e.location);
+    if (sel opt_into.none) { ret false; }
+    val opt_back: opt[*Move] = move.move_of(w.r.moves, w.r.at, w.r.context.view, e.location, t);
+    ret sel opt_back.some;
+}
+
+# the widest power of two an offset into a slot keeps of the slot's alignment
+fun aligned_at(align: u64, at: u64) u64 {
+    if (at == 0) { ret align; }
+    var p: u64 = 1;
+    for (p < align && at % (p * 2) == 0) {
+        p = p * 2;
+    }
+    ret p;
+}
+
+# the bytes of the part of a split through a register at an offset into both
+# slots, 0 when the frame code moves none that fits
+fun next_part(w: *Writer, r: rf.Id, size: u64, align: u64, at: u64) u64 {
+    ret code.widest(w.r.code, r, size - at, aligned_at(align, at));
+}
+
+# the alignment both slots of a split keep
+fun split_align(w: *Writer, to: u32, from: u32) u64 {
+    val a: u64 = w.src.function.slots.data[to].align;
+    val b: u64 = w.src.function.slots.data[from].align;
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# whether a register moves a slot's fixed bytes into another in exact parts
+fun splits(w: *Writer, r: rf.Id, to: u32, from: u32) bool {
+    val s: SlotData = w.src.function.slots.data[from];
+    if (s.per != 0 || s.size == 0) { ret false; }
+    val align: u64 = split_align(w, to, from);
+    var at:    u64 = 0;
+    for (at < s.size) {
+        val n: u64 = next_part(w, r, s.size, align, at);
+        if (n == 0) { ret false; }
+        at = at + n;
+    }
+    ret true;
+}
+
+# the candidates of a class, which a free location is one of
+fun spares_of(w: *Writer, class_key: u32) Slice[u32] {
+    if (class_key == NONE) { ret Slice[u32]{data: nil, size: 0}; }
+    ret graph.list[u32](?w.spares, class_key);
+}
+
+# the free candidates made, the first time a copy asks for them
+fun spare_room(w: *Writer) err[Error] {
+    if (w.listed) { ret err[Error].ok{}; }
+    w.listed = true;
+    ret candidates(w);
+}
+
+# whether a candidate holds no value across the copy and none of the copy's own
+fun free(w: *Writer, loc: u32) res[bool, Error] {
+    if (is_busy(w, loc)) { ret res[bool, Error].ok{false}; }
+    val res_liveness: res[*Live, Error] = liveness(w);
+    if (sel res_liveness.err) { ret res[bool, Error].err{res_liveness.err}; }
+    val opt_slot: opt[u32] = live.use_slot(res_liveness.ok, w.at);
+    if (sel opt_slot.none) { ret res[bool, Error].ok{false}; }
+    var span:        [1]Segment = [1]Segment{Segment{from: opt_slot.some, to: opt_slot.some + 2}};
+    val opt_blocked: opt[u32]   = live.blocked_over(res_liveness.ok, w.r.at, loc, Slice[Segment]{data: ?span[0], size: 1}, Slice[u32]{data: nil, size: 0});
+    ret res[bool, Error].ok{sel opt_blocked.none};
+}
+
+# the liveness of the function, computed the first time a copy needs a free location, which most never do
+fun liveness(w: *Writer) res[*Live, Error] {
+    if (!w.known) {
+        val res_computed: res[Live, live.Error] = live.compute(w.a, ?w.src.function, w.r.context, w.r.at, live.unclobbered());
+        if (sel res_computed.err) { ret res[*Live, Error].err{Error.live{res_computed.err}}; }
+        w.l     = res_computed.ok;
+        w.known = true;
+    }
+    ret res[*Live, Error].ok{?w.l};
+}
+
+# what a free location is taken for
+# ---
+# through: the location a move between two memory locations goes through whole
+# split:   the register a move between two slots goes through in parts
+# save:    the location a cycle's value is saved into from one end, to be moved
+#          back out to another
+tag Spare: u8 {
+    through: Ends;
+    split:   Slots;
+    save:    Ends;
+}
+
+# the two ends of a move
+rec Ends {
+    to:   End;
+    from: End;
+}
+
+# the two slots of a move, by their indices
+rec Slots {
+    to:   u32;
+    from: u32;
+}
+
+# two moves through a register, into it and out of it
+fun through(w: *Writer, t: u32, to: End, from: End, position: u32) err[Error] {
+    val via:       End              = End.location{t};
+    val res_first: res[bool, Error] = direct(w, via, from, position);
+    if (sel res_first.err) { ret err[Error].err{res_first.err}; }
+    if (!res_first.ok)     { ret refuse(Error.unmoved{placed(w, position)}); }
+    val res_second: res[bool, Error] = direct(w, to, via, position);
+    if (sel res_second.err) { ret err[Error].err{res_second.err}; }
+    if (!res_second.ok)     { ret refuse(Error.unmoved{placed(w, position)}); }
+    ret err[Error].ok{};
+}
+
+# the parts of a move between two slots through a register, each loaded from
+# one slot and stored to the other at one offset
+fun pieces(w: *Writer, t: u32, to: u32, from: u32, position: u32) err[Error] {
+    val p: Physical = location.physical(w.r.at, t);
+    if (!(sel p.register)) { ret refuse(Error.scratch{placed(w, position)}); }
+    val size:  u64 = w.src.function.slots.data[from].size;
+    val align: u64 = split_align(w, to, from);
+    var at:    u64 = 0;
+    for (at < size) {
+        val n:          u64              = next_part(w, p.register, size, align, at);
+        val step:       Offset           = record.bytes(n::i64);
+        val res_loaded: res[bool, Error] = access(w, t, from, at::i64, step, false, position);
+        if (sel res_loaded.err) { ret err[Error].err{res_loaded.err}; }
+        val res_stored: res[bool, Error] = access(w, t, to, at::i64, step, true, position);
+        if (sel res_stored.err) { ret err[Error].err{res_stored.err}; }
+        at = at + n;
+    }
+    ret err[Error].ok{};
+}
+
+# the moves a free location is taken for, made through it
+fun made_through(w: *Writer, t: u32, u: Spare, position: u32) err[Error] {
+    if (sel u.through) { ret through(w, t, u.through.to, u.through.from, position); }
+    or (sel u.split)   { ret pieces(w, t, u.split.to, u.split.from, position); }
+    val err_into: err[Error] = moved(w, End.location{t}, u.save.from, position);
+    if (sel err_into.err) { ret err_into; }
+    ret moved(w, u.save.to, End.location{t}, position);
+}
+
+# the moves a free location is taken for, made through it while it is taken
+fun use(w: *Writer, t: u32, u: Spare, position: u32) err[Error] {
+    take(w, t);
+    val err_made: err[Error] = made_through(w, t, u, position);
+    give(w, t);
+    ret err_made;
+}
+
+# the first breach of an instruction the moves through a location make,
+# made into a function of their own
+fun trial(w: *Writer, t: u32, u: Spare, position: u32) res[opt[Breach], Error] {
+    var probe: Function = function.init(w.a, w.out.set, w.out.checked);
+    fin { function.dnit(?probe); }
+    val res_block: res[Block, function.Error] = function.block(?probe);
+    if (sel res_block.err) { ret res[opt[Breach], Error].err{Error.made{res_block.err}}; }
+    val out:   *Function = w.out;
+    val block: Block     = w.block;
+    w.out   = ?probe;
+    w.block = res_block.ok;
+    val err_made: err[Error] = use(w, t, u, position);
+    w.out   = out;
+    w.block = block;
+    if (sel err_made.err) { ret res[opt[Breach], Error].err{err_made.err}; }
+    var i: usize = 0;
+    for (i < probe.instructions.len) {
+        val d:          *InstructionData = ?probe.instructions.data[i];
+        val opt_stands: opt[Breach]      = constraint.stands(?probe, w.r.context, d);
+        if (sel opt_stands.some) { ret res[opt[Breach], Error].ok{opt_stands}; }
+        i = i + 1;
+    }
+    ret res[opt[Breach], Error].ok{opt[Breach].none{}};
+}
+
+# whether a location holds what it is taken for: the whole value of both
+# ends it goes between, a slot's bytes in exact parts, or the value it saves
+fun fits(w: *Writer, t: u32, u: Spare) bool {
+    if (sel u.through) { ret holds(w, t, u.through.from) && holds(w, t, u.through.to); }
+    or (sel u.split) {
+        val p: Physical = location.physical(w.r.at, t);
+        if (!(sel p.register)) { ret false; }
+        ret splits(w, p.register, u.split.to, u.split.from);
+    }
+    ret holds(w, t, u.save.from) && holds(w, t, u.save.to);
+}
+
+# the first free location, by class and then by location, holding what it is
+# taken for under which every instruction of the moves through it stands,
+# none when none is free
+fun spare(w: *Writer, u: Spare, position: u32) res[opt[u32], Error] {
+    val err_listed: err[Error] = spare_room(w);
+    if (sel err_listed.err) { ret res[opt[u32], Error].err{err_listed.err}; }
+    var tried: u32 = 0;
+    var first: Breach;
+    var k:     u32 = 0;
+    for (k < location.keys(w.r.at)) {
+        val list: Slice[u32] = spares_of(w, k);
+        var i:    usize      = 0;
+        for (i < list.size) {
+            val loc:     u32              = list.data[i];
+            val res_out: res[bool, Error] = free(w, loc);
+            if (sel res_out.err) { ret res[opt[u32], Error].err{res_out.err}; }
+            if (res_out.ok && fits(w, loc, u)) {
+                val res_trial: res[opt[Breach], Error] = trial(w, loc, u, position);
+                if (sel res_trial.err) { ret res[opt[u32], Error].err{res_trial.err}; }
+                val opt_broke: opt[Breach] = res_trial.ok;
+                if (sel opt_broke.none) { ret res[opt[u32], Error].ok{opt[u32].some{loc}}; }
+                if (tried == 0)         { first = opt_broke.some; }
+                tried = tried + 1;
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    if (tried > 0) { ret res[opt[u32], Error].err{Error.constrained{Breached{at: w.at, breach: first}}}; }
+    ret res[opt[u32], Error].ok{opt[u32].none{}};
+}
+
+# every free register of a class holding the stack pointer's values, the frame code's scratches
+fun scratches(w: *Writer) res[Slice[rf.Id], Error] {
+    val err_listed: err[Error] = spare_room(w);
+    if (sel err_listed.err) { ret res[Slice[rf.Id], Error].err{err_listed.err}; }
+    vector.clear[rf.Id](?w.frees);
+    val stack: rf.Id    = w.src.layout.stack;
+    val file:  *rf.File = w.r.at.file;
+    var k:     u32      = 0;
+    for (stack != rf.NONE && k < file.class_count) {
+        if (class.addresses(file, stack, k::u16)) {
+            val list: Slice[u32] = spares_of(w, k);
+            var i:    usize      = 0;
+            for (i < list.size) {
+                val p: Physical = location.physical(w.r.at, list.data[i]);
+                if (sel p.register) {
+                    val res_out: res[bool, Error] = free(w, list.data[i]);
+                    if (sel res_out.err) { ret res[Slice[rf.Id], Error].err{res_out.err}; }
+                    if (res_out.ok) {
+                        val res_pushed: res[usize, allocator.Error] = vector.push[rf.Id](?w.frees, p.register);
+                        if (sel res_pushed.err) { ret res[Slice[rf.Id], Error].err{Error.alloc{res_pushed.err}}; }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[Slice[rf.Id], Error].ok{Slice[rf.Id]{data: w.frees.data, size: w.frees.len}};
+}
+
+# the operand a part of a move takes
+fun part(w: *Writer, p: move.Part, to: u32, from: u32) Operand {
+    if (sel p.literal) { ret Operand.immediate{p.literal}; }
+    if (sel p.to)      { ret operand_of(w, End.location{to}); }
+    ret operand_of(w, End.location{from});
+}
+
+# one row of the set's moves, its parts naming two locations
+fun row(w: *Writer, m: *Move, to: u32, from: u32) err[Error] {
+    vector.clear[Operand](?w.ops);
+    var i: u32 = 0;
+    for (i < m.parts.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Operand](?w.ops, part(w, m.parts.at[i], to, from));
+        if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+        i = i + 1;
+    }
+    # a register move holds what its source holds, which the constant-time walk follows, so it marks nothing secret
+    var moved: Metadata = w.d.metadata;
+    moved.secret = false;
+    val res_appended: res[Instruction, function.Error] = function.append(w.out, w.block, Opcode.row{m.row}, Slice[Operand]{data: w.ops.data, size: w.ops.len}, moved, w.d.declassifies, vstate.NONE);
+    if (sel res_appended.err) { ret err[Error].err{Error.made{res_appended.err}}; }
+    ret err[Error].ok{};
+}
+
+# a register loaded from bytes of a slot or stored to them by the frame code,
+# false when the location is no register
+# ---
+# loc:   the location
+# s:     the slot
+# at:    the bytes into the slot the access starts
+# size:  the bytes it moves
+# store: whether it stores the register, else loads it
+fun access(w: *Writer, loc: u32, s: u32, at: i64, size: Offset, store: bool, position: u32) res[bool, Error] {
+    val p: Physical = location.physical(w.r.at, loc);
+    if (!(sel p.register)) { ret res[bool, Error].ok{false}; }
+    val pl: Place = w.src.layout.slots.data[s];
+    if (sel pl.dropped) { ret res[bool, Error].err{Error.dropped{placed(w, position)}}; }
+    val base:     rf.Id      = record.base_of(?w.src.layout, pl.at);
+    val place:    Offset     = pl.at.offset;
+    val step:     Access     = Access{register: p.register, base: base, at: Offset{fixed: place.fixed + at, per: place.per, scale: place.scale}, size: size};
+    var err_done: err[Error] = err[Error].ok{};
+    if (store)            { err_done = framed(w, Step.store{step}); }
+    or                    { err_done = framed(w, Step.load{step}); }
+    if (sel err_done.err) { ret res[bool, Error].err{err_done.err}; }
+    ret res[bool, Error].ok{true};
+}
+
+# a move of the frame code, with no scratch where it needs none, so most moves ask nothing of liveness, and otherwise
+# offered the free registers and scavenging more
+fun framed(w: *Writer, s: Step) err[Error] {
+    var e:         Emit            = Emit{admitted: w.r.code, f: w.out, block: w.block, metadata: w.d.metadata, stack: w.src.layout.stack, scratches: code.NO_SCRATCH, scratch: opt[rf.Id].none{}};
+    val err_plain: err[code.Error] = code.make(?e, s);
+    if (sel err_plain.ok) { ret err[Error].ok{}; }
+    val res_free: res[Slice[rf.Id], Error] = scratches(w);
+    if (sel res_free.err) { ret err[Error].err{res_free.err}; }
+    e.scratches = res_free.ok;
+    val err_done: err[code.Error] = scavenge.make(?e, s, ?w.src.layout, lent_now(w), w.r.at, w.r.pool);
+    if (sel err_done.err) { ret err[Error].err{Error.code{err_done.err}}; }
+    ret err[Error].ok{};
+}
+
+# one move the set or the frame code makes in one step, false when neither does
+fun direct(w: *Writer, to: End, from: End, position: u32) res[bool, Error] {
+    if (sel to.location) {
+        val t: u32 = to.location;
+        if (sel from.location) {
+            val opt_move_of: opt[*Move] = move.move_of(w.r.moves, w.r.at, w.r.context.view, t, from.location);
+            if (sel opt_move_of.none) { ret res[bool, Error].ok{false}; }
+            val err_done: err[Error] = row(w, opt_move_of.some, t, from.location);
+            if (sel err_done.err) { ret res[bool, Error].err{err_done.err}; }
+            ret res[bool, Error].ok{true};
+        }
+        ret access(w, t, from.slot, 0, slot_size(w, from.slot), false, position);
+    }
+    if (sel from.location) { ret access(w, from.location, to.slot, 0, slot_size(w, to.slot), true, position); }
+    ret res[bool, Error].ok{false};
+}
+
+# a move of the whole value of one end into another, between two memory
+# locations of one size two moves through a free location holding all of
+# it, or the parts of a split through a free register
+fun moved(w: *Writer, to: End, from: End, position: u32) err[Error] {
+    val res_one: res[bool, Error] = direct(w, to, from, position);
+    if (sel res_one.err)                    { ret err[Error].err{res_one.err}; }
+    if (res_one.ok)                         { ret err[Error].ok{}; }
+    if (!memory(w, to) || !memory(w, from)) { ret refuse(Error.unmoved{placed(w, position)}); }
+    if (!alike(w, to, from))                { ret refuse(Error.sizes{placed(w, position)}); }
+    val whole:      Spare                = Spare.through{Ends{to: to, from: from}};
+    val res_picked: res[opt[u32], Error] = spare(w, whole, position);
+    if (sel res_picked.err) { ret err[Error].err{res_picked.err}; }
+    val opt_picked: opt[u32] = res_picked.ok;
+    if (sel opt_picked.some) { ret use(w, opt_picked.some, whole, position); }
+    if (sel to.slot) {
+        if (sel from.slot) {
+            val parts:      Spare                = Spare.split{Slots{to: to.slot, from: from.slot}};
+            val res_parted: res[opt[u32], Error] = spare(w, parts, position);
+            if (sel res_parted.err) { ret err[Error].err{res_parted.err}; }
+            val opt_parted: opt[u32] = res_parted.ok;
+            if (sel opt_parted.some) { ret use(w, opt_parted.some, parts, position); }
+        }
+    }
+    val res_lent: res[bool, Error] = borrow(w, whole, position);
+    if (sel res_lent.err) { ret err[Error].err{res_lent.err}; }
+    if (res_lent.ok)      { ret err[Error].ok{}; }
+    if (sel to.slot) {
+        if (sel from.slot) {
+            val res_parts: res[bool, Error] = borrow(w, Spare.split{Slots{to: to.slot, from: from.slot}}, position);
+            if (sel res_parts.err) { ret err[Error].err{res_parts.err}; }
+            if (res_parts.ok)      { ret err[Error].ok{}; }
+        }
+    }
+    ret refuse(Error.scratch{placed(w, position)});
+}
+
+# a register's save to the next emergency slot of its kind or its restore,
+# offered the free scratches
+fun save_lent(w: *Writer, r: rf.Id, restore: bool) err[Error] {
+    val res_free: res[Slice[rf.Id], Error] = scratches(w);
+    if (sel res_free.err) { ret err[Error].err{res_free.err}; }
+    var e:        Emit            = Emit{admitted: w.r.code, f: w.out, block: w.block, metadata: w.d.metadata, stack: w.src.layout.stack, scratches: res_free.ok, scratch: opt[rf.Id].none{}};
+    val err_done: err[code.Error] = scavenge.lend(?e, ?w.src.layout, r, lent_now(w), restore, w.r.at, w.r.pool);
+    if (sel err_done.err) { ret err[Error].err{Error.code{err_done.err}}; }
+    ret err[Error].ok{};
+}
+
+# the moves a lendable register is taken for, made through it while it is
+# lent, between its save to the next emergency slot of its kind and its
+# restore
+fun lend(w: *Writer, r: rf.Id, loc: u32, u: Spare, position: u32) err[Error] {
+    val err_saved: err[Error] = save_lent(w, r, false);
+    if (sel err_saved.err) { ret err_saved; }
+    val res_pushed: res[usize, allocator.Error] = vector.push[rf.Id](?w.lent, r);
+    if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+    val err_made: err[Error] = use(w, loc, u, position);
+    vector.pop[rf.Id](?w.lent);
+    if (sel err_made.err) { ret err_made; }
+    ret save_lent(w, r, true);
+}
+
+# a move between two memory locations made through the first lendable
+# register with an emergency slot of its kind left, none sharing storage
+# with a location taken for a value of the copy's own, that holds what it is
+# taken for and under which every instruction of the moves through it
+# stands, borrowed through that slot, false when none does
+fun borrow(w: *Writer, u: Spare, position: u32) res[bool, Error] {
+    val file: *rf.File = w.r.at.file;
+    var i:    usize    = 0;
+    for (i < w.lendable.len) {
+        val r:          rf.Id                        = w.lendable.data[i];
+        val res_locate: res[u32, location.Unlocated] = location.locate(w.r.at, Physical.register{r});
+        val left:       bool                         = scavenge.holding(file, lent_now(w), r) < scavenge.room(?w.src.layout, file, r);
+        if (sel res_locate.ok) {
+            if (left && !is_busy(w, res_locate.ok) && fits(w, res_locate.ok, u)) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[rf.Id](?w.lent, r);
+                if (sel res_pushed.err) { ret res[bool, Error].err{Error.alloc{res_pushed.err}}; }
+                val res_trial: res[opt[Breach], Error] = trial(w, res_locate.ok, u, position);
+                vector.pop[rf.Id](?w.lent);
+                if (sel res_trial.err) { ret res[bool, Error].err{res_trial.err}; }
+                val opt_broke: opt[Breach] = res_trial.ok;
+                if (sel opt_broke.none) {
+                    val err_lent: err[Error] = lend(w, r, res_locate.ok, u, position);
+                    if (sel err_lent.err) { ret res[bool, Error].err{err_lent.err}; }
+                    ret res[bool, Error].ok{true};
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{false};
+}
+
+fun touch(w: *Writer, k: u32) err[Error] {
+    val res_pushed: res[usize, allocator.Error] = vector.push[u32](?w.touched, k);
+    if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+    ret err[Error].ok{};
+}
+
+fun push_ready(w: *Writer, i: u32) err[Error] {
+    val res_pushed: res[usize, allocator.Error] = vector.push[u32](?w.ready, i);
+    if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+    ret err[Error].ok{};
+}
+
+# list pair i first among the pending readers of the end it reads
+fun link(w: *Writer, i: u32) {
+    val k: u32 = key(w, w.pairs.data[i].from);
+    val h: u32 = w.head.data[k];
+    w.pairs.data[i].prev = NONE;
+    w.pairs.data[i].next = h;
+    if (h != NONE) { w.pairs.data[h].prev = i; }
+    w.head.data[k] = i;
+}
+
+# take pair i out of the pending readers of the end it reads
+fun unlink(w: *Writer, i: u32) {
+    val p: Pair = w.pairs.data[i];
+    if (p.prev != NONE) { w.pairs.data[p.prev].next = p.next; }
+    or                  { w.head.data[key(w, p.from)] = p.next; }
+    if (p.next != NONE) { w.pairs.data[p.next].prev = p.prev; }
+}
+
+# every pending pair but i writing storage an end shares waits on i's read of it
+fun block(w: *Writer, i: u32, e: End) {
+    var own:   u32;
+    val alias: Slice[u32] = sharing(w, e, ?own);
+    var k:     usize      = 0;
+    for (k < alias.size) {
+        val j: u32 = w.writer.data[alias.data[k]];
+        if (j != NONE && j != i && !w.pairs.data[j].done) { w.pairs.data[j].waits = w.pairs.data[j].waits + 1; }
+        k = k + 1;
+    }
+}
+
+# pair i no longer reads an end, and a pending pair writing storage it shares
+# is ready once it waits on no other read
+fun unblock(w: *Writer, i: u32, e: End) err[Error] {
+    var own:   u32;
+    val alias: Slice[u32] = sharing(w, e, ?own);
+    var k:     usize      = 0;
+    for (k < alias.size) {
+        val j: u32 = w.writer.data[alias.data[k]];
+        if (j != NONE && j != i && !w.pairs.data[j].done) {
+            w.pairs.data[j].waits = w.pairs.data[j].waits - 1;
+            if (w.pairs.data[j].waits == 0) {
+                val err_ready: err[Error] = push_ready(w, j);
+                if (sel err_ready.err) { ret err_ready; }
+            }
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the move of pair i, already marked made, is out of the pending pairs and no
+# longer reads its end, and a location saved for it is given back
+fun retire(w: *Writer, i: u32) err[Error] {
+    w.left = w.left - 1;
+    unlink(w, i);
+    val p: Pair = w.pairs.data[i];
+    if (p.held) {
+        if (sel p.from.location) { give(w, p.from.location); }
+    }
+    ret unblock(w, i, p.from);
+}
+
+# a pair's move is made
+fun finished(w: *Writer, i: u32) err[Error] {
+    w.pairs.data[i].done = true;
+    ret retire(w, i);
+}
+
+# pair k reads an end in place of the one it read
+fun redirect(w: *Writer, k: u32, e: End) err[Error] {
+    val old: End = w.pairs.data[k].from;
+    unlink(w, k);
+    w.pairs.data[k].from = e;
+    link(w, k);
+    block(w, k, e);
+    ret unblock(w, k, old);
+}
+
+# the pending pairs but i reading storage an end shares, added to those found
+fun readers_of(w: *Writer, i: u32, e: End) err[Error] {
+    var own:   u32;
+    val alias: Slice[u32] = sharing(w, e, ?own);
+    var k:     usize      = 0;
+    for (k < alias.size) {
+        var q: u32 = w.head.data[alias.data[k]];
+        for (q != NONE) {
+            if (q != i) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](?w.found, q);
+                if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+            }
+            q = w.pairs.data[q].next;
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# break the cycle through pair i by saving the value each pending pair reading
+# storage its destination shares needs in a free location of the value's
+# storage, that pair then reading it from there, false when one finds none
+# free, the values saved before it staying saved
+fun saved(w: *Writer, i: u32) res[bool, Error] {
+    vector.clear[u32](?w.found);
+    val err_listed: err[Error] = readers_of(w, i, w.pairs.data[i].to);
+    if (sel err_listed.err) { ret res[bool, Error].err{err_listed.err}; }
+    var n: usize = 0;
+    for (n < w.found.len) {
+        val k:          u32                  = w.found.data[n];
+        val from:       End                  = w.pairs.data[k].from;
+        val at:         u32                  = w.pairs.data[k].position;
+        val res_picked: res[opt[u32], Error] = spare(w, Spare.save{Ends{to: w.pairs.data[k].to, from: from}}, at);
+        if (sel res_picked.err) { ret res[bool, Error].err{res_picked.err}; }
+        val opt_picked: opt[u32] = res_picked.ok;
+        if (sel opt_picked.none) { ret res[bool, Error].ok{false}; }
+        take(w, opt_picked.some);
+        val err_made: err[Error] = moved(w, End.location{opt_picked.some}, from, at);
+        if (sel err_made.err) { ret res[bool, Error].err{err_made.err}; }
+        val err_touched: err[Error] = touch(w, opt_picked.some);
+        if (sel err_touched.err) { ret res[bool, Error].err{err_touched.err}; }
+        w.pairs.data[k].held = true;
+        val err_moved_to: err[Error] = redirect(w, k, End.location{opt_picked.some});
+        if (sel err_moved_to.err) { ret res[bool, Error].err{err_moved_to.err}; }
+        n = n + 1;
+    }
+    ret res[bool, Error].ok{true};
+}
+
+# the register a location is, none for a cell
+fun register_at(w: *Writer, loc: u32) opt[rf.Id] {
+    val p: Physical = location.physical(w.r.at, loc);
+    if (sel p.register) { ret opt[rf.Id].some{p.register}; }
+    ret opt[rf.Id].none{};
+}
+
+# where a reader of storage `from` shares reads once a swap moves what `from`
+# held to `to`: `to` for `from` itself, and for a register lying within `from`
+# the register of its class lying within `to` at the same place, none for a
+# location `from` does not hold whole or holds at no one place
+fun swapped_end(w: *Writer, e: End, from: u32, to: u32) opt[End] {
+    if (!(sel e.location))  { ret opt[End].none{}; }
+    if (e.location == from) { ret opt[End].some{End.location{to}}; }
+    val opt_part:        opt[rf.Id] = register_at(w, e.location);
+    val opt_register_at: opt[rf.Id] = register_at(w, from);
+    val opt_to_register: opt[rf.Id] = register_at(w, to);
+    if (sel opt_part.none)        { ret opt[End].none{}; }
+    if (sel opt_register_at.none) { ret opt[End].none{}; }
+    if (sel opt_to_register.none) { ret opt[End].none{}; }
+    val opt_other: opt[rf.Id] = storage.counterpart(w.r.at.file, opt_part.some, opt_register_at.some, opt_to_register.some);
+    if (sel opt_other.none) { ret opt[End].none{}; }
+    val res_locate: res[u32, location.Unlocated] = location.locate(w.r.at, Physical.register{opt_other.some});
+    if (sel res_locate.err) { ret opt[End].none{}; }
+    ret opt[End].some{End.location{res_locate.ok}};
+}
+
+# whether a location lies within the destination of a pending pair but i
+fun pending_within(w: *Writer, i: u32, loc: u32) bool {
+    val opt_register_at: opt[rf.Id] = register_at(w, loc);
+    var k:               usize      = 0;
+    for (k < w.pairs.len) {
+        val p: Pair = w.pairs.data[k];
+        if (k::u32 != i && !p.done) {
+            val to: End = p.to;
+            if (sel to.location) {
+                if (to.location == loc) { ret true; }
+                val opt_register_at_location: opt[rf.Id] = register_at(w, to.location);
+                if (sel opt_register_at.some) {
+                    if (sel opt_register_at_location.some) {
+                        val opt_lies: opt[rf.Placement] = storage.lies(w.r.at.file, opt_register_at.some, opt_register_at_location.some);
+                        if (sel opt_lies.some) { ret true; }
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# whether every location sharing storage with `loc` that lies within no
+# pending pair's destination but i's holds no value past the copy, so a swap
+# may leave what it moves into `loc` there
+fun dead_past(w: *Writer, i: u32, loc: u32) res[bool, Error] {
+    val res_liveness: res[*Live, Error] = liveness(w);
+    if (sel res_liveness.err) { ret res[bool, Error].err{res_liveness.err}; }
+    val opt_def: opt[u32] = live.def_slot(res_liveness.ok, w.at);
+    if (sel opt_def.none) { ret res[bool, Error].ok{false}; }
+    var after: Segment    = Segment{from: opt_def.some, to: opt_def.some + 1};
+    val alias: Slice[u32] = location.shares(w.r.at, loc);
+    var a:     usize      = 0;
+    for (a < alias.size) {
+        if (!pending_within(w, i, alias.data[a])) {
+            val opt_held: opt[u32] = live.held_over(res_liveness.ok, alias.data[a], Slice[Segment]{data: ?after, size: 1}, Slice[u32]{data: nil, size: 0});
+            if (sel opt_held.some) { ret res[bool, Error].ok{false}; }
+        }
+        a = a + 1;
+    }
+    ret res[bool, Error].ok{true};
+}
+
+# break the cycle through pair i, which moves register `from` to register
+# `to` of its class, by the set's swap of the two, false when the set states
+# none or a pending pair reads storage either shares other than the register
+# itself or one lying within it at one place. the swap leaves `from` holding
+# what `to` held, so every location sharing `from`'s storage that no pending
+# destination covers must hold no value past the copy. each pending pair
+# reading storage of one then reads where the swap moved it, a part of a
+# register the part of its class at the same place within the other, and one
+# then reading its own destination is made
+fun swapped(w: *Writer, i: u32) res[bool, Error] {
+    val p:  Pair = w.pairs.data[i];
+    val to: End  = p.to;
+    if (sel to.slot) { ret res[bool, Error].ok{false}; }
+    val from: End = p.from;
+    if (sel from.slot) { ret res[bool, Error].ok{false}; }
+    val alias: Slice[u32] = location.shares(w.r.at, to.location);
+    var a:     usize      = 0;
+    for (a < alias.size) {
+        if (alias.data[a] == from.location) { ret res[bool, Error].ok{false}; }
+        a = a + 1;
+    }
+    val opt_swap_of: opt[*Move] = move.swap_of(w.r.moves, w.r.at, w.r.context.view, to.location, from.location);
+    if (sel opt_swap_of.none) { ret res[bool, Error].ok{false}; }
+    val res_dead: res[bool, Error] = dead_past(w, i, from.location);
+    if (sel res_dead.err) { ret res_dead; }
+    if (!res_dead.ok)     { ret res_dead; }
+    vector.clear[u32](?w.found);
+    val err_of_to: err[Error] = readers_of(w, i, to);
+    if (sel err_of_to.err) { ret res[bool, Error].err{err_of_to.err}; }
+    val split:       usize      = w.found.len;
+    val err_of_from: err[Error] = readers_of(w, i, from);
+    if (sel err_of_from.err) { ret res[bool, Error].err{err_of_from.err}; }
+    var n: usize = 0;
+    for (n < w.found.len) {
+        val e:               End      = w.pairs.data[w.found.data[n]].from;
+        var opt_swapped_end: opt[End] = opt[End].none{};
+        if (n < split)                { opt_swapped_end = swapped_end(w, e, to.location, from.location); }
+        or                            { opt_swapped_end = swapped_end(w, e, from.location, to.location); }
+        if (sel opt_swapped_end.none) { ret res[bool, Error].ok{false}; }
+        n = n + 1;
+    }
+    val err_made: err[Error] = row(w, opt_swap_of.some, to.location, from.location);
+    if (sel err_made.err) { ret res[bool, Error].err{err_made.err}; }
+    w.pairs.data[i].done = true;
+    n                    = 0;
+    for (n < w.found.len) {
+        val k:               u32      = w.found.data[n];
+        var opt_swapped_end: opt[End] = opt[End].none{};
+        if (n < split) { opt_swapped_end = swapped_end(w, w.pairs.data[k].from, to.location, from.location); }
+        or             { opt_swapped_end = swapped_end(w, w.pairs.data[k].from, from.location, to.location); }
+        # the first pass found every reader's end, and no redirect moves another's
+        if (sel opt_swapped_end.some) {
+            var err_done: err[Error] = err[Error].ok{};
+            if (same(w, opt_swapped_end.some, w.pairs.data[k].to)) { err_done = finished(w, k); }
+            or                                                     { err_done = redirect(w, k, opt_swapped_end.some); }
+            if (sel err_done.err)                                  { ret res[bool, Error].err{err_done.err}; }
+        }
+        n = n + 1;
+    }
+    val err_retired: err[Error] = retire(w, i);
+    if (sel err_retired.err) { ret res[bool, Error].err{err_retired.err}; }
+    ret res[bool, Error].ok{true};
+}
+
+# break a cycle by the swap of the pending pair at or past `cursor` the first
+# to admit one, false when none does
+fun swap_any(w: *Writer, cursor: u32) res[bool, Error] {
+    var k: u32 = cursor;
+    for (k < w.pairs.len::u32) {
+        if (!w.pairs.data[k].done) {
+            val res_swapped: res[bool, Error] = swapped(w, k);
+            if (sel res_swapped.err) { ret res_swapped; }
+            if (res_swapped.ok)      { ret res_swapped; }
+        }
+        k = k + 1;
+    }
+    ret res[bool, Error].ok{false};
+}
+
+# order and write the pairs of a parallel copy
+fun sequence(w: *Writer) err[Error] {
+    val n: u32 = w.pairs.len::u32;
+    var i: u32 = 0;
+    for (i < n) {
+        val p:         Pair       = w.pairs.data[i];
+        val t:         u32        = key(w, p.to);
+        val err_touch: err[Error] = touch(w, t);
+        if (sel err_touch.err) { ret err_touch; }
+        val err_touch_key: err[Error] = touch(w, key(w, p.from));
+        if (sel err_touch_key.err) { ret err_touch_key; }
+        var own:   u32;
+        val alias: Slice[u32] = sharing(w, p.to, ?own);
+        var k:     usize      = 0;
+        for (k < alias.size) {
+            if (w.writer.data[alias.data[k]] != NONE) { ret refuse(Error.twice{placed(w, p.position)}); }
+            k = k + 1;
+        }
+        w.writer.data[t] = i;
+        link(w, i);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        block(w, i, w.pairs.data[i].from);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        if (w.pairs.data[i].waits == 0) {
+            val err_ready: err[Error] = push_ready(w, i);
+            if (sel err_ready.err) { ret err_ready; }
+        }
+        i = i + 1;
+    }
+    w.left = n;
+    var cursor: u32 = 0;
+    for (w.left > 0) {
+        for (w.ready.len > 0) {
+            val at: u32 = w.ready.data[w.ready.len - 1];
+            vector.truncate[u32](?w.ready, w.ready.len - 1);
+            val p:        Pair       = w.pairs.data[at];
+            val err_made: err[Error] = moved(w, p.to, p.from, p.position);
+            if (sel err_made.err) { ret err_made; }
+            val err_done: err[Error] = finished(w, at);
+            if (sel err_done.err) { ret err_done; }
+        }
+        if (w.left > 0) {
+            for (w.pairs.data[cursor].done) {
+                cursor = cursor + 1;
+            }
+            val res_by_save: res[bool, Error] = saved(w, cursor);
+            if (sel res_by_save.err) { ret err[Error].err{res_by_save.err}; }
+            if (!res_by_save.ok) {
+                val res_by_swap: res[bool, Error] = swap_any(w, cursor);
+                if (sel res_by_swap.err) { ret err[Error].err{res_by_swap.err}; }
+                if (!res_by_swap.ok)     { ret refuse(Error.cycle{w.at}); }
+            }
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# set every key a copy touched back to its rest
+fun reset(w: *Writer) {
+    var i: usize = 0;
+    for (i < w.touched.len) {
+        val k: u32 = w.touched.data[i];
+        w.writer.data[k] = NONE;
+        w.head.data[k]   = NONE;
+        i                = i + 1;
+    }
+    vector.clear[u32](?w.touched);
+    vector.clear[u32](?w.ready);
+    vector.clear[u32](?w.found);
+    vector.clear[Pair](?w.pairs);
+}
+
+# a slot's address plus a displacement: the slot's place and the displacement
+# added to its base into the destination by the frame code, offered every free
+# register as its scratch and scavenging more where it needs them
+fun lower_address(w: *Writer) err[Error] {
+    val d: *InstructionData = w.d;
+    if (d.operands.size != 3) { ret refuse(Error.operand{placed(w, 0)}); }
+    val o: Operand = d.operands.data[0];
+    if (!(sel o.physical)) { ret refuse(Error.operand{placed(w, 0)}); }
+    val p: Physical = o.physical;
+    if (!(sel p.register)) { ret refuse(Error.operand{placed(w, 0)}); }
+    val so: Operand = d.operands.data[1];
+    if (!(sel so.slot)) { ret refuse(Error.operand{placed(w, 1)}); }
+    val disp: Operand = d.operands.data[2];
+    if (!(sel disp.immediate)) { ret refuse(Error.operand{placed(w, 2)}); }
+    val pl: Place = w.src.layout.slots.data[so.slot];
+    if (sel pl.dropped) { ret refuse(Error.dropped{placed(w, 1)}); }
+    ret framed(w, Step.add{Add{dest: p.register, src: record.base_of(?w.src.layout, pl.at), by: record.past(pl.at.offset, disp.immediate)}});
+}
+
+# one copy or parallel copy as the set's moves
+fun lower_copy(w: *Writer) err[Error] {
+    val d: *InstructionData = w.d;
+    if (d.label != instruction.NO_LABEL) { ret refuse(Error.label{w.at}); }
+    if (d.implicit.size != 0)            { ret refuse(Error.implied{w.at}); }
+    val n: u32 = d.operands.size::u32 / 2;
+    var k: u32 = 0;
+    for (k < n) {
+        val res_end_of: res[End, Error] = end_of(w, d.operands.data[k], k);
+        if (sel res_end_of.err) { ret refuse(res_end_of.err); }
+        val res_from: res[End, Error] = end_of(w, d.operands.data[k + n], k + n);
+        if (sel res_from.err) { ret refuse(res_from.err); }
+        # a declassifying copy is written even where both ends share a place, so the point it makes has its instruction
+        if (d.declassifies || !same(w, res_end_of.ok, res_from.ok)) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Pair](?w.pairs, Pair{to: res_end_of.ok, from: res_from.ok, position: k, done: false, next: NONE, prev: NONE, waits: 0, held: false});
+            if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+        }
+        k = k + 1;
+    }
+    if (w.pairs.len == 1) { ret moved(w, w.pairs.data[0].to, w.pairs.data[0].from, w.pairs.data[0].position); }
+    ret sequence(w);
+}
+
+# whether an instruction is a copy: a copy, a parallel copy, a spill or a
+# reload, each its destinations then its sources
+fun is_copy(op: Opcode) bool {
+    if (!(sel op.pseudo)) { ret false; }
+    val p: pseudo.Pseudo = op.pseudo;
+    ret p == pseudo.COPY || p == pseudo.PARALLEL_COPY || p == pseudo.SPILL || p == pseudo.RELOAD;
+}
+
+# the instruction being lowered, copied as it is
+fun copied(w: *Writer) err[Error] {
+    val d:        *InstructionData                 = w.d;
+    val res_made: res[Instruction, function.Error] = function.carry(w.out, w.block, d, d.operands);
+    if (sel res_made.err) { ret err[Error].err{Error.made{res_made.err}}; }
+    ret err[Error].ok{};
+}
+
+# the free candidates by the key of their class: the allowed locations a call
+# clobbers or the frame saves
+fun candidates(w: *Writer) err[Error] {
+    val at:    *Locations          = w.r.at;
+    var marks: vector.Vector[bool] = vector.init[bool](w.a);
+    fin { vector.dnit[bool](?marks); }
+    val err_filled: err[allocator.Error] = slice.fill[bool](?marks, location.count(at)::usize, false);
+    if (sel err_filled.err) { ret alloc_err(err_filled.err); }
+    var i: usize = 0;
+    for (i < w.r.clobbered.size) {
+        val res_locate: res[u32, location.Unlocated] = location.locate(at, Physical.register{w.r.clobbered.data[i]});
+        if (sel res_locate.err) { ret err[Error].err{Error.unlocated{res_locate.err}}; }
+        marks.data[res_locate.ok] = true;
+        i                         = i + 1;
+    }
+    i = 0;
+    for (i < w.src.layout.saves.len) {
+        val res_locate: res[u32, location.Unlocated] = location.locate(at, Physical.register{w.src.layout.saves.data[i].register});
+        if (sel res_locate.err) { ret err[Error].err{Error.unlocated{res_locate.err}}; }
+        marks.data[res_locate.ok] = true;
+        i                         = i + 1;
+    }
+    var locs: vector.Vector[u32] = vector.init[u32](w.a);
+    fin { vector.dnit[u32](?locs); }
+    i = 0;
+    for (i < w.r.allowed.size) {
+        val res_locate: res[u32, location.Unlocated] = location.locate(at, w.r.allowed.data[i]);
+        if (sel res_locate.err) { ret err[Error].err{Error.unlocated{res_locate.err}}; }
+        if (marks.data[res_locate.ok]) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[u32](?locs, res_locate.ok);
+            if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+        }
+        i = i + 1;
+    }
+    sort.sort[u32](locs.data, locs.len);
+    var keys: vector.Vector[u32] = vector.init[u32](w.a);
+    fin { vector.dnit[u32](?keys); }
+    i = 0;
+    for (i < locs.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[u32](?keys, location.key_at(at, locs.data[i]));
+        if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+        i = i + 1;
+    }
+    val res_made: res[Lists[u32], allocator.Error] = graph.lists[u32](w.a, location.keys(at), Slice[u32]{data: keys.data, size: keys.len}, Slice[u32]{data: locs.data, size: locs.len});
+    if (sel res_made.err) { ret alloc_err(res_made.err); }
+    w.spares = res_made.ok;
+    ret err[Error].ok{};
+}
+
+# the function's virtual registers, slots and blocks, then its instructions
+# with every copy lowered, noting where each instruction's own begin and how
+# many it made
+fun write(w: *Writer, first: *vector.Vector[u32], made: *vector.Vector[u32], origins: *vector.Vector[u32]) err[Error] {
+    val f: *Function = ?w.src.function;
+    var i: usize     = 0;
+    for (i < f.virtuals.len) {
+        val res_virtual: res[Virtual, function.Error] = function.virtual(w.out, f.virtuals.data[i], f.secret.data[i], f.widths.data[i]);
+        if (sel res_virtual.err) { ret err[Error].err{Error.made{res_virtual.err}}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.slots.len) {
+        val res_slot: res[Slot, function.Error] = function.slot(w.out, f.slots.data[i]);
+        if (sel res_slot.err) { ret err[Error].err{Error.made{res_slot.err}}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.blocks.len) {
+        val res_block: res[Block, function.Error] = function.block(w.out);
+        if (sel res_block.err) { ret err[Error].err{Error.made{res_block.err}}; }
+        i = i + 1;
+    }
+    val err_room: err[allocator.Error] = function.room_of(w.out, f);
+    if (sel err_room.err) { ret alloc_err(err_room.err); }
+    i = 0;
+    for (i < f.blocks.len) {
+        w.block = (i::u32);
+        val list: Slice[Instruction] = function.instructions(f, w.block);
+        var k:    usize              = 0;
+        for (k < list.size) {
+            w.at = list.data[k];
+            w.d  = function.data(f, w.at);
+            val from:     usize      = w.out.instructions.len;
+            var err_done: err[Error] = err[Error].ok{};
+            val op:       Opcode     = w.d.opcode;
+            if (is_copy(op)) {
+                err_done = lower_copy(w);
+                reset(w);
+            }
+            or (sel op.pseudo && op.pseudo == pseudo.ADDRESS) { err_done = lower_address(w); }
+            or (sel op.pseudo && pseudo.marks(op.pseudo))     {}
+            or                                                { err_done = copied(w); }
+            if (sel err_done.err)                             { ret err_done; }
+            first.data[w.at] = from::u32;
+            made.data[w.at]  = (w.out.instructions.len - from)::u32;
+            var o: usize = from;
+            for (o < w.out.instructions.len) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](origins, w.src.origins.data[w.at]);
+                if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+                o = o + 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun per_key(v: *vector.Vector[u32], n: usize, value: u32) err[Error] {
+    val err_filled: err[allocator.Error] = slice.fill[u32](v, n, value);
+    if (sel err_filled.err) { ret alloc_err(err_filled.err); }
+    ret err[Error].ok{};
+}
+
+fun writer_dnit(w: *Writer) {
+    if (w.known) { live.dnit(?w.l); }
+    graph.lists_dnit[u32](?w.spares);
+    vector.dnit[Pair](?w.pairs);
+    vector.dnit[u32](?w.writer);
+    vector.dnit[u32](?w.head);
+    vector.dnit[u32](?w.touched);
+    vector.dnit[u32](?w.ready);
+    vector.dnit[u32](?w.covered);
+    vector.dnit[u32](?w.found);
+    vector.dnit[Operand](?w.ops);
+    vector.dnit[rf.Id](?w.frees);
+    vector.dnit[rf.Id](?w.lendable);
+    vector.dnit[rf.Id](?w.lent);
+}
+
+# the per key tables at rest and the lendable registers listed
+fun prepare(w: *Writer) err[Error] {
+    val n:          usize      = (location.count(w.r.at) + w.src.function.slots.len::u32)::usize;
+    val err_writer: err[Error] = per_key(?w.writer, n, NONE);
+    if (sel err_writer.err) { ret err_writer; }
+    val err_head: err[Error] = per_key(?w.head, n, NONE);
+    if (sel err_head.err) { ret err_head; }
+    val err_covered: err[Error] = per_key(?w.covered, location.count(w.r.at)::usize, 0);
+    if (sel err_covered.err) { ret err_covered; }
+    ret lendable(w);
+}
+
+# the registers a move between memory may borrow: the pool's with an
+# emergency slot of their kind, then every other allowed register of a class
+# holding none of the stack pointer's values with one. whether a class holds
+# them is asked once for each run of allowed registers of one class
+fun lendable(w: *Writer) err[Error] {
+    val file:   *rf.File             = w.r.at.file;
+    val stack:  rf.Id                = w.src.layout.stack;
+    var others: vector.Vector[rf.Id] = vector.init[rf.Id](w.a);
+    fin { vector.dnit[rf.Id](?others); }
+    var last:      u16   = 0;
+    var addresses: bool  = false;
+    var asked:     bool  = false;
+    var i:         usize = 0;
+    for (i < w.r.allowed.size) {
+        val p: Physical = w.r.allowed.data[i];
+        if (sel p.register) {
+            val r: rf.Id = p.register;
+            val k: u16   = rf.class_of(r);
+            if (!asked || k != last) {
+                addresses = class.addresses(file, stack, k);
+                last      = k;
+                asked     = true;
+            }
+            if (!addresses) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[rf.Id](?others, r);
+                if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+            }
+        }
+        i = i + 1;
+    }
+    val err_pooled: err[Error] = with_room(w, w.r.pool);
+    if (sel err_pooled.err) { ret err_pooled; }
+    ret with_room(w, Slice[rf.Id]{data: others.data, size: others.len});
+}
+
+# the registers of a list with an emergency slot of their kind, added to the lendable ones
+fun with_room(w: *Writer, list: Slice[rf.Id]) err[Error] {
+    val file: *rf.File = w.r.at.file;
+    var i:    usize    = 0;
+    for (i < list.size) {
+        if (scavenge.room(?w.src.layout, file, list.data[i]) > 0) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[rf.Id](?w.lendable, list.data[i]);
+            if (sel res_pushed.err) { ret alloc_err(res_pushed.err); }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the lowered framed function in `out`, its facts following the instructions
+# they name and the source function's written state carried over
+fun lowered(w: *Writer, out: *Framed) err[Error] {
+    val err_ready: err[Error] = prepare(w);
+    if (sel err_ready.err) { ret err_ready; }
+    val err_inherited: err[allocator.Error] = function.inherit(w.out, ?w.src.function);
+    if (sel err_inherited.err) { ret err[Error].err{Error.alloc{err_inherited.err}}; }
+    var first: vector.Vector[u32] = vector.init[u32](w.a);
+    var made:  vector.Vector[u32] = vector.init[u32](w.a);
+    fin {
+        vector.dnit[u32](?first);
+        vector.dnit[u32](?made);
+    }
+    val count:      usize      = w.src.function.instructions.len;
+    val err_starts: err[Error] = per_key(?first, count, 0);
+    if (sel err_starts.err) { ret err_starts; }
+    val err_counts: err[Error] = per_key(?made, count, 0);
+    if (sel err_counts.err) { ret err_counts; }
+    val err_written: err[Error] = write(w, ?first, ?made, ?out.origins);
+    if (sel err_written.err) { ret err_written; }
+    val err_followed: err[allocator.Error] = record.follow(?w.src.facts, Slice[u32]{data: first.data, size: first.len}, Slice[u32]{data: made.data, size: made.len}, ?out.facts);
+    if (sel err_followed.err) { ret alloc_err(err_followed.err); }
+    val err_carried: err[allocator.Error] = function.carry_written(w.out, ?w.src.function, Slice[u32]{data: first.data, size: first.len}, Slice[u32]{data: made.data, size: made.len});
+    if (sel err_carried.err) { ret alloc_err(err_carried.err); }
+    ret err[Error].ok{};
+}
+
+# lower the copies of a framed function into the set's moves
+# ---
+# a:   the allocator the lowered function takes
+# x:   the framed function, every operand a location or a slot, replaced by
+#      the lowered one when the lowering succeeds and unchanged when refused
+# r:   what the lowering reads beside it
+# ret: ok, or why the copies were not lowered
+pub fun lower(a: *allocator.Allocator, x: *Framed, r: *Request) err[Error] {
+    var out: Framed = Framed{function: function.init(a, x.function.set, x.function.checked), layout: x.layout, facts: vector.init[Fact](a), origins: vector.init[u32](a)};
+    var w:   Writer = Writer{
+        a:        a,
+        r:        r,
+        src:      x,
+        out:      ?out.function,
+        known:    false,
+        listed:   false,
+        spares:   Lists[u32]{first: vector.init[u32](a), items: vector.init[u32](a)},
+        pairs:    vector.init[Pair](a),
+        writer:   vector.init[u32](a),
+        head:     vector.init[u32](a),
+        touched:  vector.init[u32](a),
+        ready:    vector.init[u32](a),
+        covered:  vector.init[u32](a),
+        found:    vector.init[u32](a),
+        ops:      vector.init[Operand](a),
+        frees:    vector.init[rf.Id](a),
+        left:     0,
+        block:    0,
+        at:       0,
+        d:        nil,
+        lendable: vector.init[rf.Id](a),
+        lent:     vector.init[rf.Id](a),
+    };
+    fin { writer_dnit(?w); }
+    val err_done: err[Error] = lowered(?w, ?out);
+    if (sel err_done.err) {
+        function.dnit(?out.function);
+        vector.dnit[Fact](?out.facts);
+        vector.dnit[u32](?out.origins);
+        ret err_done;
+    }
+    var err_failed: err[allocator.Error] = function.dnit(?x.function);
+    keep(?err_failed, vector.dnit[Fact](?x.facts));
+    keep(?err_failed, vector.dnit[u32](?x.origins));
+    x.function = out.function;
+    x.facts    = out.facts;
+    x.origins  = out.origins;
+    ret err[Error].ok{};
+}

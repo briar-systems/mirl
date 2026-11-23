@@ -1,0 +1,324 @@
+# `mirl compile <file> [-o <path>] [--emit <kind>]`: compile the text for a
+# target through mirl.target.compile and write one kind of what the
+# compilation makes
+#
+# a kind is a row of KINDS, a stopping point as mach's --emit names it: the
+# module after the pass schedule, the machine form text of the laid out
+# functions, masc's listing of the object, the object in the format of the
+# target's system, through mink, the default, or the final image the target
+# loads as it is, which mink's link makes of the object. the command reads the
+# line and reports, and the compilation is the library's.
+
+use std.format;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use fs: std.filesystem;
+use io: std.io.writer;
+
+use mirl.base.stats.Stats;
+use mirl.cli.build;
+use verify_cmd: mirl.cli.cmd.verify;
+use mirl.cli.command;
+use mirl.cli.diagnostic;
+use mirl.cli.exit;
+use mirl.cli.source;
+use cli_target: mirl.cli.target;
+use mct:        mirl.ct;
+use mirl.debug.records;
+use mirl.failure;
+use mirl.failure.text;
+use debug_place: mirl.ir.debug.place;
+use mirl.ir.debug.record.Position;
+use debug_table: mirl.ir.debug.table;
+use mirl.ir.function;
+use mirl.ir.id;
+use mirl.ir.instruction;
+use mirl.ir.module;
+use irow:         mirl.ir.opcode.row;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.text.item;
+use mirl.ir.text.printer;
+use mirl.ir.text.sink;
+use mirl.ir.type.table;
+use mirl.machine.alloc.allocate;
+use mirl.machine.alloc.check;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.rewrite;
+use mirl.machine.alloc.scan;
+use mirl.machine.alloc.spill;
+use mcompile: mirl.machine.compile;
+use mirl.machine.copy.lower;
+use mirl.machine.emit.handover;
+use mirl.machine.frame.code;
+use mirl.machine.frame.finish;
+use minline: mirl.machine.inline;
+use lrow:    mirl.machine.loop.row;
+use mirl.machine.select.engine;
+use mirl.machine.timing;
+use mirl.pass.relaxation;
+use mirl.pass.setting.Optimise;
+use mirl.target.assemble;
+use target_basis: mirl.target.basis;
+use mirl.target.compile;
+use mirl.target.family;
+use thead: mirl.target.head;
+use mirl.target.options;
+use mirl.target.record.Target;
+use spirv_error: mirl.target.spirv.error;
+use mirl.target.warning.Scalarized;
+use mirl.target.warning.Warning;
+use wasm_error: mirl.target.wasm.error;
+use mirl.target.widening;
+use mirl.target.widening.Widenings;
+use std.args;
+
+use masc_ct: masc.core.ct;
+use masc.core.unmet;
+
+# one kind of output, by the name mach's --emit gives it
+# ---
+# name:    the --emit value that names it
+# ir:      it is the module after the pass schedule, which stops there
+# machine: it is the machine form text
+# listing: it is masc's listing
+# object:  it is the object's bytes
+# image:   the object's bytes are the final image, not a relocatable object
+pub rec Kind {
+    name:    str;
+    ir:      bool;
+    machine: bool;
+    listing: bool;
+    object:  bool;
+    image:   bool;
+}
+
+# the permission bits of a file -o creates, rw-r--r--
+val FILE_MODE: i32 = 420;
+
+# every kind, in the order help lists them
+pub val KINDS: [5]Kind = [5]Kind{
+    Kind{name: "ir", ir: true, machine: false, listing: false, object: false, image: false},
+    Kind{name: "machine", ir: false, machine: true, listing: false, object: false, image: false},
+    Kind{name: "asm", ir: false, machine: false, listing: true, object: false, image: false},
+    Kind{name: "obj", ir: false, machine: false, listing: false, object: true, image: false},
+    Kind{name: "exe", ir: false, machine: false, listing: false, object: true, image: true},
+};
+
+# the kind written when --emit is not given
+val OBJ: usize = 3;
+
+# the flag that names the kind of output to write
+pub val EMIT: args.Flag = args.Flag{long: "emit", short: 0, value: "kind", repeat: false, negatable: false, help: "the output: ir, machine, asm, obj or exe (default: obj)"};
+
+# the flag that names the file the output goes to, stdout when it is not given
+pub val OUTPUT: args.Flag = args.Flag{long: "output", short: 'o', value: "path", repeat: false, negatable: false, help: "the file to write (default: stdout)"};
+
+# the switch that verifies the module around every pass and every function after every stage
+pub val VERIFY: args.Flag = args.Flag{long: "verify", short: 0, value: nil, repeat: false, negatable: true, help: "verify after every pass and stage, and prove every allocation"};
+
+# the switch that lets the linker relax the code, on unless negated
+pub val RELAX: args.Flag = args.Flag{long: "relax", short: 0, value: nil, repeat: false, negatable: true, help: "mark relocations the linker may relax (default: on)"};
+
+# the flags the command reads, in the order help lists them
+val FLAGS: [15]*args.Flag = [15]*args.Flag{?command.HELP, ?EMIT, ?OUTPUT, ?cli_target.TARGET, ?cli_target.ENV, ?cli_target.ABI, ?cli_target.ISA, ?cli_target.EXT, ?cli_target.CODE_MODEL, ?build.KIND, ?build.OPTIMIZE, ?build.PASS, ?build.FLOAT_RELAX, ?VERIFY, ?RELAX};
+
+# the command's registration
+pub val SPEC: args.Command = args.Command{name: "compile", aliases: Slice[str]{data: nil, size: 0}, help: "compile a module", usage: "<file>", flags: Slice[*args.Flag]{data: ?FLAGS[0], size: 15}, commands: Slice[*args.Command]{data: nil, size: 0}, operand_min: 1, operand_max: 1, passthrough: false};
+
+# the command as the program runs it
+pub val COMMAND: command.Command = command.Command{spec: ?SPEC, run: handle};
+
+# the kind an --emit value names, nil for none
+pub fun kind_of(s: str) *Kind {
+    if (s == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < $length_of(KINDS)) {
+        if (str_equals(KINDS[i].name, s)) { ret ?KINDS[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun handle(call: *command.Call) i64 {
+    val asked: str   = args.value(call.p, ?EMIT);
+    var named: *Kind = ?KINDS[OBJ];
+    if (asked != nil) { named = kind_of(asked); }
+    if (named == nil) {
+        text.named(?call.report, "not a kind of output, ir, machine, asm, obj or exe", asked);
+        ret exit.REFUSED;
+    }
+    val k:       Kind = @named;
+    val checked: bool = args.on(call.p, ?VERIFY);
+    var relax:   bool = options.RELAX;
+    if (args.given(call.p, ?RELAX)) { relax = args.on(call.p, ?RELAX); }
+    var output: options.Output = options.Output.object{};
+    if (k.image) { output = options.Output.image{}; }
+    val res_optimise: res[Optimise, i64] = build.asked_optimise(call);
+    if (sel res_optimise.err) { ret res_optimise.err; }
+    val res_text: res[str, i64] = source.text(call);
+    if (sel res_text.err) { ret res_text.err; }
+    val res_parsed: res[module.Module, i64] = source.parse(call, res_text.ok);
+    if (sel res_parsed.err) { ret res_parsed.err; }
+    var m: module.Module = res_parsed.ok;
+    fin { module.dnit(?m); }
+    var added:            Slice[str]       = Slice[str]{data: nil, size: 0};
+    val res_asked_target: res[Target, i64] = build.asked_target(call, ?m, ?added);
+    if (sel res_asked_target.err) { ret res_asked_target.err; }
+    var own: Target = res_asked_target.ok;
+    fin { assemble.dnit(call.a, ?own); }
+    val read: i64 = verify_cmd.read(call, ?m, ?own);
+    if (read != exit.OK) { ret read; }
+    val res_floats: res[relaxation.Relaxations, i64] = build.asked_floats(call);
+    if (sel res_floats.err) { ret res_floats.err; }
+
+    # the output is held until the compilation is done, so a refused one writes nothing
+    var held: sink.Sink = sink.init(call.a);
+    fin { sink.dnit(?held); }
+    var w:           io.Writer       = sink.writer(?held);
+    var opt_none:    opt[*io.Writer] = opt[*io.Writer].none{};
+    var opt_machine: opt[*io.Writer] = opt_none;
+    var opt_listing: opt[*io.Writer] = opt_none;
+    if (k.machine) { opt_machine = opt[*io.Writer].some{?w}; }
+    if (k.listing) { opt_listing = opt[*io.Writer].some{?w}; }
+    val options: options.Options = options.Options{
+        output:   output,
+        optimise: res_optimise.ok,
+        checked:  checked,
+        machine:  opt_machine,
+        listing:  opt_listing,
+        relax:    relax,
+        floats:   res_floats.ok,
+        stats:    opt[*Stats].none{},
+        name:     call.operand,
+        unwind:   options.UNWIND,
+    };
+    var prepared:   compile.Prepared;
+    val err_opened: err[family.Error] = compile.init(?prepared, call.a, ?own, added);
+    if (sel err_opened.err) { ret exit.of(failure.compiled(?call.report, ?m, ?own, added, err_opened.err)); }
+    fin { compile.dnit(?prepared); }
+    if (k.ir) {
+        var given: vector.Vector[Warning] = vector.init[Warning](call.a);
+        fin { vector.dnit[Warning](?given); }
+        var table:      Widenings;
+        val err_scoped: err[family.Error] = compile.widen(?prepared, call.a, ?m, ?table);
+        fin { widening.dnit(?table); }
+        if (sel err_scoped.err) { ret exit.of(failure.compiled(?call.report, ?m, ?own, added, err_scoped.err)); }
+        val err_ran: err[family.Error] = compile.optimise(?prepared, ?m, options, ?table, ?given);
+        if (sel err_ran.err) { ret exit.of(failure.compiled(?call.report, ?m, ?own, added, err_ran.err)); }
+        warned(call, ?m, ?given);
+        val err_printed: err[printer.Error] = item.print(?w, ?m);
+        if (sel err_printed.err) {
+            text.headline_because(?call.report, "cannot print the module", printer.describe(err_printed.err));
+            if (sel err_printed.err.alloc) { ret exit.ENVIRONMENT; }
+            ret exit.INTERNAL;
+        }
+        ret delivered(call, sink.view(?held));
+    }
+    val res_made: res[compile.Compiled, family.Error] = compile.compile(?prepared, call.a, ?m, options);
+    if (sel res_made.err) { ret exit.of(failure.compiled(?call.report, ?m, ?own, added, res_made.err)); }
+    var c: compile.Compiled = res_made.ok;
+    module.lent_to(?m, ?c.object.names);
+    fin {
+        module.spent(?m);
+        compile.compiled_dnit(?c);
+    }
+    warned(call, ?m, ?c.warnings);
+    if (k.object) {
+        val err_wrote: err[family.Error] = compile.write(?prepared, call.a, ?c.object, output, ?w);
+        if (sel err_wrote.err) { ret exit.of(failure.compiled(?call.report, ?m, ?own, added, err_wrote.err)); }
+    }
+    ret delivered(call, sink.view(?held));
+}
+
+# write the warnings a compilation gave, each as a line `warning <function>: ...`
+fun warned(call: *command.Call, m: *module.Module, given: *vector.Vector[Warning]) {
+    var i: usize = 0;
+    for (i < given.len) {
+        val w: Warning = given.data[i];
+        if (sel w.unheld)     { unheld(call, m, w.unheld); }
+        if (sel w.scalarized) { scalarized(call, m, w.scalarized); }
+        i = i + 1;
+    }
+}
+
+# the warning that a soft constant-time function's timing is not held, and what the walk could not follow, where it
+# could not
+fun unheld(call: *command.Call, m: *module.Module, u: mct.Unheld) {
+    val name: View = module.name_of(m, m.functions.data[u.function].data.name);
+    format.write_str(call.report.w, "warning ");
+    text.view(?call.report, name);
+    format.write_str(call.report.w, ": ");
+    format.write_str(call.report.w, masc_ct.UNGUARANTEED);
+    format.write_str(call.report.w, "\n");
+    if (sel u.unread.none) { ret; }
+    format.write_str(call.report.w, "warning ");
+    text.view(?call.report, name);
+    format.write_str(call.report.w, ": not verified: ");
+    format.write_str(call.report.w, u.unread.some.message);
+    format.write_str(call.report.w, "\n");
+}
+
+# the warning that a vector operation of the source is taken lane by lane, with the line and column it stands at and why
+fun scalarized(call: *command.Call, m: *module.Module, s: Scalarized) {
+    val name: View = module.name_of(m, m.functions.data[s.function].data.name);
+    format.write_str(call.report.w, "warning ");
+    text.view(?call.report, name);
+    format.write_str(call.report.w, ": the vector operation ");
+    val opt_row: opt[*irow.Row] = opcode_table.at(s.opcode);
+    if (sel opt_row.some) { format.write_str(call.report.w, opt_row.some.name); }
+    val res_shape: res[table.Shape, table.Error] = table.shape(?m.types, s.vector);
+    if (sel res_shape.ok) {
+        val shape: table.Shape = res_shape.ok;
+        if (sel shape.vector) {
+            format.write_str(call.report.w, " on ");
+            format.write_u64(call.report.w, shape.vector.lanes::u64);
+            format.write_str(call.report.w, " lanes");
+        }
+    }
+    if (sel s.location.some) {
+        val res_position: res[Position, debug_table.Error] = debug_place.position(?m.debug, s.location.some);
+        if (sel res_position.ok) {
+            format.write_str(call.report.w, " at line ");
+            format.write_u64(call.report.w, res_position.ok.line::u64);
+            format.write_str(call.report.w, " column ");
+            format.write_u64(call.report.w, res_position.ok.column::u64);
+        }
+    }
+    format.write_str(call.report.w, " is split into scalar operations");
+    if (sel s.cause.computed) { format.write_str(call.report.w, ", as no vector unit computes it\n"); }
+    or (sel s.cause.unheld)   { format.write_str(call.report.w, ", as no vector unit holds all its lanes\n"); }
+    or (sel s.cause.timed)    { format.write_str(call.report.w, ", as its function requires constant time and the build's vector code for it is not timed relative to its lanes\n"); }
+    or                        { format.write_str(call.report.w, ", as the build meets no vector unit\n"); }
+}
+
+# write the output to the file -o names, or to stdout when it names none
+fun delivered(call: *command.Call, bytes: View) i64 {
+    val path: str = args.value(call.p, ?OUTPUT);
+    if (path == nil) {
+        val err_wrote: err[io.WriteError] = io.write_all(call.out, bytes.data::*u8, bytes.len);
+        if (sel err_wrote.err) {
+            diagnostic.unwritten_output(?call.report, err_wrote.err);
+            ret exit.ENVIRONMENT;
+        }
+        ret exit.OK;
+    }
+    val err_put: err[fs.FsError] = fs.write_bytes(path, bytes.data::*u8, bytes.len, FILE_MODE);
+    if (sel err_put.err) {
+        text.named_because(?call.report, "cannot write", path, diagnostic.fs_cause(err_put.err));
+        if (sel err_put.err.alloc) { ret exit.ENVIRONMENT; }
+        ret exit.ENVIRONMENT;
+    }
+    ret exit.OK;
+}

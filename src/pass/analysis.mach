@@ -1,0 +1,362 @@
+# the analysis registry: the analyses a pass may ask of a function
+#
+# each analysis is a row, and its id is its position. an analysis reads only
+# the ones it needs through the cache, so a new analysis is a new row that
+# names what it needs, and the cache drops it whenever one of those drops.
+
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+
+use mirl.base.fail.keep;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.cfg.view;
+use mirl.ir.function.Body;
+use mirl.ir.id.Function;
+use mirl.ir.module;
+use mirl.pass.analysis.induction;
+use mirl.pass.analysis.induction.Inductions;
+use mirl.pass.analysis.live;
+use mirl.pass.analysis.live.Liveness;
+use mirl.pass.analysis.memory;
+use mirl.pass.analysis.memory.Memory;
+use mirl.pass.analysis.range;
+use mirl.pass.analysis.range.Ranges;
+use mirl.pass.analysis.slots;
+use mirl.pass.analysis.slots.Slots;
+use mirl.pass.cache;
+use mirl.pass.cache.Analysis;
+use mirl.pass.cache.Cache;
+use mirl.pass.cache.Row;
+use mirl.pass.cache.Set;
+use mirl.pass.refusal;
+use mirl.structure.region;
+use mirl.structure.region.Structure;
+use mirl.structure.shape;
+use mirl.structure.shape.Flaw;
+use mirl.structure.shape.Work;
+use mirl.target.basis;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use verify: mirl.verify.failure;
+use mirl.verify.failure.Trees;
+
+# the graph view of the function's blocks, read from its edges alone
+pub val GRAPH: Analysis = 0;
+# the dominator tree and frontiers over the graph
+pub val DOMINANCE: Analysis = 1;
+# the natural loops over the graph and its dominator tree
+pub val LOOPS: Analysis = 2;
+
+# the unsigned ranges of the function's integer values, read from its body,
+# so any pass that changes an instruction drops it
+pub val RANGES: Analysis = 3;
+# per stack slot: whether its address escapes, the parts its accesses cut it
+# into and the rest of `mirl.pass.analysis.slots`, read from the body and the
+# graph, so any pass that changes an instruction drops it
+pub val SLOTS: Analysis = 4;
+# the memory dependence and alias of the function's accesses, read from its
+# body, its slots and the target's data layout
+pub val MEMORY: Analysis = 5;
+# the tree of regions a structured target's emitter reads, refused while the
+# graph is not structured
+pub val STRUCTURE: Analysis = 6;
+# the values live into and out of each block, read from the body and the
+# graph with no register file, so any pass that changes an instruction drops it
+pub val LIVENESS: Analysis = 7;
+# per loop: the header parameters that step by a constant and whether a compare
+# against a bound counts the loop, read from the body and the loops, so any pass
+# that changes an instruction drops it
+pub val INDUCTIONS: Analysis = 8;
+
+# each row alone as a set, for the `needs` of a pass record
+pub val OF_GRAPH:      Set = 0x1;
+pub val OF_DOMINANCE:  Set = 0x2;
+pub val OF_LOOPS:      Set = 0x4;
+pub val OF_RANGES:     Set = 0x8;
+pub val OF_SLOTS:      Set = 0x10;
+pub val OF_MEMORY:     Set = 0x20;
+pub val OF_STRUCTURE:  Set = 0x40;
+pub val OF_LIVENESS:   Set = 0x80;
+pub val OF_INDUCTIONS: Set = 0x100;
+
+# the control flow analyses, which a pass that leaves every edge and block
+# alone keeps whatever else it changes: the graph, dominance and loops
+pub val FLOW: Set = 0x7;
+
+# what the verifier reads past legalisation, a reader with its own rows: the region trees
+pub val VERIFIER: Set = OF_STRUCTURE;
+
+val COUNT: usize      = 9;
+val TABLE: [COUNT]Row = [COUNT]Row{
+    Row{name: "graph", needs: 0x0, compute: graph_compute, release: graph_dnit},
+    Row{name: "dominance", needs: 0x1, compute: dominance_compute, release: dominance_dnit},
+    Row{name: "loops", needs: 0x3, compute: loops_compute, release: loops_dnit},
+    Row{name: "ranges", needs: 0x6, compute: ranges_compute, release: ranges_dnit},
+    Row{name: "slots", needs: 0x1, compute: slots_compute, release: slots_dnit},
+    Row{name: "memory", needs: 0x18, compute: memory_compute, release: memory_dnit},
+    Row{name: "structure", needs: 0x7, compute: structure_compute, release: structure_dnit},
+    Row{name: "liveness", needs: 0x3, compute: liveness_compute, release: liveness_dnit},
+    Row{name: "inductions", needs: 0x4, compute: inductions_compute, release: inductions_dnit},
+};
+
+# the registry
+pub fun rows() Slice[Row] {
+    ret Slice[Row]{data: ?TABLE[0], size: COUNT};
+}
+
+# keep a computed analysis in storage of its own
+fun hold[T](a: *allocator.Allocator, value: T, release: fun(*T) err[allocator.Error]) res[ptr, refusal.Error] {
+    var v:        T                        = value;
+    val res_room: res[*T, allocator.Error] = allocator.allocate[T](a, 1);
+    if (sel res_room.err) {
+        release(?v);
+        ret res[ptr, refusal.Error].err{refusal.Error.alloc{res_room.err}};
+    }
+    res_room.ok[0] = v;
+    ret res[ptr, refusal.Error].ok{res_room.ok::ptr};
+}
+
+# release an analysis `hold` kept and give back its storage, the first failure
+# of the two kept
+fun give_back[T](a: *allocator.Allocator, p: ptr, release: fun(*T) err[allocator.Error]) err[allocator.Error] {
+    val held:       *T                   = p::*T;
+    var err_failed: err[allocator.Error] = release(held);
+    keep(?err_failed, allocator.deallocate[T](a, held, 1));
+    ret err_failed;
+}
+
+fun graph_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_view_of: res[Graph, module.Error] = view.of(c.m, f);
+    if (sel res_view_of.err) { ret res[ptr, refusal.Error].err{refusal.Error.ir{res_view_of.err}}; }
+    ret hold[Graph](c.m.a, res_view_of.ok, graph.dnit);
+}
+
+fun graph_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Graph](a, p, graph.dnit);
+}
+
+fun dominance_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_graph_of: res[*Graph, refusal.Error] = graph_of(c, f);
+    if (sel res_graph_of.err) { ret res[ptr, refusal.Error].err{res_graph_of.err}; }
+    val res_compute: res[Dominance, allocator.Error] = dominance.compute(c.m.a, res_graph_of.ok);
+    if (sel res_compute.err) { ret res[ptr, refusal.Error].err{refusal.Error.alloc{res_compute.err}}; }
+    ret hold[Dominance](c.m.a, res_compute.ok, dominance.dnit);
+}
+
+fun dominance_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Dominance](a, p, dominance.dnit);
+}
+
+fun loops_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_graph_of: res[*Graph, refusal.Error] = graph_of(c, f);
+    if (sel res_graph_of.err) { ret res[ptr, refusal.Error].err{res_graph_of.err}; }
+    val res_dominance_of: res[*Dominance, refusal.Error] = dominance_of(c, f);
+    if (sel res_dominance_of.err) { ret res[ptr, refusal.Error].err{res_dominance_of.err}; }
+    val res_compute: res[Loops, allocator.Error] = loops.compute(c.m.a, res_graph_of.ok, res_dominance_of.ok);
+    if (sel res_compute.err) { ret res[ptr, refusal.Error].err{refusal.Error.alloc{res_compute.err}}; }
+    ret hold[Loops](c.m.a, res_compute.ok, loops.dnit);
+}
+
+fun loops_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Loops](a, p, loops.dnit);
+}
+
+fun ranges_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_graph_of: res[*Graph, refusal.Error] = graph_of(c, f);
+    if (sel res_graph_of.err) { ret res[ptr, refusal.Error].err{res_graph_of.err}; }
+    val res_dominance_of: res[*Dominance, refusal.Error] = dominance_of(c, f);
+    if (sel res_dominance_of.err) { ret res[ptr, refusal.Error].err{res_dominance_of.err}; }
+    val res_loops_of: res[*Loops, refusal.Error] = loops_of(c, f);
+    if (sel res_loops_of.err) { ret res[ptr, refusal.Error].err{res_loops_of.err}; }
+    ret hold[Ranges](c.m.a, range.make(c.m, f, res_graph_of.ok, res_dominance_of.ok, res_loops_of.ok), no_dnit[Ranges]);
+}
+
+fun ranges_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Ranges](a, p, no_dnit[Ranges]);
+}
+
+fun slots_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_graph_of: res[*Graph, refusal.Error] = graph_of(c, f);
+    if (sel res_graph_of.err) { ret res[ptr, refusal.Error].err{res_graph_of.err}; }
+    var l:           Layout                   = layout.of(c.t, ?c.m.types, basis.context_of(c.basis));
+    val res_compute: res[Slots, module.Error] = slots.compute(c.m.a, c.m, ?l, f, res_graph_of.ok);
+    if (sel res_compute.err) {
+        if (sel res_compute.err.alloc) { ret res[ptr, refusal.Error].err{refusal.Error.alloc{res_compute.err.alloc}}; }
+        ret res[ptr, refusal.Error].err{refusal.Error.ir{res_compute.err}};
+    }
+    ret hold[Slots](c.m.a, res_compute.ok, slots_release);
+}
+
+fun slots_release(s: *Slots) err[allocator.Error] {
+    slots.dnit(s);
+    ret err[allocator.Error].ok{};
+}
+
+fun slots_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Slots](a, p, slots_release);
+}
+
+fun memory_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_ranges_of: res[*Ranges, refusal.Error] = ranges_of(c, f);
+    if (sel res_ranges_of.err) { ret res[ptr, refusal.Error].err{res_ranges_of.err}; }
+    val res_slots_of: res[*Slots, refusal.Error] = slots_of(c, f);
+    if (sel res_slots_of.err) { ret res[ptr, refusal.Error].err{res_slots_of.err}; }
+    ret hold[Memory](c.m.a, memory.make(c.m, c.t, basis.context_of(c.basis), f, res_ranges_of.ok, res_slots_of.ok), no_dnit[Memory]);
+}
+
+fun memory_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Memory](a, p, no_dnit[Memory]);
+}
+
+fun structure_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_graph_of: res[*Graph, refusal.Error] = graph_of(c, f);
+    if (sel res_graph_of.err) { ret res[ptr, refusal.Error].err{res_graph_of.err}; }
+    val res_dominance_of: res[*Dominance, refusal.Error] = dominance_of(c, f);
+    if (sel res_dominance_of.err) { ret res[ptr, refusal.Error].err{res_dominance_of.err}; }
+    val res_loops_of: res[*Loops, refusal.Error] = loops_of(c, f);
+    if (sel res_loops_of.err) { ret res[ptr, refusal.Error].err{res_loops_of.err}; }
+    var w: Work      = shape.init(c.m.a);
+    var s: Structure = region.init(c.m.a);
+    fin { shape.dnit(?w); }
+    val res_found: res[opt[Flaw], allocator.Error] = shape.find(c.m.a, res_graph_of.ok, res_dominance_of.ok, res_loops_of.ok, ?w, ?s);
+    if (sel res_found.err) {
+        region.dnit(?s);
+        ret res[ptr, refusal.Error].err{refusal.Error.alloc{res_found.err}};
+    }
+    if (sel res_found.ok.some) {
+        region.dnit(?s);
+        ret res[ptr, refusal.Error].err{refusal.Error.reason{shape.why(res_found.ok.some)}};
+    }
+    ret hold[Structure](c.m.a, s, region.dnit);
+}
+
+fun structure_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Structure](a, p, region.dnit);
+}
+
+fun liveness_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(c.m, f);
+    if (sel res_body.err) { ret res[ptr, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val res_graph_of: res[*Graph, refusal.Error] = graph_of(c, f);
+    if (sel res_graph_of.err) { ret res[ptr, refusal.Error].err{res_graph_of.err}; }
+    val res_dominance_of: res[*Dominance, refusal.Error] = dominance_of(c, f);
+    if (sel res_dominance_of.err) { ret res[ptr, refusal.Error].err{res_dominance_of.err}; }
+    val res_compute: res[Liveness, allocator.Error] = live.compute(c.m.a, res_body.ok, res_graph_of.ok, res_dominance_of.ok);
+    if (sel res_compute.err) { ret res[ptr, refusal.Error].err{refusal.Error.alloc{res_compute.err}}; }
+    ret hold[Liveness](c.m.a, res_compute.ok, live.dnit);
+}
+
+fun liveness_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Liveness](a, p, live.dnit);
+}
+
+fun inductions_compute(c: *Cache, f: Function) res[ptr, refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(c.m, f);
+    if (sel res_body.err) { ret res[ptr, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val res_loops_of: res[*Loops, refusal.Error] = loops_of(c, f);
+    if (sel res_loops_of.err) { ret res[ptr, refusal.Error].err{res_loops_of.err}; }
+    val res_compute: res[Inductions, allocator.Error] = induction.compute(c.m.a, c.m, res_body.ok, res_loops_of.ok);
+    if (sel res_compute.err) { ret res[ptr, refusal.Error].err{refusal.Error.alloc{res_compute.err}}; }
+    ret hold[Inductions](c.m.a, res_compute.ok, induction.dnit);
+}
+
+fun inductions_dnit(a: *allocator.Allocator, p: ptr) err[allocator.Error] {
+    ret give_back[Inductions](a, p, induction.dnit);
+}
+
+# an analysis that owns nothing but its record
+fun no_dnit[T](v: *T) err[allocator.Error] {
+    ret err[allocator.Error].ok{};
+}
+
+# the graph of a function, valid until the cache drops it
+pub fun graph_of(c: *Cache, f: Function) res[*Graph, refusal.Error] {
+    val res_graph_entry: res[ptr, refusal.Error] = cache.get(c, f, GRAPH);
+    if (sel res_graph_entry.err) { ret res[*Graph, refusal.Error].err{res_graph_entry.err}; }
+    ret res[*Graph, refusal.Error].ok{res_graph_entry.ok::*Graph};
+}
+
+# the dominance of a function, valid until the cache drops it
+pub fun dominance_of(c: *Cache, f: Function) res[*Dominance, refusal.Error] {
+    val res_dominance_entry: res[ptr, refusal.Error] = cache.get(c, f, DOMINANCE);
+    if (sel res_dominance_entry.err) { ret res[*Dominance, refusal.Error].err{res_dominance_entry.err}; }
+    ret res[*Dominance, refusal.Error].ok{res_dominance_entry.ok::*Dominance};
+}
+
+# the loops of a function, valid until the cache drops it
+pub fun loops_of(c: *Cache, f: Function) res[*Loops, refusal.Error] {
+    val res_loops_entry: res[ptr, refusal.Error] = cache.get(c, f, LOOPS);
+    if (sel res_loops_entry.err) { ret res[*Loops, refusal.Error].err{res_loops_entry.err}; }
+    ret res[*Loops, refusal.Error].ok{res_loops_entry.ok::*Loops};
+}
+
+# the value ranges of a function, valid until the cache drops them
+pub fun ranges_of(c: *Cache, f: Function) res[*Ranges, refusal.Error] {
+    val res_ranges_entry: res[ptr, refusal.Error] = cache.get(c, f, RANGES);
+    if (sel res_ranges_entry.err) { ret res[*Ranges, refusal.Error].err{res_ranges_entry.err}; }
+    ret res[*Ranges, refusal.Error].ok{res_ranges_entry.ok::*Ranges};
+}
+
+# the slots of a function, valid until the cache drops them
+pub fun slots_of(c: *Cache, f: Function) res[*Slots, refusal.Error] {
+    val res_slots_entry: res[ptr, refusal.Error] = cache.get(c, f, SLOTS);
+    if (sel res_slots_entry.err) { ret res[*Slots, refusal.Error].err{res_slots_entry.err}; }
+    ret res[*Slots, refusal.Error].ok{res_slots_entry.ok::*Slots};
+}
+
+# the memory analysis of a function, valid until the cache drops it
+pub fun memory_of(c: *Cache, f: Function) res[*Memory, refusal.Error] {
+    val res_memory_entry: res[ptr, refusal.Error] = cache.get(c, f, MEMORY);
+    if (sel res_memory_entry.err) { ret res[*Memory, refusal.Error].err{res_memory_entry.err}; }
+    ret res[*Memory, refusal.Error].ok{res_memory_entry.ok::*Memory};
+}
+
+# the structure of a function, valid until the cache drops it, or why its
+# graph is not structured
+pub fun structure_of(c: *Cache, f: Function) res[*Structure, refusal.Error] {
+    val res_structure_entry: res[ptr, refusal.Error] = cache.get(c, f, STRUCTURE);
+    if (sel res_structure_entry.err) { ret res[*Structure, refusal.Error].err{res_structure_entry.err}; }
+    ret res[*Structure, refusal.Error].ok{res_structure_entry.ok::*Structure};
+}
+
+# the inductions of a function, valid until the cache drops them
+pub fun inductions_of(c: *Cache, f: Function) res[*Inductions, refusal.Error] {
+    val res_inductions_entry: res[ptr, refusal.Error] = cache.get(c, f, INDUCTIONS);
+    if (sel res_inductions_entry.err) { ret res[*Inductions, refusal.Error].err{res_inductions_entry.err}; }
+    ret res[*Inductions, refusal.Error].ok{res_inductions_entry.ok::*Inductions};
+}
+
+# the liveness of a function's values, valid until the cache drops it
+pub fun liveness_of(c: *Cache, f: Function) res[*Liveness, refusal.Error] {
+    val res_liveness_entry: res[ptr, refusal.Error] = cache.get(c, f, LIVENESS);
+    if (sel res_liveness_entry.err) { ret res[*Liveness, refusal.Error].err{res_liveness_entry.err}; }
+    ret res[*Liveness, refusal.Error].ok{res_liveness_entry.ok::*Liveness};
+}
+
+# the structure of a function from the cache a `Trees` holds, a refusal turned
+# into the verifier's error
+fun tree_of(holder: ptr, f: Function) res[*Structure, verify.Error] {
+    val res_structure_of: res[*Structure, refusal.Error] = structure_of(holder::*Cache, f);
+    if (sel res_structure_of.err) {
+        if (sel res_structure_of.err.alloc)  { ret res[*Structure, verify.Error].err{verify.Error.alloc{res_structure_of.err.alloc}}; }
+        if (sel res_structure_of.err.reason) { ret res[*Structure, verify.Error].err{verify.Error.refused{verify.finding(verify.module_wide(), res_structure_of.err.reason)}}; }
+        ret res[*Structure, verify.Error].err{verify.Error.refused{verify.finding(verify.module_wide(), "the structure analysis could not read the function")}};
+    }
+    ret res[*Structure, verify.Error].ok{res_structure_of.ok};
+}
+
+# the region trees a cache's structure analysis holds, computing any it has
+# dropped, for the verifier past legalisation
+pub fun trees(c: *Cache) Trees {
+    ret Trees{holder: c::ptr, of: tree_of};
+}

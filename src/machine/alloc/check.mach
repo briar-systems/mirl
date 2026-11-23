@@ -1,0 +1,500 @@
+# the allocation checker: a proof that a rewritten function is its virtual
+# form under an assignment that holds
+#
+# the checker trusts nothing the scan built. it computes the virtual form's
+# liveness again and proves that
+#
+# - every virtual register live anywhere has a location the target lets the
+#   allocator assign, of the register's class, and so does every register
+#   after it that its span covers,
+# - no two values meet in storage one location shares: for each location,
+#   the segments of every virtual register a register of whose group shares
+#   its storage and the location's own holds are sorted and swept once, and a
+#   position held by two owners is refused when one of them is in the
+#   location itself, since sharing is not transitive: values in x10 and x11
+#   each share the pair x10:x11 and never meet,
+# - every pinned read and write is in the location its row fixes, and
+# - the rewritten function has the virtual form's blocks and instructions in
+#   order, with every operand the form's own but each virtual register
+#   replaced by its location, or by the register of the view its position
+#   takes within that location, a tuple's first member where the position
+#   admits its members alone, and a member operand that member of its
+#   tuple's location, so every rewritten operand names a register of
+#   its position's class, and every instruction of it passed its row's check when made,
+# - every rewritten instruction stands against its row's register
+#   constraints,
+# - and every value the form reads is in its place when it is read, which the
+#   contents proof shows of the input's values by a rule of its own
+#   (`mirl.machine.alloc.contents`), not the value map the allocator drops
+#   copies by, so a spill, a reload or a copy carrying the wrong value, or one
+#   dropped by a wrong rule of the map, is refused.
+#
+# with v virtual registers of s segments each, sharing at most k locations,
+# and h holds, the sweep is O((v s k + h) log (v s k + h)), the class and pin
+# checks are linear in the virtual registers and their uses, and the shape
+# and constraint checks are linear in the operands and the constraints. the
+# contents proof's cost is its own module's.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.sort;
+use std.collections.vector;
+
+use mirl.machine.alloc.allowed;
+use mirl.machine.alloc.allowed.Allowed;
+use mirl.machine.alloc.contents;
+use mirl.machine.alloc.live;
+use mirl.machine.alloc.live.Clobbers;
+use mirl.machine.alloc.live.Hold;
+use mirl.machine.alloc.live.Live;
+use mirl.machine.alloc.live.Mark;
+use mirl.machine.alloc.live.Segment;
+use mirl.machine.alloc.live.Site;
+use mirl.machine.alloc.live.Use;
+use mirl.machine.alloc.location;
+use mirl.machine.alloc.location.Locations;
+use mirl.machine.class;
+use mirl.machine.class.Physical;
+use mirl.machine.constraint;
+use mirl.machine.constraint.Constrained;
+use mirl.machine.effects;
+use mirl.machine.effects.Effects;
+use mirl.machine.function;
+use mirl.machine.function.Function;
+use mirl.machine.instruction;
+use mirl.machine.instruction.InstructionData;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.instruction.Viewing;
+use mirl.machine.operand;
+use mirl.machine.operand.Instruction;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+use mirl.machine.operand.Virtual;
+use mirl.machine.vstate;
+
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+
+# no location or owner
+pub val NONE: u32 = 0xffffffff;
+
+# two values in storage one location shares at one position
+# ---
+# location: the location
+# position: the position
+# first:    one owner, a virtual register
+# second:   the other, a virtual register, or NONE for a value the location
+#           holds of its own
+pub rec Meeting {
+    location: u32;
+    position: u32;
+    first:    u32;
+    second:   u32;
+}
+
+# why the checker refused an allocation
+# ---
+# alloc:      the allocator refused storage
+# live:       the virtual form's liveness was refused
+# count:      an assignment of another number of virtual registers than the form's
+# unassigned: a live virtual register with no location
+# outside:    a virtual register at a location the target does not allow
+# class:      a virtual register at a location outside its class
+# meet:       two values in storage one location shares at one position
+# unpinned:   a pinned read or write outside the location its row fixes
+# shape:      a rewritten instruction that is not the form's under the assignment
+# breach:     a rewritten instruction that does not stand against its row's
+#             register constraints, by the form's instruction
+# contents:   the contents proof refused the form
+pub tag Error: u8 {
+    alloc: allocator.Error;
+    live:  live.Error;
+    count;
+    unassigned: Virtual;
+    outside:    Virtual;
+    class:      Virtual;
+    meet:       Meeting;
+    unpinned:   Site;
+    shape:      Site;
+    breach:     Constrained;
+    contents:   contents.Error;
+}
+
+# the allocator's refusal `e` stands for, its own or a step's it carries, none for any other
+pub fun starved(e: Error) opt[allocator.Error] {
+    if (sel e.alloc)    { ret opt[allocator.Error].some{e.alloc}; }
+    if (sel e.live)     { ret live.starved(e.live); }
+    if (sel e.contents) { ret contents.starved(e.contents); }
+    ret opt[allocator.Error].none{};
+}
+
+# one owner's positions in one location's storage
+# ---
+# own: the owner is in the location itself, not in one sharing its storage
+rec Item {
+    location: u32;
+    from:     u32;
+    to:       u32;
+    owner:    u32;
+    own:      bool;
+}
+
+# the furthest positions items of a sweep reach, by the two owners reaching
+# furthest, so the furthest of any owner but one is known
+rec Reach {
+    first:  u32;
+    by:     u32;
+    second: u32;
+    next:   u32;
+}
+
+val NO_REACH: Reach = Reach{first: 0, by: NONE, second: 0, next: NONE};
+
+# the reach with an item of `owner` to `to` added
+fun reached(r: Reach, owner: u32, to: u32) Reach {
+    if (owner == r.by) {
+        if (to > r.first) { ret Reach{first: to, by: owner, second: r.second, next: r.next}; }
+        ret r;
+    }
+    if (to > r.first)  { ret Reach{first: to, by: owner, second: r.first, next: r.by}; }
+    if (to > r.second) { ret Reach{first: r.first, by: r.by, second: to, next: owner}; }
+    ret r;
+}
+
+# the owner whose item reaches past `from` where `owner`'s would meet it, NONE
+# for none. an owner NONE is the location's own value, which meets only
+# another owner
+fun meets(r: Reach, owner: u32, from: u32) opt[u32] {
+    if (r.by != owner && from < r.first)    { ret opt[u32].some{r.by}; }
+    if (r.next != owner && from < r.second) { ret opt[u32].some{r.next}; }
+    ret opt[u32].none{};
+}
+
+fun by_place(a: *Item, b: *Item) i64 {
+    if (a.location != b.location) {
+        if (a.location < b.location) { ret -1; }
+        ret 1;
+    }
+    if (a.from < b.from)   { ret -1; }
+    if (a.from > b.from)   { ret 1; }
+    if (a.owner < b.owner) { ret -1; }
+    if (a.owner > b.owner) { ret 1; }
+    ret 0;
+}
+
+fun fail(f: Error) err[Error] {
+    ret err[Error].err{f};
+}
+
+fun alloc_fail(e: allocator.Error) err[Error] {
+    ret fail(Error.alloc{e});
+}
+
+# every live virtual register's location, its class and its pins
+fun assigned(l: *Live, f: *Function, at: *Locations, x: *Allowed, locations: Slice[u32]) err[Error] {
+    var v: u32 = 0;
+    for (v::usize < f.virtuals.len) {
+        val vr:   Virtual        = v;
+        val segs: Slice[Segment] = live.segments(l, vr);
+        if (segs.size > 0) {
+            val loc: u32 = locations.data[v];
+            if (loc == NONE || loc >= location.count(at)) { ret fail(Error.unassigned{vr}); }
+            var g: u32 = 0;
+            for (g < live.span(l, vr)) {
+                val next: u32 = location.past(at, loc, g);
+                if (next == location.NONE || !allowed.admits(x, next))                   { ret fail(Error.outside{vr}); }
+                if (!class.holds(function.class_of(f, vr), location.physical(at, next))) { ret fail(Error.class{vr}); }
+                g = g + 1;
+            }
+            val us: Slice[Use] = live.uses(l, vr);
+            var k:  usize      = 0;
+            for (k < us.size) {
+                if (us.data[k].fixed != live.NONE && us.data[k].fixed != loc) { ret fail(Error.unpinned{Site{instruction: us.data[k].instruction, operand: us.data[k].operand}}); }
+                k = k + 1;
+            }
+        }
+        v = v + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun push_item(items: *vector.Vector[Item], it: Item) err[Error] {
+    val res_items_pushed: res[usize, allocator.Error] = vector.push[Item](items, it);
+    if (sel res_items_pushed.err) { ret alloc_fail(res_items_pushed.err); }
+    ret err[Error].ok{};
+}
+
+# the sweep of every location's owners for two that meet
+fun apart(l: *Live, f: *Function, at: *Locations, locations: Slice[u32], items: *vector.Vector[Item]) err[Error] {
+    var v: u32 = 0;
+    for (v::usize < f.virtuals.len) {
+        val segs: Slice[Segment] = live.segments(l, v);
+        var g:    u32            = 0;
+        for (segs.size > 0 && g < live.span(l, v)) {
+            val alias: Slice[u32] = location.shares(at, location.past(at, locations.data[v], g));
+            var k:     usize      = 0;
+            for (k < alias.size) {
+                var j: usize = 0;
+                for (j < segs.size) {
+                    val err_push_item: err[Error] = push_item(items, Item{location: alias.data[k], from: segs.data[j].from, to: segs.data[j].to, owner: v, own: k == 0});
+                    if (sel err_push_item.err) { ret err_push_item; }
+                    j = j + 1;
+                }
+                k = k + 1;
+            }
+            g = g + 1;
+        }
+        v = v + 1;
+    }
+    var loc: u32 = 0;
+    for (loc < location.count(at)) {
+        val hs: Slice[Hold] = live.holds(l, loc);
+        var k:  usize       = 0;
+        for (k < hs.size) {
+            val err_push_item: err[Error] = push_item(items, Item{location: loc, from: hs.data[k].from, to: hs.data[k].to, owner: hs.data[k].owner, own: true});
+            if (sel err_push_item.err) { ret err_push_item; }
+            k = k + 1;
+        }
+        val marks: Slice[Mark] = live.marks(l);
+        var m:     usize       = 0;
+        for (m < marks.size) {
+            if (live.marks_location(l, marks.data[m], loc)) {
+                val err_push_item: err[Error] = push_item(items, Item{location: loc, from: marks.data[m].position, to: marks.data[m].position + 1, owner: NONE, own: false});
+                if (sel err_push_item.err) { ret err_push_item; }
+            }
+            m = m + 1;
+        }
+        loc = loc + 1;
+    }
+    sort.sort_by[Item](items.data, items.len, by_place);
+    # an item in the location meets any item before it, one sharing its storage only an item in it
+    var i:     usize = 0;
+    var all:   Reach = NO_REACH;
+    var owned: Reach = NO_REACH;
+    for (i < items.len) {
+        val it: Item = items.data[i];
+        if (i == 0 || items.data[i - 1].location != it.location) {
+            all   = NO_REACH;
+            owned = NO_REACH;
+        }
+        var opt_met: opt[u32] = meets(owned, it.owner, it.from);
+        if (it.own) { opt_met = meets(all, it.owner, it.from); }
+        if (sel opt_met.some) {
+            var first:  u32 = it.owner;
+            var second: u32 = opt_met.some;
+            if (first == NONE) {
+                first  = second;
+                second = NONE;
+            }
+            ret fail(Error.meet{Meeting{location: it.location, position: it.from, first: first, second: second}});
+        }
+        all = reached(all, it.owner, it.to);
+        if (it.own) { owned = reached(owned, it.owner, it.to); }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun same_opcode(a: Opcode, b: Opcode) bool {
+    if (sel a.row)    { ret sel b.row && b.row == a.row; }
+    or (sel a.loop)   { ret sel b.loop && b.loop == a.loop; }
+    or (sel a.inline) { ret sel b.inline && b.inline == a.inline; }
+    ret sel b.pseudo && b.pseudo == a.pseudo;
+}
+
+# a register at its location, a physical one as it stands
+fun rewritten(at: *Locations, locations: Slice[u32], r: Register) Register {
+    if (sel r.physical) { ret r; }
+    ret Register.physical{location.physical(at, locations.data[r.virtual])};
+}
+
+# the location an operand of the form names through the view its position
+# takes of its virtual register's class, none for a location of no register
+fun viewed_at(at: *Locations, loc: u32, w: Viewing) opt[Physical] {
+    val p: Physical = location.physical(at, loc);
+    if (!(sel p.register)) { ret opt[Physical].none{}; }
+    val opt_viewed_in: opt[rf.Id] = instruction.viewed_in(at.file, p.register, w);
+    if (sel opt_viewed_in.none) { ret opt[Physical].none{}; }
+    ret opt[Physical].some{Physical.register{opt_viewed_in.some}};
+}
+
+# whether a half of a tie of the result is the form's under the assignment,
+# a virtual one the register of the view its position takes within its
+# location where it takes one
+fun half_stands(f: *Function, at: *Locations, locations: Slice[u32], op: Opcode, n: u32, r: Register, got: Register) bool {
+    if (!(sel got.physical)) { ret false; }
+    if (sel r.physical)      { ret class.same_physical(r.physical, got.physical); }
+    val loc: u32 = locations.data[r.virtual];
+    if (loc == NONE) { ret false; }
+    val opt_viewing: opt[Viewing] = instruction.viewing(function.file(f), op, n, function.class_of(f, r.virtual));
+    if (sel opt_viewing.some) {
+        val opt_viewed_at: opt[Physical] = viewed_at(at, loc, opt_viewing.some);
+        if (sel opt_viewed_at.none) { ret false; }
+        ret class.same_physical(got.physical, opt_viewed_at.some);
+    }
+    ret class.same_physical(got.physical, location.physical(at, loc));
+}
+
+# whether operand `n` of the result is the form's under the assignment, a
+# virtual register at a position taking a view of its class the register of
+# the view within its location
+fun stands(f: *Function, at: *Locations, locations: Slice[u32], op: Opcode, n: u32, o: Operand, got: Operand) bool {
+    if (sel o.member) {
+        val loc: u32 = locations.data[o.member.virtual];
+        if (loc == NONE) { ret false; }
+        val opt_member_viewing: opt[Viewing] = instruction.member_viewing(function.file(f), function.class_of(f, o.member.virtual), o.member.index);
+        if (sel opt_member_viewing.none) { ret false; }
+        val opt_viewed_at: opt[Physical] = viewed_at(at, loc, opt_member_viewing.some);
+        if (sel opt_viewed_at.none) { ret false; }
+        ret sel got.physical && class.same_physical(got.physical, opt_viewed_at.some);
+    }
+    if (sel o.virtual) {
+        val loc: u32 = locations.data[o.virtual];
+        if (loc == NONE) { ret false; }
+        val opt_viewing: opt[Viewing] = instruction.viewing(function.file(f), op, n, function.class_of(f, o.virtual));
+        if (sel opt_viewing.some) {
+            val opt_viewed_at: opt[Physical] = viewed_at(at, loc, opt_viewing.some);
+            if (sel opt_viewed_at.none) { ret false; }
+            ret sel got.physical && class.same_physical(got.physical, opt_viewed_at.some);
+        }
+        ret sel got.physical && class.same_physical(got.physical, location.physical(at, loc));
+    }
+    if (sel o.tied) {
+        if (!(sel got.tied)) { ret false; }
+        ret half_stands(f, at, locations, op, n, o.tied.dest, got.tied.dest) && half_stands(f, at, locations, op, n, o.tied.source, got.tied.source);
+    }
+    var names: [operand.MOST_NAMED]Register;
+    val count: u32 = operand.named(o, ?names[0]);
+    var i:     u32 = 0;
+    for (i < count) {
+        val r: Register = names[i];
+        if (sel r.virtual) {
+            if (locations.data[r.virtual] == NONE) { ret false; }
+        }
+        names[i] = rewritten(at, locations, r);
+        i        = i + 1;
+    }
+    if (count == 0) { ret operand.same(o, got); }
+    ret operand.same(operand.renamed(o, ?names[0]), got);
+}
+
+# how many of a block's instructions the result keeps
+fun kept(want: Slice[Instruction], dropped: Slice[bool]) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < want.size) {
+        if (!dropped.data[want.data[i]]) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# prove `result` has the blocks and instructions of `f` in order, less those `dropped` leaves out, each operand the form's under the assignment and each instruction standing against its row's constraints, failing at the first that does not
+fun shaped(f: *Function, ctx: *core_state.Context, at: *Locations, locations: Slice[u32], result: *Function, dropped: Slice[bool]) err[Error] {
+    if (result.blocks.len != f.blocks.len || result.virtuals.len != 0) { ret fail(Error.shape{Site{instruction: NONE, operand: NONE}}); }
+    var k: usize = 0;
+    for (k < f.blocks.len) {
+        val want: Slice[Instruction] = function.instructions(f, (k::u32));
+        val have: Slice[Instruction] = function.instructions(result, (k::u32));
+        if (kept(want, dropped) != have.size) { ret fail(Error.shape{Site{instruction: NONE, operand: NONE}}); }
+        var i: usize = 0;
+        var j: usize = 0;
+        for (i < want.size) {
+            if (dropped.data[want.data[i]]) {
+                i = i + 1;
+                cnt;
+            }
+            val a: *InstructionData = function.data(f, want.data[i]);
+            val b: *InstructionData = function.data(result, have.data[j]);
+            j = j + 1;
+            val site: Site = Site{instruction: want.data[i], operand: NONE};
+            if (!same_opcode(a.opcode, b.opcode) || a.operands.size != b.operands.size || a.declassifies != b.declassifies) { ret fail(Error.shape{site}); }
+            if (a.implicit.size != b.implicit.size || a.label != b.label || !vstate.same(a.state, b.state))                 { ret fail(Error.shape{site}); }
+            var n: usize = 0;
+            for (n < a.operands.size) {
+                if (!stands(f, at, locations, a.opcode, n::u32, a.operands.data[n], b.operands.data[n])) { ret fail(Error.shape{Site{instruction: want.data[i], operand: n::u32}}); }
+                n = n + 1;
+            }
+            val opt_broke: opt[constraint.Breach] = constraint.stands(result, ctx, b);
+            if (sel opt_broke.some) { ret fail(Error.breach{Constrained{instruction: want.data[i], breach: opt_broke.some}}); }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# what the form is of, which the contents proof reads
+# ---
+# input:   the function the form is of
+# origin:  each virtual register of the form's register of the input
+# sources: each instruction of the form's instruction of the input, NONE for
+#          one the allocator inserted
+# dropped: each instruction of the form, whether the result leaves it out as
+#          a copy whose places hold one value, which the contents proof proves
+# unset:   the locations that hold no value at the function's entry, as the
+#          allocation's liveness read them
+pub rec Of {
+    input:   *Function;
+    origin:  Slice[u32];
+    sources: Slice[u32];
+    dropped: Slice[bool];
+    unset:   Slice[u32];
+}
+
+# the liveness of the form, with the reads and writes the contents proof follows
+fun proved(a: *allocator.Allocator, f: *Function, ctx: *core_state.Context, at: *Locations, clobbers: Clobbers, x: *Allowed, locations: Slice[u32], result: *Function, of: Of) err[Error] {
+    val res_read: res[Effects, effects.Error] = effects.read(a, f, ctx);
+    if (sel res_read.err) {
+        val e: effects.Error = res_read.err;
+        if (sel e.alloc) { ret alloc_fail(e.alloc); }
+        ret fail(Error.live{live.Error.undecided{e.undecided}});
+    }
+    var fx: Effects = res_read.ok;
+    fin { effects.dnit(?fx); }
+    var k: live.Known = live.known(a);
+    fin { live.forget(?k); }
+    var w: live.Scratch = live.scratch(a);
+    fin { live.scratch_dnit(?w); }
+    var l: Live = live.init(a);
+    fin { live.dnit(?l); }
+    val err_live: err[live.Error] = live.round(?w, ?l, f, ctx, at, ?fx, clobbers, ?k, live.Carried{sources: Slice[u32]{data: nil, size: 0}, renamed: Slice[bool]{data: nil, size: 0}}, of.unset);
+    if (sel err_live.err) { ret fail(Error.live{err_live.err}); }
+    val err_placed: err[Error] = assigned(?l, f, at, x, locations);
+    if (sel err_placed.err) { ret err_placed; }
+    var items: vector.Vector[Item] = vector.init[Item](a);
+    fin { vector.dnit[Item](?items); }
+    val err_kept: err[Error] = apart(?l, f, at, locations, ?items);
+    if (sel err_kept.err) { ret err_kept; }
+    val err_shaped: err[Error] = shaped(f, ctx, at, locations, result, of.dropped);
+    if (sel err_shaped.err) { ret err_shaped; }
+    var g:          contents.Given      = contents.Given{f: f, input: of.input, origin: of.origin, sources: of.sources, dropped: of.dropped, at: at, locations: locations, l: ?l, events: live.events(?w, ?k), graph: ?k.graph, regs: ctx.view};
+    val err_proved: err[contents.Error] = contents.prove(a, ?g);
+    if (sel err_proved.err) { ret fail(Error.contents{err_proved.err}); }
+    ret err[Error].ok{};
+}
+
+# prove an allocation
+# ---
+# a:         the allocator the proof takes
+# f:         the virtual form
+# ctx:       the context masc's footprints and groupings are asked under
+# at:        the locations of its target
+# clobbers:  the locations its instructions leave undefined beyond their rows
+# x:         the locations the target lets the allocator assign
+# locations: each virtual register's location, NONE for one with none
+# result:    the rewritten function
+# of:        what the form is of
+# ret:       ok, or the first fact that does not hold
+pub fun check(a: *allocator.Allocator, f: *Function, ctx: *core_state.Context, at: *Locations, clobbers: Clobbers, x: *Allowed, locations: Slice[u32], result: *Function, of: Of) err[Error] {
+    if (locations.size != f.virtuals.len) { ret fail(Error.count{}); }
+    ret proved(a, f, ctx, at, clobbers, x, locations, result, of);
+}

@@ -1,0 +1,235 @@
+# forwarder bypass: a block that only jumps on is bypassed by the edges that enter it
+#
+# a forwarder is a block that holds nothing but a `br`, whose parameters nothing but that `br` reads. each edge into
+# it moves to the block its `br` enters, passing the arguments its `br` passes with each of the forwarder's parameters
+# read as the edge's argument for it, in whatever order and as often as the `br` passes them. a value the `br` passes
+# that is no parameter is a constant or is defined above the forwarder, so it is defined where every edge into it
+# starts. the forwarder goes once no edge enters it. a moved edge skips nothing that runs: the forwarder holds no
+# instruction but the jump, and the values of its parameters go on in the arguments. the jump's own location goes
+# with it.
+#
+# the rule by which a forwarder stays: it is the entry or the entry does not reach it, its `br` enters itself or is
+# kept or volatile, it or its `br` holds a value binding record or a record reads one of its parameters, so no
+# description of a variable is dropped, or it stands in a loop's shape that a pass after it reads: it or its target
+# is a loop's header (a preheader or a latch: licm, the vectoriser and the unroller read them), or an edge leaving a
+# loop enters it (the unroller takes a loop whose exits leave to a block nothing outside the loop enters). a block
+# holding a slot marker holds an instruction and is no forwarder. an edge stays where it leaves an instruction other
+# than `br` or `cbr`, or a `cbr` whose other edge already enters the target, or where it leaves a `cbr`, the `br` passes
+# arguments and the target is entered from elsewhere: the forwarder is then where that path gives the target's
+# parameters their values, which an edge of a conditional branch into a block it does not alone enter has no place for
+# (the back end would make the block again), and a chain of tests becomes a multi-way branch only while each case
+# enters a block of its own (`mirl.opt.switch`).
+#
+# it costs each forwarder its predecessors and the uses of its parameters. it reads the loops as they were when it
+# began: a bypass moves no edge into a header, and an edge leaving a loop leaves it to the same block as
+# before, so every loop it read keeps its header, its latches and the blocks its exits leave to. it adds no branch and
+# decides none, so it keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.ir.body;
+use mirl.ir.body.Source;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.loops;
+use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.module;
+use mirl.ir.opcode.table;
+use mirl.ir.value.Def;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.record.did;
+use mirl.pass.refusal;
+use mirl.pass.refusal.edit;
+
+# the pass: it moves edges and removes blocks, so it keeps no analysis
+pub val BYPASS: Pass = Pass{name: "bypass", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_DOMINANCE | analysis.OF_LOOPS, preserves: cache.NONE, time: Time.keeps{}, counts: "blocks bypassed"};
+
+# a run of the pass over one function
+# ---
+# c:       the run
+# f:       the function
+# b:       its body
+# d:       its dominator tree as the run began
+# l:       its loops as the run began
+# scratch: storage for one forwarder's edges
+rec Run {
+    c:       *Context;
+    f:       Function;
+    b:       *Body;
+    d:       *Dominance;
+    l:       *Loops;
+    scratch: *allocator.Allocator;
+}
+
+# whether block `k` is a loop's header
+fun header(l: *Loops, k: Block) bool {
+    val opt_loop: opt[u32] = loops.innermost(l, k);
+    ret sel opt_loop.some && loops.loop(l, opt_loop.some).header == k;
+}
+
+# whether an edge leaving a loop enters block `k`: a predecessor stands in a loop that does not hold it
+fun exit(x: *Run, k: Block) bool {
+    val b: *Body = x.b;
+    var p: usize = 0;
+    for (p < b.blocks.data[k].predecessors.len) {
+        val place: Place = b.instructions.data[b.blocks.data[k].predecessors.data[p]].place;
+        if (sel place.placed) {
+            val opt_loop: opt[u32] = loops.innermost(x.l, place.placed);
+            if (sel opt_loop.some && !loops.contains(x.l, opt_loop.some, k)) { ret true; }
+        }
+        p = p + 1;
+    }
+    ret false;
+}
+
+# the `br` of block `k` where it is a forwarder the pass bypasses, NO_INSTRUCTION where it stays
+fun forwarder(x: *Run, k: Block) Instruction {
+    val b: *Body = x.b;
+    if (k == 0 || !dominance.reachable(x.d, k)) { ret NO_INSTRUCTION; }
+    val jump: Instruction = b.blocks.data[k].first;
+    if (jump == NO_INSTRUCTION || jump != b.blocks.data[k].last) { ret NO_INSTRUCTION; }
+    val d: *InstructionData = ?b.instructions.data[jump];
+    if (d.opcode != table.BR || d.edges.len != 1)                  { ret NO_INSTRUCTION; }
+    if (d.metadata.flags.kept || d.metadata.flags.volatile)        { ret NO_INSTRUCTION; }
+    if (d.points.first != 0 || b.blocks.data[k].ending.first != 0) { ret NO_INSTRUCTION; }
+    val to: Block = d.edges.data[0].block;
+    if (to == k || to == 0) { ret NO_INSTRUCTION; }
+    var j: usize = 0;
+    for (j < b.blocks.data[k].parameters.len) {
+        val v: Value = b.blocks.data[k].parameters.data[j];
+        if (b.values.data[v].bound.len != 0) { ret NO_INSTRUCTION; }
+        var u: usize = 0;
+        for (u < b.values.data[v].uses.len) {
+            if (b.values.data[v].uses.data[u] != jump) { ret NO_INSTRUCTION; }
+            u = u + 1;
+        }
+        j = j + 1;
+    }
+    if (header(x.l, k) || header(x.l, to) || exit(x, k)) { ret NO_INSTRUCTION; }
+    ret jump;
+}
+
+# whether instruction `from` has an edge into block `to`
+fun enters(b: *Body, from: Instruction, to: Block) bool {
+    var e: usize = 0;
+    for (e < b.instructions.data[from].edges.len) {
+        if (b.instructions.data[from].edges.data[e].block == to) { ret true; }
+        e = e + 1;
+    }
+    ret false;
+}
+
+# move every edge into forwarder `k` that may move to the block its `br` enters, answering whether one moved
+fun bypass(x: *Run, k: Block, jump: Instruction) res[bool, refusal.Error] {
+    val b:       *Body                 = x.b;
+    val to:      Block                 = b.instructions.data[jump].edges.data[0].block;
+    var sources: vector.Vector[Source] = vector.init[Source](x.scratch);
+    var p:       usize                 = 0;
+    for (p < b.blocks.data[k].predecessors.len) {
+        val from: Instruction = b.blocks.data[k].predecessors.data[p];
+        val op:   u32         = b.instructions.data[from].opcode;
+        var e:    usize       = 0;
+        for ((op == table.BR || op == table.CBR) && e < b.instructions.data[from].edges.len) {
+            if (b.instructions.data[from].edges.data[e].block == k) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Source](?sources, Source{branch: from, edge: e::u32});
+                if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+            }
+            e = e + 1;
+        }
+        p = p + 1;
+    }
+
+    var args:  vector.Vector[Value] = vector.init[Value](x.scratch);
+    var moved: bool                 = false;
+    var s:     usize                = 0;
+    for (s < sources.len) {
+        val from:  Instruction = sources.data[s].branch;
+        val edge:  usize       = sources.data[s].edge::usize;
+        val plain: bool        = b.instructions.data[from].opcode == table.BR || b.instructions.data[jump].edges.data[0].arguments.len == 0 || b.blocks.data[to].predecessors.len == 1;
+        if (plain && !enters(b, from, to)) {
+            vector.truncate[Value](?args, 0);
+            var n: usize = 0;
+            for (n < b.instructions.data[jump].edges.data[0].arguments.len) {
+                var v:   Value = b.instructions.data[jump].edges.data[0].arguments.data[n];
+                val def: Def   = b.values.data[v].def;
+                if (sel def.parameter) {
+                    if (def.parameter.block == k) { v = b.instructions.data[from].edges.data[edge].arguments.data[def.parameter.index::usize]; }
+                }
+                val res_pushed: res[usize, allocator.Error] = vector.push[Value](?args, v);
+                if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                n = n + 1;
+            }
+            val err_moved: err[refusal.Error] = edit(body.retarget(x.c.m, x.f, from, edge::u32, to, Slice[Value]{data: args.data, size: args.len}));
+            if (sel err_moved.err) { ret res[bool, refusal.Error].err{err_moved.err}; }
+            moved = true;
+        }
+        s = s + 1;
+    }
+    if (moved && b.blocks.data[k].predecessors.len == 0) {
+        var gone:       [1]Block           = [1]Block{k};
+        val err_erased: err[refusal.Error] = edit(body.erase_unreached(x.c.m, x.f, Slice[Block]{data: ?gone[0], size: 1}));
+        if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+        did(x.c, x.f, 1);
+    }
+    ret res[bool, refusal.Error].ok{moved};
+}
+
+# bypass every forwarder of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:                *Body                          = res_body.ok;
+    val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, u.f);
+    if (sel res_dominance_of.err) { ret res[bool, refusal.Error].err{res_dominance_of.err}; }
+    val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, u.f);
+    if (sel res_loops_of.err) { ret res[bool, refusal.Error].err{res_loops_of.err}; }
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    var x:       Run   = Run{c: c, f: u.f, b: b, d: res_dominance_of.ok, l: res_loops_of.ok, scratch: ?scratch};
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            arena.reset(?ar);
+            val jump: Instruction = forwarder(?x, k::u32);
+            if (jump != NO_INSTRUCTION) {
+                val res_moved: res[bool, refusal.Error] = bypass(?x, k::u32, jump);
+                if (sel res_moved.err) { ret res_moved; }
+                if (res_moved.ok)      { changed = true; }
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}

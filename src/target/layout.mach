@@ -1,0 +1,576 @@
+# data layout: the size, alignment and member offsets of any ir type
+#
+# the one routine every reader asks, the front end, the backend and each debug
+# producer alike, so no other module computes a size, an alignment, an offset
+# or a stride. it reads a type table, the target's widths and alignments, and
+# the rules of the address space a type is laid out in. the table need not be
+# a module's: a front end lays its own types out before it builds any module
+# by interning them in a table of its own and asking `of` over it, so a
+# packed or over-aligned record, a union and an opaque type of a size and an
+# alignment, a structure of bytes at a stated alignment, are laid out here.
+#
+# each type is laid out once, in id order, onto the sheet its rules write in
+# the module's type table, and a question reads that row. a module names one
+# target, so a sheet needs no key but its rules. what turns on the build, a
+# vector the target aligns by its registers or a pointer under an addressing
+# model, is left open on the sheet and worked out per build, since one table
+# is read under a build's context and under none.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use vectors: std.collections.vector;
+
+use core_state: masc.core.state;
+
+use mink.catalog.trait.Choice;
+
+use mirl.ir.type.format.Format;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Laid;
+use mirl.ir.type.table.Shape;
+use mirl.ir.type.table.Sheet;
+use mirl.ir.type.table.Standing;
+use mirl.ir.type.table.Structure;
+use mirl.ir.type.table.Type;
+use mirl.target.capability;
+use mirl.target.capability.AddressingModel;
+use mirl.target.capability.Extent;
+use mirl.target.capability.Fact;
+use mirl.target.capability.Fit;
+use mirl.target.capability.FloatLayout;
+use mirl.target.capability.IntegerLayout;
+use mirl.target.capability.Modelled;
+use mirl.target.capability.Pointer;
+use mirl.target.capability.Rules;
+use mirl.target.capability.Scalar;
+use mirl.target.capability.Space;
+use mirl.target.capability.Stored;
+use mirl.target.capability.VectorRule;
+use mirl.target.record;
+use mirl.target.record.Error;
+use mirl.target.record.Placement;
+use mirl.target.record.Target;
+use mirl.target.record.Unmodelled;
+
+# the types of one table laid out for one target and build
+# ---
+# target: the target
+# types:  the type table, a module's or one of its own
+# ctx:    the context the build's selection opened, none when it has none,
+#         which the conditions of the target's vector registers and
+#         addressing models are read against
+pub rec Layout {
+    target: *Target;
+    types:  *table.Table;
+    ctx:    opt[*core_state.Context];
+}
+
+# no build, as a layout reads where no family opened one, under which only
+# the vector registers every build holds are met
+pub val NO_BUILD: opt[*core_state.Context] = opt[*core_state.Context].none{};
+
+# the layout of a module's types for a target under a build's context
+pub fun of(target: *Target, types: *table.Table, ctx: opt[*core_state.Context]) Layout {
+    ret Layout{target: target, types: types, ctx: ctx};
+}
+
+# the size and alignment of a type
+# ---
+# l:     the layout
+# ty:    the type
+# space: the address space whose rules it is laid out by
+# ret:   its extent, or why it has none in that space on this target
+pub fun extent(l: *Layout, ty: Type, space: u32) res[Extent, Error] {
+    val res_rules: res[Rules, Error] = rules(l, space);
+    if (sel res_rules.err) { ret res[Extent, Error].err{res_rules.err}; }
+    ret walk(l, res_rules.ok, ty);
+}
+
+# the size in bytes of a type in an address space
+pub fun size(l: *Layout, ty: Type, space: u32) res[u64, Error] {
+    val res_extent: res[Extent, Error] = extent(l, ty, space);
+    if (sel res_extent.err) { ret res[u64, Error].err{res_extent.err}; }
+    ret res[u64, Error].ok{res_extent.ok.size};
+}
+
+# the alignment in bytes of a type in an address space
+pub fun align(l: *Layout, ty: Type, space: u32) res[u64, Error] {
+    val res_extent: res[Extent, Error] = extent(l, ty, space);
+    if (sel res_extent.err) { ret res[u64, Error].err{res_extent.err}; }
+    ret res[u64, Error].ok{res_extent.ok.align};
+}
+
+# the byte offset of a member of a structure or union
+# ---
+# l:      the layout
+# ty:     the structure or union
+# space:  the address space whose rules it is laid out by
+# member: the member's index
+# ret:    its offset, answered only when the whole type lays out
+pub fun offset(l: *Layout, ty: Type, space: u32, member: u32) res[u64, Error] {
+    val res_rules: res[Rules, Error] = rules(l, space);
+    if (sel res_rules.err) { ret res[u64, Error].err{res_rules.err}; }
+    val res_shape_at: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+    if (sel res_shape_at.err) { ret res[u64, Error].err{Error.types{res_shape_at.err}}; }
+    var at: u64 = 0;
+    if (sel res_shape_at.ok.structure) {
+        if (member::usize >= res_shape_at.ok.structure.members.size) { ret res[u64, Error].err{Error.member{member}}; }
+        val res_row: res[*Laid, Error] = laid(l, res_rules.ok, ty);
+        if (sel res_row.err)                { ret res[u64, Error].err{res_row.err}; }
+        if (sel res_row.ok.standing.placed) { ret res[u64, Error].ok{sheet_of(l, res_rules.ok).offsets.data[res_row.ok.first + member]}; }
+        val res_structure: res[Extent, Error] = structure(l, res_rules.ok, ty, res_shape_at.ok.structure, member, ?at, nil);
+        if (sel res_structure.err) { ret res[u64, Error].err{res_structure.err}; }
+        ret res[u64, Error].ok{at};
+    }
+    if (sel res_shape_at.ok.union) {
+        if (member::usize >= res_shape_at.ok.union.members.size) { ret res[u64, Error].err{Error.member{member}}; }
+        val res_walk: res[Extent, Error] = walk(l, res_rules.ok, ty);
+        if (sel res_walk.err) { ret res[u64, Error].err{res_walk.err}; }
+        ret res[u64, Error].ok{0};
+    }
+    ret res[u64, Error].err{wrong(l, ty)};
+}
+
+# the byte offset of every member of a structure, in one walk
+# ---
+# l:     the layout
+# ty:    the structure
+# space: the address space whose rules it is laid out by
+# out:   room for one offset per member
+# ret:   ok when the whole type lays out, or why it does not
+pub fun offsets(l: *Layout, ty: Type, space: u32, out: *u64) err[Error] {
+    val res_rules: res[Rules, Error] = rules(l, space);
+    if (sel res_rules.err) { ret err[Error].err{res_rules.err}; }
+    val res_shape_at: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+    if (sel res_shape_at.err)             { ret err[Error].err{Error.types{res_shape_at.err}}; }
+    if (!(sel res_shape_at.ok.structure)) { ret err[Error].err{wrong(l, ty)}; }
+    val res_row: res[*Laid, Error] = laid(l, res_rules.ok, ty);
+    if (sel res_row.err) { ret err[Error].err{res_row.err}; }
+    if (sel res_row.ok.standing.placed) {
+        val from: *u64  = ?sheet_of(l, res_rules.ok).offsets.data[res_row.ok.first];
+        var i:    usize = 0;
+        for (i < res_shape_at.ok.structure.members.size) {
+            out[i] = from[i];
+            i      = i + 1;
+        }
+        ret err[Error].ok{};
+    }
+    var at:            u64                = 0;
+    val res_structure: res[Extent, Error] = structure(l, res_rules.ok, ty, res_shape_at.ok.structure, 0, ?at, out);
+    if (sel res_structure.err) { ret err[Error].err{res_structure.err}; }
+    ret err[Error].ok{};
+}
+
+# the bytes from one element of an array to the next
+# ---
+# l:     the layout
+# ty:    the array
+# space: the address space whose rules it is laid out by
+# ret:   its stride, stated or placed by the rules, answered only when the
+#        whole type lays out
+pub fun stride(l: *Layout, ty: Type, space: u32) res[u64, Error] {
+    val res_rules: res[Rules, Error] = rules(l, space);
+    if (sel res_rules.err) { ret res[u64, Error].err{res_rules.err}; }
+    val res_shape_at: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+    if (sel res_shape_at.err)         { ret res[u64, Error].err{Error.types{res_shape_at.err}}; }
+    if (!(sel res_shape_at.ok.array)) { ret res[u64, Error].err{wrong(l, ty)}; }
+    var step:      u64                = 0;
+    val res_array: res[Extent, Error] = array(l, res_rules.ok, ty, res_shape_at.ok.array, ?step);
+    if (sel res_array.err) { ret res[u64, Error].err{res_array.err}; }
+    ret res[u64, Error].ok{step};
+}
+
+val MAX: u64 = 0xffff_ffff_ffff_ffff;
+
+# the alignment std140 rounds an array's and a structure's up to, a vector of
+# four 32 bit lanes
+val EXTENDED: u64 = 16;
+
+fun round_up(value: u64, align: u64) opt[u64] {
+    val rem: u64 = value % align;
+    if (rem == 0)                    { ret opt[u64].some{value}; }
+    if (value > MAX - (align - rem)) { ret opt[u64].none{}; }
+    ret opt[u64].some{value + (align - rem)};
+}
+
+fun power_of_two(n: u64) bool {
+    ret n != 0 && (n & (n - 1)) == 0;
+}
+
+fun unstated(f: Fact) res[Extent, Error] {
+    ret res[Extent, Error].err{Error.unstated{f}};
+}
+
+fun overflow(ty: Type) res[Extent, Error] {
+    ret res[Extent, Error].err{Error.overflow{ty}};
+}
+
+fun ruled(ty: Type) res[Extent, Error] {
+    ret res[Extent, Error].err{Error.ruled{ty}};
+}
+
+# the refusal of an offset or a stride asked of a type of the wrong kind
+fun wrong(l: *Layout, ty: Type) Error {
+    val res_kind: res[table.Kind, table.Error] = table.kind(l.types, ty);
+    if (sel res_kind.err) { ret Error.types{res_kind.err}; }
+    ret Error.kind{res_kind.ok};
+}
+
+# the rules of an address space's row
+fun rules(l: *Layout, space: u32) res[Rules, Error] {
+    val rows: Slice[Space] = l.target.caps.widths.pointers;
+    var i:    usize        = 0;
+    for (i < rows.size) {
+        if (rows.data[i].space == space) {
+            val r: Rules = rows.data[i].layout;
+            if (sel r.unstated) { ret res[Rules, Error].err{Error.unstated{Fact.pointers{}}}; }
+            ret res[Rules, Error].ok{r};
+        }
+        i = i + 1;
+    }
+    ret res[Rules, Error].err{Error.space{space}};
+}
+
+# a scalar under the rules: at its row's alignment under c, and at its size
+# under every rule of vulkan's
+fun scalar(r: Rules, ty: Type, s: Scalar) res[Extent, Error] {
+    if (sel r.c)               { ret res[Extent, Error].ok{Extent{size: s.size, align: s.align}}; }
+    if (!power_of_two(s.size)) { ret ruled(ty); }
+    ret res[Extent, Error].ok{Extent{size: s.size, align: s.size}};
+}
+
+# a scalar as its row stores it, as the data model states or as mirl
+# defines it where the data model states none
+fun stored(r: Rules, ty: Type, s: Stored, fact: Fact) res[Extent, Error] {
+    if (sel s.scalar)  { ret scalar(r, ty, s.scalar); }
+    if (sel s.defined) { ret scalar(r, ty, s.defined); }
+    ret unstated(fact);
+}
+
+fun integer(l: *Layout, r: Rules, ty: Type, width: u32) res[Extent, Error] {
+    val rows: Slice[IntegerLayout] = l.target.data.integers;
+    var i:    usize                = 0;
+    for (i < rows.size) {
+        if (rows.data[i].width == width) { ret stored(r, ty, rows.data[i].stored, Fact.integer_layout{}); }
+        i = i + 1;
+    }
+    ret unstated(Fact.integer_layout{});
+}
+
+fun float(l: *Layout, r: Rules, ty: Type, f: Format) res[Extent, Error] {
+    val rows: Slice[FloatLayout] = l.target.data.floats;
+    var i:    usize              = 0;
+    for (i < rows.size) {
+        if (rows.data[i].format != nil && (@rows.data[i].format) == f) { ret stored(r, ty, rows.data[i].stored, Fact.float_layout{}); }
+        i = i + 1;
+    }
+    ret unstated(Fact.float_layout{});
+}
+
+fun pointer(l: *Layout, r: Rules, ty: Type, space: u32) res[Extent, Error] {
+    val rows: Slice[Space] = l.target.caps.widths.pointers;
+    var i:    usize        = 0;
+    for (i < rows.size) {
+        if (rows.data[i].space == space) {
+            val p: Pointer = record.pointer_of(l.target, ?rows.data[i]);
+            if (sel p.physical) { ret scalar(r, ty, p.physical); }
+            if (sel p.modelled) { ret modelled(l, r, ty, p.modelled); }
+            if (sel p.logical)  { ret unheld(l, ty); }
+            ret unstated(Fact.pointers{});
+        }
+        i = i + 1;
+    }
+    ret res[Extent, Error].err{Error.space{space}};
+}
+
+# a pointer under the addressing model the build states, an address of the
+# size its row states for that model, and refused naming the model where it
+# lists none
+fun modelled(l: *Layout, r: Rules, ty: Type, rows: Slice[Modelled]) res[Extent, Error] {
+    val res_model: res[opt[*Choice], Error] = model(l);
+    if (sel res_model.err) { ret res[Extent, Error].err{res_model.err}; }
+    val opt_stated: opt[*Choice] = res_model.ok;
+    if (sel opt_stated.none) { ret unstated(Fact.models{}); }
+    var i: usize = 0;
+    for (i < rows.size) {
+        if (rows.data[i].model == opt_stated.some) { ret scalar(r, ty, rows.data[i].scalar); }
+        i = i + 1;
+    }
+    ret res[Extent, Error].err{Error.unmodelled{Unmodelled{pointer: ty, model: opt_stated.some}}};
+}
+
+# a pointer with no representation in memory: refused naming the model the
+# build states on a target that states models, and as unsized on one with none
+fun unheld(l: *Layout, ty: Type) res[Extent, Error] {
+    val res_model: res[opt[*Choice], Error] = model(l);
+    if (sel res_model.err) { ret res[Extent, Error].err{res_model.err}; }
+    val opt_stated: opt[*Choice] = res_model.ok;
+    if (sel opt_stated.none) { ret res[Extent, Error].err{Error.unsized{ty}}; }
+    ret res[Extent, Error].err{Error.unmodelled{Unmodelled{pointer: ty, model: opt_stated.some}}};
+}
+
+# the addressing model the build states, none on a target that states none
+fun model(l: *Layout) res[opt[*Choice], Error] {
+    val res_model_of: res[opt[*AddressingModel], capability.Error] = capability.model_of(l.ctx, l.target.caps.widths.models);
+    if (sel res_model_of.err) { ret res[opt[*Choice], Error].err{Error.unstated{Fact.models{}}}; }
+    val opt_row: opt[*AddressingModel] = res_model_of.ok;
+    if (sel opt_row.none) { ret res[opt[*Choice], Error].ok{opt[*Choice].none{}}; }
+    ret res[opt[*Choice], Error].ok{opt[*Choice].some{opt_row.some.model}};
+}
+
+# a vector under c, aligned by the target's vector rule
+fun c_vector(l: *Layout, ty: Type, bytes: u64, lane: Extent) res[Extent, Error] {
+    val rule: VectorRule = l.target.data.vectors;
+    if (sel rule.element)     { ret res[Extent, Error].ok{Extent{size: bytes, align: lane.align}}; }
+    if (!(sel rule.register)) { ret unstated(Fact.vector_rule{}); }
+    val fit:      Fit                        = rule.register;
+    val res_wide: res[u64, capability.Error] = capability.widest_register(l.ctx, fit);
+    if (sel res_wide.err) { ret unstated(Fact.vector_rule{}); }
+    var to:     u64 = lane.align;
+    val narrow: u64 = fit.narrow::u64 / 8;
+    if (bytes >= narrow) {
+        to = narrow;
+        for (to * 2 <= bytes && to * 2 <= res_wide.ok / 8) { to = to * 2; }
+    }
+    val opt_rounded: opt[u64] = round_up(bytes, to);
+    if (sel opt_rounded.none) { ret overflow(ty); }
+    ret res[Extent, Error].ok{Extent{size: opt_rounded.some, align: to}};
+}
+
+# a vector's lanes are packed. under scalar it keeps its lane's alignment, and
+# under std140 and std430 twice that for two lanes and four times for three or
+# four, the only counts those rules lay out
+fun vector(l: *Layout, r: Rules, ty: Type, lanes: u32, element: Type) res[Extent, Error] {
+    val res_walk: res[Extent, Error] = walk(l, r, element);
+    if (sel res_walk.err)                                             { ret res_walk; }
+    if (res_walk.ok.size != 0 && lanes::u64 > MAX / res_walk.ok.size) { ret overflow(ty); }
+    val bytes: u64 = res_walk.ok.size * lanes::u64;
+    if (sel r.c)                  { ret c_vector(l, ty, bytes, res_walk.ok); }
+    if (sel r.scalar)             { ret res[Extent, Error].ok{Extent{size: bytes, align: res_walk.ok.align}}; }
+    if (lanes == 2)               { ret res[Extent, Error].ok{Extent{size: bytes, align: 2 * res_walk.ok.align}}; }
+    if (lanes == 3 || lanes == 4) { ret res[Extent, Error].ok{Extent{size: bytes, align: 4 * res_walk.ok.align}}; }
+    ret ruled(ty);
+}
+
+# the alignment of an array or structure whose strictest member keeps align
+fun aggregate(r: Rules, align: u64) opt[u64] {
+    if (sel r.std140) { ret round_up(align, EXTENDED); }
+    ret opt[u64].some{align};
+}
+
+# an aggregate's alignment raised to the one it states, when that is more
+fun raised(align: u64, stated: opt[u64]) u64 {
+    if (sel stated.some) {
+        if (stated.some > align) { ret stated.some; }
+    }
+    ret align;
+}
+
+# lay an array out, its elements at its stated stride or at its element's size
+# rounded up to its alignment, and give the stride through `step`
+fun array(l: *Layout, r: Rules, ty: Type, a: table.Array, step: *u64) res[Extent, Error] {
+    val res_walk: res[Extent, Error] = walk(l, r, a.element);
+    if (sel res_walk.err) { ret res_walk; }
+    val opt_align: opt[u64] = aggregate(r, res_walk.ok.align);
+    if (sel opt_align.none) { ret overflow(ty); }
+    var stride: u64 = 0;
+    if (sel a.stride.some) {
+        stride = a.stride.some;
+        if (stride % opt_align.some != 0 || stride < res_walk.ok.size) { ret res[Extent, Error].err{Error.stride{ty}}; }
+    }
+    or {
+        val opt_placed: opt[u64] = round_up(res_walk.ok.size, opt_align.some);
+        if (sel opt_placed.none) { ret overflow(ty); }
+        stride = opt_placed.some;
+    }
+    if (stride != 0 && a.count > MAX / stride) { ret overflow(ty); }
+    @step = stride;
+    ret res[Extent, Error].ok{Extent{size: stride * a.count, align: opt_align.some}};
+}
+
+# lay a structure's members out, by the rules or at its stated offsets, and
+# give the offset of member `stop` through `at` and, when `every` is not nil,
+# the offset of each member through it. a packed structure places each
+# member at an alignment of one and is laid out by c alone
+fun structure(l: *Layout, r: Rules, ty: Type, s: Structure, stop: u32, at: *u64, every: *u64) res[Extent, Error] {
+    if (s.packed && !(sel r.c)) { ret ruled(ty); }
+    var align: u64   = 1;
+    var end:   u64   = 0;
+    var i:     usize = 0;
+    for (i < s.members.size) {
+        val res_walk: res[Extent, Error] = walk(l, r, s.members.data[i]);
+        if (sel res_walk.err) { ret res_walk; }
+        var own: u64 = res_walk.ok.align;
+        if (s.packed)    { own = 1; }
+        if (own > align) { align = own; }
+        var place: u64 = 0;
+        if (sel s.offsets.some) {
+            place = s.offsets.some.data[i];
+            val p: Placement = Placement{member: i::u32, offset: place, align: own};
+            if (place % own != 0) { ret res[Extent, Error].err{Error.misaligned{p}}; }
+            if (place < end)      { ret res[Extent, Error].err{Error.overlap{p}}; }
+        }
+        or {
+            val opt_rounded: opt[u64] = round_up(end, own);
+            if (sel opt_rounded.none) { ret overflow(ty); }
+            place = opt_rounded.some;
+        }
+        if (i == stop::usize)               { @at = place; }
+        if (every != nil)                   { every[i] = place; }
+        if (place > MAX - res_walk.ok.size) { ret overflow(ty); }
+        end = place + res_walk.ok.size;
+        i   = i + 1;
+    }
+    val opt_whole: opt[u64] = aggregate(r, raised(align, s.align));
+    if (sel opt_whole.none) { ret overflow(ty); }
+    val opt_total: opt[u64] = round_up(end, opt_whole.some);
+    if (sel opt_total.none) { ret overflow(ty); }
+    ret res[Extent, Error].ok{Extent{size: opt_total.some, align: opt_whole.some}};
+}
+
+# a union is laid out by c alone, since no rule of vulkan's has one. a packed
+# union is aligned at one, and its stated alignment raises either
+fun union_of(l: *Layout, r: Rules, ty: Type, u: table.Union) res[Extent, Error] {
+    if (!(sel r.c)) { ret ruled(ty); }
+    var align:  u64   = 1;
+    var widest: u64   = 0;
+    var i:      usize = 0;
+    for (i < u.members.size) {
+        val res_walk: res[Extent, Error] = walk(l, r, u.members.data[i]);
+        if (sel res_walk.err)                       { ret res_walk; }
+        if (!u.packed && res_walk.ok.align > align) { align = res_walk.ok.align; }
+        if (res_walk.ok.size > widest)              { widest = res_walk.ok.size; }
+        i = i + 1;
+    }
+    align = raised(align, u.align);
+    val opt_total: opt[u64] = round_up(widest, align);
+    if (sel opt_total.none) { ret overflow(ty); }
+    ret res[Extent, Error].ok{Extent{size: opt_total.some, align: align}};
+}
+
+# the sheet a set of rules writes
+fun sheet_of(l: *Layout, r: Rules) *Sheet {
+    if (sel r.std140) { ret table.sheet(l.types, 1); }
+    if (sel r.std430) { ret table.sheet(l.types, 2); }
+    if (sel r.scalar) { ret table.sheet(l.types, 3); }
+    ret table.sheet(l.types, 0);
+}
+
+# whether a sheet left a type open
+fun left_open(sheet: *Sheet, ty: Type) bool {
+    val row: *Laid = ?sheet.laid.data[ty];
+    ret sel row.standing.open;
+}
+
+# whether a type's layout turns on the build: a vector the target aligns by
+# its registers, a pointer not physical, or anything holding one
+fun turns_on_build(l: *Layout, r: Rules, sheet: *Sheet, ty: Type) bool {
+    val res_shape_at: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+    if (sel res_shape_at.err) { ret false; }
+    val s: *Shape = res_shape_at.ok;
+    if (sel s.pointer) {
+        val rows: Slice[Space] = l.target.caps.widths.pointers;
+        var i:    usize        = 0;
+        for (i < rows.size) {
+            if (rows.data[i].space == s.pointer.space) {
+                val p: Pointer = record.pointer_of(l.target, ?rows.data[i]);
+                ret !(sel p.physical);
+            }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (sel s.vector) {
+        if (sel r.c && sel l.target.data.vectors.register) { ret true; }
+        ret left_open(sheet, s.vector.element);
+    }
+    if (sel s.array) { ret left_open(sheet, s.array.element); }
+    var members: Slice[Type] = Slice[Type]{data: nil, size: 0};
+    if (sel s.structure) { members = s.structure.members; }
+    if (sel s.union)     { members = s.union.members; }
+    var i: usize = 0;
+    for (i < members.size) {
+        if (left_open(sheet, members.data[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# lay out every type the table has interned since the sheet was last written,
+# each from the rows of its members, which are interned before their owner
+fun lay_up(l: *Layout, r: Rules, sheet: *Sheet) err[Error] {
+    val count: usize = l.types.nodes.len;
+    for (sheet.laid.len < count) {
+        val ty:  Type = (sheet.laid.len::u32);
+        var row: Laid = Laid{size: 0, align: 0, first: sheet.offsets.len::u32, standing: Standing.open{}};
+        if (!turns_on_build(l, r, sheet, ty)) {
+            val res_shape_at: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+            if (sel res_shape_at.err) { ret err[Error].err{Error.types{res_shape_at.err}}; }
+            var held: usize = 0;
+            if (sel res_shape_at.ok.structure) { held = res_shape_at.ok.structure.members.size; }
+            val res_room: res[usize, allocator.Error] = vectors.reserve[u64](?sheet.offsets, held);
+            if (sel res_room.err) { ret err[Error].err{Error.types{table.Error.alloc{res_room.err}}}; }
+            val res_lay: res[Extent, Error] = lay(l, r, ty, vectors.spare[u64](?sheet.offsets).data);
+            row.standing = Standing.refused{};
+            if (sel res_lay.ok) {
+                row.size     = res_lay.ok.size;
+                row.align    = res_lay.ok.align;
+                row.standing = Standing.placed{};
+                vectors.commit[u64](?sheet.offsets, held);
+            }
+        }
+        val res_pushed: res[usize, allocator.Error] = vectors.push[Laid](?sheet.laid, row);
+        if (sel res_pushed.err) { ret err[Error].err{Error.types{table.Error.alloc{res_pushed.err}}}; }
+    }
+    ret err[Error].ok{};
+}
+
+# a type's row on the sheet of a set of rules
+fun laid(l: *Layout, r: Rules, ty: Type) res[*Laid, Error] {
+    val sheet: *Sheet = sheet_of(l, r);
+    if (ty::usize >= sheet.laid.len) {
+        val err_lay_up: err[Error] = lay_up(l, r, sheet);
+        if (sel err_lay_up.err)          { ret res[*Laid, Error].err{err_lay_up.err}; }
+        if (ty::usize >= sheet.laid.len) { ret res[*Laid, Error].err{Error.types{table.Error.unknown{ty}}}; }
+    }
+    ret res[*Laid, Error].ok{?sheet.laid.data[ty]};
+}
+
+# the extent of a type: its row when placed, and worked out when its row is
+# open or why it is refused is what is asked
+fun walk(l: *Layout, r: Rules, ty: Type) res[Extent, Error] {
+    val res_row: res[*Laid, Error] = laid(l, r, ty);
+    if (sel res_row.err)                { ret res[Extent, Error].err{res_row.err}; }
+    if (sel res_row.ok.standing.placed) { ret res[Extent, Error].ok{Extent{size: res_row.ok.size, align: res_row.ok.align}}; }
+    ret lay(l, r, ty, nil);
+}
+
+# work a type out from its members' extents, giving a structure's member
+# offsets through `every` when it is not nil
+fun lay(l: *Layout, r: Rules, ty: Type, every: *u64) res[Extent, Error] {
+    val res_shape_at: res[*Shape, table.Error] = table.shape_at(l.types, ty);
+    if (sel res_shape_at.err) { ret res[Extent, Error].err{Error.types{res_shape_at.err}}; }
+    val s: *Shape = res_shape_at.ok;
+    if (sel s.integer) { ret integer(l, r, ty, s.integer.width); }
+    if (sel s.float)   { ret float(l, r, ty, s.float.format); }
+    if (sel s.pointer) { ret pointer(l, r, ty, s.pointer.space); }
+    if (sel s.vector)  { ret vector(l, r, ty, s.vector.lanes, s.vector.element); }
+    if (sel s.array) {
+        var step: u64 = 0;
+        ret array(l, r, ty, s.array, ?step);
+    }
+    if (sel s.structure) {
+        var at: u64 = 0;
+        ret structure(l, r, ty, s.structure, 0, ?at, every);
+    }
+    if (sel s.union) { ret union_of(l, r, ty, s.union); }
+    ret res[Extent, Error].err{Error.unsized{ty}};
+}

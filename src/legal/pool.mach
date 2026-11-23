@@ -1,0 +1,584 @@
+# constants a target loads from read-only data in place of making them
+#
+# a held format whose row states its constants `loaded` has no rule that
+# builds one in a register, as binary64 has none on a 32 bit RISC-V, and a
+# vector constant is loaded where the unit that holds it states its constants
+# `loaded`, as every register target's units do. a unit that states them
+# `made`, as spir-v's, whose OpConstantComposite is a value of its own, or
+# wasm's, whose v128.const holds the bytes in the code, has none of its
+# vector constants loaded. a vector's lanes are integers of a byte or more, or floats, each a constant
+# of bits or zero: a vector of conditions has no layout in memory its
+# register form keeps, and an address in a lane has no bits to name it by.
+# every use of such a constant, as an operand or an edge's argument, reads it
+# instead from a global of the module: local, constant and initialised with
+# the constant, one per type and bit pattern, named by mirl's prefix, the
+# type and the bits, so every function of the module reads the same one. the
+# load goes just ahead of the instruction that uses it, which an edge's
+# argument is too, and is reached through the global's address constant, so
+# the target's addressing selects it and the target's placement puts the
+# global in read-only data.
+#
+# the load reads no value of the program and the constant is public, so the
+# pass keeps constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+
+use mink.base.intern.Name;
+use mink.base.table.Id;
+
+use mirl.build.builder;
+use mirl.ir.body;
+use mirl.ir.constant.Address;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.contents;
+use mirl.ir.debug.record.Binding;
+use mirl.ir.function.Body;
+use mirl.ir.global.GlobalData;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Global;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.linkage;
+use mirl.ir.linkage.Linkage;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.format;
+use mirl.ir.type.format.Format;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.ValueData;
+use mirl.legal.emit;
+use mirl.legal.emit.Site;
+use mirl.legal.helper.table.PREFIX;
+use mirl.pass.analysis;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.target.basis;
+use mirl.target.capability.Held;
+use mirl.target.capability.LaneType;
+use VectorUnit:    mirl.target.capability.Unit;
+use target_layout: mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record;
+use units: mirl.target.vector;
+
+use mink.model.symbol;
+
+# the pass: it adds loads in front of the instructions that use the constants
+# and never touches an edge or a block
+pub val POOL: Pass = Pass{name: "constant pool", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
+
+# a pooled constant is seen by its module alone
+val POOLED: Linkage = Linkage{binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT};
+
+# what mirl delivers under a pooled constant's name, which a refusal of another symbol of it names
+val WANTED: str = "a pooled constant";
+
+# whether the build may meet a constant it loads: some vector unit of the
+# target loads its constants, or the target loads the constants of some format
+# it holds, or a row's condition cannot be read, which the visit refuses
+fun wanted(g: *Ground) bool {
+    if (sel g.t.caps.vectors.units) {
+        val list: Slice[VectorUnit] = g.t.caps.vectors.units;
+        var u:    usize             = 0;
+        for (u < list.size) {
+            if (sel list.data[u].constants.loaded) { ret true; }
+            u = u + 1;
+        }
+    }
+    var f: u32 = 0;
+    for (f < format.rows()) {
+        val res_held: res[opt[*Held], basis.Error] = basis.held(g.basis, ?g.t.caps, f);
+        if (sel res_held.err) { ret true; }
+        if (sel res_held.ok.some) {
+            if (sel res_held.ok.some.constants.loaded) { ret true; }
+        }
+        f = f + 1;
+    }
+    ret false;
+}
+
+# one visit
+# ---
+# c:       the run
+# site:    where the loads are built
+# layout:  the target's data layout
+# pointer: the type of an address in the space of globals
+# changed: some use was rewritten
+rec Visit {
+    c:       *Context;
+    site:    Site;
+    layout:  Layout;
+    pointer: Type;
+    changed: bool;
+}
+
+fun typed(e: table.Error) refusal.Error {
+    ret refusal.Error.ir{module.Error.types{e}};
+}
+
+# a lane of a pooled vector, or a pooled float: its name and its width
+# ---
+# word:  a float format's name, empty for an integer, which the name spells as
+#        `i` and its width
+# width: its bits
+rec Lane {
+    word:  View;
+    width: u32;
+}
+
+# how a pooled constant is laid out for its name: its lanes, one for a float
+# ---
+# lane:   each lane's type
+# lanes:  how many
+# vector: it is a vector, named by its lanes
+rec Form {
+    lane:   Lane;
+    lanes:  u32;
+    vector: bool;
+}
+
+# the lane a scalar type is, where a pooled vector may hold it: an integer of
+# a byte or more, or a float
+fun lane_of(m: *Module, ty: Type) res[opt[Lane], refusal.Error] {
+    val res_shape: res[*table.Shape, table.Error] = table.shape_at(?m.types, ty);
+    if (sel res_shape.err) { ret res[opt[Lane], refusal.Error].err{typed(res_shape.err)}; }
+    if (sel res_shape.ok.float) {
+        val opt_row: opt[format.Row] = format.row(res_shape.ok.float.format);
+        if (sel opt_row.none) { ret res[opt[Lane], refusal.Error].err{typed(table.Error.format{res_shape.ok.float.format})}; }
+        ret res[opt[Lane], refusal.Error].ok{opt[Lane].some{Lane{word: View{data: opt_row.some.name, len: str_len(opt_row.some.name)}, width: opt_row.some.width}}};
+    }
+    if (sel res_shape.ok.integer) {
+        if (res_shape.ok.integer.width < 8) { ret res[opt[Lane], refusal.Error].ok{opt[Lane].none{}}; }
+        ret res[opt[Lane], refusal.Error].ok{opt[Lane].some{Lane{word: View{data: nil, len: 0}, width: res_shape.ok.integer.width}}};
+    }
+    ret res[opt[Lane], refusal.Error].ok{opt[Lane].none{}};
+}
+
+# whether the unit function `f` holds a vector of a lane type in states its
+# constants loaded, false where no unit holds it
+fun unit_loads(c: *Context, f: Function, element: Type, lanes: u32) res[bool, refusal.Error] {
+    val res_shape: res[*table.Shape, table.Error] = table.shape_at(?c.m.types, element);
+    if (sel res_shape.err) { ret res[bool, refusal.Error].err{typed(res_shape.err)}; }
+    var held: Format;
+    var lane: LaneType = LaneType.integer{0};
+    if (sel res_shape.ok.integer) { lane = LaneType.integer{res_shape.ok.integer.width}; }
+    or (sel res_shape.ok.float) {
+        held = res_shape.ok.float.format;
+        lane = LaneType.float{?held};
+    }
+    or { ret res[bool, refusal.Error].ok{false}; }
+    val res_split: res[units.Split, units.Error] = units.split_for(c.basis, c.m.functions.data[f].data.constant_time, ?c.t.caps, lane, lanes);
+    if (sel res_split.err) {
+        if (sel res_split.err.condition) { ret res[bool, refusal.Error].err{refusal.Error.condition{res_split.err.condition}}; }
+        ret res[bool, refusal.Error].err{refusal.Error.reason{"a vector unit whose width or lanes the target leaves unstated, or whose scaled width the build binds no quantity to"}};
+    }
+    if (!(sel res_split.ok.pieces)) { ret res[bool, refusal.Error].ok{false}; }
+    ret res[bool, refusal.Error].ok{sel res_split.ok.pieces.unit.constants.loaded};
+}
+
+# how a constant of a value's type is pooled in function `f`, none where it is
+# not: a float of a loaded format, or a vector of lanes a pooled vector may hold
+fun pooled(c: *Context, f: Function, ty: Type) res[opt[Form], refusal.Error] {
+    val res_shape: res[*table.Shape, table.Error] = table.shape_at(?c.m.types, ty);
+    if (sel res_shape.err) { ret res[opt[Form], refusal.Error].err{typed(res_shape.err)}; }
+    if (sel res_shape.ok.float) {
+        val res_held: res[opt[*Held], basis.Error] = basis.held(c.basis, ?c.t.caps, res_shape.ok.float.format);
+        if (sel res_held.err)                         { ret res[opt[Form], refusal.Error].err{refusal.Error.condition{res_held.err}}; }
+        if (sel res_held.ok.none)                     { ret res[opt[Form], refusal.Error].ok{opt[Form].none{}}; }
+        if (!(sel res_held.ok.some.constants.loaded)) { ret res[opt[Form], refusal.Error].ok{opt[Form].none{}}; }
+        val res_lane_of: res[opt[Lane], refusal.Error] = lane_of(c.m, ty);
+        if (sel res_lane_of.err)     { ret res[opt[Form], refusal.Error].err{res_lane_of.err}; }
+        if (sel res_lane_of.ok.none) { ret res[opt[Form], refusal.Error].ok{opt[Form].none{}}; }
+        ret res[opt[Form], refusal.Error].ok{opt[Form].some{Form{lane: res_lane_of.ok.some, lanes: 1, vector: false}}};
+    }
+    if (sel res_shape.ok.vector) {
+        val lanes:      u32                      = res_shape.ok.vector.lanes;
+        val res_loaded: res[bool, refusal.Error] = unit_loads(c, f, res_shape.ok.vector.element, lanes);
+        if (sel res_loaded.err) { ret res[opt[Form], refusal.Error].err{res_loaded.err}; }
+        if (!res_loaded.ok)     { ret res[opt[Form], refusal.Error].ok{opt[Form].none{}}; }
+        val res_lane_of: res[opt[Lane], refusal.Error] = lane_of(c.m, res_shape.ok.vector.element);
+        if (sel res_lane_of.err)     { ret res[opt[Form], refusal.Error].err{res_lane_of.err}; }
+        if (sel res_lane_of.ok.none) { ret res[opt[Form], refusal.Error].ok{opt[Form].none{}}; }
+        ret res[opt[Form], refusal.Error].ok{opt[Form].some{Form{lane: res_lane_of.ok.some, lanes: lanes, vector: true}}};
+    }
+    ret res[opt[Form], refusal.Error].ok{opt[Form].none{}};
+}
+
+# a pooled constant an instruction reads
+# ---
+# value:    the value that stands for it
+# constant: the constant
+# form:     how it is laid out for its name
+# type:     its type
+rec Pooled {
+    value:    Value;
+    constant: Constant;
+    form:     Form;
+    type:     Type;
+}
+
+# the constant a value of function `f` stands for, where it is one the target
+# loads and every lane of it has bits
+fun constant_of(c: *Context, f: Function, b: *Body, x: Value) res[opt[Pooled], refusal.Error] {
+    val d: *ValueData = ?b.values.data[x];
+    if (!(sel d.def.constant))                   { ret res[opt[Pooled], refusal.Error].ok{opt[Pooled].none{}}; }
+    if (module.specialized(c.m, d.def.constant)) { ret res[opt[Pooled], refusal.Error].ok{opt[Pooled].none{}}; }
+    val res_pooled: res[opt[Form], refusal.Error] = pooled(c, f, d.type);
+    if (sel res_pooled.err)             { ret res[opt[Pooled], refusal.Error].err{res_pooled.err}; }
+    if (sel res_pooled.ok.none)         { ret res[opt[Pooled], refusal.Error].ok{opt[Pooled].none{}}; }
+    if (!all_bits(c.m, d.def.constant)) { ret res[opt[Pooled], refusal.Error].ok{opt[Pooled].none{}}; }
+    ret res[opt[Pooled], refusal.Error].ok{opt[Pooled].some{Pooled{value: x, constant: d.def.constant, form: res_pooled.ok.some, type: d.type}}};
+}
+
+# whether value `x` of function `f` is a constant the pass reads from read-only
+# data at each use, which constant hoisting carries through a loop
+pub fun loads(c: *Context, f: Function, b: *Body, x: Value) res[bool, refusal.Error] {
+    val res_constant_of: res[opt[Pooled], refusal.Error] = constant_of(c, f, b, x);
+    if (sel res_constant_of.err) { ret res[bool, refusal.Error].err{res_constant_of.err}; }
+    ret res[bool, refusal.Error].ok{sel res_constant_of.ok.some};
+}
+
+# whether a constant is bits or zero, or an aggregate of lanes each bits or zero
+fun all_bits(m: *Module, c: Constant) bool {
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, c);
+    if (sel res_constant_data.err) { ret false; }
+    val d: ConstantData = res_constant_data.ok;
+    if (sel d.integer || sel d.float || sel d.zero) { ret true; }
+    if (!(sel d.aggregate))                         { ret false; }
+    var i: usize = 0;
+    for (i < d.aggregate.elements.size) {
+        val res_lane: res[ConstantData, module.Error] = module.constant_data(m, d.aggregate.elements.data[i]);
+        if (sel res_lane.err)                                                            { ret false; }
+        if (!(sel res_lane.ok.integer || sel res_lane.ok.float || sel res_lane.ok.zero)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun digit(n: u64) u8 {
+    if (n < 10) { ret ('0'::u64 + n)::u8; }
+    ret ('a'::u64 + n - 10)::u8;
+}
+
+# the bits of a scalar constant, its words from the lowest
+fun bits_of(m: *Module, c: Constant) res[Slice[u64], refusal.Error] {
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, c);
+    if (sel res_constant_data.err)        { ret res[Slice[u64], refusal.Error].err{refusal.Error.ir{res_constant_data.err}}; }
+    if (sel res_constant_data.ok.float)   { ret res[Slice[u64], refusal.Error].ok{res_constant_data.ok.float.words}; }
+    if (sel res_constant_data.ok.integer) { ret res[Slice[u64], refusal.Error].ok{res_constant_data.ok.integer.words}; }
+    if (sel res_constant_data.ok.zero)    { ret res[Slice[u64], refusal.Error].ok{Slice[u64]{data: nil, size: 0}}; }
+    ret res[Slice[u64], refusal.Error].err{refusal.Error.reason{"a pooled lane that is neither bits nor zero"}};
+}
+
+# the constant of lane `i` of a pooled constant of `lanes` lanes, which a zero
+# vector has none of
+fun lane_at(m: *Module, c: Constant, lanes: u32, i: u32) res[opt[Constant], refusal.Error] {
+    if (lanes == 1) { ret res[opt[Constant], refusal.Error].ok{opt[Constant].some{c}}; }
+    val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, c);
+    if (sel res_constant_data.err)     { ret res[opt[Constant], refusal.Error].err{refusal.Error.ir{res_constant_data.err}}; }
+    if (sel res_constant_data.ok.zero) { ret res[opt[Constant], refusal.Error].ok{opt[Constant].none{}}; }
+    if (sel res_constant_data.ok.aggregate) {
+        if (i::usize < res_constant_data.ok.aggregate.elements.size) { ret res[opt[Constant], refusal.Error].ok{opt[Constant].some{res_constant_data.ok.aggregate.elements.data[i]}}; }
+    }
+    ret res[opt[Constant], refusal.Error].err{refusal.Error.reason{"a pooled vector whose lanes are not one constant each"}};
+}
+
+# the bits of lane `i` of a pooled constant, its words from the lowest
+fun lane_bits(m: *Module, c: Constant, lanes: u32, i: u32) res[Slice[u64], refusal.Error] {
+    val res_lane_at: res[opt[Constant], refusal.Error] = lane_at(m, c, lanes, i);
+    if (sel res_lane_at.err)     { ret res[Slice[u64], refusal.Error].err{res_lane_at.err}; }
+    if (sel res_lane_at.ok.none) { ret res[Slice[u64], refusal.Error].ok{Slice[u64]{data: nil, size: 0}}; }
+    ret bits_of(m, res_lane_at.ok.some);
+}
+
+# whether two pooled constants of one form have the same bits in every lane,
+# which two constants of the module may have
+fun same_lanes(m: *Module, l: Form, a: Constant, b: Constant) res[bool, refusal.Error] {
+    if (a == b) { ret res[bool, refusal.Error].ok{true}; }
+    var i: u32 = 0;
+    for (i < l.lanes) {
+        val res_lane_bits: res[Slice[u64], refusal.Error] = lane_bits(m, a, l.lanes, i);
+        if (sel res_lane_bits.err) { ret res[bool, refusal.Error].err{res_lane_bits.err}; }
+        val res_lane_bits_lanes: res[Slice[u64], refusal.Error] = lane_bits(m, b, l.lanes, i);
+        if (sel res_lane_bits_lanes.err)                           { ret res[bool, refusal.Error].err{res_lane_bits_lanes.err}; }
+        if (!same_words(res_lane_bits.ok, res_lane_bits_lanes.ok)) { ret res[bool, refusal.Error].ok{false}; }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+# whether two lists of words hold the same bits, the shorter zero above
+fun same_words(x: Slice[u64], y: Slice[u64]) bool {
+    var n: usize = x.size;
+    if (y.size > n) { n = y.size; }
+    var i: usize = 0;
+    for (i < n) {
+        var p: u64 = 0;
+        var q: u64 = 0;
+        if (i < x.size) { p = x.data[i]; }
+        if (i < y.size) { q = y.data[i]; }
+        if (p != q)     { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the count of decimal digits of `n`
+fun decimals(n: u64) usize {
+    var k: usize = 1;
+    var x: u64   = n;
+    for (x >= 10) {
+        x = x / 10;
+        k = k + 1;
+    }
+    ret k;
+}
+
+# write `n` in decimal at `out`, `k` digits
+fun decimal(out: *u8, n: u64, k: usize) {
+    var x: u64   = n;
+    var i: usize = k;
+    for (i > 0) {
+        i      = i - 1;
+        out[i] = digit(x % 10);
+        x      = x / 10;
+    }
+}
+
+# the name of the global a constant is read from: the prefix, then for a
+# vector `v` and its lane count and `_`, then the lane type's name, a float
+# format's or `i` and an integer's width, then `_` and every lane's bits in
+# hex, the last lane first and each from its top
+fun name_of(v: *Visit, l: Form, c: Constant) res[View, refusal.Error] {
+    val digits: usize = ((l.lane.width + 3) / 4)::usize;
+    val head:   usize = str_len(PREFIX);
+    var count:  usize = 0;
+    if (l.vector) { count = 1 + decimals(l.lanes::u64) + 1; }
+    var word: usize = l.lane.word.len;
+    if (word == 0) { word = 1 + decimals(l.lane.width::u64); }
+    val n:             usize                     = head + count + word + 1 + digits * l.lanes::usize;
+    val res_zallocate: res[*u8, allocator.Error] = allocator.zallocate[u8](v.site.scratch, n);
+    if (sel res_zallocate.err) { ret res[View, refusal.Error].err{refusal.Error.alloc{res_zallocate.err}}; }
+    val out: *u8   = res_zallocate.ok;
+    var at:  usize = 0;
+    var i:   usize = 0;
+    for (i < head) {
+        out[at] = PREFIX[i];
+        at      = at + 1;
+        i       = i + 1;
+    }
+    if (l.vector) {
+        out[at] = 'v';
+        decimal(?out[at + 1], l.lanes::u64, count - 2);
+        at          = at + count;
+        out[at - 1] = '_';
+    }
+    if (l.lane.word.len == 0) {
+        out[at] = 'i';
+        decimal(?out[at + 1], l.lane.width::u64, word - 1);
+    }
+    or {
+        i = 0;
+        for (i < word) {
+            out[at + i] = l.lane.word.data[i];
+            i           = i + 1;
+        }
+    }
+    at      = at + word;
+    out[at] = '_';
+    at      = at + 1;
+    var lane: u32 = l.lanes;
+    for (lane > 0) {
+        lane = lane - 1;
+        val res_words: res[Slice[u64], refusal.Error] = lane_bits(v.c.m, c, l.lanes, lane);
+        if (sel res_words.err) { ret res[View, refusal.Error].err{res_words.err}; }
+        var k: usize = 0;
+        for (k < digits) {
+            val top:  usize = digits - 1 - k;
+            var bits: u64   = 0;
+            if (top / 16 < res_words.ok.size) { bits = res_words.ok.data[top / 16]; }
+            out[at] = digit((bits >> ((top % 16) * 4)::u64) & 0xf);
+            at      = at + 1;
+            k       = k + 1;
+        }
+    }
+    ret res[View, refusal.Error].ok{View{data: out, len: n}};
+}
+
+# the global a constant is read from, added to the module the first time
+fun global_of(v: *Visit, l: Form, c: Constant, ty: Type) res[Global, refusal.Error] {
+    val res_name: res[View, refusal.Error] = name_of(v, l, c);
+    if (sel res_name.err) { ret res[Global, refusal.Error].err{res_name.err}; }
+    val opt_found: opt[Symbol] = module.find(v.c.m, res_name.ok);
+    if (sel opt_found.some) {
+        if (!(sel opt_found.some.global)) { ret res[Global, refusal.Error].err{refusal.taken(v.c.m, opt_found.some, WANTED)}; }
+        val g:        Global                        = opt_found.some.global;
+        val res_data: res[GlobalData, module.Error] = module.global_data(v.c.m, g);
+        if (sel res_data.err) { ret res[Global, refusal.Error].err{refusal.Error.ir{res_data.err}}; }
+        val held: GlobalData = res_data.ok;
+        val same: bool       = held.constant && table.same(held.type, ty) && linkage.same(held.linkage, POOLED);
+        if (sel held.initial.some) {
+            val res_equal: res[bool, refusal.Error] = same_lanes(v.c.m, l, held.initial.some, c);
+            if (sel res_equal.err)    { ret res[Global, refusal.Error].err{res_equal.err}; }
+            if (same && res_equal.ok) { ret res[Global, refusal.Error].ok{g}; }
+        }
+        ret res[Global, refusal.Error].err{refusal.taken(v.c.m, opt_found.some, WANTED)};
+    }
+    val res_symbol: res[Id[Name], module.Error] = module.intern_name(v.c.m, res_name.ok);
+    if (sel res_symbol.err) { ret res[Global, refusal.Error].err{refusal.Error.ir{res_symbol.err}}; }
+    val data:     GlobalData                = GlobalData{name: res_symbol.ok, type: ty, initial: opt[Constant].some{c}, linkage: POOLED, constant: true, debug: opt[Binding].none{}};
+    val res_made: res[Global, module.Error] = module.add_global(v.c.m, data);
+    if (sel res_made.err) { ret res[Global, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    ret res[Global, refusal.Error].ok{res_made.ok};
+}
+
+# a load of a constant from its global, ahead of an instruction, which then
+# reads the load in place of the constant
+fun read(v: *Visit, i: Instruction, p: Pooled) err[refusal.Error] {
+    val ty:            Type                       = p.type;
+    val res_global_of: res[Global, refusal.Error] = global_of(v, p.form, p.constant, ty);
+    if (sel res_global_of.err) { ret err[refusal.Error].err{res_global_of.err}; }
+    val res_align: res[u64, record.Error] = target_layout.align(?v.layout, ty, table.DEFAULT_SPACE);
+    if (sel res_align.err) { ret err[refusal.Error].err{refusal.Error.reason{"the data layout states no alignment of a pooled constant's type"}}; }
+
+    val s: *Site = ?v.site;
+    emit.operand(s, i, p.value);
+    val address:   Constant           = builder.constant(?s.bld, ConstantData.address{Address{type: v.pointer, symbol: Symbol.global{res_global_of.ok}, offset: 0, minus: opt[Symbol].none{}}});
+    var ops:       [1]Value           = [1]Value{builder.use_constant(?s.bld, address)};
+    var imm:       [2]Immediate       = [2]Immediate{Immediate.ty{ty}, Immediate.alignment{res_align.ok}};
+    val load:      Instruction        = emit.emit(s, opcode_table.LOAD, Slice[Value]{data: ?ops[0], size: 1}, Slice[Immediate]{data: ?imm[0], size: 2});
+    val got:       Value              = emit.result(s, load, 0);
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret err[refusal.Error].err{err_built.err}; }
+    val err_swapped: err[refusal.Error] = refusal.edit(body.substitute(v.c.m, s.f, i, p.value, got));
+    if (sel err_swapped.err) { ret err[refusal.Error].err{err_swapped.err}; }
+    v.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# the next pooled constant an instruction reads, as an operand or an edge
+# argument, from a slot on: a rewrite takes every use of it in the
+# instruction, so the walk never meets one twice
+# ---
+# slot: the operands then every edge's arguments, counted in order
+fun next(v: *Visit, i: Instruction, slot: *usize) res[opt[Pooled], refusal.Error] {
+    val d:     *InstructionData = ?v.site.b.instructions.data[i];
+    var count: usize            = d.operands.len;
+    var e:     usize            = 0;
+    for (e < d.edges.len) {
+        count = count + d.edges.data[e].arguments.len;
+        e     = e + 1;
+    }
+    for (@slot < count) {
+        var x:  Value = 0;
+        val at: usize = @slot;
+        if (at < d.operands.len) { x = d.operands.data[at]; }
+        or {
+            var rest: usize = at - d.operands.len;
+            e = 0;
+            for (rest >= d.edges.data[e].arguments.len) {
+                rest = rest - d.edges.data[e].arguments.len;
+                e    = e + 1;
+            }
+            x = d.edges.data[e].arguments.data[rest];
+        }
+        @slot = at + 1;
+        val res_constant_of: res[opt[Pooled], refusal.Error] = constant_of(v.c, v.site.f, v.site.b, x);
+        if (sel res_constant_of.err)     { ret res_constant_of; }
+        if (sel res_constant_of.ok.some) { ret res_constant_of; }
+    }
+    ret res[opt[Pooled], refusal.Error].ok{opt[Pooled].none{}};
+}
+
+# whether a body holds a type a constant of may be pooled: a float of a
+# format whose constants are loaded, a vector, or a type the table cannot
+# shape, which the visit refuses
+fun concerned(m: *Module, b: *Body, loaded: *bool) bool {
+    var ty: u32 = 0;
+    for (contents.seek(?b.contents.types, ?ty)) {
+        val res_shape: res[*table.Shape, table.Error] = table.shape_at(?m.types, ty);
+        if (sel res_shape.err)                                           { ret true; }
+        if (sel res_shape.ok.vector)                                     { ret true; }
+        if (sel res_shape.ok.float && loaded[res_shape.ok.float.format]) { ret true; }
+        ty = ty + 1;
+    }
+    ret false;
+}
+
+# read every pooled constant one function uses from its global
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val res_pointer: res[Type, table.Error] = table.intern(?c.m.types, table.Shape.pointer{table.Pointer{space: 0}});
+    if (sel res_pointer.err) { ret res[bool, refusal.Error].err{typed(res_pointer.err)}; }
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    val rows:       usize                       = format.rows()::usize;
+    val res_loaded: res[*bool, allocator.Error] = allocator.zallocate[bool](c.m.a, rows);
+    if (sel res_loaded.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_loaded.err}}; }
+    fin { allocator.deallocate[bool](c.m.a, res_loaded.ok, rows); }
+    var r: usize = 0;
+    for (r < rows) {
+        val res_held: res[opt[*Held], basis.Error] = basis.held(c.basis, ?c.t.caps, (r::u32));
+        if (sel res_held.err) { ret res[bool, refusal.Error].err{refusal.Error.condition{res_held.err}}; }
+        res_loaded.ok[r] = sel res_held.ok.some && sel res_held.ok.some.constants.loaded;
+        r                = r + 1;
+    }
+    if (!concerned(c.m, res_body.ok, res_loaded.ok)) { ret res[bool, refusal.Error].ok{false}; }
+
+    var v: Visit = Visit{c: c, site: emit.init(c.m, u.f, res_body.ok, ?scratch), layout: target_layout.of(c.t, ?c.m.types, basis.context_of(c.basis)), pointer: res_pointer.ok, changed: false};
+    val b: *Body = res_body.ok;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var n: Instruction = b.blocks.data[k].first;
+            for (n != NO_INSTRUCTION) {
+                val i:    Instruction = n;
+                var slot: usize       = 0;
+                n = b.instructions.data[i].next;
+                for {
+                    arena.reset(?ar);
+                    val res_slot_next: res[opt[Pooled], refusal.Error] = next(?v, i, ?slot);
+                    if (sel res_slot_next.err)     { ret res[bool, refusal.Error].err{res_slot_next.err}; }
+                    if (sel res_slot_next.ok.none) { brk; }
+                    val err_read: err[refusal.Error] = read(?v, i, res_slot_next.ok.some);
+                    if (sel err_read.err) { ret res[bool, refusal.Error].err{err_read.err}; }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{v.changed};
+}

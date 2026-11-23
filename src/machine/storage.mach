@@ -1,0 +1,242 @@
+# the storage model of the machine form: where a value lies, read from masc
+#
+# masc states every register's storage as pieces of a bank: the bank it is in,
+# the bit range its pieces take at each multiplier of its scale, and what a
+# write through it leaves in the rest of the bank. footprint.of answers what an
+# instruction reads, writes and kills over those facts, and register.within
+# where one register lies in another. this module is the one place the machine
+# form asks them: the locations' sharing, liveness and its kills, the
+# allocation checker, copy lowering, the spiller and the frame read a location's
+# storage, its views and its groups here, and no other module restates one.
+#
+# a memory-backed class states only the bits of each cell, which share storage
+# with nothing but themselves.
+#
+# a view is a class whose every register lies in exactly one register of
+# another class at one placement, and every register of that class holds
+# exactly one of it, as a 32-bit class lies in the low half of a 64-bit one
+# or a 64-bit float class in the low part of a vector class. an operand at a position of the view's class may name
+# a virtual register of the other class, and names the register of the view
+# within its location once it has one, so no move is made between them.
+#
+# a group of registers, as a vector group under a multiplier of two, is a
+# register of its tuple class, whose storage is its members' together, scaled
+# where theirs scales, which is the size of the slot it spills to. a span of
+# registers of one class takes its class's storage once per register. a
+# list's members and their wrap are masc's, which its operand shape states.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+
+use std.allocator;
+use std.collections.slice.Slice;
+
+use mirl.machine.class.Class;
+
+use masc.core.effect;
+use masc.core.footprint;
+use masc.core.quantity;
+use rf: masc.core.register;
+
+# the storage a value takes in memory, as bits fixed plus bits per unit of
+# the multiplier of one scale that the selection leaves to the implementation,
+# the shape of masc's scaled widths
+# ---
+# fixed: the bits no scale changes
+# per:   the bits for each unit of the multiplier, 0 when none scales
+# scale: the scale of the register file, read only when per is nonzero
+pub rec Storage {
+    fixed: u64;
+    per:   u64;
+    scale: u8;
+}
+
+# the multiplier a context's view fixes for a slot, 0 when it leaves it open
+fun multiplier(regs: *rf.Available, scale: u8) u64 {
+    val opt_multiplier: opt[u32] = rf.multiplier(regs, scale);
+    if (sel opt_multiplier.none) { ret 0; }
+    ret opt_multiplier.some::u64;
+}
+
+# a storage through a selection, its fixed part with every fixed scale folded in
+pub fun fold(regs: *rf.Available, s: Storage) Storage {
+    if (s.per == 0) { ret Storage{fixed: s.fixed, per: 0, scale: 0}; }
+    val m: u64 = multiplier(regs, s.scale);
+    if (m != 0) { ret Storage{fixed: s.fixed + s.per * m, per: 0, scale: 0}; }
+    ret s;
+}
+
+# a scaled quantity through a selection, its fixed part with every fixed
+# scale folded in
+pub fun through(regs: *rf.Available, q: quantity.Scaled) Storage {
+    ret fold(regs, Storage{fixed: q.fixed::u64, per: q.per::u64, scale: q.scale});
+}
+
+# the order of two storages folded through one selection, by fixed bits, then
+# bits per unit, then scale, 0 when they are the same storage
+pub fun order(a: Storage, b: Storage) i64 {
+    if (a.fixed != b.fixed) {
+        if (a.fixed < b.fixed) { ret -1; }
+        ret 1;
+    }
+    if (a.per != b.per) {
+        if (a.per < b.per) { ret -1; }
+        ret 1;
+    }
+    if (a.per == 0 || a.scale == b.scale) { ret 0; }
+    if (a.scale < b.scale)                { ret -1; }
+    ret 1;
+}
+
+# whether storage `outer` takes at least the bits of `inner` under every
+# multiplier, both folded through one selection: a part that scales is only
+# taken by a part of the same scale
+pub fun covers(outer: Storage, inner: Storage) bool {
+    if (outer.fixed < inner.fixed) { ret false; }
+    if (inner.per == 0)            { ret true; }
+    ret outer.scale == inner.scale && outer.per >= inner.per;
+}
+
+# the storage of a register row through a selection: its class's width times
+# its pieces, none when both scale with the implementation, which no fixed
+# part plus a part per unit states
+pub fun of_register(regs: *rf.Available, row: *rf.Register) opt[Storage] {
+    val w: Storage = through(regs, regs.file.classes[row.class].width);
+    # a tuple holds no pieces of its own, and its class's width is its members' bits together
+    if (rf.tuple(row)) { ret opt[Storage].some{w}; }
+    val n: Storage = through(regs, row.count);
+    if (n.per == 0) { ret opt[Storage].some{Storage{fixed: w.fixed * n.fixed, per: w.per * n.fixed, scale: w.scale}}; }
+    if (w.per == 0) { ret opt[Storage].some{Storage{fixed: w.fixed * n.fixed, per: w.fixed * n.per, scale: n.scale}}; }
+    ret opt[Storage].none{};
+}
+
+# the storage any location of a class may need through a selection: the
+# widest of its rows, whose storages are the class's width times their
+# pieces, none when a row's storage is none
+pub fun of_class(regs: *rf.Available, c: Class) opt[Storage] {
+    if (sel c.memory) { ret opt[Storage].some{Storage{fixed: c.memory.width::u64, per: 0, scale: 0}}; }
+    val file: *rf.File = c.hardware.file;
+    var most: Storage  = through(regs, file.classes[c.hardware.index].width);
+    var i:    u32      = 0;
+    for (i < file.register_count) {
+        val row: *rf.Register = ?file.registers[i];
+        if (row.class == c.hardware.index) {
+            val opt_of_register: opt[Storage] = of_register(regs, row);
+            if (sel opt_of_register.none)                                                       { ret opt_of_register; }
+            if (opt_of_register.some.fixed > most.fixed || opt_of_register.some.per > most.per) { most = opt_of_register.some; }
+        }
+        i = i + 1;
+    }
+    ret opt[Storage].some{most};
+}
+
+# the storage a group of `span` registers of a class takes through a
+# selection, the class's once per register and scaled where it scales, the
+# size of the slot the group spills to, none where the class's is none or the
+# span is 0
+pub fun of_group(regs: *rf.Available, c: Class, span: u32) opt[Storage] {
+    if (span == 0) { ret opt[Storage].none{}; }
+    val opt_one: opt[Storage] = of_class(regs, c);
+    if (sel opt_one.none) { ret opt_one; }
+    ret opt[Storage].some{Storage{fixed: opt_one.some.fixed * span::u64, per: opt_one.some.per * span::u64, scale: opt_one.some.scale}};
+}
+
+# the rows of the file `o` indexes that share storage with row `row` at some
+# legal multiplier and some place of each, which is what an allocator assumes
+# when either is unknown, the row itself first. a tuple shares with every row
+# its members share with, as a pair with each of its halves, by masc's overlap
+# index
+pub fun sharing(o: *rf.Overlaps, row: u32) res[rf.Span, allocator.Error] {
+    ret rf.overlapping(o, row);
+}
+
+# whether an instruction leaves no bit of register `other` holding its old
+# value, from the parts of its footprint: the words of its clobbers, its
+# row's flags and its writes, the one rule liveness ends a value by
+pub fun kills(file: *rf.File, clobbers: *u64, flags: effect.Flags, writes: Slice[effect.Written], other: rf.Id) bool {
+    ret footprint.kills_of(file, clobbers, flags, writes.data, writes.size, other);
+}
+
+# a class viewed within another, as masc's register file states it
+# ---
+# placement: where each register of the view lies within the register of the
+#            other class holding it, the same for every register, each amount
+#            a fixed part plus a part per unit of one slot's multiplier
+# part:      the row of one register of the view
+# whole:     the row of the register of the other class it lies within
+pub def View: rf.View;
+
+# class `part` of `file` as a view within class `whole`, none when they are one
+# class, a register of either lies within no register of the other or two,
+# the placements differ between registers or follow no one line across the
+# multipliers, or some register of `whole` holds none
+pub fun view(file: *rf.File, part: u16, whole: u16) opt[View] {
+    if (file == nil) { ret opt[View].none{}; }
+    ret rf.view_of(file, part, whole);
+}
+
+# the row of class `class` lying within row `whole` at placement `at`, one at
+# every multiplier as masc's same_placement compares, by the rows masc lists
+# as lying within it, none when no such row lies within
+fun lying_at(file: *rf.File, whole: u32, class: u16, at: rf.Placement) opt[rf.Id] {
+    val within: rf.Lyings = rf.lying_in(file, whole);
+    var i:      u32       = 0;
+    for (i < within.len) {
+        val l: *rf.Lying    = ?within.at[i];
+        val p: *rf.Register = ?file.registers[l.row];
+        if (p.class == class && rf.same_placement(l.placement, at)) { ret opt[rf.Id].some{rf.id_of(p)}; }
+        i = i + 1;
+    }
+    ret opt[rf.Id].none{};
+}
+
+# the register of class `part` a view places within register `whole`, none
+# when `whole` holds none
+pub fun viewed(file: *rf.File, whole: rf.Id, part: u16, v: View) opt[rf.Id] {
+    val opt_index_of: opt[u32] = rf.index_of(file, whole);
+    if (sel opt_index_of.none) { ret opt[rf.Id].none{}; }
+    ret lying_at(file, opt_index_of.some, part, v.placement);
+}
+
+# where register `part` lies within register `whole` at every legal
+# multiplier, one placement whose amounts each vary linearly with the
+# multiplier of the slot masc's lies names, so a group or a pair answers as a
+# single register does. none where it lies within at none or its placements
+# follow no one line. arithmetic on its bits resolves it at one multiplier
+# first (rf.resolve)
+pub fun lies(file: *rf.File, part: rf.Id, whole: rf.Id) opt[rf.Placement] {
+    val opt_row_of: opt[*rf.Register] = rf.row_of(file, part);
+    if (sel opt_row_of.none) { ret opt[rf.Placement].none{}; }
+    val opt_row_of_file: opt[*rf.Register] = rf.row_of(file, whole);
+    if (sel opt_row_of_file.none) { ret opt[rf.Placement].none{}; }
+    ret rf.lies(file, opt_row_of.some, opt_row_of_file.some);
+}
+
+# the register of `part`'s class that lies within `to` where `part` lies
+# within `from`, as a swap of ax and cx moves what ah held to ch, or of two
+# risc-v groups v0:v3 and v4:v7 moves what v2:v3 held to v6:v7, none where
+# `part` lies within `from` at no one placement or `to` holds none there.
+# the placements compare at every multiplier, as masc's same_placement does.
+# `to` itself answers when it is of `part`'s class and lies within itself there
+pub fun counterpart(file: *rf.File, part: rf.Id, from: rf.Id, to: rf.Id) opt[rf.Id] {
+    val opt_lies: opt[rf.Placement] = lies(file, part, from);
+    if (sel opt_lies.none) { ret opt[rf.Id].none{}; }
+    val opt_index_of: opt[u32] = rf.index_of(file, to);
+    if (sel opt_index_of.none) { ret opt[rf.Id].none{}; }
+    val class: u16 = rf.class_of(part);
+    if (rf.class_of(to) == class) {
+        val opt_own: opt[rf.Placement] = lies(file, to, to);
+        if (sel opt_own.some && rf.same_placement(opt_own.some, opt_lies.some)) { ret opt[rf.Id].some{to}; }
+    }
+    ret lying_at(file, opt_index_of.some, class, opt_lies.some);
+}
+
+# whether a write through a view leaves no bit of the value of the class it is
+# a view of, as a zeroing write of a low part ends the whole's value and a
+# keeping one does not, by masc's overwrites of its rows and the extension the write states
+pub fun view_kills(file: *rf.File, v: View, stated: opt[rf.Extend]) bool {
+    ret rf.overwrites(file, ?file.registers[v.part], ?file.registers[v.whole], stated);
+}

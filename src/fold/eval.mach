@@ -1,0 +1,663 @@
+# the folder: one operation of the opcode table evaluated on constants
+#
+# the row decides everything but the arithmetic: its rules type the request
+# through the one checker, its traps refuse what would trap, its overshift and
+# order settle shifts past the width and nan comparisons, and its secrecy rule
+# marks the results. the row's entry in the evaluation table does the rest.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.base.slice;
+use mirl.fold.float;
+use mirl.fold.float.Spec;
+use mirl.fold.record.Error;
+use mirl.fold.record.Folded;
+use mirl.fold.record.Outcome;
+use mirl.fold.record.Request;
+use mirl.fold.record.Value;
+use mirl.fold.record.dnit;
+use mirl.fold.table;
+use mirl.fold.table.Entry;
+use mirl.fold.table.Relation;
+use mirl.fold.word;
+use mirl.fold.word.Wide;
+use mirl.ir.constant.Bits;
+use checker: mirl.ir.opcode.check;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Row;
+use mirl.ir.opcode.row.Traps;
+use opcode_rule: mirl.ir.opcode.rule;
+use mirl.ir.opcode.rule.Overshift;
+use mirl.ir.opcode.rule.Trap;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.format;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.target.capability.Nans;
+
+fun refuse(r: Error) Outcome {
+    ret Outcome.refused{r};
+}
+
+# a zeroed slice of n items, nil data when n is 0
+fun take[T](a: *allocator.Allocator, n: usize) res[Slice[T], allocator.Error] {
+    var s: Slice[T];
+    s.data = nil;
+    s.size = n;
+    if (n == 0) { ret res[Slice[T], allocator.Error].ok{s}; }
+    val res_zallocate: res[*T, allocator.Error] = allocator.zallocate[T](a, n);
+    if (sel res_zallocate.err) { ret res[Slice[T], allocator.Error].err{res_zallocate.err}; }
+    s.data = res_zallocate.ok;
+    ret res[Slice[T], allocator.Error].ok{s};
+}
+
+# a type read as its lanes: a vector's lane count and lane type, a scalar one lane of itself
+rec Lanes {
+    count: u32;
+    lane:  Type;
+}
+
+fun lanes_of(t: *type_table.Table, ty: Type) res[Lanes, Error] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(t, ty);
+    if (sel res_shape.err)       { ret res[Lanes, Error].err{Error.types{res_shape.err}}; }
+    if (sel res_shape.ok.vector) { ret res[Lanes, Error].ok{Lanes{count: res_shape.ok.vector.lanes, lane: res_shape.ok.vector.element}}; }
+    ret res[Lanes, Error].ok{Lanes{count: 1, lane: ty}};
+}
+
+# the bits of a lane type: an integer's width or a float format's
+pub fun bits_of(t: *type_table.Table, lane: Type) res[u32, Error] {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(t, lane);
+    if (sel res_shape.err)        { ret res[u32, Error].err{Error.types{res_shape.err}}; }
+    if (sel res_shape.ok.integer) { ret res[u32, Error].ok{res_shape.ok.integer.width}; }
+    if (sel res_shape.ok.float) {
+        val opt_row: opt[format.Row] = format.row(res_shape.ok.float.format);
+        if (sel opt_row.none) { ret res[u32, Error].err{Error.types{type_table.Error.format{res_shape.ok.float.format}}}; }
+        ret res[u32, Error].ok{opt_row.some.width};
+    }
+    ret res[u32, Error].err{Error.unfoldable{}};
+}
+
+# the spec of a float lane type, with the target's nan rule for its format
+fun spec_of(t: *type_table.Table, nans: Slice[Nans], lane: Type) res[Spec, Error] {
+    val res_format: res[format.Format, type_table.Error] = type_table.format(t, lane);
+    if (sel res_format.err) { ret res[Spec, Error].err{Error.types{res_format.err}}; }
+    val opt_row: opt[format.Row] = format.row(res_format.ok);
+    if (sel opt_row.none) { ret res[Spec, Error].err{Error.types{type_table.Error.format{res_format.ok}}}; }
+    val opt_spec: opt[Spec] = float.spec(opt_row.some);
+    if (sel opt_spec.none) { ret res[Spec, Error].err{Error.unfoldable{}}; }
+    var sp: Spec = opt_spec.some;
+    if (res_format.ok::usize < nans.size) { sp.nans = nans.data[res_format.ok]; }
+    ret res[Spec, Error].ok{sp};
+}
+
+# what the evaluation reads: the row, the request and its operands lane by lane
+rec Frame {
+    a:       *allocator.Allocator;
+    t:       *type_table.Table;
+    nans:    Slice[Nans];
+    row:     *Row;
+    req:     Request;
+    x:       Slice[Slice[Wide]];
+    widths:  Slice[u32];
+    results: Slice[Type];
+    got:     [2]Slice[Wide];
+}
+
+fun frame_dnit(f: *Frame) {
+    var i: usize = 0;
+    for (i < f.x.size) {
+        slice.free[Wide](f.a, f.x.data[i]);
+        i = i + 1;
+    }
+    slice.free[Slice[Wide]](f.a, f.x);
+    slice.free[u32](f.a, f.widths);
+    slice.free[Wide](f.a, f.got[0]);
+    slice.free[Wide](f.a, f.got[1]);
+}
+
+# read each operand into lanes, refusing one whose bits do not fit its type
+fun read(f: *Frame) err[Error] {
+    val n:         usize                                    = f.req.operands.size;
+    val res_taken: res[Slice[Slice[Wide]], allocator.Error] = take[Slice[Wide]](f.a, n);
+    if (sel res_taken.err) { ret err[Error].err{Error.alloc{res_taken.err}}; }
+    f.x = res_taken.ok;
+    val res_widths: res[Slice[u32], allocator.Error] = take[u32](f.a, n);
+    if (sel res_widths.err) { ret err[Error].err{Error.alloc{res_widths.err}}; }
+    f.widths = res_widths.ok;
+    var i: usize = 0;
+    for (i < n) {
+        val v:            Value             = f.req.operands.data[i].value;
+        val res_lanes_of: res[Lanes, Error] = lanes_of(f.t, v.type);
+        if (sel res_lanes_of.err) { ret err[Error].err{res_lanes_of.err}; }
+        val res_bits: res[u32, Error] = bits_of(f.t, res_lanes_of.ok.lane);
+        if (sel res_bits.err) { ret err[Error].err{res_bits.err}; }
+        f.widths.data[i] = res_bits.ok;
+        if (v.lanes.size != res_lanes_of.ok.count::usize) { ret err[Error].err{Error.operand{i::u32}}; }
+        val res_lanes: res[Slice[Wide], allocator.Error] = take[Wide](f.a, v.lanes.size);
+        if (sel res_lanes.err) { ret err[Error].err{Error.alloc{res_lanes.err}}; }
+        f.x.data[i] = res_lanes.ok;
+        var l: usize = 0;
+        for (l < v.lanes.size) {
+            val b: Bits = v.lanes.data[l];
+            if (!type_table.same(b.type, res_lanes_of.ok.lane))     { ret err[Error].err{Error.operand{i::u32}}; }
+            if (b.words.size != word.words_for(res_bits.ok)::usize) { ret err[Error].err{Error.operand{i::u32}}; }
+            if (b.words.size > word.words()::usize)                 { ret err[Error].err{Error.operand{i::u32}}; }
+            val k: Wide = word.of(b.words);
+            if (word.compare(word.mask(k, res_bits.ok), k) != 0) { ret err[Error].err{Error.operand{i::u32}}; }
+            f.x.data[i].data[l] = k;
+            l                   = l + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+fun any_zero(lanes: Slice[Wide]) bool {
+    var l: usize = 0;
+    for (l < lanes.size) {
+        if (word.is_zero(lanes.data[l])) { ret true; }
+        l = l + 1;
+    }
+    ret false;
+}
+
+# whether a lane divides the least signed value by -1, which overflows
+fun any_overflow(dividend: Slice[Wide], divisor: Slice[Wide], width: u32) bool {
+    var l: usize = 0;
+    for (l < dividend.size && l < divisor.size) {
+        val least: bool = word.compare(dividend.data[l], word.least(width)) == 0;
+        val ones:  bool = word.compare(divisor.data[l], word.ones(width)) == 0;
+        if (least && ones) { ret true; }
+        l = l + 1;
+    }
+    ret false;
+}
+
+# whether a lane's high word is at or above its divisor, so the quotient does not fit
+fun any_exceeding(high: Slice[Wide], divisor: Slice[Wide], width: u32) bool {
+    var l: usize = 0;
+    for (l < high.size && l < divisor.size) {
+        if (word.compare(word.mask(high.data[l], width), word.mask(divisor.data[l], width)) >= 0) { ret true; }
+        l = l + 1;
+    }
+    ret false;
+}
+
+# the first trap of the row the operands would take
+fun trapped(f: *Frame) opt[Trap] {
+    var i: u32 = 0;
+    for (i < $length_of(Traps)) {
+        val tr: Trap = f.row.effects.traps[i];
+        if (sel tr.zero && any_zero(f.x.data[tr.zero])) { ret opt[Trap].some{tr}; }
+        if (sel tr.overflow) {
+            val d: opcode_rule.Division = tr.overflow;
+            if (any_overflow(f.x.data[d.dividend], f.x.data[d.divisor], f.widths.data[d.dividend])) { ret opt[Trap].some{tr}; }
+        }
+        if (sel tr.exceeds) {
+            val d: opcode_rule.Division = tr.exceeds;
+            if (any_exceeding(f.x.data[d.dividend], f.x.data[d.divisor], f.widths.data[d.divisor])) { ret opt[Trap].some{tr}; }
+        }
+        i = i + 1;
+    }
+    ret opt[Trap].none{};
+}
+
+fun result_lanes(f: *Frame, j: usize) res[Lanes, Error] {
+    ret lanes_of(f.t, f.results.data[j]);
+}
+
+# the result of a shift by a count at or past the width, by the row's overshift rule
+fun overshift(o: Overshift, x: Wide, width: u32) Wide {
+    if (sel o.sign && word.negative(x, width)) { ret word.ones(width); }
+    ret word.zero();
+}
+
+# whether a relation is true of an ordering, below, at or above zero
+fun holds(r: Relation, order: i32) bool {
+    if (order < 0)  { ret r.less; }
+    if (order == 0) { ret r.equal; }
+    ret r.greater;
+}
+
+fun flag(b: bool) Wide {
+    if (b) { ret word.small(1); }
+    ret word.zero();
+}
+
+# the lane the immediate at `at` names, refused when it names none
+fun lane_immediate(f: *Frame, at: usize) res[u32, Error] {
+    if (at < f.req.immediates.size) {
+        val im: Immediate = f.req.immediates.data[at];
+        if (sel im.lane) { ret res[u32, Error].ok{im.lane}; }
+    }
+    ret res[u32, Error].err{Error.check{checker.Error.immediate{at::u32}}};
+}
+
+fun result_spec(f: *Frame) res[Spec, Error] {
+    val res_result_lanes: res[Lanes, Error] = result_lanes(f, 0);
+    if (sel res_result_lanes.err) { ret res[Spec, Error].err{res_result_lanes.err}; }
+    ret spec_of(f.t, f.nans, res_result_lanes.ok.lane);
+}
+
+fun result_width(f: *Frame) res[u32, Error] {
+    val res_result_lanes: res[Lanes, Error] = result_lanes(f, 0);
+    if (sel res_result_lanes.err) { ret res[u32, Error].err{res_result_lanes.err}; }
+    ret bits_of(f.t, res_result_lanes.ok.lane);
+}
+
+fun operand_spec(f: *Frame) res[Spec, Error] {
+    val res_lanes_of: res[Lanes, Error] = lanes_of(f.t, f.req.operands.data[0].value.type);
+    if (sel res_lanes_of.err) { ret res[Spec, Error].err{res_lanes_of.err}; }
+    ret spec_of(f.t, f.nans, res_lanes_of.ok.lane);
+}
+
+# the same bits laid lane after lane, the first lane lowest
+fun recast(f: *Frame, out: Slice[Wide], width: u32) {
+    val src:  Slice[Wide] = f.x.data[0];
+    val from: u32         = f.widths.data[0];
+    var l:    usize       = 0;
+    for (l < out.size) {
+        var r: Wide;
+        var b: u32 = 0;
+        for (b < width) {
+            val g: u32 = l::u32 * width + b;
+            if (word.bit(src.data[g / from], g % from)) { r[b / 64] = r[b / 64] | (1::u64 << (b % 64)::u64); }
+            b = b + 1;
+        }
+        out.data[l] = r;
+        l           = l + 1;
+    }
+}
+
+# each lane a float operation computed as the target returns it, by the nan
+# rule of its format, refused where the rule states no bits for a nan
+fun rule(s: *Spec, out: Slice[Wide]) err[Error] {
+    var l: usize = 0;
+    for (l < out.size) {
+        val opt_ruled: opt[Wide] = float.ruled(s, out.data[l]);
+        if (sel opt_ruled.none) { ret err[Error].err{Error.nan{}}; }
+        out.data[l] = opt_ruled.some;
+        l           = l + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# evaluate the entry into the result lanes
+fun evaluate(f: *Frame, e: Entry) err[Error] {
+    var j: usize = 0;
+    for (j < f.results.size) {
+        val res_result_lanes: res[Lanes, Error] = result_lanes(f, j);
+        if (sel res_result_lanes.err) { ret err[Error].err{res_result_lanes.err}; }
+        val res_usize_taken: res[Slice[Wide], allocator.Error] = take[Wide](f.a, res_result_lanes.ok.count::usize);
+        if (sel res_usize_taken.err) { ret err[Error].err{Error.alloc{res_usize_taken.err}}; }
+        f.got[j] = res_usize_taken.ok;
+        j        = j + 1;
+    }
+    val out: Slice[Wide] = f.got[0];
+    val n:   usize       = out.size;
+    var x0:  Slice[Wide];
+    var x1:  Slice[Wide];
+    var x2:  Slice[Wide];
+    var w:   u32         = 0;
+    if (f.x.size > 0) {
+        x0 = f.x.data[0];
+        w  = f.widths.data[0];
+    }
+    if (f.x.size > 1) { x1 = f.x.data[1]; }
+    if (f.x.size > 2) { x2 = f.x.data[2]; }
+    var l: usize = 0;
+
+    if (sel e.unary) {
+        for (l < n) {
+            out.data[l] = e.unary(x0.data[l], w);
+            l           = l + 1;
+        }
+    }
+    or (sel e.binary) {
+        for (l < n) {
+            out.data[l] = e.binary(x0.data[l], x1.data[l], w);
+            l           = l + 1;
+        }
+    }
+    or (sel e.shift) {
+        for (l < n) {
+            val count: Wide = x1.data[l];
+            if (word.compare(count, word.small(w::u64)) >= 0) { out.data[l] = overshift(f.row.overshift, x0.data[l], w); }
+            or                                                { out.data[l] = e.shift(x0.data[l], count[0]::u32, w); }
+            l = l + 1;
+        }
+    }
+    or (sel e.overflow) {
+        for (l < n) {
+            var over: bool = false;
+            out.data[l]      = e.overflow(x0.data[l], x1.data[l], w, ?over);
+            f.got[1].data[l] = flag(over);
+            l                = l + 1;
+        }
+    }
+    or (sel e.long) {
+        for (l < n) {
+            var rem: Wide;
+            out.data[l]      = e.long(x0.data[l], x1.data[l], x2.data[l], w, ?rem);
+            f.got[1].data[l] = rem;
+            l                = l + 1;
+        }
+    }
+    or (sel e.compare) {
+        for (l < n) {
+            var order: i32 = 0;
+            if (e.compare.signed) { order = word.compare_signed(x0.data[l], x1.data[l], w); }
+            or                    { order = word.compare(x0.data[l], x1.data[l]); }
+            out.data[l] = flag(holds(e.compare.relation, order));
+            l           = l + 1;
+        }
+    }
+    or (sel e.reduce) {
+        var acc: Wide = x0.data[0];
+        l = 1;
+        for (l < x0.size) {
+            acc = e.reduce(acc, x0.data[l], w);
+            l   = l + 1;
+        }
+        out.data[0] = acc;
+    }
+    or (sel e.resize) {
+        val res_result_width: res[u32, Error] = result_width(f);
+        if (sel res_result_width.err) { ret err[Error].err{res_result_width.err}; }
+        for (l < n) {
+            out.data[l] = e.resize(x0.data[l], w, res_result_width.ok);
+            l           = l + 1;
+        }
+    }
+    or (sel e.float_unary) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        var sp: Spec = res_operand_spec.ok;
+        for (l < n) {
+            out.data[l] = e.float_unary(?sp, x0.data[l]);
+            l           = l + 1;
+        }
+        ret rule(?sp, out);
+    }
+    or (sel e.float_binary) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        var sp: Spec = res_operand_spec.ok;
+        for (l < n) {
+            out.data[l] = e.float_binary(?sp, x0.data[l], x1.data[l]);
+            l           = l + 1;
+        }
+        ret rule(?sp, out);
+    }
+    or (sel e.float_ternary) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        var sp: Spec = res_operand_spec.ok;
+        for (l < n) {
+            if (!float.fused_ordered(?sp, x0.data[l], x1.data[l], x2.data[l])) { ret err[Error].err{Error.nan{}}; }
+            out.data[l] = e.float_ternary(?sp, x0.data[l], x1.data[l], x2.data[l]);
+            l           = l + 1;
+        }
+        ret rule(?sp, out);
+    }
+    or (sel e.sign_unary) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        var sp: Spec = res_operand_spec.ok;
+        for (l < n) {
+            out.data[l] = e.sign_unary(?sp, x0.data[l]);
+            l           = l + 1;
+        }
+    }
+    or (sel e.sign_binary) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        var sp: Spec = res_operand_spec.ok;
+        for (l < n) {
+            out.data[l] = e.sign_binary(?sp, x0.data[l], x1.data[l]);
+            l           = l + 1;
+        }
+    }
+    or (sel e.float_compare) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        var sp: Spec = res_operand_spec.ok;
+        for (l < n) {
+            val o: float.Ordering = float.order(?sp, x0.data[l], x1.data[l]);
+            var t: bool           = false;
+            if (sel o.unordered) { t = sel f.row.order.unordered; }
+            or (sel o.less)      { t = e.float_compare.less; }
+            or (sel o.equal)     { t = e.float_compare.equal; }
+            or                   { t = e.float_compare.greater; }
+            out.data[l] = flag(t);
+            l           = l + 1;
+        }
+    }
+    or (sel e.float_reduce) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        var sp:  Spec = res_operand_spec.ok;
+        var acc: Wide = x0.data[0];
+        l = 1;
+        for (l < x0.size) {
+            acc = e.float_reduce(?sp, acc, x0.data[l]);
+            l   = l + 1;
+        }
+        out.data[0] = acc;
+        ret rule(?sp, out);
+    }
+    or (sel e.to_float) {
+        val res_result_spec: res[Spec, Error] = result_spec(f);
+        if (sel res_result_spec.err) { ret err[Error].err{res_result_spec.err}; }
+        var sp: Spec = res_result_spec.ok;
+        for (l < n) {
+            out.data[l] = float.from_integer(?sp, x0.data[l], w, e.to_float);
+            l           = l + 1;
+        }
+    }
+    or (sel e.to_integer) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        val res_result_width: res[u32, Error] = result_width(f);
+        if (sel res_result_width.err) { ret err[Error].err{res_result_width.err}; }
+        var sp: Spec = res_operand_spec.ok;
+        for (l < n) {
+            out.data[l] = float.to_integer(?sp, x0.data[l], res_result_width.ok, e.to_integer);
+            l           = l + 1;
+        }
+    }
+    or (sel e.reformat) {
+        val res_operand_spec: res[Spec, Error] = operand_spec(f);
+        if (sel res_operand_spec.err) { ret err[Error].err{res_operand_spec.err}; }
+        val res_result_spec: res[Spec, Error] = result_spec(f);
+        if (sel res_result_spec.err) { ret err[Error].err{res_result_spec.err}; }
+        var from: Spec = res_operand_spec.ok;
+        var to:   Spec = res_result_spec.ok;
+        for (l < n) {
+            out.data[l] = float.convert(?from, ?to, x0.data[l]);
+            l           = l + 1;
+        }
+        ret rule(?to, out);
+    }
+    or (sel e.bitcast) {
+        val res_result_width: res[u32, Error] = result_width(f);
+        if (sel res_result_width.err) { ret err[Error].err{res_result_width.err}; }
+        recast(f, out, res_result_width.ok);
+    }
+    or (sel e.select) {
+        for (l < n) {
+            if (word.is_zero(x0.data[l])) { out.data[l] = x2.data[l]; }
+            or                            { out.data[l] = x1.data[l]; }
+            l = l + 1;
+        }
+    }
+    or (sel e.identity) {
+        for (l < n) {
+            out.data[l] = x0.data[l];
+            l           = l + 1;
+        }
+    }
+    or (sel e.splat) {
+        for (l < n) {
+            out.data[l] = x0.data[0];
+            l           = l + 1;
+        }
+    }
+    or (sel e.build) {
+        for (l < n) {
+            out.data[l] = f.x.data[l].data[0];
+            l           = l + 1;
+        }
+    }
+    or (sel e.shuffle) {
+        val im: Immediate = f.req.immediates.data[1];
+        if (!(sel im.lanes)) { ret err[Error].err{Error.check{checker.Error.immediate{1}}}; }
+        for (l < n) {
+            val k: usize = im.lanes.data[l]::usize;
+            if (k < x0.size) { out.data[l] = x0.data[k]; }
+            or               { out.data[l] = x1.data[k - x0.size]; }
+            l = l + 1;
+        }
+    }
+    or (sel e.extract) {
+        val res_lane_immediate: res[u32, Error] = lane_immediate(f, 0);
+        if (sel res_lane_immediate.err) { ret err[Error].err{res_lane_immediate.err}; }
+        out.data[0] = x0.data[res_lane_immediate.ok];
+    }
+    or (sel e.insert) {
+        val res_lane_immediate: res[u32, Error] = lane_immediate(f, 0);
+        if (sel res_lane_immediate.err) { ret err[Error].err{res_lane_immediate.err}; }
+        for (l < n) {
+            out.data[l] = x0.data[l];
+            l           = l + 1;
+        }
+        out.data[res_lane_immediate.ok] = x1.data[0];
+    }
+    or {
+        ret err[Error].err{Error.unfoldable{}};
+    }
+    ret err[Error].ok{};
+}
+
+# fill the result values, their bits copied from the evaluated lanes
+fun fill(f: *Frame, done: *Folded) err[Error] {
+    val res_size_taken: res[Slice[Value], allocator.Error] = take[Value](f.a, f.results.size);
+    if (sel res_size_taken.err) { ret err[Error].err{Error.alloc{res_size_taken.err}}; }
+    done.results = res_size_taken.ok;
+    var j: usize = 0;
+    for (j < f.results.size) {
+        val res_result_lanes: res[Lanes, Error] = result_lanes(f, j);
+        if (sel res_result_lanes.err) { ret err[Error].err{res_result_lanes.err}; }
+        val res_bits: res[u32, Error] = bits_of(f.t, res_result_lanes.ok.lane);
+        if (sel res_bits.err) { ret err[Error].err{res_bits.err}; }
+        val res_lanes: res[Slice[Bits], allocator.Error] = take[Bits](f.a, res_result_lanes.ok.count::usize);
+        if (sel res_lanes.err) { ret err[Error].err{Error.alloc{res_lanes.err}}; }
+        done.results.data[j] = Value{type: f.results.data[j], lanes: res_lanes.ok};
+        val size: usize = word.words_for(res_bits.ok)::usize;
+        var l:    usize = 0;
+        for (l < res_lanes.ok.size) {
+            val res_size_taken: res[Slice[u64], allocator.Error] = take[u64](f.a, size);
+            if (sel res_size_taken.err) { ret err[Error].err{Error.alloc{res_size_taken.err}}; }
+            val k: Wide  = word.mask(f.got[j].data[l], res_bits.ok);
+            var i: usize = 0;
+            for (i < size) {
+                res_size_taken.ok.data[i] = k[i];
+                i                         = i + 1;
+            }
+            res_lanes.ok.data[l] = Bits{type: res_result_lanes.ok.lane, words: res_size_taken.ok};
+            l                    = l + 1;
+        }
+        j = j + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# type the request by the one checker, giving its result types and whether they are secret
+fun typed(f: *Frame, out: *vector.Vector[Type]) res[bool, Error] {
+    val n:         usize                             = f.req.operands.size;
+    val res_taken: res[Slice[Type], allocator.Error] = take[Type](f.a, n);
+    if (sel res_taken.err) { ret res[bool, Error].err{Error.alloc{res_taken.err}}; }
+    fin { slice.free[Type](f.a, res_taken.ok); }
+    val res_secret: res[Slice[bool], allocator.Error] = take[bool](f.a, n);
+    if (sel res_secret.err) { ret res[bool, Error].err{Error.alloc{res_secret.err}}; }
+    fin { slice.free[bool](f.a, res_secret.ok); }
+    var i: usize = 0;
+    for (i < n) {
+        res_taken.ok.data[i]  = f.req.operands.data[i].value.type;
+        res_secret.ok.data[i] = f.req.operands.data[i].secret;
+        i                     = i + 1;
+    }
+    var inst: checker.Instance;
+    inst.operands   = res_taken.ok;
+    inst.secret     = res_secret.ok;
+    inst.declared   = false;
+    inst.immediates = f.req.immediates;
+    val res_checked: res[bool, checker.Error] = checker.check(f.t, f.req.opcode, inst, out);
+    if (sel res_checked.err) { ret res[bool, Error].err{Error.check{res_checked.err}}; }
+    ret res[bool, Error].ok{res_checked.ok};
+}
+
+# evaluate one operation on constants
+#
+# a fold gives exactly what the operation gives when it runs, or refuses: an
+# operation that would trap is refused by the trap, never answered.
+# ---
+# a:    the allocator the results are taken from
+# t:    the type table the request's types are in, which may intern a mask type
+# nans: the nan the target's float operations return in each format, at the
+#       format's index. a float operation whose result is a nan folds only in
+#       a format whose rule is canonical or propagate, and is refused in any
+#       other or one past the list
+# req:  the operation and its constant operands
+# ret:  the results, owned by the caller until `dnit`, or why there are none
+pub fun fold(a: *allocator.Allocator, t: *type_table.Table, nans: Slice[Nans], req: Request) Outcome {
+    val opt_found: opt[*Row] = opcode_table.at(req.opcode);
+    if (sel opt_found.none) { ret refuse(Error.check{checker.Error.opcode{req.opcode}}); }
+    var f: Frame;
+    f.a    = a;
+    f.t    = t;
+    f.nans = nans;
+    f.row  = opt_found.some;
+    f.req  = req;
+
+    var i: u32 = 0;
+    for (i < $length_of(Traps)) {
+        val tr: Trap = f.row.effects.traps[i];
+        if (sel tr.always) { ret refuse(Error.trap{tr}); }
+        i = i + 1;
+    }
+    val e: Entry = table.entry(req.opcode);
+    if (sel e.unfoldable || sel e.unstated) { ret refuse(Error.unfoldable{}); }
+
+    var out: vector.Vector[Type] = vector.init[Type](a);
+    fin { vector.dnit[Type](?out); }
+    val res_secret: res[bool, Error] = typed(?f, ?out);
+    if (sel res_secret.err) { ret refuse(res_secret.err); }
+    f.results = Slice[Type]{data: out.data, size: out.len};
+
+    fin { frame_dnit(?f); }
+    val err_read_in: err[Error] = read(?f);
+    if (sel err_read_in.err) { ret refuse(err_read_in.err); }
+    val opt_trap: opt[Trap] = trapped(?f);
+    if (sel opt_trap.some) { ret refuse(Error.trap{opt_trap.some}); }
+    val err_evaluated: err[Error] = evaluate(?f, e);
+    if (sel err_evaluated.err) { ret refuse(err_evaluated.err); }
+    var done: Folded;
+    done.secret = res_secret.ok;
+    val err_filled: err[Error] = fill(?f, ?done);
+    if (sel err_filled.err) {
+        dnit(a, done);
+        ret refuse(err_filled.err);
+    }
+    ret Outcome.folded{done};
+}

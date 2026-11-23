@@ -1,0 +1,473 @@
+# multiply forms: the high half of a product the target has no form for is built
+# from the multiplies it has
+#
+# the ir states the high half of a product of two W bit operands as its own
+# operation, `mul.high.u`, `mul.high.s` and `mul.high.su`, the algebra table
+# saying how each reads its operands. a target that computes it at W, by a
+# multiply that gives the high half or the whole product, selects it as it
+# stands. a target declares those forms and the pass reads them. a front end
+# may also write the high half as the low W bits of the exact product shifted
+# down by W, the product being the multiply of the two operands extended to 2W
+# bits, each by sign or by zeros. where the target has a form for it the pass
+# writes the pattern as that form, and a target with a native multiply at 2W
+# selects the pattern as it stands. the instructions a rewritten pattern was
+# made of go where nothing else reads them.
+#
+# where a target has neither, and multiplies natively at W, the pass builds the
+# high half from four multiplies of the half width pieces of the operands,
+# carried into the high half, the way a split product is built. an operand read
+# as signed takes the other operand away from the result when it is negative,
+# so the three signs a pair of operands makes are one construction. the widths
+# a target does not multiply natively are not this pass's: an integer wider than
+# the register is split by the wide integer legalisation, one narrower than
+# the arithmetic widths is widened by the narrow integer legalisation, and one
+# with no multiply calls a helper. a vector no unit multiplies is taken lane
+# by lane by the vector legalisation first.
+#
+# the construction is shifts, masks, adds and multiplies, with no branch and no
+# memory access, so it keeps constant time, and its secrecy is that of the
+# instructions it is made of.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.vector;
+
+use mirl.fold.algebra;
+use mirl.fold.algebra.Op;
+use mirl.fold.record;
+use mirl.fold.word;
+use mirl.ir.body;
+use mirl.ir.contents;
+use mirl.ir.function.Body;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.opcode.row;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Def;
+use mirl.legal.emit;
+use mirl.legal.emit.Lane;
+use mirl.legal.emit.Site;
+use mirl.opt.number;
+use mirl.pass.analysis;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.target.capability;
+use mirl.target.capability.Arithmetic;
+use mirl.target.capability.Sign;
+
+# the pass: it adds instructions in front of the truncation it rebuilds and
+# never touches an edge or a block
+pub val MULTIPLY_FORMS: Pass = Pass{name: "multiply forms", kind: Kind.legalise{}, scope: Scope.function{visit}, preserves: analysis.FLOW, time: Time.keeps{}, applies: wanted};
+
+# whether the target multiplies at some width, where a high half is either a
+# form it computes, which a pattern is written as, or one it builds
+fun wanted(g: *Ground) bool {
+    ret sel g.t.caps.arithmetic.multiply.widths;
+}
+
+# the instructions a pattern of the high half is made of, above its truncation
+# ---
+# shift:   the shift down of the product
+# product: the multiply of the two extensions
+# left:    the extension of the first operand
+# right:   the extension of the second
+pub rec Parts {
+    shift:   Instruction;
+    product: Instruction;
+    left:    Instruction;
+    right:   Instruction;
+}
+
+# the high half of a product
+# ---
+# lhs:   the first operand
+# rhs:   the second
+# lhs_s: the first is read as signed
+# rhs_s: the second is read as signed
+# lane:  the integer the high half is
+pub rec High {
+    lhs:   Value;
+    rhs:   Value;
+    lhs_s: bool;
+    rhs_s: bool;
+    lane:  Lane;
+}
+
+# the high half of a product, as a pattern is written
+# ---
+# high:  the high half, its operands before their extensions
+# parts: the instructions the pattern is made of
+pub rec Found {
+    high:  High;
+    parts: Parts;
+}
+
+# one visit
+# ---
+# site:    the function being rewritten
+# caps:    the target's arithmetic declarations
+# changed: the function was changed
+# taken:   the instructions of each pattern rewritten, which go once unused
+rec Work {
+    site:    Site;
+    caps:    *Arithmetic;
+    changed: bool;
+    taken:   vector.Vector[Instruction];
+}
+
+# the placed instruction that defines a value
+fun defining(b: *Body, v: Value) opt[Instruction] {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.result)) { ret opt[Instruction].none{}; }
+    val d: *InstructionData = ?b.instructions.data[def.result.instruction];
+    if (!(sel d.place.placed)) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{def.result.instruction};
+}
+
+# the algebra a placed instruction's opcode states
+fun op_of(d: *InstructionData) Op {
+    ret algebra.op(d.opcode);
+}
+
+# whether a value is the constant n in its one lane
+fun constant_is(s: *Site, v: Value, n: u64) res[bool, refusal.Error] {
+    val res_read: res[opt[record.Value], refusal.Error] = number.read(s.m, s.b, s.scratch, v);
+    if (sel res_read.err)                 { ret res[bool, refusal.Error].err{res_read.err}; }
+    if (sel res_read.ok.none)             { ret res[bool, refusal.Error].ok{false}; }
+    if (res_read.ok.some.lanes.size != 1) { ret res[bool, refusal.Error].ok{false}; }
+    ret res[bool, refusal.Error].ok{word.compare(word.of(res_read.ok.some.lanes.data[0].words), word.small(n)) == 0};
+}
+
+# an extension: the value it extends and whether it extends by sign
+# ---
+# x:      the value extended
+# signed: it is extended with copies of its sign bit
+# at:     the extension
+rec Extended {
+    x:      Value;
+    signed: bool;
+    at:     Instruction;
+}
+
+# the extension an operand of a product is, of a value of type from to type to
+fun extension(s: *Site, v: Value, to: Type, from: Type) opt[Extended] {
+    val opt_defining: opt[Instruction] = defining(s.b, v);
+    if (sel opt_defining.none) { ret opt[Extended].none{}; }
+    val d:  *InstructionData = ?s.b.instructions.data[opt_defining.some];
+    val op: Op               = op_of(d);
+    if (!(sel op.extend_u || sel op.extend_s) || d.operands.len != 1) { ret opt[Extended].none{}; }
+    val x: Value = d.operands.data[0];
+    if (!table.same(s.b.values.data[x].type, from)) { ret opt[Extended].none{}; }
+    if (!table.same(s.b.values.data[v].type, to))   { ret opt[Extended].none{}; }
+    ret opt[Extended].some{Extended{x: x, signed: sel op.extend_s, at: opt_defining.some}};
+}
+
+# what a truncation is of, when it is the high half of a product of two
+# extensions, as a front end may write a high multiply
+# ---
+# s:   the function the truncation is in
+# t:   the truncation
+# ret: the pattern, none when the truncation is not one, or why it could not be read
+pub fun high(s: *Site, t: *InstructionData) res[opt[Found], refusal.Error] {
+    val res_none: res[opt[Found], refusal.Error] = res[opt[Found], refusal.Error].ok{opt[Found].none{}};
+    val top:      Op                             = op_of(t);
+    if (!(sel top.truncate)) { ret res_none; }
+    ret high_of(s, t);
+}
+
+# what a truncation is of, as `high` finds it
+fun high_of(s: *Site, t: *InstructionData) res[opt[Found], refusal.Error] {
+    val res_none: res[opt[Found], refusal.Error] = res[opt[Found], refusal.Error].ok{opt[Found].none{}};
+    if (t.operands.len != 1 || t.results.len != 1) { ret res_none; }
+    val ty:          Type                          = s.b.values.data[t.results.data[0]].type;
+    val res_lane_of: res[opt[Lane], refusal.Error] = emit.lane_of(s.m, ty);
+    if (sel res_lane_of.err)     { ret res[opt[Found], refusal.Error].err{res_lane_of.err}; }
+    if (sel res_lane_of.ok.none) { ret res_none; }
+    val lane: Lane = res_lane_of.ok.some;
+    if (lane.lanes != 0) { ret res_none; }
+
+    val opt_down: opt[Instruction] = defining(s.b, t.operands.data[0]);
+    if (sel opt_down.none) { ret res_none; }
+    val dd:  *InstructionData = ?s.b.instructions.data[opt_down.some];
+    val dop: Op               = op_of(dd);
+    if (!(sel dop.shift_right_u || sel dop.shift_right_s) || dd.operands.len != 2) { ret res_none; }
+    val res_constant_is: res[bool, refusal.Error] = constant_is(s, dd.operands.data[1], lane.bits::u64);
+    if (sel res_constant_is.err) { ret res[opt[Found], refusal.Error].err{res_constant_is.err}; }
+    if (!res_constant_is.ok)     { ret res_none; }
+
+    val product:  Value            = dd.operands.data[0];
+    val wide:     Type             = s.b.values.data[product].type;
+    val opt_prod: opt[Instruction] = defining(s.b, product);
+    if (sel opt_prod.none) { ret res_none; }
+    val pd:  *InstructionData = ?s.b.instructions.data[opt_prod.some];
+    val pop: Op               = op_of(pd);
+    if (!(sel pop.product) || pd.operands.len != 2) { ret res_none; }
+    val res_twice: res[opt[Lane], refusal.Error] = emit.lane_of(s.m, wide);
+    if (sel res_twice.err)                                                       { ret res[opt[Found], refusal.Error].err{res_twice.err}; }
+    if (sel res_twice.ok.none)                                                   { ret res_none; }
+    if (res_twice.ok.some.lanes != 0 || res_twice.ok.some.bits != lane.bits * 2) { ret res_none; }
+
+    val opt_extension: opt[Extended] = extension(s, pd.operands.data[0], wide, ty);
+    if (sel opt_extension.none) { ret res_none; }
+    val opt_extension_data: opt[Extended] = extension(s, pd.operands.data[1], wide, ty);
+    if (sel opt_extension_data.none) { ret res_none; }
+    val parts: Parts = Parts{shift: opt_down.some, product: opt_prod.some, left: opt_extension.some.at, right: opt_extension_data.some.at};
+    val h:     High  = High{lhs: opt_extension.some.x, rhs: opt_extension_data.some.x, lhs_s: opt_extension.some.signed, rhs_s: opt_extension_data.some.signed, lane: lane};
+    ret res[opt[Found], refusal.Error].ok{opt[Found].some{Found{high: h, parts: parts}}};
+}
+
+# the high multiply an instruction is, by its opcode's algebra, none when it is
+# not one or is a vector, which the vector legalisation takes lane by lane
+# first where no unit computes it
+fun stated(s: *Site, t: *InstructionData, op: Op) res[opt[High], refusal.Error] {
+    val res_none: res[opt[High], refusal.Error] = res[opt[High], refusal.Error].ok{opt[High].none{}};
+    if (!(sel op.high))                            { ret res_none; }
+    if (t.operands.len != 2 || t.results.len != 1) { ret res_none; }
+    val res_lane_of: res[opt[Lane], refusal.Error] = emit.lane_of(s.m, s.b.values.data[t.results.data[0]].type);
+    if (sel res_lane_of.err)     { ret res[opt[High], refusal.Error].err{res_lane_of.err}; }
+    if (sel res_lane_of.ok.none) { ret res_none; }
+    val lane: Lane = res_lane_of.ok.some;
+    if (lane.lanes != 0) { ret res_none; }
+    ret res[opt[High], refusal.Error].ok{opt[High].some{High{lhs: t.operands.data[0], rhs: t.operands.data[1], lhs_s: op.high.lhs, rhs_s: op.high.rhs, lane: lane}}};
+}
+
+# how a high half reads its operands, each read as signed when true
+pub fun signs_of(lhs_s: bool, rhs_s: bool) Sign {
+    if (lhs_s && rhs_s)   { ret Sign.signed{}; }
+    if (!lhs_s && !rhs_s) { ret Sign.unsigned{}; }
+    ret Sign.mixed{};
+}
+
+# how a high half's operands are read
+fun sign_of(f: High) Sign {
+    ret signs_of(f.lhs_s, f.rhs_s);
+}
+
+# whether the pass builds the high half of a product of two operands of a
+# width, read as a sign says, from four multiplies at the width: the target
+# has no form for it and multiplies at the width
+pub fun builds(a: *Arithmetic, width: u32, sign: Sign) bool {
+    ret !capability.computes_high(a, width, sign) && capability.holds(a.multiply, width);
+}
+
+# the other operand where an operand read as signed is negative, which a
+# product of the operands as unsigned counts in the high half too many times
+fun taken(s: *Site, negative: Value, other: Value, last: Value) Value {
+    ret emit.binary(s, opcode_table.AND, emit.binary(s, opcode_table.SHR_S, negative, last), other);
+}
+
+# build the high half of the product of two operands from multiplies at their
+# width, in the slot of the high multiply or of the truncation that was the
+# pattern
+fun split(w: *Work, i: Instruction, f: High) err[refusal.Error] {
+    val s:  *Site = ?w.site;
+    val ty: Type  = s.b.values.data[f.lhs].type;
+    val h:  u32   = f.lane.bits / 2;
+
+    val res_mask: res[Value, refusal.Error] = emit.constant(s, ty, word.ones(h));
+    if (sel res_mask.err) { ret err[refusal.Error].err{res_mask.err}; }
+    val res_half: res[Value, refusal.Error] = emit.constant(s, ty, word.small(h::u64));
+    if (sel res_half.err) { ret err[refusal.Error].err{res_half.err}; }
+    val res_last: res[Value, refusal.Error] = emit.constant(s, ty, word.small((f.lane.bits - 1)::u64));
+    if (sel res_last.err) { ret err[refusal.Error].err{res_last.err}; }
+
+    emit.begin(s, i);
+    val a0:    Value = emit.binary(s, opcode_table.AND, f.lhs, res_mask.ok);
+    val a1:    Value = emit.binary(s, opcode_table.SHR_U, f.lhs, res_half.ok);
+    val b0:    Value = emit.binary(s, opcode_table.AND, f.rhs, res_mask.ok);
+    val b1:    Value = emit.binary(s, opcode_table.SHR_U, f.rhs, res_half.ok);
+    val p00:   Value = emit.binary(s, opcode_table.MUL, a0, b0);
+    val p01:   Value = emit.binary(s, opcode_table.MUL, a0, b1);
+    val p10:   Value = emit.binary(s, opcode_table.MUL, a1, b0);
+    val p11:   Value = emit.binary(s, opcode_table.MUL, a1, b1);
+    val mid:   Value = emit.binary(s, opcode_table.ADD, p10, emit.binary(s, opcode_table.SHR_U, p00, res_half.ok));
+    val cross: Value = emit.binary(s, opcode_table.ADD, p01, emit.binary(s, opcode_table.AND, mid, res_mask.ok));
+    val high:  Value = emit.binary(s, opcode_table.ADD, p11, emit.binary(s, opcode_table.SHR_U, mid, res_half.ok));
+    val carry: Value = emit.binary(s, opcode_table.SHR_U, cross, res_half.ok);
+    if (!f.lhs_s && !f.rhs_s) {
+        emit.end(s, i);
+        emit.binary(s, opcode_table.ADD, high, carry);
+    }
+    or {
+        val sum: Value = emit.binary(s, opcode_table.ADD, high, carry);
+        if (f.lhs_s && f.rhs_s) {
+            val first:  Value = emit.binary(s, opcode_table.SUB, sum, taken(s, f.lhs, f.rhs, res_last.ok));
+            val second: Value = taken(s, f.rhs, f.lhs, res_last.ok);
+            emit.end(s, i);
+            emit.binary(s, opcode_table.SUB, first, second);
+        }
+        or {
+            var negative: Value = f.lhs;
+            var other:    Value = f.rhs;
+            if (f.rhs_s) {
+                negative = f.rhs;
+                other    = f.lhs;
+            }
+            val away: Value = taken(s, negative, other, res_last.ok);
+            emit.end(s, i);
+            emit.binary(s, opcode_table.SUB, sum, away);
+        }
+    }
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret err[refusal.Error].err{err_built.err}; }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# rebuild an instruction if it is the high half of a product the target has no
+# form for
+fun rebuild(w: *Work, i: Instruction) err[refusal.Error] {
+    val d:    *InstructionData = ?w.site.b.instructions.data[i];
+    val code: Op               = op_of(d);
+    if (!reads(code)) { ret err[refusal.Error].ok{}; }
+    val res_stated: res[opt[High], refusal.Error] = stated(?w.site, d, code);
+    if (sel res_stated.err) { ret err[refusal.Error].err{res_stated.err}; }
+    if (sel res_stated.ok.some) {
+        val h: High = res_stated.ok.some;
+        if (!builds(w.caps, h.lane.bits, sign_of(h))) { ret err[refusal.Error].ok{}; }
+        ret split(w, i, h);
+    }
+    val res_found: res[opt[Found], refusal.Error] = high_of(?w.site, d);
+    if (sel res_found.err)     { ret err[refusal.Error].err{res_found.err}; }
+    if (sel res_found.ok.none) { ret err[refusal.Error].ok{}; }
+    val f: High = res_found.ok.some.high;
+    if (capability.holds(w.caps.multiply, f.lane.bits * 2) && !capability.computes_high(w.caps, f.lane.bits, sign_of(f))) { ret err[refusal.Error].ok{}; }
+    if (!capability.computes_high(w.caps, f.lane.bits, sign_of(f)) && !capability.holds(w.caps.multiply, f.lane.bits))    { ret err[refusal.Error].ok{}; }
+    var err_made: err[refusal.Error] = err[refusal.Error].ok{};
+    if (capability.computes_high(w.caps, f.lane.bits, sign_of(f))) { err_made = stated_as(w, i, f); }
+    or                                                             { err_made = split(w, i, f); }
+    if (sel err_made.err)                                          { ret err_made; }
+    val parts: Parts          = res_found.ok.some.parts;
+    val four:  [4]Instruction = [4]Instruction{parts.shift, parts.product, parts.left, parts.right};
+    var p:     usize          = 0;
+    for (p < 4) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?w.taken, four[p]);
+        if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        p = p + 1;
+    }
+    ret err_made;
+}
+
+# erase each instruction a rewritten pattern was made of that nothing reads,
+# since selection meets every instruction left in the body
+fun clear(w: *Work, c: *Context, u: *Unit) err[refusal.Error] {
+    var t: usize = 0;
+    for (t < w.taken.len) {
+        val x:      Instruction      = w.taken.data[t];
+        val d:      *InstructionData = ?w.site.b.instructions.data[x];
+        var unused: bool             = !(sel d.place.erased);
+        var r:      usize            = 0;
+        for (r < d.results.len) {
+            if (w.site.b.values.data[d.results.data[r]].uses.len != 0) { unused = false; }
+            r = r + 1;
+        }
+        if (unused) {
+            val err_gone: err[module.Error] = body.erase(c.m, u.f, x);
+            if (sel err_gone.err) { ret err[refusal.Error].err{refusal.Error.ir{err_gone.err}}; }
+        }
+        t = t + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the pattern of a high half the target computes a form of, written as that
+# form in the slot of its truncation, a mixed one with its signed operand first
+fun stated_as(w: *Work, i: Instruction, f: High) err[refusal.Error] {
+    val s:   *Site      = ?w.site;
+    var lhs: Value      = f.lhs;
+    var rhs: Value      = f.rhs;
+    var op:  row.Opcode = opcode_table.MUL_HIGH_U;
+    if (f.lhs_s && f.rhs_s) { op = opcode_table.MUL_HIGH_S; }
+    or (f.lhs_s || f.rhs_s) {
+        op = opcode_table.MUL_HIGH_SU;
+        if (f.rhs_s) {
+            lhs = f.rhs;
+            rhs = f.lhs;
+        }
+    }
+    emit.begin(s, i);
+    emit.end(s, i);
+    emit.binary(s, op, lhs, rhs);
+    val err_built: err[refusal.Error] = emit.done(s);
+    if (sel err_built.err) { ret err[refusal.Error].err{err_built.err}; }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# whether the pass reads an operation: a high half, or a truncation that may
+# be the high half of a product
+fun reads(op: Op) bool {
+    ret sel op.high || sel op.truncate;
+}
+
+# whether a body holds a high half, or every operation the pattern of one
+# written over a product is made of: a truncation, a shift right, a product
+# and an extension
+fun concerned(b: *Body) bool {
+    var parts: u8  = 0;
+    var code:  u32 = 0;
+    for (contents.seek(?b.contents.opcodes, ?code)) {
+        val op: Op = algebra.op(code);
+        if (sel op.high)                                  { ret true; }
+        if (sel op.truncate)                              { parts = parts | 1; }
+        if (sel op.shift_right_u || sel op.shift_right_s) { parts = parts | 2; }
+        if (sel op.product)                               { parts = parts | 4; }
+        if (sel op.extend_u || sel op.extend_s)           { parts = parts | 8; }
+        code = code + 1;
+    }
+    ret parts == 15;
+}
+
+# build the high halves of one function
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err)        { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    if (!concerned(res_body.ok)) { ret res[bool, refusal.Error].ok{false}; }
+
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+
+    var w: Work = Work{site: emit.init(c.m, u.f, res_body.ok, ?scratch), caps: ?c.t.caps.arithmetic, changed: false, taken: vector.init[Instruction](c.m.a)};
+    fin { vector.dnit[Instruction](?w.taken); }
+    var k: usize = 0;
+    for (k < res_body.ok.blocks.len) {
+        if (!res_body.ok.blocks.data[k].erased) {
+            var n: Instruction = res_body.ok.blocks.data[k].first;
+            for (n != NO_INSTRUCTION) {
+                arena.reset(?ar);
+                val i: Instruction = n;
+                n = res_body.ok.instructions.data[i].next;
+                val err_rebuild: err[refusal.Error] = rebuild(?w, i);
+                if (sel err_rebuild.err) { ret res[bool, refusal.Error].err{err_rebuild.err}; }
+            }
+        }
+        k = k + 1;
+    }
+    val err_cleared: err[refusal.Error] = clear(?w, c, u);
+    if (sel err_cleared.err) { ret res[bool, refusal.Error].err{err_cleared.err}; }
+    ret res[bool, refusal.Error].ok{w.changed};
+}

@@ -1,0 +1,247 @@
+# what `mirl compile` reads of the line beside the output, the target, the
+# setting, the float relaxations and the product, and how it reports a build or
+# a schedule that failed
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+
+use io: std.io.writer;
+
+use verify_cmd: mirl.cli.cmd.verify;
+use mirl.cli.command;
+use mirl.cli.diagnostic;
+use mirl.cli.exit;
+use mirl.cli.flag;
+use cli_target: mirl.cli.target;
+use mct:        mirl.ct;
+use mirl.failure.text;
+use mirl.ir.module;
+use mirl.ir.text.printer;
+use mirl.ir.type.calling;
+use pass_failure: mirl.pass.failure;
+use mirl.pass.record.Pass;
+use mirl.pass.refusal;
+use mirl.pass.relaxation;
+use mirl.pass.rows;
+use mirl.pass.setting;
+use mirl.pass.setting.Optimise;
+use mirl.target.assemble;
+use mirl.target.basis;
+use mirl.target.compile;
+use mirl.target.family;
+use mirl.target.record;
+use mirl.target.record.Target;
+use verify_failure: mirl.verify.failure;
+use A:              std.allocator;
+use std.args;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use std.format;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.catalog.code.CodeModel;
+use mink.catalog.output;
+
+use masc.core.ct;
+use masc.core.extension;
+use masc.core.requirement;
+use mset: masc.core.set;
+
+# the switch that runs the optimisation passes
+pub val OPTIMIZE: args.Flag = args.Flag{long: "optimize", short: 'O', value: nil, repeat: false, negatable: true, help: "run the optimisation passes (default: off)"};
+
+# the flag that turns one optimisation pass on or off, by the name its record gives it, given once for each
+pub val PASS: args.Flag = args.Flag{long: "pass", short: 0, value: "name=on|off", repeat: true, negatable: false, help: "turn one optimisation pass on or off, as promote=off, once for each"};
+
+# the flag that names a float relaxation the build permits, given once for
+# each, by its name in mirl.pass.relaxation
+pub val FLOAT_RELAX: args.Flag = args.Flag{long: "float-relax", short: 0, value: "name", repeat: true, negatable: false, help: "a float relaxation to permit, float-reassoc, once for each"};
+
+# the flag that names the product the code is built into. -k is the
+# toolchain's short spelling of --kind, mach's and mink's alike
+pub val KIND: args.Flag = args.Flag{long: "kind", short: 'k', value: "bin|static|shared|object|module", repeat: false, negatable: false, help: "the product to make"};
+
+# the setting the command line asks for: --optimize, then each --pass over it in the line's order, the last
+# word on a pass its own
+# ---
+# call: the command's context
+# ret:  the setting, or the exit code of a --pass that names no optimisation pass or says neither on nor off,
+#       which is reported with the names it may give
+pub fun asked_optimise(call: *command.Call) res[Optimise, i64] {
+    var o: Optimise = setting.OFF;
+    o.on = args.on(call.p, ?OPTIMIZE);
+    val res_named: res[Slice[str], i64] = flag.collected(call, ?PASS);
+    if (sel res_named.err) { ret res[Optimise, i64].err{res_named.err}; }
+    var i: usize = 0;
+    for (i < res_named.ok.size) {
+        val given: str   = res_named.ok.data[i];
+        var at:    usize = 0;
+        for (given[at] != 0 && given[at] != '=') { at = at + 1; }
+        if (given[at] != '=') { ret res[Optimise, i64].err{unnamed_pass(call, given)}; }
+        val word: str  = (?given[at + 1])::str;
+        var on:   bool = false;
+        if (str_equals(word, "on"))   { on = true; }
+        or (!str_equals(word, "off")) { ret res[Optimise, i64].err{unnamed_pass(call, given)}; }
+        val res_name: res[str, StrError] = str_copy_slice(call.a, given, 0, at);
+        if (sel res_name.err) {
+            text.headline(?call.report, nil, "out of memory");
+            ret res[Optimise, i64].err{exit.ENVIRONMENT};
+        }
+        val opt_place: opt[u32] = setting.index_of(rows.optimisations(), res_name.ok);
+        if (sel opt_place.none) { ret res[Optimise, i64].err{unnamed_pass(call, given)}; }
+        o = setting.chose(o, opt_place.some, on);
+        i = i + 1;
+    }
+    ret res[Optimise, i64].ok{o};
+}
+
+# report a --pass value that names no optimisation pass or says neither on nor off, with the names it may give
+fun unnamed_pass(call: *command.Call, given: str) i64 {
+    text.named(?call.report, "--pass takes name=on or name=off, of an optimisation pass", given);
+    format.write_str(call.report.w, "  help the optimisation passes are");
+    val listed: Slice[*Pass] = rows.optimisations();
+    var i:      usize        = 0;
+    for (i < listed.size) {
+        format.write_str(call.report.w, " ");
+        format.write_str(call.report.w, listed.data[i].name);
+        i = i + 1;
+    }
+    format.write_str(call.report.w, "\n");
+    ret exit.REFUSED;
+}
+
+# the target the command line asks for, see mirl.cli.target, assembled under
+# its code model and the product --kind names
+# ---
+# call:  the command's context
+# m:     the module, whose target statement stands when -t is not given
+# added: where the extensions the line adds to the instruction set are left
+# ret:   the target, given back by `assemble.dnit` through the command's
+#        allocator, or the exit code when the target is refused or assembles
+#        to none, which is reported with the rule it breaks
+pub fun asked_target(call: *command.Call, m: *module.Module, added: *Slice[str]) res[Target, i64] {
+    val res_asked: res[cli_target.Asked, i64] = cli_target.asked(call, m);
+    if (sel res_asked.err) { ret res[Target, i64].err{res_asked.err}; }
+    @added = res_asked.ok.added;
+    if (res_asked.ok.named) {
+        val err_stated: err[module.Error] = module.retarget(m, res_asked.ok.tuple);
+        if (sel err_stated.err) {
+            if (sel err_stated.err.convention) {
+                var held: calling.Spelling;
+                text.lead(?call.report, nil);
+                format.write_str(call.report.w, "a signature names a convention row the target's architecture has none of '");
+                text.view(?call.report, calling.spell(err_stated.err.convention, ?held));
+                format.write_str(call.report.w, "'\n");
+                ret res[Target, i64].err{exit.REFUSED};
+            }
+            text.headline(?call.report, nil, "out of memory");
+            ret res[Target, i64].err{exit.ENVIRONMENT};
+        }
+    }
+    val named:    str               = args.value(call.p, ?KIND);
+    var opt_kind: opt[*output.Kind] = opt[*output.Kind].none{};
+    if (named != nil) {
+        val res_row: res[output.Spelled, Fail] = output.spelled(named);
+        if (sel res_row.err) {
+            text.headline(?call.report, nil, "--kind names no product of mink's catalog");
+            text.failure(?call.report, call.a, fail.about(res_row.err, named));
+            ret res[Target, i64].err{exit.REFUSED};
+        }
+        val spelled: output.Spelled = res_row.ok;
+        if (sel spelled.row) { opt_kind = opt[*output.Kind].some{spelled.row}; }
+    }
+    val opt_code: opt[*CodeModel]             = res_asked.ok.code;
+    val res_made: res[Target, assemble.Error] = assemble.assemble_coded(call.a, res_asked.ok.tuple, opt_code, opt_kind);
+    if (sel res_made.err) {
+        if (sel res_made.err.alloc) {
+            text.headline(?call.report, nil, "the target was not assembled");
+            ret res[Target, i64].err{exit.ENVIRONMENT};
+        }
+        if (sel res_made.err.code) {
+            text.headline(?call.report, nil, "mirl carries no address model for the target's code model, which mink's catalog offers");
+            ret res[Target, i64].err{exit.REFUSED};
+        }
+        if (sel res_made.err.declined) {
+            text.lead(?call.report, nil);
+            format.write_str(call.report.w, "mirl declines the address model the target's code model and product ask for (");
+            format.write_str(call.report.w, res_made.err.declined);
+            format.write_str(call.report.w, ")\n");
+            ret res[Target, i64].err{exit.REFUSED};
+        }
+        if (sel res_made.err.uncarried) {
+            text.headline(?call.report, nil, res_made.err.uncarried);
+            ret res[Target, i64].err{exit.REFUSED};
+        }
+        text.lead(?call.report, nil);
+        format.write_str(call.report.w, "the target was not assembled, as its tuple breaks the rule that ");
+        format.write_str(call.report.w, assemble.rule(res_made.err));
+        format.write_str(call.report.w, "\n");
+        if (sel res_made.err.requires) {
+            var lack: assemble.Requires = res_made.err.requires;
+            unmet_lines(call.report.w, ?lack);
+            assemble.unmet_dnit(call.a, ?lack);
+        }
+        ret res[Target, i64].err{exit.REFUSED};
+    }
+    ret res[Target, i64].ok{res_made.ok};
+}
+
+# the atoms an unmet requirement names, spelled by the architecture's catalog
+fun unmet_atoms(w: *io.Writer, u: *assemble.Requires, ids: requirement.Ids) {
+    var i: u32 = 0;
+    for (i < ids.len) {
+        if (i != 0) { format.write_str(w, ", "); }
+        val opt_name: opt[str] = assemble.unmet_name(u, ids.at[i]);
+        if (sel opt_name.some) { format.write_str(w, opt_name.some); }
+        or                     { format.write_str(w, "an atom the catalog does not name"); }
+        i = i + 1;
+    }
+}
+
+# what the baseline lacks of each alternative the convention requires, the
+# nearest first
+fun unmet_lines(w: *io.Writer, u: *assemble.Requires) {
+    val opt_near: opt[usize] = assemble.nearest(u);
+    var i:        usize      = 0;
+    for (i < u.alternatives.size) {
+        val row: assemble.Lacking = u.alternatives.data[i];
+        if (sel opt_near.some && opt_near.some == i) { format.write_str(w, "  the baseline lacks "); }
+        or                                           { format.write_str(w, "  or lacks "); }
+        if (row.lacks.len != 0)                      { unmet_atoms(w, u, row.lacks); }
+        if (row.bars.len != 0) {
+            if (row.lacks.len != 0) { format.write_str(w, " and "); }
+            format.write_str(w, "holds, though barred, ");
+            unmet_atoms(w, u, row.bars);
+        }
+        format.write_str(w, "\n");
+        i = i + 1;
+    }
+}
+
+# the float relaxations the command line permits, none when it names none
+# ---
+# call: the command's context
+# ret:  the set, or the exit code of a name no relaxation has or one named
+#       twice, which is reported naming it, or of the failure to read them
+pub fun asked_floats(call: *command.Call) res[relaxation.Relaxations, i64] {
+    val res_names: res[Slice[str], i64] = flag.collected(call, ?FLOAT_RELAX);
+    if (sel res_names.err) { ret res[relaxation.Relaxations, i64].err{res_names.err}; }
+    val res_relaxation_of: res[relaxation.Relaxations, relaxation.Error] = relaxation.of(res_names.ok);
+    if (sel res_relaxation_of.err) {
+        val why: relaxation.Error = res_relaxation_of.err;
+        if (sel why.unknown) { text.named(?call.report, "not a float relaxation", why.unknown); }
+        or (sel why.twice)   { text.named(?call.report, "a float relaxation named twice", why.twice); }
+        ret res[relaxation.Relaxations, i64].err{exit.REFUSED};
+    }
+    ret res[relaxation.Relaxations, i64].ok{res_relaxation_of.ok};
+}

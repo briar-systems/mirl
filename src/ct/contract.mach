@@ -1,0 +1,466 @@
+# the contract a constant-time function is called under, from its declaration alone
+#
+# a function's declaration states its mode (`mirl.ir.function.ConstantTime`)
+# and how much of each parameter is secret (`FunctionData.secrets`), both from
+# its source declaration, and a caller in any module declares it with the
+# same facts. the caller trusts the declaration and never reads the callee's
+# body, and the definition, wherever it is compiled, is held at its own walk
+# to what makes the declaration true:
+#
+# - its secrets arrive where its signature says (`arrivals`): a piece of a
+#   parameter carries a secret exactly where the parameter's declared bytes it
+#   carries hold one, byte by byte (`piece_bytes`), so a piece carrying a
+#   secret member and a public one is public in the public one's bytes. the definition's entry seeds and the caller's accepted
+#   places both come from this one function, so they never differ. the address
+#   of a copy the caller passes by reference is public, and what the copy holds
+#   is memory the definition reads as any other it is given a pointer to.
+# - it takes every byte it reads outside its own frame and its module's
+#   globals as the access reading it states, and as secret where the access
+#   states nothing (`masc.walk`), so whatever memory a pointer it is given
+#   reaches, a secret there is never taken as public. what an access stated
+#   public reads is public by the type it reads through, which no secret is
+#   ever stored through (`ct.STORED`, and the source's welded pointers).
+#
+# - its results leave a secret only where its signature says (`results`): at
+#   every return, a byte of a register holding a piece of the result the
+#   declaration states public holds no secret in any bit, those the convention
+#   leaves undefined past a piece public whole included, which the ir's oblivious check holds of
+#   a result public whole and the walk of the definition holds of every piece. a caller that trusts
+#   the callee takes each piece as public or secret as the declaration states
+#   it. a result returned by reference states its public bytes off the address
+#   the caller passes (`public_memory`): the walk of the definition holds that
+#   it puts no secret there at any return, and a caller that trusts it takes
+#   them as holding what they held before the call.
+# - a declaration that states its result follows its arguments (`follows`),
+#   as mirl's division and product helpers do, is one whose result is formed
+#   from its arguments alone: a caller that trusts it takes the result public
+#   where nothing it passes the arguments in holds a secret where the call
+#   starts, registers, stack places and copies passed by reference alike, and
+#   as `results` states where something does. the definition's text reads no
+#   memory and calls nothing (`mirl.legal.helper.deliver` refuses one that
+#   states it and does), so no secret reaches its result but through them.
+#
+# a call trusts its callee (`trusted`) when the callee is declared constant
+# time, its definition is not one a definition elsewhere may replace, as a
+# `#[weak]` default, and a hard caller calls a hard callee or a soft one in a
+# build that guarantees every mode a soft function's code may be held under, so
+# a guarantee the build gives never rests on a callee that holds its timing
+# mode only where the processor has it. a callee reached through a value is
+# trusted only where the call states the declaration it keeps
+# (`Metadata.stated`), which the front end states only of a function type
+# marked constant time, whose values it lets hold only functions declared in
+# that mode or a stronger one with that signature. every other call is walked
+# under a model that accepts no secret at all, so a secret reaching such a
+# callee in a register, an argument the stack passes or memory it may reach is
+# refused.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mct: mirl.ct;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.function.ConstantTime;
+use mirl.ir.function.FunctionData;
+use mirl.ir.function.in_constant_time;
+use mirl.ir.function.parameter_secrecy;
+use mirl.ir.global.Range;
+use mirl.ir.global.Secrecy;
+use mirl.ir.id;
+use mirl.ir.id.Declared;
+use mirl.ir.id.Symbol;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.place.Named;
+use mirl.ir.place.Place;
+use type_table: mirl.ir.type.table;
+use mirl.ir.value.Def;
+use mirl.target.abi.call;
+use mirl.target.abi.convention.Resolved;
+use mirl.target.abi.piece;
+use mirl.target.abi.piece.Assignment;
+use mirl.target.abi.piece.Piece;
+use mirl.target.build;
+use mirl.target.build.Build;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
+use mirl.target.record;
+
+use rf:         masc.core.register;
+use mset:       masc.core.set;
+use core_state: masc.core.state;
+
+# whether a call from `caller` may trust what `callee` declares: the callee is declared constant time, no definition
+# elsewhere may replace its own, and a hard caller's callee is hard or soft in a build of `build` over `set` that
+# guarantees every mode a soft function's code may be held under (`mct.soft_guaranteed`)
+pub fun trusted(m: *Module, set: *mset.Set, build: *core_state.Context, caller: id.Function, callee: Declared) bool {
+    if (standing(m, caller, callee)) { ret true; }
+    val d: *FunctionData = module.declaration(m, callee);
+    if (!(sel d.constant_time.soft) || d.linkage.replaceable) { ret false; }
+    ret mct.soft_guaranteed(set, build);
+}
+
+# whether the two declarations alone make a call from `caller` trust `callee`, with no fact of the build: the callee is
+# declared constant time, no definition elsewhere may replace its own, and the caller is soft or the callee hard. the
+# one trusted call this leaves out, a hard caller's call of a soft callee, rests on what the build guarantees
+# (`trusted`). the inliner reads this for a callee it names, as it runs where no build may be open
+# ---
+# m:      the module
+# caller: the calling function
+# callee: the declaration the call trusts its callee to keep, of the function it names or the one it states
+# ret:    whether the call trusts it on the declarations alone
+pub fun standing(m: *Module, caller: id.Function, callee: Declared) bool {
+    val c: ConstantTime = module.declaration(m, callee).constant_time;
+    if (!in_constant_time(c))                              { ret false; }
+    if (module.declaration(m, callee).linkage.replaceable) { ret false; }
+    val mode: ConstantTime = m.functions.data[caller].data.constant_time;
+    ret !(sel mode.hard) || sel c.hard;
+}
+
+# the declaration the ir call `d` of body `b` trusts its callee to keep: that of the function its callee names by its
+# address, else the one it states for a callee it reaches through a value (`Metadata.stated`), none for a call that
+# states none
+pub fun declared_of(m: *Module, b: *Body, d: *InstructionData) opt[Declared] {
+    if (d.operands.len > 0) {
+        val def: Def = b.values.data[d.operands.data[0]].def;
+        if (sel def.constant) {
+            val res_constant_data: res[ConstantData, module.Error] = module.constant_data(m, def.constant);
+            if (sel res_constant_data.ok) {
+                if (sel res_constant_data.ok.address) {
+                    val named: Symbol = res_constant_data.ok.address.symbol;
+                    if (sel named.function) { ret opt[Declared].some{Declared.function{named.function}}; }
+                }
+            }
+        }
+    }
+    if (sel d.metadata.stated.some) { ret opt[Declared].some{Declared.stated{d.metadata.stated.some}}; }
+    ret opt[Declared].none{};
+}
+
+# one place a piece of a function's arguments arrives at or of its results is left at, and whether a secret may be
+# there
+# ---
+# place:  where a piece travels
+# length: the bytes it covers
+# secret: whether the declaration states a secret byte there
+# bytes:  the bytes of where it travels that may hold a secret (`piece_bytes`)
+pub rec Arrival {
+    place:  Place;
+    length: u64;
+    secret: bool;
+    bytes:  u64;
+}
+
+# whether a piece of a parameter of secrecy `s` carries a secret byte: every piece of a parameter secret whole, and a
+# piece of one secret in part where its bytes meet a secret range, or wherever it scales, as its bytes are not known
+pub fun piece_secret(s: Secrecy, p: Piece) bool {
+    if (!(sel p.scale.fixed) && !(sel s.public)) { ret true; }
+    ret range_secret(s, p.offset, p.size);
+}
+
+# the bytes of the register or slot a piece `p` of a value of secrecy `s` travels in that may hold a secret, bit k its
+# k-th from its least significant: each byte of the piece a secret range covers, and where any does every byte past
+# the piece, which the convention leaves undefined and a caller may leave a secret in. every byte of a piece that
+# scales or is 64 bytes or wider and holds a secret, and of a value secret whole
+pub fun piece_bytes(s: Secrecy, p: Piece) u64 {
+    if (!piece_secret(s, p))                                     { ret 0; }
+    if (!(sel p.scale.fixed) || !(sel s.ranges) || p.size >= 64) { ret 0xFFFF_FFFF_FFFF_FFFF; }
+    var out: u64 = 0;
+    var k:   u64 = 0;
+    for (k < p.size) {
+        if (range_secret(s, p.offset + k, 1)) { out = out | (1::u64 << k); }
+        k = k + 1;
+    }
+    ret out | ~((1::u64 << p.size) - 1);
+}
+
+# whether `size` bytes at `offset` of a value secrecy `s` states hold a secret
+pub fun range_secret(s: Secrecy, offset: u64, size: u64) bool {
+    if (sel s.public)    { ret false; }
+    if (!(sel s.ranges)) { ret true; }
+    var i: usize = 0;
+    for (i < s.ranges.size) {
+        val r: Range = s.ranges.data[i];
+        if (r.offset < offset + size && offset < r.offset + r.length) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the assignment of a call of `callee` under the convention its declared signature names under the build's rows, none
+# where the signature does not classify under them, which no caller can trust and no definition seed or check
+fun assigned(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared) res[opt[Assignment], allocator.Error] {
+    val ty:      type_table.Type                            = module.declaration(m, callee).signature;
+    val res_sig: res[type_table.Function, type_table.Error] = type_table.signature(?m.types, ty);
+    if (sel res_sig.err) { ret res[opt[Assignment], allocator.Error].ok{opt[Assignment].none{}}; }
+    val opt_row: opt[*Resolved] = build.under(bd, res_sig.ok.convention);
+    if (sel opt_row.none) { ret res[opt[Assignment], allocator.Error].ok{opt[Assignment].none{}}; }
+    val res_classify: res[Assignment, call.Error] = call.classify(a, l, opt_row.some, ty, call.Statement{aggregates: call.Aggregates.platform{}, named: Named.all{}});
+    if (sel res_classify.err) {
+        if (sel res_classify.err.alloc) { ret res[opt[Assignment], allocator.Error].err{res_classify.err.alloc}; }
+        ret res[opt[Assignment], allocator.Error].ok{opt[Assignment].none{}};
+    }
+    ret res[opt[Assignment], allocator.Error].ok{opt[Assignment].some{res_classify.ok}};
+}
+
+# where the arguments of a call of `callee` arrive, into `out`, from its declared signature and secret parameters and
+# the convention its signature names under the build's rows: one arrival per piece of each argument, the address of a
+# copy passed by reference public. false where the signature does not classify under them. the address of a result
+# passed by reference is public and is no argument
+pub fun arrivals(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared, out: *vector.Vector[Arrival]) res[bool, allocator.Error] {
+    val res_assigned: res[opt[Assignment], allocator.Error] = assigned(a, m, bd, l, callee);
+    if (sel res_assigned.err)     { ret res[bool, allocator.Error].err{res_assigned.err}; }
+    if (sel res_assigned.ok.none) { ret res[bool, allocator.Error].ok{false}; }
+    var asg: Assignment = res_assigned.ok.some;
+    fin { piece.dnit(?asg); }
+    var i: usize = 0;
+    for (i < asg.arguments.len) {
+        val passed:   piece.Passed = asg.arguments.data[i];
+        val s:        Secrecy      = parameter_secrecy(module.declaration(m, callee), i);
+        val by_value: bool         = sel passed.passing.value;
+        var k:        u32          = 0;
+        for (k < passed.count) {
+            val p:     Piece = asg.pieces.data[(passed.first + k)::usize];
+            var bytes: u64   = 0;
+            if (by_value) { bytes = piece_bytes(s, p); }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Arrival](out, Arrival{place: p.place, length: p.size, secret: bytes != 0, bytes: bytes});
+            if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# whether `at` is a register the walk holds whole, one of no general class
+fun held_whole(bd: *Build, at: Place) bool {
+    if (!(sel at.register)) { ret false; }
+    val file:    *rf.File          = bd.basis.set.codec.registers;
+    val opt_row: opt[*rf.Register] = rf.row_of(file, at.register);
+    if (sel opt_row.none) { ret true; }
+    ret file.classes[opt_row.some.class].kind != rf.GENERAL;
+}
+
+# the first piece of a parameter of `callee` passed by value that carries a secret byte and a public byte together in a
+# register the walk holds whole, one of no general class, as a floating-point or vector register, which its walk seeds
+# secret whole. none where no piece does or the signature does not classify under the build's rows. a piece in a
+# general register or an argument slot is seeded byte by byte (`piece_bytes`)
+pub fun shared(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared) res[opt[mct.Shared], allocator.Error] {
+    val res_assigned: res[opt[Assignment], allocator.Error] = assigned(a, m, bd, l, callee);
+    if (sel res_assigned.err)     { ret res[opt[mct.Shared], allocator.Error].err{res_assigned.err}; }
+    if (sel res_assigned.ok.none) { ret res[opt[mct.Shared], allocator.Error].ok{opt[mct.Shared].none{}}; }
+    var asg: Assignment = res_assigned.ok.some;
+    fin { piece.dnit(?asg); }
+    var i: usize = 0;
+    for (i < asg.arguments.len) {
+        val passed: piece.Passed = asg.arguments.data[i];
+        val s:      Secrecy      = parameter_secrecy(module.declaration(m, callee), i);
+        i = i + 1;
+        if (!(sel passed.passing.value)) { cnt; }
+        if (sel s.ranges) {
+            val ranges: Slice[Range] = s.ranges;
+            var k:      u32          = 0;
+            for (k < passed.count) {
+                val p: Piece = asg.pieces.data[(passed.first + k)::usize];
+                k = k + 1;
+                if (!(sel p.scale.fixed) || !piece_secret(s, p)) { cnt; }
+                if (!held_whole(bd, p.place))                    { cnt; }
+                var secret: u64   = 0;
+                var n:      usize = 0;
+                for (n < ranges.size) {
+                    val r:     Range = ranges.data[n];
+                    var start: u64   = r.offset;
+                    var end:   u64   = r.offset + r.length;
+                    if (start < p.offset)        { start = p.offset; }
+                    if (end > p.offset + p.size) { end = p.offset + p.size; }
+                    if (end > start)             { secret = secret + (end - start); }
+                    n = n + 1;
+                }
+                if (secret < p.size) { ret res[opt[mct.Shared], allocator.Error].ok{opt[mct.Shared].some{mct.Shared{parameter: (i - 1)::u32, offset: p.offset, length: p.size}}}; }
+            }
+        }
+    }
+    ret res[opt[mct.Shared], allocator.Error].ok{opt[mct.Shared].none{}};
+}
+
+# the place the address of `callee`'s result passed by reference arrives in, none for a result returned by value or a
+# signature that does not classify under the build's rows. public, as the caller's own storage
+pub fun address(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared) res[opt[Place], allocator.Error] {
+    val res_assigned: res[opt[Assignment], allocator.Error] = assigned(a, m, bd, l, callee);
+    if (sel res_assigned.err)     { ret res[opt[Place], allocator.Error].err{res_assigned.err}; }
+    if (sel res_assigned.ok.none) { ret res[opt[Place], allocator.Error].ok{opt[Place].none{}}; }
+    var asg: Assignment = res_assigned.ok.some;
+    fin { piece.dnit(?asg); }
+    if (sel asg.address.some) { ret res[opt[Place], allocator.Error].ok{opt[Place].some{asg.address.some.place}}; }
+    ret res[opt[Place], allocator.Error].ok{opt[Place].none{}};
+}
+
+# the bytes of `callee`'s one result returned by reference its declaration states public, into `out`, as offsets and
+# lengths off the address the caller passes, and the place that address arrives in. none for a result returned by
+# value, more than one result, a signature that does not classify under the build's rows, or a type of no known size.
+# the definition leaves no secret it puts there in those bytes at any return, and a caller that trusts it takes them as
+# holding no secret the callee put there
+pub fun public_memory(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared, out: *vector.Vector[Range]) res[opt[Place], allocator.Error] {
+    val ty:      type_table.Type                            = module.declaration(m, callee).signature;
+    val res_sig: res[type_table.Function, type_table.Error] = type_table.signature(?m.types, ty);
+    if (sel res_sig.err)              { ret res[opt[Place], allocator.Error].ok{opt[Place].none{}}; }
+    if (res_sig.ok.results.size != 1) { ret res[opt[Place], allocator.Error].ok{opt[Place].none{}}; }
+    val res_sized: res[u64, record.Error] = layout.size(l, res_sig.ok.results.data[0], type_table.DEFAULT_SPACE);
+    if (sel res_sized.err) { ret res[opt[Place], allocator.Error].ok{opt[Place].none{}}; }
+    val res_carried: res[opt[Place], allocator.Error] = address(a, m, bd, l, callee);
+    if (sel res_carried.err)     { ret res_carried; }
+    if (sel res_carried.ok.none) { ret res_carried; }
+    val s:    Secrecy = module.declaration(m, callee).result;
+    val size: u64     = res_sized.ok;
+    if (sel s.whole) { ret res_carried; }
+    var at: u64 = 0;
+    for (at < size) {
+        var covered: u64 = at;
+        var next:    u64 = size;
+        if (sel s.ranges) {
+            var i: usize = 0;
+            for (i < s.ranges.size) {
+                val r: Range = s.ranges.data[i];
+                if (r.offset <= at && at < r.offset + r.length) {
+                    if (r.offset + r.length > covered) { covered = r.offset + r.length; }
+                }
+                or (r.offset > at && r.offset < next) { next = r.offset; }
+                i = i + 1;
+            }
+        }
+        if (covered > at) {
+            at = covered;
+            cnt;
+        }
+        val res_pushed: res[usize, allocator.Error] = vector.push[Range](out, Range{offset: at, length: next - at});
+        if (sel res_pushed.err) { ret res[opt[Place], allocator.Error].err{res_pushed.err}; }
+        at = next;
+    }
+    ret res_carried;
+}
+
+# where a call of `callee` leaves its results, into `out`, from its declared signature and secret result under the
+# build's rows: one per piece of a result returned by value, secret where its declaration states a secret byte there.
+# a caller that trusts the callee takes each piece as its declaration states it, and the definition leaves no secret
+# in a piece it states public at any return. a result returned by reference states no piece here, its bytes being
+# `public_memory`'s. false where the signature does not classify under them
+pub fun results(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared, out: *vector.Vector[Arrival]) res[bool, allocator.Error] {
+    val res_assigned: res[opt[Assignment], allocator.Error] = assigned(a, m, bd, l, callee);
+    if (sel res_assigned.err)     { ret res[bool, allocator.Error].err{res_assigned.err}; }
+    if (sel res_assigned.ok.none) { ret res[bool, allocator.Error].ok{false}; }
+    var asg: Assignment = res_assigned.ok.some;
+    fin { piece.dnit(?asg); }
+    val s: Secrecy = module.declaration(m, callee).result;
+    var i: usize   = 0;
+    for (i < asg.results.len) {
+        val passed: piece.Passed = asg.results.data[i];
+        i = i + 1;
+        if (!(sel passed.passing.value)) { cnt; }
+        var k: u32 = 0;
+        for (k < passed.count) {
+            val p:          Piece                       = asg.pieces.data[(passed.first + k)::usize];
+            val bytes:      u64                         = piece_bytes(s, p);
+            val res_pushed: res[usize, allocator.Error] = vector.push[Arrival](out, Arrival{place: p.place, length: p.size, secret: bytes != 0, bytes: bytes});
+            if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+            k = k + 1;
+        }
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# memory a call of a callee whose result follows its arguments passes an argument or takes its result in
+# ---
+# place:  the stack place the bytes are at, or the register or operand their address travels in
+# length: how many bytes
+pub rec Carried {
+    place:  Place;
+    length: u64;
+}
+
+# where a call of `callee` passes what its result is formed from, where its declaration states the result follows its
+# arguments (`FunctionData.follows`), so a call that trusts it takes the result public where none of that holds a
+# secret where the call starts: the pieces of each argument by value, each in a register, an operand or at a stack
+# place (`stacked`), and the copy of each argument passed by reference, off the place its address travels in
+# (`addressed`). `result` is set to its result returned by reference, off the place its address travels in, which the
+# callee leaves holding the result whole. false where the declaration does not state it, the signature does not
+# classify under the build's rows, or a piece scales, so the call takes the result as `results` states
+pub fun follows(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared, stacked: *vector.Vector[Carried], addressed: *vector.Vector[Carried], result: *opt[Carried]) res[bool, allocator.Error] {
+    if (!module.declaration(m, callee).follows) { ret res[bool, allocator.Error].ok{false}; }
+    val res_assigned: res[opt[Assignment], allocator.Error] = assigned(a, m, bd, l, callee);
+    if (sel res_assigned.err)     { ret res[bool, allocator.Error].err{res_assigned.err}; }
+    if (sel res_assigned.ok.none) { ret res[bool, allocator.Error].ok{false}; }
+    var asg: Assignment = res_assigned.ok.some;
+    fin { piece.dnit(?asg); }
+    var i: usize = 0;
+    for (i < asg.arguments.len) {
+        val passed: piece.Passed = asg.arguments.data[i];
+        i = i + 1;
+        if (sel passed.passing.reference) {
+            if (passed.count != 1) { ret res[bool, allocator.Error].ok{false}; }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Carried](addressed, Carried{place: asg.pieces.data[passed.first::usize].place, length: passed.passing.reference.size});
+            if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+            cnt;
+        }
+        var k: u32 = 0;
+        for (k < passed.count) {
+            val p: Piece = asg.pieces.data[(passed.first + k)::usize];
+            k = k + 1;
+            if (!(sel p.scale.fixed)) { ret res[bool, allocator.Error].ok{false}; }
+            if (sel p.place.stack) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Carried](stacked, Carried{place: p.place, length: p.size});
+                if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+            }
+        }
+    }
+    i = 0;
+    for (i < asg.results.len) {
+        val passed: piece.Passed = asg.results.data[i];
+        i = i + 1;
+        if (sel passed.passing.reference) {
+            if (sel asg.address.none) { ret res[bool, allocator.Error].ok{false}; }
+            @result = opt[Carried].some{Carried{place: asg.address.some.place, length: passed.passing.reference.size}};
+            cnt;
+        }
+        var k: u32 = 0;
+        for (k < passed.count) {
+            val at: Place = asg.pieces.data[(passed.first + k)::usize].place;
+            if (sel at.stack) { ret res[bool, allocator.Error].ok{false}; }
+            k = k + 1;
+        }
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# the places of the pointers a call of `callee` passes to storage its declaration states holds no secret
+# (`FunctionData.pointers`), into `out`, one per such parameter passed by value in one piece, which the callee reads
+# through as public, so its caller passes none of them to bytes it holds a secret in. false where the signature does
+# not classify under the build's rows
+pub fun pointers(a: *allocator.Allocator, m: *Module, bd: *Build, l: *Layout, callee: Declared, out: *vector.Vector[Place]) res[bool, allocator.Error] {
+    val list: Slice[u32] = module.declaration(m, callee).pointers;
+    if (list.size == 0) { ret res[bool, allocator.Error].ok{true}; }
+    val res_assigned: res[opt[Assignment], allocator.Error] = assigned(a, m, bd, l, callee);
+    if (sel res_assigned.err)     { ret res[bool, allocator.Error].err{res_assigned.err}; }
+    if (sel res_assigned.ok.none) { ret res[bool, allocator.Error].ok{false}; }
+    var asg: Assignment = res_assigned.ok.some;
+    fin { piece.dnit(?asg); }
+    var i: usize = 0;
+    for (i < list.size) {
+        val at: usize = list.data[i]::usize;
+        i = i + 1;
+        if (at >= asg.arguments.len) { cnt; }
+        val passed: piece.Passed = asg.arguments.data[at];
+        if (!(sel passed.passing.value) || passed.count != 1) { cnt; }
+        val res_pushed: res[usize, allocator.Error] = vector.push[Place](out, asg.pieces.data[passed.first::usize].place);
+        if (sel res_pushed.err) { ret res[bool, allocator.Error].err{res_pushed.err}; }
+    }
+    ret res[bool, allocator.Error].ok{true};
+}

@@ -1,0 +1,858 @@
+# the risc-v vector rules: the v extension's loads, stores, lanewise
+# operations, splat, extract, insert and reductions, the guards they read and
+# the immediates they compute
+#
+# a vector the v unit holds is in one register at lmul 1, its lanes from lane
+# 0 at the low bits, and the bits above it are undefined, so a rule reads no
+# lane past the vector's and may write any (rvv 1.0, section 4.5 "mapping for
+# lmul = 1"). its length is the build's vlen, which only a zvl extension
+# bounds, so every vector instruction a rule emits states the vtype and the
+# vector length it runs at as its configuration state (`Stated.matched`), the
+# length the lanes of the vector the root gives, reads or stores, one for a
+# move of lane 0 and the lane plus one for an insert. the configure step
+# establishes a state only where it differs from the one in force (section 6
+# "configuration-setting instructions", `mirl.target.register.riscv.vtype`),
+# so the rules of one block that run at one state share one vsetivli. the
+# vtype is tail and mask agnostic and lmul 1, but an insert
+# keeps the tail undisturbed and a narrowing runs at a fractional lmul. no
+# rule is masked.
+#
+# no rule reads or writes the mask register v0, so a comparison is packed only
+# as the sign extension of its mask to lanes as wide as those compared (the
+# unit's masks are widened), all ones where it holds, made of unmasked
+# integer instructions: equal and not equal from x = a ^ b, whose sign of
+# x | -x is set unless x is zero, spread over the lane by vsra by w - 1;
+# signed less from the sign of d ^ ((a ^ b) & (d ^ a)), d = a - b; unsigned
+# less from the sign of (~a & b) | ((~a | b) & d) (hacker's delight 2-12);
+# less or equal as the complement of less with the operands exchanged. vsra
+# takes five bits of count, so a 64 bit lane spreads by vsra.vx of 63 set by
+# addi. a shift by a count per lane shifts by the count modulo w and fixes
+# the lanes whose count is w or more, read unsigned: (count >> log2 w) - 1 is
+# negative only where the count is below w, so its spread keeps the left and
+# logical right shifts through vand, and the spread of -(count >> log2 w), all
+# ones where the count is w or more, or-ed into the count makes an
+# arithmetic shift's count w - 1 there. no row is vminu or vmerge, which zvkt
+# does not hold independent or which read v0.
+#
+# a load or a store is vle or vse at the lane width where the access is
+# aligned to a lane, and vle8 or vse8 of the vector's bytes otherwise, since a
+# misaligned element may trap (section 7.3). a lane's index is the root's
+# immediate, which the computed sources turn into the offset of vslidedown and
+# vslideup and the vector length an insert writes up to. an extract slides
+# the lane down to lane 0 and moves it out by vmv.x.s or vfmv.f.s, and an
+# insert moves the scalar into lane 0 of a temporary and slides it up into
+# the vector under a vector length of the lane plus one, tail undisturbed
+# (sections 16.1 to 16.3).
+#
+# a reduction reads its seed from lane 0 of a register (section 14): the
+# vector itself where the operation is idempotent, a minimum, maximum, and or
+# or, and a lane of zero, or of negative zero for a float sum, made by vmv.s.x
+# and vfsgnjn.vv, which is mirl's choice of identity. a reduction of one lane
+# is that lane. vfredosum adds in lane order from the seed, as reduce.fadd.seq
+# does, and vfredusum in an order the implementation picks, which the ir
+# leaves free. vfredmin, vfredmax, vfmin and vfmax give the other operand for
+# one nan operand and the canonical nan for two (section 13.11), as fminnum and
+# fmaxnum do on risc-v. rvv has no product reduction and no ieee minimum or
+# maximum, so those stay lane by lane.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use riscv_config: masc.isa.riscv.config;
+use masc.isa.riscv.gen_register;
+use masc.isa.riscv.gen_row;
+use masc.isa.riscv.gen_row_index;
+
+use mirl.ir.id;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.rule.Class;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.format;
+use mirl.ir.type.table;
+use mirl.machine.instruction.Opcode;
+use mirl.machine.pseudo;
+use mirl.machine.select.match;
+use mirl.machine.select.rule.Emit;
+use mirl.machine.select.rule.Match;
+use mirl.machine.select.rule.NO_IMPLIED;
+use mirl.machine.select.rule.Node;
+use mirl.machine.select.rule.Ref;
+use mirl.machine.select.rule.Scratch;
+use mirl.machine.select.rule.Slot;
+use mirl.machine.select.rule.Source;
+use mirl.machine.select.rule.Sources;
+use mirl.machine.select.rule.Stated;
+use mirl.machine.select.rule.Test;
+use mirl.machine.select.rule.Tie;
+use mirl.machine.select.rule.Width;
+use mirl.machine.vstate;
+
+# the lanes of a vector: how many and the bits of each, zero for a value
+# that is no vector
+rec Lanes {
+    count: u32;
+    bits:  u32;
+}
+
+fun lanes_of(mt: *Match, v: opt[id.Value]) Lanes {
+    val none: Lanes = Lanes{count: 0, bits: 0};
+    if (sel v.none) { ret none; }
+    val res_shape: res[table.Shape, table.Error] = match.shape(mt, v.some);
+    if (sel res_shape.err) { ret none; }
+    val sh: table.Shape = res_shape.ok;
+    if (!(sel sh.vector)) { ret none; }
+    val res_shape_types: res[table.Shape, table.Error] = table.shape(?mt.module.types, sh.vector.element);
+    if (sel res_shape_types.err) { ret none; }
+    val es:   table.Shape = res_shape_types.ok;
+    var bits: u32         = 0;
+    if (sel es.integer) { bits = es.integer.width; }
+    or (sel es.float) {
+        val opt_row: opt[format.Row] = format.row(es.float.format);
+        if (sel opt_row.none) { ret none; }
+        bits = opt_row.some.width;
+    }
+    ret Lanes{count: sh.vector.lanes, bits: bits};
+}
+
+fun result_lanes(mt: *Match) Lanes {
+    ret lanes_of(mt, match.result(mt, Slot{node: 0, index: 0}));
+}
+
+fun operand_lanes(mt: *Match) Lanes {
+    ret lanes_of(mt, match.operand(mt, Slot{node: 0, index: 0}));
+}
+
+# the vector a store writes, its second operand
+fun stored_lanes(mt: *Match) Lanes {
+    ret lanes_of(mt, match.operand(mt, Slot{node: 0, index: 1}));
+}
+
+fun immediate(x: u64) opt[i64] {
+    ret opt[i64].some{x:~i64};
+}
+
+fun count_of(l: Lanes) opt[i64] {
+    if (l.count == 0) { ret opt[i64].none{}; }
+    ret immediate(l.count::u64);
+}
+
+fun bytes_of(l: Lanes) opt[i64] {
+    if (l.count == 0 || l.bits % 8 != 0) { ret opt[i64].none{}; }
+    ret immediate(l.count::u64 * l.bits::u64 / 8);
+}
+
+# the vector length a rule runs at: the lanes of the vector the root gives,
+# reads or stores, or its bytes for a load or a store of bytes
+pub fun result_count(mt: *Match) opt[i64] {
+    ret count_of(result_lanes(mt));
+}
+
+# the lane count of the vector the root reads
+# ---
+# mt:  the match the immediate is computed from
+# ret: the lanes of operand 0, none for a value that is no vector
+pub fun operand_count(mt: *Match) opt[i64] {
+    ret count_of(operand_lanes(mt));
+}
+
+# the lane count of the vector a store writes
+# ---
+# mt:  the match the immediate is computed from
+# ret: the lanes of operand 1, none for a value that is no vector
+pub fun stored_count(mt: *Match) opt[i64] {
+    ret count_of(stored_lanes(mt));
+}
+
+# the bytes of the vector a load gives, the length of a load of bytes
+# ---
+# mt:  the match the immediate is computed from
+# ret: the bytes of the result, none for a value that is no vector or whose
+#      lanes are not whole bytes
+pub fun result_bytes(mt: *Match) opt[i64] {
+    ret bytes_of(result_lanes(mt));
+}
+
+# the bytes of the vector a store writes, the length of a store of bytes
+# ---
+# mt:  the match the immediate is computed from
+# ret: the bytes of operand 1, none for a value that is no vector or whose
+#      lanes are not whole bytes
+pub fun stored_bytes(mt: *Match) opt[i64] {
+    ret bytes_of(stored_lanes(mt));
+}
+
+# the lane the root names
+fun lane_of(mt: *Match) opt[u32] {
+    val d: *InstructionData = match.instruction(mt, 0);
+    var i: usize            = 0;
+    for (i < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[i];
+        if (sel imm.lane) { ret opt[u32].some{imm.lane}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the lane, the offset of a slide
+pub fun lane(mt: *Match) opt[i64] {
+    val opt_lane_of: opt[u32] = lane_of(mt);
+    if (sel opt_lane_of.none) { ret opt[i64].none{}; }
+    ret immediate(opt_lane_of.some::u64);
+}
+
+# the lane plus one, the vector length an insert writes up to
+pub fun lane_after(mt: *Match) opt[i64] {
+    val opt_lane_of: opt[u32] = lane_of(mt);
+    if (sel opt_lane_of.none) { ret opt[i64].none{}; }
+    ret immediate(opt_lane_of.some::u64 + 1);
+}
+
+# the root names lane 0
+pub fun lane_zero(mt: *Match) bool {
+    val opt_lane_of: opt[u32] = lane_of(mt);
+    ret sel opt_lane_of.some && opt_lane_of.some == 0;
+}
+
+# the root reduces a vector of one lane, or of more
+pub fun single(mt: *Match) bool {
+    ret operand_lanes(mt).count == 1;
+}
+
+# the root reduces a vector of more than one lane
+# ---
+# mt:  the match the guard reads
+# ret: whether the guard holds
+pub fun several(mt: *Match) bool {
+    ret operand_lanes(mt).count > 1;
+}
+
+# the alignment the root's access states, zero where it states none
+fun alignment(mt: *Match) u64 {
+    val d: *InstructionData = match.instruction(mt, 0);
+    var i: usize            = 0;
+    for (i < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[i];
+        if (sel imm.alignment) { ret imm.alignment; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun aligned(mt: *Match, l: Lanes) bool {
+    ret l.bits != 0 && alignment(mt) * 8 >= l.bits::u64;
+}
+
+# the access is aligned to a lane of the vector it loads or stores
+pub fun load_aligned(mt: *Match) bool {
+    ret aligned(mt, result_lanes(mt));
+}
+
+# the store is aligned to a lane of the vector it writes
+# ---
+# mt:  the match the guard reads
+# ret: whether the guard holds
+pub fun store_aligned(mt: *Match) bool {
+    ret aligned(mt, stored_lanes(mt));
+}
+
+# the state an instruction runs under: its vtype and the vector length the root gives, reads or stores, or
+# one for an instruction that moves a scalar into or out of lane 0, or the lane plus one for an insert
+fun stated(vtype: u64, n: opt[i64]) opt[vstate.State] {
+    if (sel n.none)  { ret opt[vstate.State].none{}; }
+    if (n.some <= 0) { ret opt[vstate.State].none{}; }
+    ret opt[vstate.State].some{vstate.State{config: riscv_config.configured(vtype, n.some:~u64)}};
+}
+
+# a vector length of one, for an instruction that moves a scalar into or out of lane 0
+fun one(mt: *Match) opt[i64] {
+    ret opt[i64].some{1};
+}
+
+fun e16_mf2_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(207, result_count(mt));
+}
+
+fun e16_mf4_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(206, result_count(mt));
+}
+
+fun e16_one(mt: *Match) opt[vstate.State] {
+    ret stated(200, one(mt));
+}
+
+fun e16_operand_count(mt: *Match) opt[vstate.State] {
+    ret stated(200, operand_count(mt));
+}
+
+fun e16_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(200, result_count(mt));
+}
+
+fun e16_stored_count(mt: *Match) opt[vstate.State] {
+    ret stated(200, stored_count(mt));
+}
+
+fun e16_tu_lane_after(mt: *Match) opt[vstate.State] {
+    ret stated(136, lane_after(mt));
+}
+
+fun e16_tu_one(mt: *Match) opt[vstate.State] {
+    ret stated(136, one(mt));
+}
+
+fun e32_mf2_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(215, result_count(mt));
+}
+
+fun e32_one(mt: *Match) opt[vstate.State] {
+    ret stated(208, one(mt));
+}
+
+fun e32_operand_count(mt: *Match) opt[vstate.State] {
+    ret stated(208, operand_count(mt));
+}
+
+fun e32_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(208, result_count(mt));
+}
+
+fun e32_stored_count(mt: *Match) opt[vstate.State] {
+    ret stated(208, stored_count(mt));
+}
+
+fun e32_tu_lane_after(mt: *Match) opt[vstate.State] {
+    ret stated(144, lane_after(mt));
+}
+
+fun e32_tu_one(mt: *Match) opt[vstate.State] {
+    ret stated(144, one(mt));
+}
+
+fun e64_one(mt: *Match) opt[vstate.State] {
+    ret stated(216, one(mt));
+}
+
+fun e64_operand_count(mt: *Match) opt[vstate.State] {
+    ret stated(216, operand_count(mt));
+}
+
+fun e64_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(216, result_count(mt));
+}
+
+fun e64_stored_count(mt: *Match) opt[vstate.State] {
+    ret stated(216, stored_count(mt));
+}
+
+fun e64_tu_lane_after(mt: *Match) opt[vstate.State] {
+    ret stated(152, lane_after(mt));
+}
+
+fun e64_tu_one(mt: *Match) opt[vstate.State] {
+    ret stated(152, one(mt));
+}
+
+fun e8_mf2_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(199, result_count(mt));
+}
+
+fun e8_mf4_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(198, result_count(mt));
+}
+
+fun e8_mf8_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(197, result_count(mt));
+}
+
+fun e8_one(mt: *Match) opt[vstate.State] {
+    ret stated(192, one(mt));
+}
+
+fun e8_operand_count(mt: *Match) opt[vstate.State] {
+    ret stated(192, operand_count(mt));
+}
+
+fun e8_result_bytes(mt: *Match) opt[vstate.State] {
+    ret stated(192, result_bytes(mt));
+}
+
+fun e8_result_count(mt: *Match) opt[vstate.State] {
+    ret stated(192, result_count(mt));
+}
+
+fun e8_stored_bytes(mt: *Match) opt[vstate.State] {
+    ret stated(192, stored_bytes(mt));
+}
+
+fun e8_stored_count(mt: *Match) opt[vstate.State] {
+    ret stated(192, stored_count(mt));
+}
+
+fun e8_tu_lane_after(mt: *Match) opt[vstate.State] {
+    ret stated(128, lane_after(mt));
+}
+
+fun e8_tu_one(mt: *Match) opt[vstate.State] {
+    ret stated(128, one(mt));
+}
+
+pub val N_ADD:             [1]Node = [1]Node{Node{opcode: opcode_table.ADD, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_AND:             [1]Node = [1]Node{Node{opcode: opcode_table.AND, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_BITCAST:         [1]Node = [1]Node{Node{opcode: opcode_table.BITCAST, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_DECLASSIFY:      [1]Node = [1]Node{Node{opcode: opcode_table.DECLASSIFY, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_S:           [1]Node = [1]Node{Node{opcode: opcode_table.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_U:           [1]Node = [1]Node{Node{opcode: opcode_table.EXT_U, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FABS:            [1]Node = [1]Node{Node{opcode: opcode_table.FABS, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FADD:            [1]Node = [1]Node{Node{opcode: opcode_table.FADD, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FDIV:            [1]Node = [1]Node{Node{opcode: opcode_table.FDIV, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FMA:             [1]Node = [1]Node{Node{opcode: opcode_table.FMA, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FMAXNUM:         [1]Node = [1]Node{Node{opcode: opcode_table.FMAXNUM, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FMINNUM:         [1]Node = [1]Node{Node{opcode: opcode_table.FMINNUM, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FMUL:            [1]Node = [1]Node{Node{opcode: opcode_table.FMUL, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FNEG:            [1]Node = [1]Node{Node{opcode: opcode_table.FNEG, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FSQRT:           [1]Node = [1]Node{Node{opcode: opcode_table.FSQRT, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FTOI_U:          [1]Node = [1]Node{Node{opcode: opcode_table.FTOI_U, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FTOI_S:          [1]Node = [1]Node{Node{opcode: opcode_table.FTOI_S, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_ITOF_U:          [1]Node = [1]Node{Node{opcode: opcode_table.ITOF_U, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_ITOF_S:          [1]Node = [1]Node{Node{opcode: opcode_table.ITOF_S, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_FSUB:            [1]Node = [1]Node{Node{opcode: opcode_table.FSUB, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_LOAD:            [1]Node = [1]Node{Node{opcode: opcode_table.LOAD, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_MUL:             [1]Node = [1]Node{Node{opcode: opcode_table.MUL, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_NEG:             [1]Node = [1]Node{Node{opcode: opcode_table.NEG, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_NOT:             [1]Node = [1]Node{Node{opcode: opcode_table.NOT, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_OR:              [1]Node = [1]Node{Node{opcode: opcode_table.OR, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_ADD:      [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_ADD, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_AND:      [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_AND, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FADD_ANY: [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_FADD_ANY, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FADD_SEQ: [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_FADD_SEQ, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FMAXNUM:  [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_FMAXNUM, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_FMINNUM:  [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_FMINNUM, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_OR:       [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_OR, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_SMAX:     [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_SMAX, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_SMIN:     [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_SMIN, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_UMAX:     [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_UMAX, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_UMIN:     [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_UMIN, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_REDUCE_XOR:      [1]Node = [1]Node{Node{opcode: opcode_table.REDUCE_XOR, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_STORE:           [1]Node = [1]Node{Node{opcode: opcode_table.STORE, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_SUB:             [1]Node = [1]Node{Node{opcode: opcode_table.SUB, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_TRUNC:           [1]Node = [1]Node{Node{opcode: opcode_table.TRUNC, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_VEXTRACT:        [1]Node = [1]Node{Node{opcode: opcode_table.VEXTRACT, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_VINSERT:         [1]Node = [1]Node{Node{opcode: opcode_table.VINSERT, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_VSPLAT:          [1]Node = [1]Node{Node{opcode: opcode_table.VSPLAT, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_XOR:             [1]Node = [1]Node{Node{opcode: opcode_table.XOR, parent: 0, operand: 0, result: 0, constants: 0}};
+
+pub val T_O0FD_X0VEC:    [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O0FS_X0VEC:    [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O0LFD:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: true}};
+pub val T_O0LFS:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: true}};
+pub val T_O0LW16:        [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}};
+pub val T_O0LW16_X0LW32: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}};
+pub val T_O0LW16_X0LW64: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}};
+pub val T_O0LW16_X0LW8:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}};
+pub val T_O0LW32:        [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}};
+pub val T_O0LW32_X0LW16: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}};
+pub val T_O0LW32_X0LW64: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}};
+pub val T_O0LW32_X0LW8:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}};
+pub val T_O0LW64:        [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}};
+pub val T_O0LW64_O1W64R: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}, Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.width{64}, lanes: false, width: Width.register{}}};
+pub val T_O0LW64_X0LW16: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}};
+pub val T_O0LW64_X0LW32: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}};
+pub val T_O0LW64_X0LW8:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}};
+pub val T_O0LW64_X0W64R: [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: false, width: Width.register{}}};
+pub val T_O0LW8:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}};
+pub val T_O0LW8_X0LW16:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}};
+pub val T_O0LW8_X0LW32:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}};
+pub val T_O0LW8_X0LW64:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}};
+pub val T_O0VEC:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O0VEC_X0FD:    [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: false}};
+pub val T_O0VEC_X0FS:    [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: false}};
+pub val T_O0VEC_X0VEC:   [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O0VEC_X0W16:   [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: false}};
+pub val T_O0VEC_X0W32:   [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: false}};
+pub val T_O0VEC_X0W64R:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: false, width: Width.register{}}};
+pub val T_O0VEC_X0W8:    [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: false}};
+pub val T_O0W16_X0VEC:   [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O0W32_X0VEC:   [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O0W64R_X0VEC:  [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: false, width: Width.register{}}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O0W8_X0VEC:    [2]Test = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: false}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+pub val T_O1LFD:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.format{format.BINARY64}, lanes: true}};
+pub val T_O1LFS:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.format{format.BINARY32}, lanes: true}};
+pub val T_O1LW16:        [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.width{16}, lanes: true}};
+pub val T_O1LW32:        [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.width{32}, lanes: true}};
+pub val T_O1LW64:        [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.width{64}, lanes: true}};
+pub val T_O1LW8:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.width{8}, lanes: true}};
+pub val T_O1VEC:         [1]Test = [1]Test{Test{at: Ref.operand{Slot{node: 0, index: 1}}, class: Class.vector{}, lanes: false}};
+pub val T_X0LFD:         [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: true}};
+pub val T_X0LFS:         [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: true}};
+pub val T_X0LW16:        [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}};
+pub val T_X0LW32:        [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}};
+pub val T_X0LW64:        [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}};
+pub val T_X0LW8:         [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}};
+pub val T_X0VEC:         [1]Test = [1]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.vector{}, lanes: false}};
+
+val S_GV2_GV2_GV2_L1:  [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}};
+val S_GV2_V0_CLANE_L1: [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 0}}, Source.computed{lane}, Source.literal{1}};
+val S_GV2_V0_GV2_L1:   [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 0}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}};
+val S_GV2_V0_GX0_L1:   [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 0}}, Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.literal{1}};
+val S_GV2_V0_L0_L1:    [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{0}, Source.literal{1}};
+val S_GV2_V0_V0_L1:    [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+val S_GV2_V1:          [2]Source = [2]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 1}}};
+val S_GV2_X0:          [2]Source = [2]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.fixed{gen_register.X0}};
+val S_GV3_GV2_L0_L1:   [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{0}, Source.literal{1}};
+val S_GX0_X0_CLANE:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.fixed{gen_register.X0}, Source.computed{lane}};
+val S_GX1_X0_CLANE:    [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: gen_register.X}}, Source.fixed{gen_register.X0}, Source.computed{lane}};
+val S_R_GV2:           [2]Source = [2]Source{Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}};
+val S_R_GV2_L0_L1:     [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{0}, Source.literal{1}};
+val S_R_GV3_L0_L1:     [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.literal{0}, Source.literal{1}};
+val S_R_V0:            [2]Source = [2]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}};
+val S_R_V0_L0_L1:      [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.literal{0}, Source.literal{1}};
+val S_R_V0_L1:         [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+val S_R_V0_LM1_L1:     [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.literal{-1}, Source.literal{1}};
+val S_R_V0_V0_L1:      [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+val S_R_V0_V1_L1:      [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 1}}, Source.literal{1}};
+val S_R_V0_X0_L1:      [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.fixed{gen_register.X0}, Source.literal{1}};
+val S_T0_GV2_CLANE_L1: [4]Source = [4]Source{Source.tied{Tie{result: 0, value: Slot{node: 0, index: 0}}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.computed{lane}, Source.literal{1}};
+val S_T0_GV2_GX1_L1:   [4]Source = [4]Source{Source.tied{Tie{result: 0, value: Slot{node: 0, index: 0}}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 1, class: gen_register.X}}, Source.literal{1}};
+val S_T0_V1:           [2]Source = [2]Source{Source.tied{Tie{result: 0, value: Slot{node: 0, index: 0}}}, Source.value{Slot{node: 0, index: 1}}};
+val S_T2_V0_V1_L1:     [4]Source = [4]Source{Source.tied{Tie{result: 0, value: Slot{node: 0, index: 2}}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 1}}, Source.literal{1}};
+val S_V1_V0_L1:        [3]Source = [3]Source{Source.value{Slot{node: 0, index: 1}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+
+pub val E_ADD_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_ADD_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_ADD_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_ADD_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_SUB_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_SUB_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_SUB_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_SUB_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_AND_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_AND_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_AND_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_AND_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_OR_W8:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_OR_W16:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_OR_W32:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_OR_W64:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_XOR_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_XOR_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_XOR_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_XOR_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_MUL_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMUL_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_MUL_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMUL_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_MUL_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMUL_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_MUL_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMUL_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_NEG_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_R_V0_X0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_NOT_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_V0_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_NEG_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_R_V0_X0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_NOT_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_V0_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_NEG_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_R_V0_X0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_NOT_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_V0_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_NEG_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_R_V0_X0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_NOT_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_V0_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FADD_FS:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFADD_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FADD_FD:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFADD_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FSUB_FS:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSUB_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FSUB_FD:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSUB_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FMUL_FS:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMUL_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FMUL_FD:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMUL_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FDIV_FS:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFDIV_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FDIV_FD:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFDIV_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FMINNUM_FS:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMIN_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FMINNUM_FD:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMIN_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FMAXNUM_FS:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMAX_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FMAXNUM_FD:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMAX_VV]}, operands: Sources{at: ?S_R_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FSQRT_FS:          [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSQRT_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+val     S_CV_R_V0_L1:        [3]Source = [3]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}};
+val     S_CV_R_R_GV2_L1:     [4]Source = [4]Source{Source.result{0}, Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}};
+val     S_CV_GV2_V0_L1_L1:   [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 0}}, Source.literal{1}, Source.literal{1}};
+val     S_CV_GV2_GV2_L1_L1:  [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}, Source.literal{1}};
+val     S_CV_GX0_X0_L255:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.fixed{gen_register.X0}, Source.literal{255}};
+val     S_CV_GX0_GX0_L23:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.literal{23}};
+val     S_CV_GV2_GV2_GX0_L1: [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.literal{1}};
+val     S_CV_GV2_GV2_L31_L1: [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{31}, Source.literal{1}};
+val     S_CV_GV2_GV2_LM1_L1: [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{-1}, Source.literal{1}};
+val     S_CV_GX0_X0_L2047:   [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.fixed{gen_register.X0}, Source.literal{2047}};
+val     S_CV_GX0_GX0_L52:    [3]Source = [3]Source{Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.scratch{Scratch{index: 0, class: gen_register.X}}, Source.literal{52}};
+val     S_CV_GX1_X0_L63:     [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: gen_register.X}}, Source.fixed{gen_register.X0}, Source.literal{63}};
+val     S_CV_GV2_GV2_GX1_L1: [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 1, class: gen_register.X}}, Source.literal{1}};
+pub val T_O0LW32_X0LFS:      [2]Test   = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: true}};
+pub val T_O0LFS_X0LW32:      [2]Test   = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY32}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}};
+pub val T_O0LW64_X0LFD:      [2]Test   = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: true}};
+pub val T_O0LFD_X0LW64:      [2]Test   = [2]Test{Test{at: Ref.operand{Slot{node: 0, index: 0}}, class: Class.format{format.BINARY64}, lanes: true}, Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}};
+# the conversions between integer and float lanes of one width. vfcvt rounds to the float in the rounding mode,
+# and toward zero to the integer saturating at its bounds, but gives the greatest value for a nan where the
+# ir gives 0 (rvv 1.0, section 13.17 and the f extension's table 11.4), so a lane that is a nan is cleared by
+# a mask made with no v0: the lane's bits less the sign, as a signed integer, exceed the infinity's only for a nan
+pub val E_ITOF_S_W32_FS:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_F_X_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_ITOF_U_W32_FS:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_F_XU_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FTOI_S_FS_W32:        [9]Emit   = [9]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VI]}, operands: Sources{at: ?S_CV_GV2_V0_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_CV_GX0_X0_L255[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.SLLI]}, operands: Sources{at: ?S_CV_GX0_GX0_L23[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_CV_GV2_GV2_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_RTZ_X_F_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_CV_R_R_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FTOI_U_FS_W32:        [9]Emit   = [9]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VI]}, operands: Sources{at: ?S_CV_GV2_V0_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_CV_GX0_X0_L255[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.SLLI]}, operands: Sources{at: ?S_CV_GX0_GX0_L23[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_CV_GV2_GV2_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_RTZ_XU_F_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_CV_R_R_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_ITOF_S_W64_FD:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_F_X_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_ITOF_U_W64_FD:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_F_XU_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FTOI_S_FD_W64:        [10]Emit  = [10]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VI]}, operands: Sources{at: ?S_CV_GV2_V0_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_CV_GX0_X0_L2047[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.SLLI]}, operands: Sources{at: ?S_CV_GX0_GX0_L52[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_CV_GV2_GV2_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_CV_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_CV_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_RTZ_X_F_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_CV_R_R_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FTOI_U_FD_W64:        [10]Emit  = [10]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VI]}, operands: Sources{at: ?S_CV_GV2_V0_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_L1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_CV_GX0_X0_L2047[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.SLLI]}, operands: Sources{at: ?S_CV_GX0_GX0_L52[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VX]}, operands: Sources{at: ?S_CV_GV2_GV2_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_CV_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_CV_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_CV_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFCVT_RTZ_XU_F_V]}, operands: Sources{at: ?S_CV_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_CV_R_R_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FNEG_FS:              [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJN_VV]}, operands: Sources{at: ?S_R_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FABS_FS:              [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJX_VV]}, operands: Sources{at: ?S_R_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FMA_FS:               [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMACC_VV]}, operands: Sources{at: ?S_T2_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_FSQRT_FD:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSQRT_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FNEG_FD:              [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJN_VV]}, operands: Sources{at: ?S_R_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FABS_FD:              [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJX_VV]}, operands: Sources{at: ?S_R_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_FMA_FD:               [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMACC_VV]}, operands: Sources{at: ?S_T2_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_EXT_S_W8_W16:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSEXT_VF2]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_EXT_U_W8_W16:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VZEXT_VF2]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_TRUNC_W16_W8:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_R_V0_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_mf2_result_count}}};
+pub val E_EXT_S_W8_W32:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSEXT_VF4]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_EXT_U_W8_W32:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VZEXT_VF4]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_TRUNC_W32_W8:         [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_GV2_V0_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_mf2_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_R_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_mf4_result_count}}};
+pub val E_EXT_S_W8_W64:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSEXT_VF8]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_EXT_U_W8_W64:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VZEXT_VF8]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_TRUNC_W64_W8:         [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_GV2_V0_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_mf2_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_mf4_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_R_GV3_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_mf8_result_count}}};
+pub val E_EXT_S_W16_W32:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSEXT_VF2]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_EXT_U_W16_W32:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VZEXT_VF2]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_TRUNC_W32_W16:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_R_V0_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_mf2_result_count}}};
+pub val E_EXT_S_W16_W64:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSEXT_VF4]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_EXT_U_W16_W64:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VZEXT_VF4]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_TRUNC_W64_W16:        [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_GV2_V0_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_mf2_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_R_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_mf4_result_count}}};
+pub val E_EXT_S_W32_W64:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSEXT_VF2]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_EXT_U_W32_W64:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VZEXT_VF2]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_TRUNC_W64_W32:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VNSRL_WI]}, operands: Sources{at: ?S_R_V0_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_mf2_result_count}}};
+pub val E_VSPLAT_W8:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_V_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_VEXTRACT_W8_0:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_VEXTRACT_W8:          [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VI]}, operands: Sources{at: ?S_GV2_V0_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_VEXTRACT_W8_R:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX0_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VX]}, operands: Sources{at: ?S_GV2_V0_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_VINSERT_W8_0:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_T0_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_tu_one}}};
+pub val E_VINSERT_W8:           [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VI]}, operands: Sources{at: ?S_T0_GV2_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_tu_lane_after}}};
+pub val E_VINSERT_W8_R:         [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VX]}, operands: Sources{at: ?S_T0_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_tu_lane_after}}};
+pub val E_VSPLAT_W16:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_V_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_VEXTRACT_W16_0:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_VEXTRACT_W16:         [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VI]}, operands: Sources{at: ?S_GV2_V0_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_VEXTRACT_W16_R:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX0_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VX]}, operands: Sources{at: ?S_GV2_V0_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_VINSERT_W16_0:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_T0_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_tu_one}}};
+pub val E_VINSERT_W16:          [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VI]}, operands: Sources{at: ?S_T0_GV2_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_tu_lane_after}}};
+pub val E_VINSERT_W16_R:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VX]}, operands: Sources{at: ?S_T0_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_tu_lane_after}}};
+pub val E_VSPLAT_W32:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_V_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VEXTRACT_W32_0:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_VEXTRACT_W32:         [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VI]}, operands: Sources{at: ?S_GV2_V0_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_VEXTRACT_W32_R:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX0_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VX]}, operands: Sources{at: ?S_GV2_V0_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_VINSERT_W32_0:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_T0_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_one}}};
+pub val E_VINSERT_W32:          [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VI]}, operands: Sources{at: ?S_T0_GV2_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}};
+pub val E_VINSERT_W32_R:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VX]}, operands: Sources{at: ?S_T0_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}};
+pub val E_VSPLAT_W64:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_V_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_VEXTRACT_W64_0:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_VEXTRACT_W64:         [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VI]}, operands: Sources{at: ?S_GV2_V0_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_VEXTRACT_W64_R:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX0_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VX]}, operands: Sources{at: ?S_GV2_V0_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_VINSERT_W64_0:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_T0_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_one}}};
+pub val E_VINSERT_W64:          [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VI]}, operands: Sources{at: ?S_T0_GV2_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}};
+pub val E_VINSERT_W64_R:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VX]}, operands: Sources{at: ?S_T0_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}};
+pub val E_VSPLAT_FS:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_V_F]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VEXTRACT_FS_0:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_VEXTRACT_FS:          [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VI]}, operands: Sources{at: ?S_GV2_V0_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_VEXTRACT_FS_R:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX0_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VX]}, operands: Sources{at: ?S_GV2_V0_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_VINSERT_FS_0:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_T0_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_one}}};
+pub val E_VINSERT_FS:           [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VI]}, operands: Sources{at: ?S_T0_GV2_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}};
+pub val E_VINSERT_FS_R:         [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VX]}, operands: Sources{at: ?S_T0_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_tu_lane_after}}};
+pub val E_VSPLAT_FD:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_V_F]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_VEXTRACT_FD_0:        [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_VEXTRACT_FD:          [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VI]}, operands: Sources{at: ?S_GV2_V0_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_VEXTRACT_FD_R:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX0_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEDOWN_VX]}, operands: Sources{at: ?S_GV2_V0_GX0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_VINSERT_FD_0:         [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_T0_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_one}}};
+pub val E_VINSERT_FD:           [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VI]}, operands: Sources{at: ?S_T0_GV2_CLANE_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}};
+pub val E_VINSERT_FD_R:         [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_GV2_V1[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_CLANE[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLIDEUP_VX]}, operands: Sources{at: ?S_T0_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_tu_lane_after}}};
+pub val E_REDUCE_ADD_W8_1:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_ADD_W8:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_ADD_W16_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_ADD_W16:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_ADD_W32_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_ADD_W32:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_ADD_W64_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_ADD_W64:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_XOR_W8_1:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_XOR_W8:        [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDXOR_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_XOR_W16_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_XOR_W16:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDXOR_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_XOR_W32_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_XOR_W32:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDXOR_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_XOR_W64_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_XOR_W64:       [3]Emit   = [3]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDXOR_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_AND_W8_1:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_AND_W8:        [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDAND_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_AND_W16_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_AND_W16:       [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDAND_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_AND_W32_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_AND_W32:       [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDAND_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_AND_W64_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_AND_W64:       [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDAND_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_OR_W8_1:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_OR_W8:         [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDOR_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_OR_W16_1:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_OR_W16:        [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDOR_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_OR_W32_1:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_OR_W32:        [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDOR_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_OR_W64_1:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_OR_W64:        [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDOR_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_SMIN_W8_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_SMIN_W8:       [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMIN_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_SMIN_W16_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_SMIN_W16:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMIN_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_SMIN_W32_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_SMIN_W32:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMIN_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_SMIN_W64_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_SMIN_W64:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMIN_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_SMAX_W8_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_SMAX_W8:       [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAX_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_SMAX_W16_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_SMAX_W16:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAX_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_SMAX_W32_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_SMAX_W32:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAX_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_SMAX_W64_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_SMAX_W64:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAX_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_UMIN_W8_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_UMIN_W8:       [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMINU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_UMIN_W16_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_UMIN_W16:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMINU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_UMIN_W32_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_UMIN_W32:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMINU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_UMIN_W64_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_UMIN_W64:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMINU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_UMAX_W8_1:     [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_REDUCE_UMAX_W8:       [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAXU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_operand_count}}};
+pub val E_REDUCE_UMAX_W16_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_REDUCE_UMAX_W16:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAXU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_operand_count}}};
+pub val E_REDUCE_UMAX_W32_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_UMAX_W32:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAXU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_UMAX_W64_1:    [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_UMAX_W64:      [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VREDMAXU_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_FADD_ANY_FS_1: [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_FADD_ANY_FS:   [4]Emit   = [4]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJN_VV]}, operands: Sources{at: ?S_GV2_GV2_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDUSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_FADD_ANY_FD_1: [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_FADD_ANY_FD:   [4]Emit   = [4]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJN_VV]}, operands: Sources{at: ?S_GV2_GV2_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDUSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_FADD_SEQ_FS_1: [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_FADD_SEQ_FS:   [4]Emit   = [4]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJN_VV]}, operands: Sources{at: ?S_GV2_GV2_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDOSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_FADD_SEQ_FD_1: [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_FADD_SEQ_FD:   [4]Emit   = [4]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_GV2_X0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFSGNJN_VV]}, operands: Sources{at: ?S_GV2_GV2_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDOSUM_VS]}, operands: Sources{at: ?S_GV2_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_FMINNUM_FS_1:  [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_FMINNUM_FS:    [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDMIN_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_FMINNUM_FD_1:  [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_FMINNUM_FD:    [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDMIN_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_REDUCE_FMAXNUM_FS_1:  [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_REDUCE_FMAXNUM_FS:    [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDMAX_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_operand_count}}};
+pub val E_REDUCE_FMAXNUM_FD_1:  [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_REDUCE_FMAXNUM_FD:    [2]Emit   = [2]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFREDMAX_VS]}, operands: Sources{at: ?S_GV2_V0_V0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_GV2[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_operand_count}}};
+pub val E_LOAD_W8:              [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VLE8_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_STORE_W8:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSE8_V]}, operands: Sources{at: ?S_V1_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e8_stored_count}}};
+pub val E_LOAD_W16:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VLE16_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_STORE_W16:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSE16_V]}, operands: Sources{at: ?S_V1_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e16_stored_count}}};
+pub val E_LOAD_W32:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VLE32_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_STORE_W32:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSE32_V]}, operands: Sources{at: ?S_V1_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_stored_count}}};
+pub val E_LOAD_W64:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VLE64_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_STORE_W64:            [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSE64_V]}, operands: Sources{at: ?S_V1_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_stored_count}}};
+pub val E_LOAD_FS:              [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VLE32_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_STORE_FS:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSE32_V]}, operands: Sources{at: ?S_V1_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e32_stored_count}}};
+pub val E_LOAD_FD:              [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VLE64_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_STORE_FD:             [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSE64_V]}, operands: Sources{at: ?S_V1_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e64_stored_count}}};
+pub val E_LOAD_BYTES:           [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VLE8_V]}, operands: Sources{at: ?S_R_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e8_result_bytes}}};
+pub val E_STORE_BYTES:          [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSE8_V]}, operands: Sources{at: ?S_V1_V0_L1[0], len: 3}, implied: NO_IMPLIED, state: Stated.matched{e8_stored_bytes}}};
+pub val E_BITCAST_VEC:          [1]Emit   = [1]Emit{Emit{opcode: Opcode.pseudo{pseudo.COPY}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_DECLASSIFY_VEC:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV1R_V]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED}};
+pub val E_BITCAST_VEC_W8:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_BITCAST_W8_VEC:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e8_one}}};
+pub val E_BITCAST_VEC_W16:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_BITCAST_W16_VEC:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e16_one}}};
+pub val E_BITCAST_VEC_W32:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_BITCAST_W32_VEC:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_BITCAST_VEC_W64:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_X_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_BITCAST_W64_VEC:      [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VMV_S_X]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_BITCAST_VEC_FS:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_BITCAST_FS_VEC:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e32_one}}};
+pub val E_BITCAST_VEC_FD:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_F_S]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val E_BITCAST_FD_VEC:       [1]Emit   = [1]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VFMV_S_F]}, operands: Sources{at: ?S_R_V0[0], len: 2}, implied: NO_IMPLIED, state: Stated.matched{e64_one}}};
+pub val N_EXT_S_EQP0O0:         [2]Node   = [2]Node{Node{opcode: opcode_table.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: opcode_table.EQ, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_S_NEP0O0:         [2]Node   = [2]Node{Node{opcode: opcode_table.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: opcode_table.NE, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_S_LT_SP0O0:       [2]Node   = [2]Node{Node{opcode: opcode_table.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: opcode_table.LT_S, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_S_LE_SP0O0:       [2]Node   = [2]Node{Node{opcode: opcode_table.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: opcode_table.LE_S, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_S_LT_UP0O0:       [2]Node   = [2]Node{Node{opcode: opcode_table.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: opcode_table.LT_U, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_EXT_S_LE_UP0O0:       [2]Node   = [2]Node{Node{opcode: opcode_table.EXT_S, parent: 0, operand: 0, result: 0, constants: 0}, Node{opcode: opcode_table.LE_U, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_SHL:                  [1]Node   = [1]Node{Node{opcode: opcode_table.SHL, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_SHR_U:                [1]Node   = [1]Node{Node{opcode: opcode_table.SHR_U, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val N_SHR_S:                [1]Node   = [1]Node{Node{opcode: opcode_table.SHR_S, parent: 0, operand: 0, result: 0, constants: 0}};
+pub val T_X0LW8_N10LW8:         [2]Test   = [2]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{8}, lanes: true}, Test{at: Ref.operand{Slot{node: 1, index: 0}}, class: Class.width{8}, lanes: true}};
+pub val T_X0LW16_N10LW16:       [2]Test   = [2]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{16}, lanes: true}, Test{at: Ref.operand{Slot{node: 1, index: 0}}, class: Class.width{16}, lanes: true}};
+pub val T_X0LW32_N10LW32:       [2]Test   = [2]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{32}, lanes: true}, Test{at: Ref.operand{Slot{node: 1, index: 0}}, class: Class.width{32}, lanes: true}};
+pub val T_X0LW64_N10LW64:       [2]Test   = [2]Test{Test{at: Ref.result{Slot{node: 0, index: 0}}, class: Class.width{64}, lanes: true}, Test{at: Ref.operand{Slot{node: 1, index: 0}}, class: Class.width{64}, lanes: true}};
+val     S_GV2_N10_N11_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 1, index: 0}}, Source.value{Slot{node: 1, index: 1}}, Source.literal{1}};
+val     S_GV2_GV2_GV3_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.literal{1}};
+val     S_GV2_GV2_L7_L1:        [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{7}, Source.literal{1}};
+val     S_R_GV2_LM1_L1:         [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{-1}, Source.literal{1}};
+val     S_GV2_GV2_L15_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{15}, Source.literal{1}};
+val     S_GV2_GV2_L31_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{31}, Source.literal{1}};
+val     S_GX1_X0_L63:           [3]Source = [3]Source{Source.scratch{Scratch{index: 1, class: gen_register.X}}, Source.fixed{gen_register.X0}, Source.literal{63}};
+val     S_GV2_GV2_GX1_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 1, class: gen_register.X}}, Source.literal{1}};
+val     S_R_GV2_L7_L1:          [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{7}, Source.literal{1}};
+val     S_R_GV2_L15_L1:         [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{15}, Source.literal{1}};
+val     S_R_GV2_L31_L1:         [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{31}, Source.literal{1}};
+val     S_R_GV2_GX1_L1:         [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 1, class: gen_register.X}}, Source.literal{1}};
+val     S_GV3_N10_N11_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 0}}, Source.value{Slot{node: 1, index: 1}}, Source.literal{1}};
+val     S_GV4_GV2_N10_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 1, index: 0}}, Source.literal{1}};
+val     S_GV3_GV3_GV4_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.literal{1}};
+val     S_GV2_N11_N10_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 1, index: 1}}, Source.value{Slot{node: 1, index: 0}}, Source.literal{1}};
+val     S_GV3_N11_N10_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 1}}, Source.value{Slot{node: 1, index: 0}}, Source.literal{1}};
+val     S_GV4_GV2_N11_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 1, index: 1}}, Source.literal{1}};
+val     S_GV3_N10_LM1_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 0}}, Source.literal{-1}, Source.literal{1}};
+val     S_GV4_GV3_N11_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 1}}, Source.literal{1}};
+val     S_GV3_GV3_N11_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 1}}, Source.literal{1}};
+val     S_GV4_GV4_GV2_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}};
+val     S_GV2_GV3_GV4_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.literal{1}};
+val     S_GV3_N11_LM1_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 1}}, Source.literal{-1}, Source.literal{1}};
+val     S_GV4_GV3_N10_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 4, class: gen_register.V}}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 0}}, Source.literal{1}};
+val     S_GV3_GV3_N10_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 1, index: 0}}, Source.literal{1}};
+val     S_GV3_V0_V1_L1:         [4]Source = [4]Source{Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.value{Slot{node: 0, index: 0}}, Source.value{Slot{node: 0, index: 1}}, Source.literal{1}};
+val     S_GV2_V1_L3_L1:         [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 1}}, Source.literal{3}, Source.literal{1}};
+val     S_GV2_GV2_LM1_L1:       [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{-1}, Source.literal{1}};
+val     S_R_GV3_GV2_L1:         [4]Source = [4]Source{Source.result{0}, Source.scratch{Scratch{index: 3, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}};
+val     S_GV2_V1_L4_L1:         [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 1}}, Source.literal{4}, Source.literal{1}};
+val     S_GV2_V1_L5_L1:         [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 1}}, Source.literal{5}, Source.literal{1}};
+val     S_GV2_V1_L6_L1:         [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 1}}, Source.literal{6}, Source.literal{1}};
+val     S_GV2_GV2_L0_L1:        [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{0}, Source.literal{1}};
+val     S_GV2_V1_GV2_L1:        [4]Source = [4]Source{Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.value{Slot{node: 0, index: 1}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}};
+val     S_R_V0_GV2_L1:          [4]Source = [4]Source{Source.result{0}, Source.value{Slot{node: 0, index: 0}}, Source.scratch{Scratch{index: 2, class: gen_register.V}}, Source.literal{1}};
+pub val E_VCMP_EQ_W8:           [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_VCMP_EQ_W16:          [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_VCMP_EQ_W32:          [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VCMP_EQ_W64:          [6]Emit   = [6]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_VCMP_NE_W8:           [4]Emit   = [4]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_VCMP_NE_W16:          [4]Emit   = [4]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_VCMP_NE_W32:          [4]Emit   = [4]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VCMP_NE_W64:          [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV3_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_R_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_VCMP_LT_S_W8:         [6]Emit   = [6]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_VCMP_LT_S_W16:        [6]Emit   = [6]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_VCMP_LT_S_W32:        [6]Emit   = [6]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VCMP_LT_S_W64:        [7]Emit   = [7]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_R_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_VCMP_LE_S_W8:         [7]Emit   = [7]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_VCMP_LE_S_W16:        [7]Emit   = [7]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_VCMP_LE_S_W32:        [7]Emit   = [7]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VCMP_LE_S_W64:        [8]Emit   = [8]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV3_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV4_GV2_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VV]}, operands: Sources{at: ?S_GV2_GV2_GV3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_VCMP_LT_U_W8:         [7]Emit   = [7]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N10_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_VCMP_LT_U_W16:        [7]Emit   = [7]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N10_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_VCMP_LT_U_W32:        [7]Emit   = [7]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N10_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_R_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VCMP_LT_U_W64:        [8]Emit   = [8]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N10_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N10_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N11_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_R_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_VCMP_LE_U_W8:         [8]Emit   = [8]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N11_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_VCMP_LE_U_W16:        [8]Emit   = [8]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N11_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_VCMP_LE_U_W32:        [8]Emit   = [8]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N11_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_VCMP_LE_U_W64:        [9]Emit   = [9]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSUB_VV]}, operands: Sources{at: ?S_GV2_N11_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_GV3_N11_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV4_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV3_GV3_N10_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_GV4_GV4_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_GV3_GV4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VXOR_VI]}, operands: Sources{at: ?S_R_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_SHL_W8:               [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_SHL_W16:              [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_SHL_W32:              [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L5_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_SHL_W64:              [6]Emit   = [6]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSLL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L6_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_SHR_U_W8:             [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_SHR_U_W16:            [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_SHR_U_W32:            [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L5_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_SHR_U_W64:            [6]Emit   = [6]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VV]}, operands: Sources{at: ?S_GV3_V0_V1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L6_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VADD_VI]}, operands: Sources{at: ?S_GV2_GV2_LM1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VAND_VV]}, operands: Sources{at: ?S_R_GV3_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};
+pub val E_SHR_S_W8:             [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L3_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV2_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L7_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_V1_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VV]}, operands: Sources{at: ?S_R_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e8_result_count}}};
+pub val E_SHR_S_W16:            [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L4_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV2_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L15_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_V1_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VV]}, operands: Sources{at: ?S_R_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e16_result_count}}};
+pub val E_SHR_S_W32:            [5]Emit   = [5]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L5_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV2_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VI]}, operands: Sources{at: ?S_GV2_GV2_L31_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_V1_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VV]}, operands: Sources{at: ?S_R_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e32_result_count}}};
+pub val E_SHR_S_W64:            [6]Emit   = [6]Emit{Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRL_VI]}, operands: Sources{at: ?S_GV2_V1_L6_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VRSUB_VI]}, operands: Sources{at: ?S_GV2_GV2_L0_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.ADDI]}, operands: Sources{at: ?S_GX1_X0_L63[0], len: 3}, implied: NO_IMPLIED}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VX]}, operands: Sources{at: ?S_GV2_GV2_GX1_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VOR_VV]}, operands: Sources{at: ?S_GV2_V1_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}, Emit{opcode: Opcode.row{?gen_row.ROWS[gen_row_index.VSRA_VV]}, operands: Sources{at: ?S_R_V0_GV2_L1[0], len: 4}, implied: NO_IMPLIED, state: Stated.matched{e64_result_count}}};

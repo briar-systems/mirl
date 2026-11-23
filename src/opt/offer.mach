@@ -1,0 +1,596 @@
+# offers: the bodies a module lets the inliners of other modules read (design 2.7)
+#
+# a module's offer is a text of the module's own functions another module's inliner may expand (`inline.offered`),
+# each with its body as the module lowered it, and every typedef, debug entry and declaration that text names
+# (`mirl.ir.text.item`'s part). a function is offered only where every symbol its text names is one another object may
+# refer to and that one definition stands for: a binding other objects see, not merged. an importer binds the text into
+# its own module before anything else reads it (`bind`, the bind mode of `mirl.ir.text.parse`), so the bodies are
+# available copies (`FunctionData.available`) its inliner reads and the `available` legalisation drops. a symbol hidden
+# from other images is offered, since the modules of one build link into one image.
+#
+# an offered function is a strong definition other objects see, neither weak, replaceable, merged nor exported, so
+# the link binds every reference to its name in another object to it or refuses a second definition of the name. an
+# importer's declaration of the name is therefore bound to this body at link time, whichever module the importer's
+# source named it through, and binding the body changes no call's target. a symbol the importer defines itself is
+# another matter: its own references never reach the link, so a body of that name, or a body naming it, would replace
+# or reach the importer's definition where the link reaches the offerer's.
+#
+# an offer is made of pieces, one per offered function: the function with its body and every typedef, debug entry and
+# declaration its text names, a text the bind mode reads on its own. an importer chooses the pieces it binds from the
+# offer's names list before it reads any text (`select`): each piece whose function it declares, with the signature
+# the piece states, and does not define, read on the module as lowered so the choice does not depend on the order
+# offers are bound in, and each piece of the same offer whose function a chosen piece declares, so a copy reaches the
+# importer's inliner with the callees its own module's inliner would expand into it. it then binds, in order, each
+# chosen piece that fits the module as it stands with those bound before it (`bind`): it holds the piece's function as
+# nothing or a bodiless declaration, each symbol the piece declares as nothing, a declaration or an available copy,
+# never its own definition nor a symbol of the other kind, and each function of the piece's it holds with the
+# signature the piece states. a piece that does not fit is left out alone, its neighbours bound where they fit. a
+# module whose own names never meet another's binds every piece that serves it; only a name stated by `#[symbol]` in
+# one module can meet another module's name.
+#
+# an importer whose declaration of a name states another signature declares a function the offerer does not define:
+# its source is wrong, the link binds the two anyway, and the call is made through the importer's own declaration, as
+# a build that binds no offer makes it. so a piece stating another signature for a function the importer holds does
+# not fit, and a piece whose own function the importer declares with another signature is not chosen.
+#
+# an offer's names list, its index, holds a line per piece and a line per symbol each piece declares. a piece's line
+# is, in order: the kind `BODY`; the offset and the length of its text in the offer's text, in decimal, each followed
+# by one space; its function's signature as a printer that names no type spells it; a tab (`SIGNED`); its function's
+# name. the lines after it, up to the next piece's, are the functions (`CALLED`) and globals (`READ`) its text
+# declares: a function's line is the kind, its signature, a tab and its name, and a global's is the kind and its name.
+#
+# the text is made from the module before any pass runs on it, so it does not depend on the order in which modules are
+# compiled, and an offer read back from a cache is the offer the module's lowering made.
+#
+# cost: per offered function one size measure, one writing of its text nowhere, one writing of its piece and one
+# spelling of its signature and of each function's its piece declares. an importer reads the names list once per
+# offer, spells the signature of each function it holds that a piece it considers names, and reads the text only of
+# the pieces it binds.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.format;
+use io: std.io.writer;
+use std.io.writer.Memory;
+use std.io.writer.WriteError;
+
+use mirl.base.slice;
+use mirl.ir.id.Function;
+use mirl.ir.id.Global;
+use mirl.ir.id.Symbol;
+use mirl.ir.linkage;
+use mirl.ir.linkage.Linkage;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.text.item;
+use mirl.ir.text.item.Part;
+use mirl.ir.text.parse;
+use parse_refusal: mirl.ir.text.parse.refusal;
+use mirl.ir.text.printer;
+use mirl.ir.text.printer.Printer;
+use mirl.opt.inline;
+use mirl.pass.refusal;
+use mirl.pass.rows;
+use mirl.pass.setting;
+use mirl.pass.setting.Optimise;
+
+# why an offer was not made or not read
+# ---
+# text:     its text was not written
+# refused:  a body's size was not measured
+# attached: an importer's module did not read it
+# index:    its names list is not one `write` makes
+# alloc:    the allocator refused storage for choosing its pieces
+pub tag Error: u8 {
+    text:     printer.Error;
+    refused:  refusal.Error;
+    attached: parse_refusal.Error;
+    index;
+    alloc: allocator.Error;
+}
+
+# a piece of an offer as its names list states it
+# ---
+# start:     where its text starts in the offer's text
+# length:    the length of its text
+# signature: its function's signature as the names list spells it, a view of the names list
+# name:      its function's name, a view of the names list
+# from:      where the lines of the symbols it declares start in the names list
+# to:        where they end
+pub rec Piece {
+    start:     usize;
+    length:    usize;
+    signature: View;
+    name:      View;
+    from:      usize;
+    to:        usize;
+}
+
+# the pieces of one offer an importer binds, chosen on its module as lowered (`select`), drawn from the allocator it
+# was chosen with
+# ---
+# pieces: every piece of the offer
+# chosen: per piece, whether the importer binds it where it fits
+pub rec Selection {
+    pieces: Slice[Piece];
+    chosen: *bool;
+}
+
+# the kind byte of a line of an offer's names: a piece, a function its text declares, a global it declares
+val BODY:   u8 = 'b';
+val CALLED: u8 = 'c';
+val READ:   u8 = 'r';
+# what ends a function line's signature
+val SIGNED: u8 = '\t';
+
+# whether a build of setting `o` makes offers: it runs the inliner, their one reader
+pub fun wanted(o: *Optimise) bool {
+    val opt_placed: opt[u32] = setting.place_of(rows.optimisations(), ?inline.INLINE);
+    if (sel opt_placed.none) { ret false; }
+    ret setting.runs(o, opt_placed.some);
+}
+
+# whether another object's reference to a symbol of this linkage is the definition here: a binding other objects see,
+# and one definition, never merged
+fun linked(l: Linkage) bool {
+    ret linkage.external(l) && sel l.merged.none;
+}
+
+# whether the symbols the function on trial names past those already offered are all `linked`
+fun named_linked(m: *Module, pt: *Part) bool {
+    val functions: Slice[u32] = item.part_tried(pt, printer.FUNCTIONS);
+    var i:         usize      = 0;
+    for (i < functions.size) {
+        if (!linked(m.functions.data[functions.data[i]].data.linkage)) { ret false; }
+        i = i + 1;
+    }
+    val globals: Slice[u32] = item.part_tried(pt, printer.GLOBALS);
+    i = 0;
+    for (i < globals.size) {
+        if (!linked(m.globals.data[globals.data[i]].data.linkage)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# write the line of the global `v` to `names`
+fun written(names: *io.Writer, kind: u8, v: View) err[Error] {
+    var line:     [1]u8           = [1]u8{kind};
+    val err_kind: err[WriteError] = io.write_all(names, ?line[0], 1);
+    if (sel err_kind.err) { ret err[Error].err{Error.text{printer.Error.write{err_kind.err}}}; }
+    ret ended(names, v);
+}
+
+# write the signature of the function `f` of module m, spelled by the printer `sp`, the tab after it and the function's
+# name ending the line, to the printer's writer
+fun signed(sp: *Printer, m: *Module, f: Function) err[Error] {
+    printer.ty(sp, m.functions.data[f].data.signature);
+    val opt_failed: opt[printer.Error] = sp.failed;
+    if (sel opt_failed.some) { ret err[Error].err{Error.text{opt_failed.some}}; }
+    var tab:     [1]u8           = [1]u8{SIGNED};
+    val err_tab: err[WriteError] = io.write_all(sp.w, ?tab[0], 1);
+    if (sel err_tab.err) { ret err[Error].err{Error.text{printer.Error.write{err_tab.err}}}; }
+    ret ended(sp.w, module.name_of(m, m.functions.data[f].data.name));
+}
+
+# write the line of the function `f` of module m that the text of a piece declares to the printer's writer
+fun called(sp: *Printer, m: *Module, f: Function) err[Error] {
+    var line:     [1]u8           = [1]u8{CALLED};
+    val err_kind: err[WriteError] = io.write_all(sp.w, ?line[0], 1);
+    if (sel err_kind.err) { ret err[Error].err{Error.text{printer.Error.write{err_kind.err}}}; }
+    ret signed(sp, m, f);
+}
+
+# write the name `v` that ends a line, and the line's end
+fun ended(names: *io.Writer, v: View) err[Error] {
+    val err_name: err[WriteError] = io.write_all(names, v.data, v.len);
+    if (sel err_name.err) { ret err[Error].err{Error.text{printer.Error.write{err_name.err}}}; }
+    val err_end: err[WriteError] = io.write_str(names, "\n");
+    if (sel err_end.err) { ret err[Error].err{Error.text{printer.Error.write{err_end.err}}}; }
+    ret err[Error].ok{};
+}
+
+# write the line of a piece whose text is `length` bytes from `start`, of the function `f` of module m, to the
+# printer's writer
+fun piece_written(sp: *Printer, start: usize, length: usize, m: *Module, f: Function) err[Error] {
+    var line:     [1]u8           = [1]u8{BODY};
+    var sep:      [1]u8           = [1]u8{' '};
+    val err_kind: err[WriteError] = io.write_all(sp.w, ?line[0], 1);
+    if (sel err_kind.err) { ret err[Error].err{Error.text{printer.Error.write{err_kind.err}}}; }
+    val res_start: res[usize, WriteError] = format.write_u64(sp.w, start::u64);
+    if (sel res_start.err) { ret err[Error].err{Error.text{printer.Error.write{res_start.err}}}; }
+    val err_sep: err[WriteError] = io.write_all(sp.w, ?sep[0], 1);
+    if (sel err_sep.err) { ret err[Error].err{Error.text{printer.Error.write{err_sep.err}}}; }
+    val res_length: res[usize, WriteError] = format.write_u64(sp.w, length::u64);
+    if (sel res_length.err) { ret err[Error].err{Error.text{printer.Error.write{res_length.err}}}; }
+    val err_gap: err[WriteError] = io.write_all(sp.w, ?sep[0], 1);
+    if (sel err_gap.err) { ret err[Error].err{Error.text{printer.Error.write{err_gap.err}}}; }
+    ret signed(sp, m, f);
+}
+
+# write the lines of the symbols the written part `pt` declares to the writer of `sp`
+fun declared(sp: *Printer, m: *Module, pt: *Part) err[Error] {
+    val functions: Slice[u32] = item.part_named(pt, printer.FUNCTIONS);
+    var i:         usize      = 0;
+    for (i < functions.size) {
+        if (!item.part_holds(pt, functions.data[i])) {
+            val err_called: err[Error] = called(sp, m, functions.data[i]);
+            if (sel err_called.err) { ret err_called; }
+        }
+        i = i + 1;
+    }
+    val globals: Slice[u32] = item.part_named(pt, printer.GLOBALS);
+    i = 0;
+    for (i < globals.size) {
+        val err_read: err[Error] = written(sp.w, READ, module.name_of(m, m.globals.data[globals.data[i]].data.name));
+        if (sel err_read.err) { ret err_read; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# a writer that counts the bytes it passes on, so a piece's offset in the text is known as it is written
+# ---
+# w: the writer it passes them to
+# n: the bytes passed so far
+rec Counted {
+    w: *io.Writer;
+    n: usize;
+}
+
+fun counted_write(ctx: ptr, data: *u8, n: usize) res[usize, WriteError] {
+    val c:           *Counted               = ctx::*Counted;
+    val res_written: res[usize, WriteError] = c.w.fn_write(c.w.ctx, data, n);
+    if (sel res_written.ok) { c.n = c.n + res_written.ok; }
+    ret res_written;
+}
+
+# write module m's offer to `w`, a piece per offered function, and its names list to `names`. a module that offers
+# nothing writes nothing to either
+pub fun write(w: *io.Writer, names: *io.Writer, m: *Module) err[Error] {
+    var pt:        Part;
+    val err_begun: err[printer.Error] = item.part_begin(?pt, m);
+    fin { item.part_end(?pt); }
+    if (sel err_begun.err) { ret err[Error].err{Error.text{err_begun.err}}; }
+    var sp: Printer = printer.init(names, m);
+    fin { printer.dnit(?sp); }
+    var counted: Counted   = Counted{w: w, n: 0};
+    var cw:      io.Writer = io.Writer{ctx: (?counted)::ptr, fn_write: counted_write};
+    var f:       usize     = 0;
+    for (f < m.functions.len) {
+        val res_offered: res[bool, refusal.Error] = inline.offered(m, f::u32);
+        if (sel res_offered.err) { ret err[Error].err{Error.refused{res_offered.err}}; }
+        if (res_offered.ok) {
+            item.part_reset(?pt);
+            val err_tried: err[printer.Error] = item.part_try(?pt, f::u32);
+            if (sel err_tried.err) { ret err[Error].err{Error.text{err_tried.err}}; }
+            if (named_linked(m, ?pt)) {
+                val err_kept: err[printer.Error] = item.part_keep(?pt, f::u32);
+                if (sel err_kept.err) { ret err[Error].err{Error.text{err_kept.err}}; }
+                val start:       usize              = counted.n;
+                val err_written: err[printer.Error] = item.part_write(?pt, ?cw);
+                if (sel err_written.err) { ret err[Error].err{Error.text{err_written.err}}; }
+                val err_piece: err[Error] = piece_written(?sp, start, counted.n - start, m, f::u32);
+                if (sel err_piece.err) { ret err_piece; }
+                val err_declared: err[Error] = declared(?sp, m, ?pt);
+                if (sel err_declared.err) { ret err_declared; }
+            }
+        }
+        f = f + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the decimal number at `at` in `names` and the position past the space after it, none where there is none
+fun number_at(names: View, at: usize, end: usize, out: *usize) opt[usize] {
+    var n: usize = 0;
+    var i: usize = at;
+    for (i < end && names.data[i] >= '0' && names.data[i] <= '9') {
+        n = n * 10 + (names.data[i] - '0')::usize;
+        i = i + 1;
+    }
+    if (i == at || i >= end || names.data[i] != ' ') { ret opt[usize].none{}; }
+    @out = n;
+    ret opt[usize].some{i + 1};
+}
+
+# where the tab ending the signature that starts at `at` in `names` stands before `end`, none where the line holds none
+fun signed_at(names: View, at: usize, end: usize) opt[usize] {
+    var i: usize = at;
+    for (i < end && names.data[i] != SIGNED) { i = i + 1; }
+    if (i >= end) { ret opt[usize].none{}; }
+    ret opt[usize].some{i};
+}
+
+# the name of the line of a piece's symbols from `start` to `end` in `names`, which `pieces_of` checked: past the
+# signature and its tab for a function, past the kind for a global
+fun line_name(names: View, start: usize, end: usize) View {
+    if (names.data[start] == READ) { ret View{data: ?names.data[start + 1], len: end - start - 1}; }
+    val opt_tab: opt[usize] = signed_at(names, start + 1, end);
+    if (sel opt_tab.none) { ret View{data: ?names.data[end], len: 0}; }
+    ret View{data: ?names.data[opt_tab.some + 1], len: end - opt_tab.some - 1};
+}
+
+# the pieces the names list `names` of an offer whose text is `size` bytes states, drawn from `a`
+fun pieces_of(names: View, size: usize, a: *allocator.Allocator) res[Slice[Piece], Error] {
+    var count: usize = 0;
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i < names.len) {
+        if (names.data[i] == '\n') {
+            if (i > start && names.data[start] == BODY) { count = count + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (start != names.len) { ret res[Slice[Piece], Error].err{Error.index{}}; }
+    if (count == 0)         { ret res[Slice[Piece], Error].ok{Slice[Piece]{data: nil, size: 0}}; }
+    val res_pieces: res[*Piece, allocator.Error] = allocator.allocate[Piece](a, count);
+    if (sel res_pieces.err) { ret res[Slice[Piece], Error].err{Error.alloc{res_pieces.err}}; }
+    val pieces: *Piece = res_pieces.ok;
+    var n:      usize  = 0;
+    var failed: bool   = false;
+    start = 0;
+    i     = 0;
+    for (i < names.len && !failed) {
+        if (names.data[i] == '\n') {
+            if (i == start) { failed = true; }
+            or (names.data[start] == BODY) {
+                var at:     usize      = 0;
+                var length: usize      = 0;
+                val opt_at: opt[usize] = number_at(names, start + 1, i, ?at);
+                failed = true;
+                if (sel opt_at.some) {
+                    val opt_signed: opt[usize] = number_at(names, opt_at.some, i, ?length);
+                    if (sel opt_signed.some) {
+                        val signature: usize      = opt_signed.some;
+                        val opt_tab:   opt[usize] = signed_at(names, signature, i);
+                        if (sel opt_tab.some) {
+                            val tab: usize = opt_tab.some;
+                            if (tab > signature && tab + 1 < i && at + length <= size) {
+                                pieces[n] = Piece{start: at, length: length, signature: View{data: ?names.data[signature], len: tab - signature}, name: View{data: ?names.data[tab + 1], len: i - tab - 1}, from: i + 1, to: i + 1};
+                                n         = n + 1;
+                                failed    = false;
+                            }
+                        }
+                    }
+                }
+            }
+            or (n != 0 && i > start + 1 && names.data[start] == READ) {
+                pieces[n - 1].to = i + 1;
+            }
+            or (n != 0 && names.data[start] == CALLED) {
+                val opt_tab: opt[usize] = signed_at(names, start + 1, i);
+                var tab:     usize      = start;
+                if (sel opt_tab.some)               { tab = opt_tab.some; }
+                if (tab > start + 1 && tab + 1 < i) { pieces[n - 1].to = i + 1; }
+                or                                  { failed = true; }
+            }
+            or {
+                failed = true;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (failed) {
+        allocator.deallocate[Piece](a, pieces, count);
+        ret res[Slice[Piece], Error].err{Error.index{}};
+    }
+    ret res[Slice[Piece], Error].ok{Slice[Piece]{data: pieces, size: count}};
+}
+
+# the piece of `pieces` whose function is named `v`, none when no piece gives it a body
+fun piece_named(pieces: Slice[Piece], v: View) opt[usize] {
+    var i: usize = 0;
+    for (i < pieces.size) {
+        if (slice.same_view(pieces.data[i].name, v)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# a printer spelling signatures into memory of its own, which `same_signature` compares with an offer's spelling
+# ---
+# spelled: the memory the signature is spelled into
+# w:       the writer over it
+# sp:      the printer writing to `w`
+rec Spelling {
+    spelled: Memory;
+    w:       io.Writer;
+    sp:      Printer;
+}
+
+# a spelling of module m's signatures, its memory drawn from `a`, at its place `s`, which must not move until
+# `spelling_dnit`
+fun spelling_init(s: *Spelling, m: *Module, a: *allocator.Allocator) {
+    s.spelled = Memory{};
+    s.w       = io.memory_growing(?s.spelled, a);
+    s.sp      = printer.init(?s.w, m);
+}
+
+# a spelling's printer and memory given back
+fun spelling_dnit(s: *Spelling) {
+    printer.dnit(?s.sp);
+    io.memory_dnit(?s.spelled);
+}
+
+# whether the function `f` of the module `s` spells for states the signature `want` spells
+fun same_signature(s: *Spelling, m: *Module, f: Function, want: View) res[bool, Error] {
+    s.spelled.len = 0;
+    printer.ty(?s.sp, m.functions.data[f].data.signature);
+    val opt_failed: opt[printer.Error] = s.sp.failed;
+    if (sel opt_failed.some)       { ret res[bool, Error].err{Error.text{opt_failed.some}}; }
+    if (s.spelled.len != want.len) { ret res[bool, Error].ok{false}; }
+    var i: usize = 0;
+    for (i < want.len) {
+        if (s.spelled.buf[i] != want.data[i]) { ret res[bool, Error].ok{false}; }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{true};
+}
+
+# the pieces of the offer whose names list is `names` and whose text is `size` bytes long that module m binds where
+# they fit, chosen on m as lowered, before any offer is bound: each piece whose function m declares, with the
+# signature the piece states, and does not define, and each piece of the offer whose function a chosen piece declares.
+# storage from `a`, given back with `selection_dnit`
+pub fun select(m: *Module, a: *allocator.Allocator, names: View, size: usize) res[Selection, Error] {
+    val res_pieces: res[Slice[Piece], Error] = pieces_of(names, size, a);
+    if (sel res_pieces.err) { ret res[Selection, Error].err{res_pieces.err}; }
+    val pieces: Slice[Piece] = res_pieces.ok;
+    if (pieces.size == 0) { ret res[Selection, Error].ok{Selection{pieces: pieces, chosen: nil}}; }
+    val res_chosen: res[*bool, allocator.Error] = allocator.zallocate[bool](a, pieces.size);
+    if (sel res_chosen.err) {
+        allocator.deallocate[Piece](a, pieces.data, pieces.size);
+        ret res[Selection, Error].err{Error.alloc{res_chosen.err}};
+    }
+    val res_work: res[*usize, allocator.Error] = allocator.allocate[usize](a, pieces.size);
+    if (sel res_work.err) {
+        allocator.deallocate[bool](a, res_chosen.ok, pieces.size);
+        allocator.deallocate[Piece](a, pieces.data, pieces.size);
+        ret res[Selection, Error].err{Error.alloc{res_work.err}};
+    }
+    val chosen: *bool  = res_chosen.ok;
+    val work:   *usize = res_work.ok;
+    var s:      Spelling;
+    spelling_init(?s, m, a);
+    fin { spelling_dnit(?s); }
+    var queued: usize = 0;
+    var i:      usize = 0;
+    for (i < pieces.size) {
+        val opt_held: opt[Symbol] = module.find(m, pieces.data[i].name);
+        if (sel opt_held.some) {
+            val held: Symbol   = opt_held.some;
+            var f:    Function = 0;
+            var bare: bool     = false;
+            if (sel held.function) {
+                f    = held.function;
+                bare = m.functions.data[f].body.blocks.len == 0;
+            }
+            if (bare) {
+                val res_same: res[bool, Error] = same_signature(?s, m, f, pieces.data[i].signature);
+                if (sel res_same.err) {
+                    allocator.deallocate[usize](a, work, pieces.size);
+                    allocator.deallocate[bool](a, chosen, pieces.size);
+                    allocator.deallocate[Piece](a, pieces.data, pieces.size);
+                    ret res[Selection, Error].err{res_same.err};
+                }
+                if (res_same.ok) {
+                    chosen[i]    = true;
+                    work[queued] = i;
+                    queued       = queued + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    for (queued > 0) {
+        queued = queued - 1;
+        val p:     *Piece = ?pieces.data[work[queued]];
+        var start: usize  = p.from;
+        var k:     usize  = p.from;
+        for (k < p.to) {
+            if (names.data[k] == '\n') {
+                if (names.data[start] == CALLED) {
+                    val opt_piece: opt[usize] = piece_named(pieces, line_name(names, start, k));
+                    if (sel opt_piece.some) {
+                        if (!chosen[opt_piece.some]) {
+                            chosen[opt_piece.some] = true;
+                            work[queued]           = opt_piece.some;
+                            queued                 = queued + 1;
+                        }
+                    }
+                }
+                start = k + 1;
+            }
+            k = k + 1;
+        }
+    }
+    allocator.deallocate[usize](a, work, pieces.size);
+    ret res[Selection, Error].ok{Selection{pieces: pieces, chosen: chosen}};
+}
+
+# a selection's storage given back to `a`, the allocator it was chosen with
+pub fun selection_dnit(s: *Selection, a: *allocator.Allocator) {
+    if (s.chosen != nil)      { allocator.deallocate[bool](a, s.chosen, s.pieces.size); }
+    if (s.pieces.data != nil) { allocator.deallocate[Piece](a, s.pieces.data, s.pieces.size); }
+    @s = Selection{pieces: Slice[Piece]{data: nil, size: 0}, chosen: nil};
+}
+
+# whether module m, as it stands with the pieces bound before this one, may bind piece `p` of the offer whose names
+# list is `names`: it holds the piece's function as nothing or a bodiless declaration, and each function or global
+# the piece declares as nothing, a declaration or an available copy, never its own definition nor a symbol of the
+# other kind, and each function of the piece's it holds with the signature the piece states, spelled by `s`
+fun fits(m: *Module, s: *Spelling, names: View, p: *Piece) res[bool, Error] {
+    val opt_own: opt[Symbol] = module.find(m, p.name);
+    if (sel opt_own.some) {
+        val own: Symbol = opt_own.some;
+        if (!sel own.function)                                   { ret res[bool, Error].ok{false}; }
+        if (m.functions.data[own.function].body.blocks.len != 0) { ret res[bool, Error].ok{false}; }
+        val res_own: res[bool, Error] = same_signature(s, m, own.function, p.signature);
+        if (sel res_own.err) { ret res_own; }
+        if (!res_own.ok)     { ret res[bool, Error].ok{false}; }
+    }
+    var start: usize = p.from;
+    var i:     usize = p.from;
+    for (i < p.to) {
+        if (names.data[i] == '\n') {
+            val opt_held: opt[Symbol] = module.find(m, line_name(names, start, i));
+            if (sel opt_held.some) {
+                val held: Symbol = opt_held.some;
+                if (names.data[start] == READ) {
+                    if (!sel held.global) { ret res[bool, Error].ok{false}; }
+                    val g: Global = held.global;
+                    if (sel m.globals.data[g].data.initial.some) { ret res[bool, Error].ok{false}; }
+                }
+                or {
+                    if (!sel held.function) { ret res[bool, Error].ok{false}; }
+                    val f:       Function = held.function;
+                    val defined: bool     = m.functions.data[f].body.blocks.len != 0;
+                    if (defined && !m.functions.data[f].data.available) { ret res[bool, Error].ok{false}; }
+                    val opt_tab: opt[usize] = signed_at(names, start + 1, i);
+                    var want:    View       = View{data: ?names.data[start + 1], len: 0};
+                    if (sel opt_tab.some) { want.len = opt_tab.some - start - 1; }
+                    val res_same: res[bool, Error] = same_signature(s, m, f, want);
+                    if (sel res_same.err) { ret res_same; }
+                    if (!res_same.ok)     { ret res[bool, Error].ok{false}; }
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret res[bool, Error].ok{true};
+}
+
+# bind into module m, in order, each piece `s` chose of the offer whose text is `text` and names list `names` that
+# fits m as it stands, scratch storage from `a`. a piece that does not fit is left out alone. a refusal is a defect
+# of the offer, and leaves what was read before it in the module
+pub fun bind(m: *Module, a: *allocator.Allocator, text: View, names: View, s: *Selection) err[Error] {
+    var spelling: Spelling;
+    spelling_init(?spelling, m, a);
+    fin { spelling_dnit(?spelling); }
+    var i: usize = 0;
+    for (i < s.pieces.size) {
+        if (s.chosen[i]) {
+            val p:        *Piece           = ?s.pieces.data[i];
+            val res_fits: res[bool, Error] = fits(m, ?spelling, names, p);
+            if (sel res_fits.err) { ret err[Error].err{res_fits.err}; }
+            if (res_fits.ok) {
+                val err_read: err[parse_refusal.Error] = parse.parse_into(m, a, View{data: ?text.data[p.start], len: p.length}, parse.Into.bind{});
+                if (sel err_read.err) { ret err[Error].err{Error.attached{err_read.err}}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}

@@ -1,0 +1,244 @@
+# the x86-64 frame code: the instructions of each move the frame makes
+#
+# an offset is a 32-bit displacement of the address it is added at, so an add
+# is a lea, which sets no flag, and a load or store addresses its slot as
+# base plus displacement. an offset past 32 bits is refused `reach`, as no
+# frame reaches that far. a load or store is the row of the width the frame
+# code's binding chose for the register and the slot's size, from the widths
+# below: the general moves at each size, the xmm moves of a binary16, a
+# binary32, a binary64 and a whole register, and avx's moves of a vector of
+# 4, 8, 16 or 32 bytes in a ymm register, unaligned, so no slot needs more
+# than its own alignment. sse2 has no 16-bit store of an
+# xmm register, so a binary16 stores through a general scratch, and loads by
+# pinsrw, which takes none. that width is the one move here that takes a
+# scratch, so it alone states one.
+#
+# a save the frame pushes is a push and pop of the whole general register,
+# and the stack pointer is released before the pops by `add rsp, n`, the
+# release windows x64's unwinder takes for an epilogue's when no frame
+# pointer is set (x64 prolog and epilog, "epilog code"), which a lea from
+# the stack pointer is not.
+#
+# windows x64 moves the stack pointer down past a page through __mirl_chkstk,
+# which takes the bytes in eax, touches each page and leaves rsp as it was,
+# so the move is `mov eax, n; call __mirl_chkstk; sub rsp, n`, the bytes
+# subtracted as an immediate so the stack pointer stays a known offset from its
+# entry value for the constant-time walk. x86 has no offset
+# that scales: a selection's vector registers have one width.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+
+use std.collections.slice.Slice;
+
+use mo: masc.core.operand;
+use masc.core.quantity;
+use rf: masc.core.register;
+use masc.core.row.Row;
+use masc.isa.x86.gen_register;
+use masc.isa.x86.gen_row;
+use masc.isa.x86.gen_row_index;
+use mink.model.reloc;
+
+use mirl.ir.id;
+use mirl.machine.class.Physical;
+use mirl.machine.frame.code;
+use mirl.machine.frame.code.Access;
+use mirl.machine.frame.code.Admitted;
+use mirl.machine.frame.code.Code;
+use mirl.machine.frame.code.Emit;
+use mirl.machine.frame.code.Probes;
+use mirl.machine.frame.code.Push;
+use mirl.machine.frame.code.Pushes;
+use mirl.machine.frame.code.Pushing;
+use mirl.machine.frame.code.Step;
+use mirl.machine.frame.code.Steps;
+use mirl.machine.frame.code.Width;
+use mirl.machine.frame.code.Widths;
+use mirl.machine.frame.record.Offset;
+use mirl.machine.operand;
+use mirl.machine.operand.Operand;
+use mirl.machine.operand.Register;
+
+fun physical(r: rf.Id) Operand {
+    ret Operand.physical{Physical.register{r}};
+}
+
+fun two(e: *Emit, row: *Row, a: Operand, b: Operand) err[code.Error] {
+    var ops: [2]Operand = [2]Operand{a, b};
+    ret code.append(e, row, Slice[Operand]{data: ?ops[0], size: 2});
+}
+
+fun one(e: *Emit, row: *Row, a: Operand) err[code.Error] {
+    var ops: [1]Operand = [1]Operand{a};
+    ret code.append(e, row, Slice[Operand]{data: ?ops[0], size: 1});
+}
+
+# a register as the view a row's register position names, the register of
+# the position's class with the same number, as eax of rax
+fun viewed(row: *Row, position: u32, r: rf.Id) rf.Id {
+    if (position >= row.operands.len) { ret r; }
+    val sh: *mo.Shape = ?row.operands.at[position].shape;
+    if (!(sel sh.register))           { ret r; }
+    if (sh.register.classes.len == 0) { ret r; }
+    val class: u16 = sh.register.classes.at[0];
+    if (class == rf.class_of(r)) { ret r; }
+    ret rf.make(class, rf.number_of(r));
+}
+
+fun three(e: *Emit, row: *Row, a: Operand, b: Operand, c: Operand) err[code.Error] {
+    var ops: [3]Operand = [3]Operand{a, b, c};
+    ret code.append(e, row, Slice[Operand]{data: ?ops[0], size: 3});
+}
+
+fun fits8(v: i64) bool {
+    ret v >= -128 && v <= 127;
+}
+
+fun fits32(v: i64) bool {
+    ret v >= -2147483648 && v <= 2147483647;
+}
+
+# the memory at a base register plus a displacement
+fun at(base: rf.Id, disp: i64) Operand {
+    ret Operand.address{operand.Address{base: opt[Register].some{Register.physical{Physical.register{base}}}, index: opt[Register].none{}, segment: opt[Register].none{}, scale: 0, disp: disp, symbol: opt[operand.Symbol].none{}, mode: mo.OFFSET, extend: 0, broadcast: 0}};
+}
+
+fun add(e: *Emit, dest: rf.Id, src: rf.Id, by: Offset) err[code.Error] {
+    if (by.per != 0)       { ret err[code.Error].err{code.Error.scaled{by}}; }
+    if (!fits32(by.fixed)) { ret err[code.Error].err{code.Error.reach{by}}; }
+    ret two(e, ?gen_row.ROWS[gen_row_index.LEA_GPR64_AGEN_8D_O64], physical(dest), at(src, by.fixed));
+}
+
+# a register masked down to an alignment, its sign extended byte form where
+# the mask fits one
+fun mask(e: *Emit, dest: rf.Id, src: rf.Id, align: u64) err[code.Error] {
+    if (align > 0x4000_0000) { ret err[code.Error].err{code.Error.mask{align}}; }
+    if (dest != src) {
+        val err_moved: err[code.Error] = two(e, ?gen_row.ROWS[gen_row_index.MOV_GPR64_GPR64_89_O64], physical(dest), physical(src));
+        if (sel err_moved.err) { ret err_moved; }
+    }
+    val by:  i64  = 0 - align::i64;
+    var row: *Row = ?gen_row.ROWS[gen_row_index.AND_GPR64_IMM32_81R4_O64];
+    if (fits8(by)) { row = ?gen_row.ROWS[gen_row_index.AND_GPR64_IMM8_83R4_O64]; }
+    ret two(e, row, physical(dest), Operand.immediate{by});
+}
+
+fun sub(e: *Emit, dest: rf.Id, a: rf.Id, b: rf.Id) err[code.Error] {
+    val minus: *Row = ?gen_row.ROWS[gen_row_index.SUB_GPR64_GPR64_29_O64];
+    if (dest == a) { ret two(e, minus, physical(dest), physical(b)); }
+    if (dest != b) {
+        val err_moved: err[code.Error] = two(e, ?gen_row.ROWS[gen_row_index.MOV_GPR64_GPR64_89_O64], physical(dest), physical(a));
+        if (sel err_moved.err) { ret err_moved; }
+        ret two(e, minus, physical(dest), physical(b));
+    }
+    # dest is b: a - b is -b + a
+    val err_negated: err[code.Error] = one(e, ?gen_row.ROWS[gen_row_index.NEG_GPR64_F7R3_O64], physical(dest));
+    if (sel err_negated.err) { ret err_negated; }
+    ret two(e, ?gen_row.ROWS[gen_row_index.ADD_GPR64_GPR64_01_O64], physical(dest), physical(a));
+}
+
+# the low 16 bits of an xmm register stored through the scratch
+fun store_half(e: *Emit, w: *Width, value: rf.Id, base: rf.Id, by: Offset) err[code.Error] {
+    if (sel e.scratch.none) { ret err[code.Error].err{code.Error.access{value}}; }
+    val row:       *Row            = ?gen_row.ROWS[gen_row_index.MOVD_GPR32_XMM_0F7E_O32_P66];
+    val err_moved: err[code.Error] = two(e, row, physical(viewed(row, 0, e.scratch.some)), physical(value));
+    if (sel err_moved.err) { ret err_moved; }
+    ret two(e, w.store, at(base, by.fixed), physical(viewed(w.store, 1, e.scratch.some)));
+}
+
+fun store(e: *Emit, w: *Width, value: rf.Id, base: rf.Id, by: Offset) err[code.Error] {
+    if (by.per != 0)        { ret err[code.Error].err{code.Error.scaled{by}}; }
+    if (!fits32(by.fixed))  { ret err[code.Error].err{code.Error.reach{by}}; }
+    if (w == ?WIDTHS[HALF]) { ret store_half(e, w, value, base, by); }
+    ret two(e, w.store, at(base, by.fixed), physical(viewed(w.store, 1, value)));
+}
+
+fun load(e: *Emit, w: *Width, dest: rf.Id, base: rf.Id, by: Offset) err[code.Error] {
+    if (by.per != 0)        { ret err[code.Error].err{code.Error.scaled{by}}; }
+    if (!fits32(by.fixed))  { ret err[code.Error].err{code.Error.reach{by}}; }
+    if (w == ?WIDTHS[HALF]) { ret three(e, w.load, physical(dest), at(base, by.fixed), Operand.immediate{0}); }
+    ret two(e, w.load, physical(viewed(w.load, 0, dest)), at(base, by.fixed));
+}
+
+# windows x64's page probe: the bytes in eax, the call, then the move by the
+# same bytes as an immediate
+fun probe(e: *Emit, stack: rf.Id, bytes: u64, helper: id.Symbol) err[code.Error] {
+    if (bytes > 0x7fff_ffff) { ret err[code.Error].err{code.Error.reach{Offset{fixed: bytes::i64, per: 0, scale: 0}}}; }
+    val err_counted: err[code.Error] = two(e, ?gen_row.ROWS[gen_row_index.MOV_GPR32_IMM32_B8_O32], physical(gen_register.EAX), Operand.immediate{bytes::i64});
+    if (sel err_counted.err) { ret err_counted; }
+    val err_called: err[code.Error] = one(e, ?gen_row.ROWS[gen_row_index.CALL_NEAR_REL32_E8], Operand.symbol{operand.Symbol{symbol: helper, addend: 0, kind: ?reloc.BRANCH32}});
+    if (sel err_called.err) { ret err_called; }
+    ret two(e, ?gen_row.ROWS[gen_row_index.SUB_GPR64_IMM32_81R5_O64], physical(stack), Operand.immediate{bytes::i64});
+}
+
+# a register pushed or popped by its push width's row
+fun stacked(e: *Emit, p: *Push, r: rf.Id, push: bool) err[code.Error] {
+    var row: *Row = p.pop;
+    if (push) { row = p.push; }
+    ret one(e, row, physical(viewed(row, 0, r)));
+}
+
+# the stack pointer moved up by an add of an immediate, its sign extended
+# byte form where the bytes fit one
+fun release(e: *Emit, stack: rf.Id, by: Offset) err[code.Error] {
+    if (by.per != 0)       { ret err[code.Error].err{code.Error.scaled{by}}; }
+    if (!fits32(by.fixed)) { ret err[code.Error].err{code.Error.reach{by}}; }
+    var row: *Row = ?gen_row.ROWS[gen_row_index.ADD_GPR64_IMM32_81R0_O64];
+    if (fits8(by.fixed)) { row = ?gen_row.ROWS[gen_row_index.ADD_GPR64_IMM8_83R0_O64]; }
+    ret two(e, row, physical(stack), Operand.immediate{by.fixed});
+}
+
+val PUSHED: [1]Push = [1]Push{
+    Push{class: ?gen_register.CLASSES[gen_register.GPR64_CLASS], bits: quantity.Scaled{fixed: 64, per: 0, scale: 0}, push: ?gen_row.ROWS[gen_row_index.PUSH_GPR64_50_O64], pop: ?gen_row.ROWS[gen_row_index.POP_GPR64_58_O64]},
+};
+
+# the width of a binary16 in an xmm register, its rows of two classes. 64 bits
+# of an xmm register move through movq, which intel lists as data operand
+# independent, as sse movsd it does not (intel 768547, table 1)
+val HALF: u32 = 4;
+
+val WIDTHS: [12]Width = [12]Width{
+    Width{class: ?gen_register.CLASSES[gen_register.GPR64_CLASS], bits: quantity.Scaled{fixed: 8, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.MOVZX_GPR32_MEM8_0FB6_O32], store: ?gen_row.ROWS[gen_row_index.MOV_MEM8_GPR8_88], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.GPR64_CLASS], bits: quantity.Scaled{fixed: 16, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.MOVZX_GPR32_MEM16_0FB7_O32], store: ?gen_row.ROWS[gen_row_index.MOV_MEM16_GPR16_89_O16], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.GPR64_CLASS], bits: quantity.Scaled{fixed: 32, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.MOV_GPR32_MEM32_8B_O32], store: ?gen_row.ROWS[gen_row_index.MOV_MEM32_GPR32_89_O32], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.GPR64_CLASS], bits: quantity.Scaled{fixed: 64, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.MOV_GPR64_MEM64_8B_O64], store: ?gen_row.ROWS[gen_row_index.MOV_MEM64_GPR64_89_O64], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.XMM_CLASS], bits: quantity.Scaled{fixed: 16, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.PINSRW_XMM_MEM16_IMM8_0FC4_P66], store: ?gen_row.ROWS[gen_row_index.MOV_MEM16_GPR16_89_O16], offset: true, most: 1},
+    Width{class: ?gen_register.CLASSES[gen_register.XMM_CLASS], bits: quantity.Scaled{fixed: 32, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.MOVSS_XMM_MEM32_0F10_PF3], store: ?gen_row.ROWS[gen_row_index.MOVSS_MEM32_XMM_0F11_PF3], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.XMM_CLASS], bits: quantity.Scaled{fixed: 64, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.MOVQ_XMM_MEM64_0F7E_PF3], store: ?gen_row.ROWS[gen_row_index.MOVQ_MEM64_XMM_0FD6_P66], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.XMM_CLASS], bits: quantity.Scaled{fixed: 128, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.MOVUPS_XMM_MEM128_0F10], store: ?gen_row.ROWS[gen_row_index.MOVUPS_MEM128_XMM_0F11], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.YMM_CLASS], bits: quantity.Scaled{fixed: 32, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.VMOVD_XMM_MEM32_V0F6E_P66_L128_W64], store: ?gen_row.ROWS[gen_row_index.VMOVD_MEM32_XMM_V0F7E_P66_L128_W64], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.YMM_CLASS], bits: quantity.Scaled{fixed: 64, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.VMOVQ_XMM_MEM64_V0F7E_PF3_L128], store: ?gen_row.ROWS[gen_row_index.VMOVQ_MEM64_XMM_V0FD6_P66_L128], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.YMM_CLASS], bits: quantity.Scaled{fixed: 128, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.VMOVDQU_XMM_MEM128_V0F6F_PF3_L128], store: ?gen_row.ROWS[gen_row_index.VMOVDQU_MEM128_XMM_V0F7F_PF3_L128], offset: true},
+    Width{class: ?gen_register.CLASSES[gen_register.YMM_CLASS], bits: quantity.Scaled{fixed: 256, per: 0, scale: 0}, load: ?gen_row.ROWS[gen_row_index.VMOVDQU_YMM_MEM256_V0F6F_PF3_L256], store: ?gen_row.ROWS[gen_row_index.VMOVDQU_MEM256_YMM_V0F7F_PF3_L256], offset: true},
+};
+
+# x86 has no offset that scales
+fun scaled(o: Offset) Steps {
+    ret Steps.none{};
+}
+
+# every move names no scratch but a store of an xmm register that may be the
+# binary16 width's, which goes through one
+fun scratchless(x: *Admitted, stack: rf.Id, s: Step) bool {
+    if (!(sel s.store)) { ret true; }
+    val a: Access = s.store;
+    if (rf.class_of(a.register) != gen_register.XMM_CLASS) { ret true; }
+    ret a.size.per == 0 && a.size.fixed != 2;
+}
+
+# a store of the binary16 width takes the one scratch it goes through, and
+# every other move takes none
+fun fewest(x: *Admitted, stack: rf.Id, s: Step) u32 {
+    if (!(sel s.store)) { ret 0; }
+    val a:            Access      = s.store;
+    val opt_width_of: opt[*Width] = code.width_of(x, a.register, a.size, true);
+    if (sel opt_width_of.none)                                     { ret 0; }
+    if (opt_width_of.some != ?WIDTHS[HALF] || !fits32(a.at.fixed)) { ret 0; }
+    ret 1;
+}
+
+# the x86-64 frame code
+pub val FRAME: Code = Code{add: add, mask: mask, sub: sub, store: store, load: load, widths: Widths{at: ?WIDTHS[0], len: 12}, scaled: scaled, probe: Probes.called{probe}, pushes: Pushes.rows{Pushing{at: ?PUSHED[0], len: 1, stacked: stacked, release: release}}, scratchless: scratchless, fewest: fewest};

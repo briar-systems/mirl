@@ -1,0 +1,1543 @@
+# reading a function body
+#
+# a body is read in three steps. the first makes every block, with its
+# parameters, and binds every name an instruction gives, so a branch can name
+# a block written after it and a use can name a value defined after it. the
+# second builds each instruction through the builder once every value it uses
+# is built, since the builder types an instruction from its operands and a
+# literal is typed from the values around it. a block's instructions go to
+# the position their statement stands at whatever order they are built in.
+# the third refuses what is left: a value nothing defines, or one that is
+# only defined by an instruction that needs it. value binding records are
+# bound last, once every value they read is built, each at the position its
+# statement stands at among its block's instructions.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.collections.map;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.ir.assembly;
+use mirl.ir.assembly.Assembly;
+use AsmOperand: mirl.ir.assembly.Operand;
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use mirl_constant: mirl.ir.constant;
+use mirl.ir.debug.record.Binding;
+use mirl.ir.debug.record.Location;
+use mirl.ir.debug.record.Site;
+use FunctionBody: mirl.ir.function.Body;
+use mirl.ir.function.FunctionData;
+use globals: mirl.ir.global;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Bindings;
+use mirl.ir.metadata.Extent;
+use mirl.ir.metadata.Flags;
+use mirl.ir.metadata.Metadata;
+use mirl.ir.metadata.NO_EXTENT;
+use mirl.ir.metadata.NO_FLAGS;
+use mirl.ir.metadata.NO_PUBLICS;
+use mirl.ir.metadata.NO_SLOT;
+use mirl.ir.metadata.Publics;
+use mirl.ir.metadata.UNBOUND;
+use mirl.ir.module;
+use mirl.ir.native.Op;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.rule;
+use mirl.ir.opcode.table;
+use ir_place: mirl.ir.place;
+use mirl.ir.place.Fill;
+use mirl.ir.place.Place;
+use mirl.ir.place.Placed;
+use mirl.ir.place.Scale;
+use mirl.ir.point;
+use mirl.ir.point.Bits;
+use mirl.ir.point.Expression;
+use mirl.ir.point.Operand;
+use mirl.ir.point.Reads;
+use mirl.ir.point.Step;
+use mirl.ir.text.implied;
+use mirl.ir.text.notes;
+use mirl.ir.text.parse.debug;
+use mirl.ir.text.parse.item;
+use mirl.ir.text.parse.lexer;
+use mirl.ir.text.parse.lexer.Token;
+use mirl.ir.text.parse.reason;
+use mirl.ir.text.parse.reason.Named;
+use mirl.ir.text.parse.state;
+use mirl.ir.text.parse.state.Mark;
+use mirl.ir.text.parse.state.Parser;
+use mirl.ir.text.parse.ty;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.ValueData;
+
+use mo: masc.core.operand;
+use rf: masc.core.register;
+use masc.inline;
+
+# an instruction statement
+# ---
+# at:     its start
+# block:  the block it stands in, by position in the body
+# made:   the instruction built for it, `NO_INSTRUCTION` before it is built
+# line:   where it starts
+# column: where it starts
+rec Line {
+    at:     Mark;
+    block:  usize;
+    made:   Instruction;
+    line:   u32;
+    column: u32;
+}
+
+# a value binding record
+# ---
+# at:     its start
+# block:  the block it stands in, by position in the body
+# next:   the position among the lines of the instruction statement after it,
+#         which stands before it only when it is in its block
+# line:   where it starts
+# column: where it starts
+rec Record {
+    at:     Mark;
+    block:  usize;
+    next:   usize;
+    line:   u32;
+    column: u32;
+}
+
+# an operand as the text writes it
+# ---
+# value:    a value, by its name
+# literal:  a literal not yet typed
+# function: a function of the module a callee names directly
+tag Arg: u8 {
+    value:    Token;
+    literal:  ty.Pending;
+    function: Token;
+}
+
+# what one slot of an instruction holds
+# ---
+# given:  the text writes it
+# imm:    what it holds, its list's data not yet pointed at
+# start:  where its list starts in the list it was read into
+# member: the member it names, written by name, to resolve once the aggregate
+#         it indexes is known
+rec Slot {
+    given:  bool;
+    imm:    opcode_row.Immediate;
+    start:  usize;
+    member: opt[Token];
+}
+
+# a target as the text writes it
+# ---
+# block: its block's name
+# case:  the case value written before it
+# first: where its arguments start among the targets' arguments
+# count: how many it has
+rec Target {
+    block: Token;
+    case:  opt[u64];
+    first: usize;
+    count: usize;
+}
+
+# a result as the text declares it
+rec Result {
+    name:   Token;
+    type:   Type;
+    secret: bool;
+}
+
+# one instruction statement, read whole before anything of it is built
+rec Parts {
+    results:  vector.Vector[Result];
+    flags:    Flags;
+    secret:   bool;
+    extent:   Extent;
+    code:     opcode_row.Opcode;
+    row:      *opcode_row.Row;
+    slots:    vector.Vector[Slot];
+    lanes:    vector.Vector[u32];
+    places:   vector.Vector[Placed];
+    cases:    vector.Vector[u64];
+    callee:   opt[Arg];
+    operands: vector.Vector[Arg];
+    targets:  vector.Vector[Target];
+    args:     vector.Vector[Arg];
+    location: opt[u32];
+    site:     opt[u32];
+    bindings: vector.Vector[Binding];
+    piece:    Bits;
+    publics:  vector.Vector[globals.Range];
+    stated:   bool;
+    block:    Assembly;
+    bound:    vector.Vector[AsmOperand];
+    op:       Op;
+    gives:    vector.Vector[Type];
+}
+
+fun parts(p: *Parser) Parts {
+    var x: Parts;
+    x.results  = vector.init[Result](p.a);
+    x.flags    = NO_FLAGS;
+    x.secret   = false;
+    x.extent   = NO_EXTENT;
+    x.code     = 0;
+    x.slots    = vector.init[Slot](p.a);
+    x.lanes    = vector.init[u32](p.a);
+    x.places   = vector.init[Placed](p.a);
+    x.cases    = vector.init[u64](p.a);
+    x.callee   = opt[Arg].none{};
+    x.operands = vector.init[Arg](p.a);
+    x.targets  = vector.init[Target](p.a);
+    x.args     = vector.init[Arg](p.a);
+    x.location = opt[u32].none{};
+    x.site     = opt[u32].none{};
+    x.bindings = vector.init[Binding](p.a);
+    x.piece    = point.WHOLE;
+    x.publics  = vector.init[globals.Range](p.a);
+    x.stated   = false;
+    x.block    = Assembly{text: View{data: nil, len: 0}, operands: Slice[AsmOperand]{data: nil, size: 0}, reads: false, writes: false, selection: View{data: nil, len: 0}};
+    x.bound    = vector.init[AsmOperand](p.a);
+    x.op       = Op{set: View{data: nil, len: 0}, name: View{data: nil, len: 0}, results: Slice[Type]{data: nil, size: 0}, reads: false, writes: false};
+    x.gives    = vector.init[Type](p.a);
+    ret x;
+}
+
+fun dnit(x: *Parts) {
+    vector.dnit[Result](?x.results);
+    vector.dnit[Slot](?x.slots);
+    vector.dnit[u32](?x.lanes);
+    vector.dnit[Placed](?x.places);
+    vector.dnit[u64](?x.cases);
+    vector.dnit[Arg](?x.operands);
+    vector.dnit[Target](?x.targets);
+    vector.dnit[Arg](?x.args);
+    vector.dnit[Binding](?x.bindings);
+    vector.dnit[globals.Range](?x.publics);
+    vector.dnit[AsmOperand](?x.bound);
+    vector.dnit[Type](?x.gives);
+}
+
+# the name a value or block is given, none when the text spells it as unnamed
+fun own(t: Token) opt[View] {
+    if (state.unnamed(t.text, '_')) { ret opt[View].none{}; }
+    ret opt[View].some{t.text};
+}
+
+# read a parameter: a name, `^` when it is secret, and a type, with the
+# extension a function's parameter may state, which its signature holds
+fun parameter(p: *Parser, decls: *vector.Vector[Declaration], names: *vector.Vector[Token]) {
+    val n: Token = state.expect(p, lexer.WORD, "a parameter's name");
+    state.expect(p, lexer.COLON, ":");
+    val secret: bool = state.accept(p, lexer.SECRET);
+    val type:   Type = ty.ty(p);
+    ty.extension(p);
+    state.push[Declaration](p, decls, Declaration{type: type, secret: secret, name: own(n)});
+    state.push[Token](p, names, n);
+}
+
+# make a block of declared parameters, labelled unless the label is none, and
+# bind its parameters' names
+fun make(p: *Parser, blocks: *vector.Vector[Block], label: opt[Token], at: Token, decls: *vector.Vector[Declaration], names: *vector.Vector[Token]) {
+    if (!state.ok(p)) { ret; }
+    val k: Block = builder.block(?p.b, Slice[Declaration]{data: decls.data, size: decls.len});
+    if (sel label.some) {
+        val opt_given: opt[View] = own(label.some);
+        if (sel opt_given.some) { builder.label(?p.b, k, opt_given.some); }
+        state.define(p, ?p.blocks, "block", label.some, blocks.len::u32);
+    }
+    state.built(p, at.line, at.column);
+    if (sel label.some) { state.note(p, at.line, notes.at(notes.BLOCK, p.fn, k)); }
+    state.push[Block](p, blocks, k);
+    var i: usize = 0;
+    for (i < names.len && state.ok(p)) {
+        val v: Value = builder.parameter(?p.b, k, i::u32);
+        state.define(p, ?p.values, "value", names.data[i], v);
+        i = i + 1;
+    }
+    state.built(p, at.line, at.column);
+}
+
+# make the entry block from a function's parameter list
+fun entry(p: *Parser, list: Mark, blocks: *vector.Vector[Block]) {
+    state.rewind(p, list);
+    val at:    Token                      = p.tok;
+    var decls: vector.Vector[Declaration] = vector.init[Declaration](p.a);
+    var names: vector.Vector[Token]       = vector.init[Token](p.a);
+    fin {
+        vector.dnit[Declaration](?decls);
+        vector.dnit[Token](?names);
+    }
+    state.expect(p, lexer.LPAREN, "(");
+    if (!state.is(p, lexer.RPAREN)) {
+        for (state.ok(p)) {
+            parameter(p, ?decls, ?names);
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RPAREN, ")");
+    make(p, blocks, opt[Token].none{}, at, ?decls, ?names);
+}
+
+# whether a block's label starts here: a name, and its parameters, before a `:`
+fun at_label(p: *Parser) bool {
+    if (!state.is(p, lexer.WORD)) { ret false; }
+    val back: Mark = state.mark(p);
+    state.advance(p);
+    if (state.is(p, lexer.LPAREN)) { state.skip_group(p); }
+    val found: bool = state.ok(p) && state.is(p, lexer.COLON);
+    state.rewind(p, back);
+    ret found;
+}
+
+# read a block's label, parameters and colon, and make the block
+fun header(p: *Parser, blocks: *vector.Vector[Block]) {
+    val t:     Token                      = state.expect(p, lexer.WORD, "a block label");
+    var decls: vector.Vector[Declaration] = vector.init[Declaration](p.a);
+    var names: vector.Vector[Token]       = vector.init[Token](p.a);
+    fin {
+        vector.dnit[Declaration](?decls);
+        vector.dnit[Token](?names);
+    }
+    if (state.accept(p, lexer.LPAREN)) {
+        if (!state.is(p, lexer.RPAREN)) {
+            for (state.ok(p)) {
+                parameter(p, ?decls, ?names);
+                if (!state.accept(p, lexer.COMMA)) { brk; }
+            }
+        }
+        state.expect(p, lexer.RPAREN, ")");
+    }
+    state.expect(p, lexer.COLON, ":");
+    make(p, blocks, opt[Token].some{t}, t, ?decls, ?names);
+}
+
+# read a frame extent's range, `(offset, length)`, into the instruction's metadata
+fun within(p: *Parser, x: *Parts) {
+    state.expect(p, lexer.LPAREN, "(");
+    val offset: u64 = state.number(p);
+    state.expect(p, lexer.COMMA, ",");
+    val length: u64 = state.number(p);
+    state.expect(p, lexer.RPAREN, ")");
+    if (length == 0) { state.expected(p, "a frame extent of at least one byte"); }
+    x.extent = Extent{slot: NO_SLOT, offset: offset, length: length};
+}
+
+# read `public`, bare the flag of an access, or an alloca's public ranges, each `[offset, length]`, none for a slot of
+# a type secret in every byte
+fun public(p: *Parser, x: *Parts) {
+    if (!state.accept(p, lexer.LPAREN)) {
+        x.flags.public = true;
+        ret;
+    }
+    x.stated = true;
+    if (state.accept(p, lexer.RPAREN)) { ret; }
+    for (state.ok(p)) {
+        state.expect(p, lexer.LBRACKET, "[");
+        val offset: u64 = state.number(p);
+        state.expect(p, lexer.COMMA, ",");
+        val length: u64 = state.number(p);
+        state.expect(p, lexer.RBRACKET, "]");
+        state.push[globals.Range](p, ?x.publics, globals.Range{offset: offset, length: length});
+        if (!state.accept(p, lexer.COMMA)) { brk; }
+    }
+    state.expect(p, lexer.RPAREN, ")");
+}
+
+# read an instruction's decorators into its flags
+fun flags(p: *Parser, x: *Parts) {
+    for (state.ok(p) && state.accept(p, lexer.DECORATE)) {
+        state.expect(p, lexer.LBRACKET, "[");
+        val w: Token = state.expect(p, lexer.WORD, "a decorator");
+        if (!state.ok(p))                        { ret; }
+        if (lexer.spelled(w.text, "volatile"))   { x.flags.volatile = true; }
+        or (lexer.spelled(w.text, "kept"))       { x.flags.kept = true; }
+        or (lexer.spelled(w.text, "bounded"))    { x.flags.bounded = true; }
+        or (lexer.spelled(w.text, "checked"))    { x.flags.checked = true; }
+        or (lexer.spelled(w.text, "public"))     { public(p, x); }
+        or (lexer.spelled(w.text, "ascending"))  { x.flags.ascending = true; }
+        or (lexer.spelled(w.text, "descending")) { x.flags.descending = true; }
+        or (lexer.spelled(w.text, "secret"))     { x.secret = true; }
+        or (lexer.spelled(w.text, "within"))     { within(p, x); }
+        or                                       { state.fail_at(p, w.line, w.column, reason.Error.unknown{Named{what: "instruction decorator", name: w.raw}}); }
+        state.expect(p, lexer.RBRACKET, "]");
+    }
+}
+
+# read one result: its name, `^` when it is secret, and its type
+fun result(p: *Parser, x: *Parts) {
+    val n: Token = state.expect(p, lexer.WORD, "a result's name");
+    state.expect(p, lexer.COLON, ":");
+    val secret: bool = state.accept(p, lexer.SECRET);
+    state.push[Result](p, ?x.results, Result{name: n, type: ty.ty(p), secret: secret});
+}
+
+# read the results an instruction declares: `val`, one or several in
+# parentheses, then `=`
+fun results(p: *Parser, x: *Parts) {
+    if (!state.accept_word(p, "val")) { ret; }
+    if (state.accept(p, lexer.LPAREN)) {
+        for (state.ok(p)) {
+            result(p, x);
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+        state.expect(p, lexer.RPAREN, ")");
+    }
+    or { result(p, x); }
+    state.expect(p, lexer.EQUALS, "=");
+}
+
+# read an instruction statement's decorators and results, binding each result
+# unbuilt, and step over the rest
+fun register(p: *Parser, blocks: *vector.Vector[Block], lines: *vector.Vector[Line]) {
+    val at:  Mark  = state.mark(p);
+    val ln:  u32   = p.tok.line;
+    val col: u32   = p.tok.column;
+    var x:   Parts = parts(p);
+    fin { dnit(?x); }
+    flags(p, ?x);
+    results(p, ?x);
+    var i: usize = 0;
+    for (i < x.results.len) {
+        state.define(p, ?p.values, "value", x.results.data[i].name, state.UNBUILT);
+        i = i + 1;
+    }
+    state.skip_statement(p);
+    state.expect_end(p);
+    state.push[Line](p, lines, Line{at: at, block: blocks.len - 1, made: NO_INSTRUCTION, line: ln, column: col});
+}
+
+# the opcode whose row a word names, refusing a word no row names
+fun find_opcode(p: *Parser, t: Token) opt[opcode_row.Opcode] {
+    var i: u32 = 0;
+    for (i < table.rows()) {
+        val opt_table_at: opt[*opcode_row.Row] = table.at(i);
+        if (sel opt_table_at.some && lexer.spelled(t.text, opt_table_at.some.name)) { ret opt[opcode_row.Opcode].some{i}; }
+        i = i + 1;
+    }
+    state.fail_at(p, t.line, t.column, reason.Error.unknown{Named{what: "opcode", name: t.raw}});
+    ret opt[opcode_row.Opcode].none{};
+}
+
+# the slot of a row a name names, none when the row has no slot of the name
+fun slot_of(r: *opcode_row.Row, name: View) opt[u32] {
+    var k: u32 = 0;
+    for (k < opcode_row.slots(r)) {
+        if (lexer.spelled(name, r.immediates[k].name)) { ret opt[u32].some{k}; }
+        k = k + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# read an operand: a literal, a run of bytes among them, or a value by its name
+fun arg(p: *Parser) Arg {
+    if (ty.starts_literal(p) || state.is(p, lexer.STRING)) { ret Arg.literal{ty.scan(p)}; }
+    ret Arg.value{state.expect(p, lexer.WORD, "a value or a literal")};
+}
+
+# read a callee: a literal, a value by its name, or a function of the module
+# by its name, which no value takes
+fun callee(p: *Parser) Arg {
+    if (ty.starts_literal(p)) { ret Arg.literal{ty.scan(p)}; }
+    val t: Token = state.name(p, "a callee");
+    if (t.kind == lexer.WORD) {
+        val opt_lookup: opt[u32] = state.lookup(?p.values, t.text);
+        if (sel opt_lookup.some) { ret Arg.value{t}; }
+    }
+    ret Arg.function{t};
+}
+
+fun ordering(p: *Parser) rule.Ordering {
+    if (state.accept_word(p, "relaxed")) { ret rule.Ordering.relaxed{}; }
+    if (state.accept_word(p, "acquire")) { ret rule.Ordering.acquire{}; }
+    if (state.accept_word(p, "release")) { ret rule.Ordering.release{}; }
+    if (state.accept_word(p, "acq_rel")) { ret rule.Ordering.acq_rel{}; }
+    if (state.accept_word(p, "seq_cst")) { ret rule.Ordering.seq_cst{}; }
+    state.expected(p, "a memory ordering");
+    ret rule.Ordering.relaxed{};
+}
+
+# read a number that fits in 32 bits, in parentheses
+fun wrapped(p: *Parser) u32 {
+    state.expect(p, lexer.LPAREN, "(");
+    val n: u32 = state.number32(p);
+    state.expect(p, lexer.RPAREN, ")");
+    ret n;
+}
+
+fun scale(p: *Parser) u8 {
+    val k: u32 = state.number32(p);
+    if (k > 0xff) { state.expected(p, "a scale of the register file"); }
+    ret k::u8;
+}
+
+# read how a place is filled past its piece
+fun fill(p: *Parser) Fill {
+    if (state.accept_word(p, "exact"))     { ret Fill.exact{}; }
+    if (state.accept_word(p, "undefined")) { ret Fill.undefined{}; }
+    if (state.accept_word(p, "boxed"))     { ret Fill.boxed{}; }
+    if (state.accept_word(p, "sign"))      { ret Fill.sign{wrapped(p)}; }
+    if (state.accept_word(p, "zero"))      { ret Fill.zero{wrapped(p)}; }
+    if (state.accept_word(p, "declared"))  { ret Fill.declared{wrapped(p)}; }
+    state.expected(p, "how a place is filled");
+    ret Fill.exact{};
+}
+
+# read one place: where a piece travels, how its size scales and how its
+# place is filled
+fun place(p: *Parser) Placed {
+    var at: Place = Place.operand{0};
+    state.expect(p, lexer.LBRACE, "{");
+    if (state.accept_word(p, "reg")) {
+        state.expect(p, lexer.LPAREN, "(");
+        val class: u32 = state.number32(p);
+        state.expect(p, lexer.COMMA, ",");
+        val number: u32 = state.number32(p);
+        state.expect(p, lexer.RPAREN, ")");
+        if (class > 0xfffe || number > 0xffff) { state.expected(p, "a register's class and number"); }
+        at = Place.register{rf.make(class::u16, number::u16)};
+    }
+    or (state.accept_word(p, "stack")) {
+        state.expect(p, lexer.LPAREN, "(");
+        val offset: u64   = state.number(p);
+        var by:     Scale = Scale.fixed{};
+        if (state.accept(p, lexer.COMMA)) {
+            state.expect_word(p, "scaled");
+            by = Scale.scaled{scale(p)};
+        }
+        state.expect(p, lexer.RPAREN, ")");
+        at = Place.stack{ir_place.Stacked{offset: offset, scale: by}};
+    }
+    or (state.accept_word(p, "operand")) { at = Place.operand{wrapped(p)}; }
+    or                                   { state.expected(p, "a register, a stack offset or an operand"); }
+    state.expect(p, lexer.COMMA, ",");
+    var by: Scale = Scale.fixed{};
+    if (state.accept_word(p, "scaled")) {
+        state.expect(p, lexer.LPAREN, "(");
+        by = Scale.scaled{scale(p)};
+        state.expect(p, lexer.RPAREN, ")");
+    }
+    or (!state.accept_word(p, "fixed")) { state.expected(p, "fixed or scaled"); }
+    state.expect(p, lexer.COMMA, ",");
+    val how: Fill = fill(p);
+    state.expect(p, lexer.RBRACE, "}");
+    ret Placed{place: at, scale: by, fill: how};
+}
+
+# read a bracketed list of places into `out`
+pub fun places(p: *Parser, out: *vector.Vector[Placed]) {
+    state.expect(p, lexer.LBRACKET, "[");
+    if (!state.is(p, lexer.RBRACKET)) {
+        for (state.ok(p)) {
+            state.push[Placed](p, out, place(p));
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RBRACKET, "]");
+}
+
+fun numbers(p: *Parser, out: *vector.Vector[u64]) {
+    state.expect(p, lexer.LBRACKET, "[");
+    if (!state.is(p, lexer.RBRACKET)) {
+        for (state.ok(p)) {
+            state.push[u64](p, out, state.number(p));
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RBRACKET, "]");
+}
+
+# read an operand's role in an assembly block
+fun role_word(p: *Parser) mo.Role {
+    if (state.accept_word(p, "in"))    { ret mo.READ; }
+    if (state.accept_word(p, "out"))   { ret mo.WRITE; }
+    if (state.accept_word(p, "inout")) { ret mo.READ_WRITE; }
+    if (state.accept_word(p, "none"))  { ret mo.NONE; }
+    state.expected(p, "in, out, inout or none");
+    ret mo.NONE;
+}
+
+# read what an assembly block's operand may be placed in: `value`, or what masc's constraint states
+fun placement(p: *Parser) assembly.Placement {
+    if (state.accept_word(p, "value")) { ret assembly.Placement.value{}; }
+    ret assembly.Placement.stated{constraint(p)};
+}
+
+# read what masc's constraint of an assembly block's operand states
+fun constraint(p: *Parser) inline.Constraint {
+    if (state.accept_word(p, "reg")) {
+        val k: u32 = wrapped(p);
+        if (k > 0xfffe) { state.expected(p, "a class of the register file"); }
+        ret inline.Constraint.class{k::u16};
+    }
+    if (state.accept_word(p, "mem")) { ret inline.Constraint.memory{}; }
+    if (state.accept_word(p, "imm")) {
+        state.expect(p, lexer.LPAREN, "(");
+        val bits: u32 = state.number32(p);
+        if (bits > 0xff) { state.expected(p, "a bit count of at most 255"); }
+        state.expect(p, lexer.COMMA, ",");
+        var signed: bool = false;
+        if (state.accept_word(p, "signed"))    { signed = true; }
+        or (!state.accept_word(p, "unsigned")) { state.expected(p, "signed or unsigned"); }
+        var symbolic: bool = false;
+        if (state.accept(p, lexer.COMMA)) {
+            state.expect_word(p, "symbolic");
+            symbolic = true;
+        }
+        state.expect(p, lexer.RPAREN, ")");
+        ret inline.Constraint.immediate{inline.Immediate{bits: bits::u8, signed: signed, symbolic: symbolic}};
+    }
+    state.expected(p, "value, reg, mem or imm");
+    ret inline.Constraint.memory{};
+}
+
+# read an inline assembly block: its text, its operands in braces each with
+# its role, constraint and type, what it declares it reads and writes of
+# memory, and the selection it states after `under`
+fun assembled(p: *Parser, x: *Parts) {
+    val t: Token = state.expect(p, lexer.STRING, "a block's text");
+    if (!state.ok(p)) { ret; }
+    x.block.text = t.text;
+    state.expect(p, lexer.LBRACE, "{");
+    if (!state.is(p, lexer.RBRACE)) {
+        for (state.ok(p)) {
+            val named: Token = state.name(p, "an operand's name");
+            state.expect(p, lexer.COLON, ":");
+            val role: mo.Role            = role_word(p);
+            val c:    assembly.Placement = placement(p);
+            val held: Type               = ty.ty(p);
+            var to:   assembly.Points    = assembly.Points.unstated{};
+            if (state.accept_word(p, "points")) {
+                state.expect(p, lexer.LPAREN, "(");
+                if (state.accept_word(p, "public")) { to = assembly.Points.public{}; }
+                or (state.accept_word(p, "secret")) { to = assembly.Points.secret{}; }
+                or                                  { state.expected(p, "public or secret"); }
+                state.expect(p, lexer.RPAREN, ")");
+            }
+            state.push[AsmOperand](p, ?x.bound, AsmOperand{name: named.text, role: role, placement: c, ty: held, points: to});
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RBRACE, "}");
+    x.block.reads  = state.accept_word(p, "reads");
+    x.block.writes = state.accept_word(p, "writes");
+    if (state.accept_word(p, "under")) {
+        val head: Token = state.expect(p, lexer.STRING, "a block's selection");
+        if (!state.ok(p)) { ret; }
+        if (head.text.len == 0) {
+            state.expected(p, "a block's selection");
+            ret;
+        }
+        x.block.selection = head.text;
+    }
+}
+
+# read a target op: `op`, then its set, its op, its result types and what it
+# declares it reads and writes of memory
+fun target_op(p: *Parser, x: *Parts) {
+    state.expect_word(p, "op");
+    state.expect(p, lexer.LPAREN, "(");
+    x.op.set = state.expect(p, lexer.STRING, "an instruction set").text;
+    state.expect(p, lexer.COMMA, ",");
+    x.op.name = state.expect(p, lexer.STRING, "an op of the set").text;
+    state.expect(p, lexer.COMMA, ",");
+    state.expect(p, lexer.LBRACKET, "[");
+    if (!state.is(p, lexer.RBRACKET)) {
+        for (state.ok(p)) {
+            state.push[Type](p, ?x.gives, ty.ty(p));
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RBRACKET, "]");
+    for (state.ok(p) && state.accept(p, lexer.COMMA)) {
+        if (state.accept_word(p, "reads"))  { x.op.reads = true; }
+        or (state.accept_word(p, "writes")) { x.op.writes = true; }
+        or                                  { state.expected(p, "reads or writes"); }
+    }
+    state.expect(p, lexer.RPAREN, ")");
+}
+
+# a function of the module, by its name
+fun function_named(p: *Parser, t: Token) opt[Function] {
+    if (!state.ok(p)) { ret opt[Function].none{}; }
+    val opt_find: opt[Symbol] = module.find(p.m, t.text);
+    if (sel opt_find.some) {
+        val at: Symbol = opt_find.some;
+        if (sel at.function) { ret opt[Function].some{at.function}; }
+    }
+    state.fail_at(p, t.line, t.column, reason.Error.unresolved{Named{what: "function", name: t.raw}});
+    ret opt[Function].none{};
+}
+
+# read what a slot holds
+fun immediate(p: *Parser, h: opcode_row.Holds, x: *Parts, slot: *Slot) {
+    slot.given = true;
+    if (sel h.ty)        { slot.imm = opcode_row.Immediate.ty{ty.ty(p)}; }
+    or (sel h.alignment) { slot.imm = opcode_row.Immediate.alignment{state.number(p)}; }
+    or (sel h.ordering)  { slot.imm = opcode_row.Immediate.ordering{ordering(p)}; }
+    or (sel h.lane)      { slot.imm = opcode_row.Immediate.lane{state.number32(p)}; }
+    or (sel h.lanes) {
+        slot.start = x.lanes.len;
+        state.expect(p, lexer.LBRACKET, "[");
+        if (!state.is(p, lexer.RBRACKET)) {
+            for (state.ok(p)) {
+                state.push[u32](p, ?x.lanes, state.number32(p));
+                if (!state.accept(p, lexer.COMMA)) { brk; }
+            }
+        }
+        state.expect(p, lexer.RBRACKET, "]");
+        slot.imm = opcode_row.Immediate.lanes{Slice[u32]{data: nil, size: x.lanes.len - slot.start}};
+    }
+    or (sel h.named) {
+        if (state.accept_word(p, "all")) { slot.imm = opcode_row.Immediate.named{ir_place.Named.all{}}; }
+        or                               { slot.imm = opcode_row.Immediate.named{ir_place.Named.first{state.number32(p)}}; }
+    }
+    or (sel h.places) {
+        slot.start = x.places.len;
+        places(p, ?x.places);
+        slot.imm = opcode_row.Immediate.places{Slice[Placed]{data: nil, size: x.places.len - slot.start}};
+    }
+    or (sel h.member) {
+        if (state.is(p, lexer.UINT)) { slot.imm = opcode_row.Immediate.member{state.number32(p)}; }
+        or                           { slot.member = opt[Token].some{state.expect(p, lexer.WORD, "a member")}; }
+    }
+    or (sel h.cases) {
+        slot.start = x.cases.len;
+        numbers(p, ?x.cases);
+        slot.imm = opcode_row.Immediate.cases{Slice[u64]{data: nil, size: x.cases.len - slot.start}};
+    }
+    or (sel h.function) {
+        val t:                  Token         = state.name(p, "a function");
+        val opt_function_named: opt[Function] = function_named(p, t);
+        if (sel opt_function_named.some) { slot.imm = opcode_row.Immediate.function{opt_function_named.some}; }
+    }
+    or (sel h.assembly) {
+        assembled(p, x);
+        slot.imm = opcode_row.Immediate.assembly{?x.block};
+    }
+    or (sel h.op) {
+        target_op(p, x);
+        slot.imm = opcode_row.Immediate.op{?x.op};
+    }
+    or (sel h.state) { slot.imm = opcode_row.Immediate.state{state.expect(p, lexer.STRING, "a state value").text}; }
+}
+
+# read the bracketed immediates: the first bare when its slot prints bare, and
+# every other by its slot's name
+fun immediates(p: *Parser, x: *Parts) {
+    if (!state.accept(p, lexer.LBRACKET)) { ret; }
+    var first: bool = true;
+    for (state.ok(p)) {
+        var slot: u32   = 0;
+        val t:    Token = p.tok;
+        if (state.is(p, lexer.WORD) && state.next_is(p, lexer.COLON)) {
+            val opt_found: opt[u32] = slot_of(x.row, t.text);
+            if (sel opt_found.none) {
+                state.fail_at(p, t.line, t.column, reason.Error.unknown{Named{what: "slot", name: t.raw}});
+                ret;
+            }
+            slot = opt_found.some;
+            state.advance(p);
+            state.advance(p);
+        }
+        or (!first || opcode_row.slots(x.row) == 0 || !implied.bare(x.row.immediates[0].holds, 0)) {
+            state.expected(p, "a slot's name");
+            ret;
+        }
+        if (x.slots.data[slot].given) {
+            state.fail_at(p, t.line, t.column, reason.Error.duplicate{Named{what: "slot", name: t.raw}});
+            ret;
+        }
+        immediate(p, x.row.immediates[slot].holds, x, ?x.slots.data[slot]);
+        first = false;
+        if (!state.accept(p, lexer.COMMA)) { brk; }
+    }
+    state.expect(p, lexer.RBRACKET, "]");
+}
+
+# read a parenthesised list of operands into `out`
+fun args(p: *Parser, out: *vector.Vector[Arg]) {
+    state.expect(p, lexer.LPAREN, "(");
+    if (!state.is(p, lexer.RPAREN)) {
+        for (state.ok(p)) {
+            state.push[Arg](p, out, arg(p));
+            if (!state.accept(p, lexer.COMMA)) { brk; }
+        }
+    }
+    state.expect(p, lexer.RPAREN, ")");
+}
+
+# whether the token being looked at starts an instruction's metadata, which
+# no block takes as its name
+fun metadata_word(p: *Parser) bool {
+    ret state.is_word(p, "at") || state.is_word(p, "in") || state.is_word(p, "holds");
+}
+
+# read the targets, each after the first led by its case value when the row
+# states a case list
+fun targets(p: *Parser, x: *Parts) {
+    if (!(state.is(p, lexer.WORD) && !metadata_word(p)) && !state.is(p, lexer.UINT)) { ret; }
+    for (state.ok(p)) {
+        var opt_case: opt[u64] = opt[u64].none{};
+        if (state.is(p, lexer.UINT)) {
+            opt_case = opt[u64].some{state.number(p)};
+            state.expect(p, lexer.COLON, ":");
+        }
+        val k:     Token = state.expect(p, lexer.WORD, "a block");
+        val first: usize = x.args.len;
+        if (state.is(p, lexer.LPAREN)) { args(p, ?x.args); }
+        state.push[Target](p, ?x.targets, Target{block: k, case: opt_case, first: first, count: x.args.len - first});
+        if (!state.accept(p, lexer.COMMA)) { brk; }
+    }
+}
+
+# read the location, inlining site and debug bindings of an instruction
+fun metadata(p: *Parser, x: *Parts) {
+    if (state.accept_word(p, "at")) { x.location = opt[u32].some{debug.ref(p, ?p.places, "location")}; }
+    if (state.accept_word(p, "in")) { x.site = opt[u32].some{debug.ref(p, ?p.sites, "site")}; }
+    if (state.accept_word(p, "holds")) {
+        state.expect(p, lexer.LBRACKET, "[");
+        if (!state.is(p, lexer.RBRACKET)) {
+            for (state.ok(p)) {
+                state.push[Binding](p, ?x.bindings, (debug.ref(p, ?p.vars, "variable")));
+                if (!state.accept(p, lexer.COMMA)) { brk; }
+            }
+        }
+        state.expect(p, lexer.RBRACKET, "]");
+        if (state.accept(p, lexer.LBRACKET)) {
+            val offset: u64 = state.number(p);
+            state.expect(p, lexer.COMMA, ",");
+            val size: u64 = state.number(p);
+            state.expect(p, lexer.RBRACKET, "]");
+            x.piece = Bits{offset: offset::u32, size: size::u32};
+        }
+    }
+}
+
+# read an instruction statement whole, building nothing of it but its types
+fun read(p: *Parser, at: Mark, x: *Parts) {
+    state.rewind(p, at);
+    flags(p, x);
+    results(p, x);
+    val w: Token = state.expect(p, lexer.WORD, "an opcode");
+    if (!state.ok(p)) { ret; }
+    val opt_code: opt[opcode_row.Opcode] = find_opcode(p, w);
+    if (sel opt_code.none) { ret; }
+    val opt_row: opt[*opcode_row.Row] = table.at(opt_code.some);
+    if (sel opt_row.none) { ret; }
+    x.code = opt_code.some;
+    x.row  = opt_row.some;
+    var s: u32 = 0;
+    for (s < opcode_row.slots(x.row)) {
+        state.push[Slot](p, ?x.slots, Slot{given: false, imm: opcode_row.Immediate.lane{0}, start: 0, member: opt[Token].none{}});
+        s = s + 1;
+    }
+    immediates(p, x);
+    val opt_at_callee: opt[u32] = implied.callee_of(x.row);
+    if (sel opt_at_callee.some)    { x.callee = opt[Arg].some{callee(p)}; }
+    if (state.is(p, lexer.LPAREN)) { args(p, ?x.operands); }
+    targets(p, x);
+    metadata(p, x);
+    state.expect_end(p);
+}
+
+# whether every value an argument names is built, keeping the first that is not
+fun built(p: *Parser, a: Arg, blame: *Token, all: *bool) {
+    if (!(sel a.value)) { ret; }
+    val index: u32 = state.resolve(p, ?p.values, "value", a.value);
+    if (state.ok(p) && index == state.UNBUILT) {
+        if (@all) { @blame = a.value; }
+        @all = false;
+    }
+}
+
+# whether every value an instruction statement reads is built, and the first
+# that is not
+fun ready(p: *Parser, ln: Line, blame: *Token) bool {
+    var x: Parts = parts(p);
+    fin { dnit(?x); }
+    read(p, ln.at, ?x);
+    var all:        bool     = true;
+    val opt_callee: opt[Arg] = x.callee;
+    if (sel opt_callee.some) { built(p, opt_callee.some, blame, ?all); }
+    var i: usize = 0;
+    for (i < x.operands.len) {
+        built(p, x.operands.data[i], blame, ?all);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.args.len) {
+        built(p, x.args.data[i], blame, ?all);
+        i = i + 1;
+    }
+    ret all;
+}
+
+fun value_data(p: *Parser, f: Function, v: Value, line: u32, column: u32) opt[ValueData] {
+    val res_value_data: res[ValueData, module.Error] = body.value_data(p.m, f, v);
+    if (sel res_value_data.err) {
+        state.fail_at(p, line, column, reason.Error.ir{res_value_data.err});
+        ret opt[ValueData].none{};
+    }
+    ret opt[ValueData].some{res_value_data.ok};
+}
+
+# a constant as a value of the function
+fun used(p: *Parser, c: Constant, line: u32, column: u32) Value {
+    if (!state.ok(p)) { ret state.UNBUILT; }
+    val v: Value = builder.use_constant(?p.b, c);
+    state.built(p, line, column);
+    ret v;
+}
+
+# build a literal of a type, from where its scan started
+fun literal(p: *Parser, k: ty.Pending, t: Type) Value {
+    val after: Mark = state.mark(p);
+    state.rewind(p, k.at);
+    val c: Constant = ty.literal(p, t);
+    state.rewind(p, after);
+    ret used(p, c, k.line, k.column);
+}
+
+# the value an argument is, building a literal of the type it has, or of the
+# type its place gives it
+fun value(p: *Parser, f: Function, a: Arg, implied_type: opt[Type]) Value {
+    if (sel a.value) { ret (state.resolve(p, ?p.values, "value", a.value)); }
+    if (sel a.literal) {
+        val opt_type_of: opt[Type] = ty.type_of(p, a.literal, implied_type);
+        if (sel opt_type_of.none) { ret state.UNBUILT; }
+        ret literal(p, a.literal, opt_type_of.some);
+    }
+    if (!(sel a.function)) { ret state.UNBUILT; }
+    val t:                  Token         = a.function;
+    val opt_function_named: opt[Function] = function_named(p, t);
+    if (sel opt_function_named.none) { ret state.UNBUILT; }
+    val ptr: Type = ty.pointer(p, t.line, t.column);
+    if (!state.ok(p)) { ret state.UNBUILT; }
+    val c: Constant = builder.constant(?p.b, mirl_constant.ConstantData.address{mirl_constant.Address{type: ptr, symbol: Symbol.function{opt_function_named.some}, offset: 0, minus: opt[Symbol].none{}}});
+    state.built(p, t.line, t.column);
+    ret used(p, c, t.line, t.column);
+}
+
+# the type an argument is known to have before its instruction's literals are
+# typed: a value's own, a literal's stated one, a callee's pointer
+fun known(p: *Parser, f: Function, a: Arg) opt[Type] {
+    if (sel a.value) {
+        val index: u32 = state.resolve(p, ?p.values, "value", a.value);
+        if (!state.ok(p)) { ret opt[Type].none{}; }
+        val opt_value_data: opt[ValueData] = value_data(p, f, index, a.value.line, a.value.column);
+        if (sel opt_value_data.none) { ret opt[Type].none{}; }
+        ret opt[Type].some{opt_value_data.some.type};
+    }
+    if (sel a.literal)  { ret a.literal.stated; }
+    if (sel a.function) { ret opt[Type].some{ty.pointer(p, a.function.line, a.function.column)}; }
+    ret opt[Type].none{};
+}
+
+# the member a slot's name names of the aggregate it indexes: the one its
+# typedef writes so, or, for a type no typedef of this text writes, the one
+# at the position an unnamed member's name spells
+fun member(p: *Parser, k: *implied.Known, slot: u32, t: Token) u32 {
+    val opt_agg: opt[Type] = implied.member_aggregate(k, slot);
+    if (sel opt_agg.some) {
+        val opt_found: opt[u32] = state.member(p, opt_agg.some, t.text);
+        if (sel opt_found.some) { ret opt_found.some; }
+    }
+    if (state.unnamed(t.text, '_')) {
+        var n: u64   = 0;
+        var i: usize = 1;
+        for (i < t.text.len && n <= 0xffffffff) {
+            n = n * 10 + (t.text.data[i] - '0')::u64;
+            i = i + 1;
+        }
+        if (n <= 0xffffffff) { ret n::u32; }
+    }
+    state.fail_at(p, t.line, t.column, reason.Error.unresolved{Named{what: "member", name: t.raw}});
+    ret 0;
+}
+
+# resolve the members slots name whose aggregate is typed, or every one still
+# left when last, reporting whether any was resolved
+fun members(p: *Parser, k: *implied.Known, x: *Parts, imms: *opcode_row.Immediate, last: bool) bool {
+    var any: bool = false;
+    var s:   u32  = 0;
+    for (s::usize < x.slots.len && state.ok(p)) {
+        val opt_named: opt[Token] = x.slots.data[s].member;
+        if (sel opt_named.some) {
+            val opt_agg: opt[Type] = implied.member_aggregate(k, s);
+            if (last || sel opt_agg.some) {
+                imms[s]                = opcode_row.Immediate.member{member(p, k, s, opt_named.some)};
+                x.slots.data[s].member = opt[Token].none{};
+                any                    = true;
+            }
+        }
+        s = s + 1;
+    }
+    ret any;
+}
+
+# point the lists of the immediates into the lists they were read into
+fun point_lists(x: *Parts, imms: *opcode_row.Immediate) {
+    var k: usize = 0;
+    for (k < x.slots.len) {
+        val old: opcode_row.Immediate = imms[k];
+        val at:  usize                = x.slots.data[k].start;
+        if (sel old.lanes) {
+            var data: *u32 = nil;
+            if (old.lanes.size > 0) { data = ?x.lanes.data[at]; }
+            imms[k] = opcode_row.Immediate.lanes{Slice[u32]{data: data, size: old.lanes.size}};
+        }
+        if (sel old.places) {
+            var data: *Placed = nil;
+            if (old.places.size > 0) { data = ?x.places.data[at]; }
+            imms[k] = opcode_row.Immediate.places{Slice[Placed]{data: data, size: old.places.size}};
+        }
+        if (sel old.cases) {
+            var data: *u64 = nil;
+            if (old.cases.size > 0) { data = ?x.cases.data[at]; }
+            imms[k] = opcode_row.Immediate.cases{Slice[u64]{data: data, size: old.cases.size}};
+        }
+        if (sel old.assembly) {
+            x.block.operands = Slice[AsmOperand]{data: x.bound.data, size: x.bound.len};
+        }
+        if (sel old.op) {
+            x.op.results = Slice[Type]{data: x.gives.data, size: x.gives.len};
+        }
+        k = k + 1;
+    }
+}
+
+# the instruction a statement's instruction goes before: that of the first
+# statement after it in its block that is built, `NO_INSTRUCTION` for none
+fun placed_after(lines: *vector.Vector[Line], i: usize) Instruction {
+    var j: usize = i + 1;
+    for (j < lines.len && lines.data[j].block == lines.data[i].block) {
+        if (lines.data[j].made != NO_INSTRUCTION) { ret lines.data[j].made; }
+        j = j + 1;
+    }
+    ret NO_INSTRUCTION;
+}
+
+# the block a target names
+fun block_named(p: *Parser, blocks: *vector.Vector[Block], t: Token) opt[Block] {
+    val k: u32 = state.resolve(p, ?p.blocks, "block", t);
+    if (!state.ok(p)) { ret opt[Block].none{}; }
+    ret opt[Block].some{blocks.data[k]};
+}
+
+# the type of a block's parameter at a position
+fun parameter_type(p: *Parser, f: Function, k: Block, i: usize, at: Token) opt[Type] {
+    val res_block_data: res[BlockData, module.Error] = body.block_data(p.m, f, k);
+    if (sel res_block_data.err) {
+        state.fail_at(p, at.line, at.column, reason.Error.ir{res_block_data.err});
+        ret opt[Type].none{};
+    }
+    if (i >= res_block_data.ok.parameters.len) { ret opt[Type].none{}; }
+    val opt_value_data: opt[ValueData] = value_data(p, f, res_block_data.ok.parameters.data[i], at.line, at.column);
+    if (sel opt_value_data.none) { ret opt[Type].none{}; }
+    ret opt[Type].some{opt_value_data.some.type};
+}
+
+# the signature a function holds
+fun signature_of(p: *Parser, fn: Function, at: Token) opt[Type] {
+    val res_function_data: res[FunctionData, module.Error] = module.function_data(p.m, fn);
+    if (sel res_function_data.err) {
+        state.fail_at(p, at.line, at.column, reason.Error.ir{res_function_data.err});
+        ret opt[Type].none{};
+    }
+    ret opt[Type].some{res_function_data.ok.signature};
+}
+
+# give the slots the text leaves out what they hold: the signature a direct
+# callee states and every argument named, before the literals are typed
+fun implied_before(p: *Parser, x: *Parts, imms: *opcode_row.Immediate, direct: opt[Function], at: Token) {
+    var s: u32 = 0;
+    for (s::usize < x.slots.len && state.ok(p)) {
+        if (!x.slots.data[s].given) {
+            val h: opcode_row.Holds = x.row.immediates[s].holds;
+            if (sel h.named) {
+                imms[s]               = opcode_row.Immediate.named{ir_place.Named.all{}};
+                x.slots.data[s].given = true;
+            }
+            or (sel h.ty && implied.signature_slot(x.row, s)) {
+                if (sel direct.some) {
+                    val opt_sig: opt[Type] = signature_of(p, direct.some, at);
+                    if (sel opt_sig.some) {
+                        imms[s]               = opcode_row.Immediate.ty{opt_sig.some};
+                        x.slots.data[s].given = true;
+                    }
+                }
+            }
+            or (sel h.cases) {
+                x.slots.data[s].start = x.cases.len;
+                var e: usize = 1;
+                for (e < x.targets.len) {
+                    val opt_target_case: opt[u64] = x.targets.data[e].case;
+                    if (sel opt_target_case.some) { state.push[u64](p, ?x.cases, opt_target_case.some); }
+                    or {
+                        val t: Token = x.targets.data[e].block;
+                        state.fail_at(p, t.line, t.column, reason.Error.expected{"the case value the target is taken for"});
+                    }
+                    e = e + 1;
+                }
+                imms[s]               = opcode_row.Immediate.cases{Slice[u64]{data: nil, size: x.cases.len - x.slots.data[s].start}};
+                x.slots.data[s].given = true;
+            }
+        }
+        s = s + 1;
+    }
+}
+
+# give an alignment the text leaves out the size of the scalar it accesses,
+# once the literals are typed, and refuse any other slot still missing
+fun implied_after(p: *Parser, k: *implied.Known, x: *Parts, imms: *opcode_row.Immediate, at: Token) {
+    var s: u32 = 0;
+    for (s::usize < x.slots.len && state.ok(p)) {
+        if (!x.slots.data[s].given) {
+            var filled: bool = false;
+            if (sel x.row.immediates[s].holds.alignment) {
+                val opt_accessed: opt[Type] = implied.accessed(k.row, k.immediates, k.operands);
+                if (sel opt_accessed.some) {
+                    val opt_natural: opt[u64] = implied.natural(p.m, opt_accessed.some);
+                    if (sel opt_natural.some) {
+                        imms[s] = opcode_row.Immediate.alignment{opt_natural.some};
+                        filled  = true;
+                    }
+                }
+            }
+            if (!filled) { state.fail_at(p, at.line, at.column, reason.Error.expected{x.row.immediates[s].name}); }
+        }
+        s = s + 1;
+    }
+}
+
+# build one instruction statement
+fun instruction(p: *Parser, f: Function, returns: Slice[Type], blocks: *vector.Vector[Block], lines: *vector.Vector[Line], i: usize) {
+    val ln: Line  = lines.data[i];
+    var x:  Parts = parts(p);
+    fin { dnit(?x); }
+    read(p, ln.at, ?x);
+    if (!state.ok(p)) { ret; }
+    var at: Token = p.tok;
+    at.line   = ln.line;
+    at.column = ln.column;
+
+    # every operand in order, the callee at its place among the fixed ones
+    var all:      vector.Vector[Arg]                  = vector.init[Arg](p.a);
+    var known_:   vector.Vector[opt[Type]]            = vector.init[opt[Type]](p.a);
+    var values:   vector.Vector[Value]                = vector.init[Value](p.a);
+    var outs:     vector.Vector[Type]                 = vector.init[Type](p.a);
+    var settled:  vector.Vector[bool]                 = vector.init[bool](p.a);
+    var actual:   vector.Vector[opt[Type]]            = vector.init[opt[Type]](p.a);
+    var imms:     vector.Vector[opcode_row.Immediate] = vector.init[opcode_row.Immediate](p.a);
+    var branches: vector.Vector[Branch]               = vector.init[Branch](p.a);
+    var targeted: vector.Vector[Value]                = vector.init[Value](p.a);
+    fin {
+        vector.dnit[Arg](?all);
+        vector.dnit[opt[Type]](?known_);
+        vector.dnit[Value](?values);
+        vector.dnit[Type](?outs);
+        vector.dnit[bool](?settled);
+        vector.dnit[opt[Type]](?actual);
+        vector.dnit[opcode_row.Immediate](?imms);
+        vector.dnit[Branch](?branches);
+        vector.dnit[Value](?targeted);
+    }
+    val opt_at_callee: opt[u32]      = implied.callee_of(x.row);
+    var opt_direct:    opt[Function] = opt[Function].none{};
+    var j:             usize         = 0;
+    for (j <= x.operands.len) {
+        if (sel opt_at_callee.some) {
+            if (opt_at_callee.some::usize == j) {
+                val opt_callee: opt[Arg] = x.callee;
+                if (sel opt_callee.some) {
+                    state.push[Arg](p, ?all, opt_callee.some);
+                    val a: Arg = opt_callee.some;
+                    if (sel a.function) { opt_direct = function_named(p, a.function); }
+                }
+            }
+        }
+        if (j < x.operands.len) { state.push[Arg](p, ?all, x.operands.data[j]); }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < all.len && state.ok(p)) {
+        state.push[opt[Type]](p, ?known_, known(p, f, all.data[j]));
+        state.push[bool](p, ?settled, false);
+        state.push[opt[Type]](p, ?actual, opt[Type].none{});
+        j = j + 1;
+    }
+    j = 0;
+    for (j < x.results.len) {
+        state.push[Type](p, ?outs, x.results.data[j].type);
+        j = j + 1;
+    }
+    var s: usize = 0;
+    for (s < x.slots.len) {
+        state.push[opcode_row.Immediate](p, ?imms, x.slots.data[s].imm);
+        s = s + 1;
+    }
+    if (!state.ok(p)) { ret; }
+    var k: implied.Known = implied.Known{
+        m:          p.m,
+        row:        x.row,
+        operands:   Slice[opt[Type]]{data: known_.data, size: known_.len},
+        immediates: Slice[opcode_row.Immediate]{data: imms.data, size: imms.len},
+        returns:    returns,
+        results:    Slice[Type]{data: outs.data, size: outs.len},
+    };
+
+    # the slots the text leaves out, then the literals and the members slots
+    # name, each member once the aggregate it indexes is typed
+    implied_before(p, ?x, imms.data, opt_direct, at);
+    if (!state.ok(p)) { ret; }
+    var resolved: bool = true;
+    for (resolved && state.ok(p)) {
+        implied.settle(?k, Slice[opt[Type]]{data: actual.data, size: actual.len}, settled.data);
+        resolved = members(p, ?k, ?x, imms.data, false);
+    }
+    if (members(p, ?k, ?x, imms.data, true)) { implied.settle(?k, Slice[opt[Type]]{data: actual.data, size: actual.len}, settled.data); }
+    implied_after(p, ?k, ?x, imms.data, at);
+    point_lists(?x, imms.data);
+    j = 0;
+    for (j < all.len && state.ok(p)) {
+        state.push[Value](p, ?values, value(p, f, all.data[j], known_.data[j]));
+        j = j + 1;
+    }
+
+    # the targets, each argument typed by the parameter it is given to
+    j = 0;
+    for (j < x.args.len && state.ok(p)) {
+        state.push[Value](p, ?targeted, 0);
+        j = j + 1;
+    }
+    var e: usize = 0;
+    for (e < x.targets.len && state.ok(p)) {
+        val t:               Target     = x.targets.data[e];
+        val opt_block_named: opt[Block] = block_named(p, blocks, t.block);
+        if (sel opt_block_named.none) { ret; }
+        var a: usize = 0;
+        for (a < t.count && state.ok(p)) {
+            targeted.data[t.first + a] = value(p, f, x.args.data[t.first + a], parameter_type(p, f, opt_block_named.some, a, t.block));
+            a                          = a + 1;
+        }
+        e = e + 1;
+    }
+    e = 0;
+    for (e < x.targets.len && state.ok(p)) {
+        val t:               Target     = x.targets.data[e];
+        val opt_block_named: opt[Block] = block_named(p, blocks, t.block);
+        var data:            *Value     = nil;
+        if (t.count > 0)              { data = ?targeted.data[t.first]; }
+        if (sel opt_block_named.some) { state.push[Branch](p, ?branches, Branch{block: opt_block_named.some, arguments: Slice[Value]{data: data, size: t.count}}); }
+        e = e + 1;
+    }
+    if (!state.ok(p)) { ret; }
+
+    # the instruction's metadata, then the instruction
+    var secret: bool = x.secret;
+    if (sel x.row.secrecy.declared) {
+        j = 0;
+        for (j < x.results.len) {
+            if (x.results.data[j].secret) { secret = true; }
+            j = j + 1;
+        }
+    }
+    var storage: Bindings = UNBOUND;
+    if (x.bindings.len > 0) {
+        val res_list: res[Bindings, module.Error] = module.bindings(p.m, Slice[Binding]{data: x.bindings.data, size: x.bindings.len});
+        if (sel res_list.err) {
+            state.fail_at(p, ln.line, ln.column, reason.Error.ir{res_list.err});
+            ret;
+        }
+        storage = res_list.ok;
+    }
+    var publics: Publics = NO_PUBLICS;
+    if (x.stated) {
+        val res_listed: res[Publics, module.Error] = module.publics(p.m, Slice[globals.Range]{data: x.publics.data, size: x.publics.len});
+        if (sel res_listed.err) {
+            state.fail_at(p, ln.line, ln.column, reason.Error.ir{res_listed.err});
+            ret;
+        }
+        publics = res_listed.ok;
+    }
+    val ahead: Instruction = placed_after(lines, i);
+    if (ahead == NO_INSTRUCTION) { builder.at_end(?p.b, blocks.data[ln.block]); }
+    or                           { builder.before(?p.b, ahead); }
+    val opt_location: opt[u32] = x.location;
+    if (sel opt_location.some) { builder.locate(?p.b, opt[Location].some{opt_location.some}); }
+    val opt_site: opt[u32] = x.site;
+    if (sel opt_site.some) { builder.site(?p.b, opt[Site].some{opt_site.some}); }
+    builder.flags(?p.b, x.flags);
+    if (secret) { builder.secret(?p.b, true); }
+    val made: Instruction = builder.emit(?p.b, Request{
+        opcode:     x.code,
+        operands:   Slice[Value]{data: values.data, size: values.len},
+        immediates: Slice[opcode_row.Immediate]{data: imms.data, size: imms.len},
+        targets:    Slice[Branch]{data: branches.data, size: branches.len},
+    });
+    builder.plain(?p.b);
+    state.built(p, ln.line, ln.column);
+    if (!state.ok(p)) { ret; }
+    lines.data[i].made = made;
+    state.note(p, ln.line, notes.at(notes.INSTRUCTION, f, made));
+    val res_instruction_data: res[InstructionData, module.Error] = body.instruction_data(p.m, f, made);
+    if (sel res_instruction_data.err) {
+        state.fail_at(p, ln.line, ln.column, reason.Error.ir{res_instruction_data.err});
+        ret;
+    }
+    if (res_instruction_data.ok.results.len != x.results.len) {
+        state.fail_at(p, ln.line, ln.column, reason.Error.results{res_instruction_data.ok.results.len::u32});
+        ret;
+    }
+    if (storage != UNBOUND || publics != NO_PUBLICS || x.extent.length != 0) {
+        var md: Metadata = res_instruction_data.ok.metadata;
+        md.bindings = storage;
+        md.piece    = x.piece;
+        md.publics  = publics;
+        md.extent   = x.extent;
+        val err_set: err[module.Error] = body.set_metadata(p.m, f, made, md);
+        if (sel err_set.err) {
+            state.fail_at(p, ln.line, ln.column, reason.Error.ir{err_set.err});
+            ret;
+        }
+    }
+
+    # the results, each the type and secrecy the statement declares it with
+    var r: usize = 0;
+    for (r < x.results.len && state.ok(p)) {
+        val declared:       Result         = x.results.data[r];
+        val v:              Value          = builder.result(?p.b, made, r::u32);
+        val opt_value_data: opt[ValueData] = value_data(p, f, v, declared.name.line, declared.name.column);
+        if (sel opt_value_data.none) { ret; }
+        if (!type_table.same(opt_value_data.some.type, declared.type) || opt_value_data.some.secret != declared.secret) {
+            state.fail_at(p, declared.name.line, declared.name.column, reason.Error.unexpected{"a result type other than the one the instruction gives"});
+            ret;
+        }
+        val opt_given: opt[View] = own(declared.name);
+        if (sel opt_given.some) { builder.name(?p.b, v, opt_given.some); }
+        state.rebind(p, ?p.values, declared.name.text, v);
+        r = r + 1;
+    }
+    state.built(p, ln.line, ln.column);
+}
+
+# save a record, to bind once every instruction is built
+fun note(p: *Parser, blocks: *vector.Vector[Block], next: usize, records: *vector.Vector[Record]) {
+    val at:  Mark = state.mark(p);
+    val ln:  u32  = p.tok.line;
+    val col: u32  = p.tok.column;
+    state.skip_statement(p);
+    state.expect_end(p);
+    state.push[Record](p, records, Record{at: at, block: blocks.len - 1, next: next, line: ln, column: col});
+}
+
+# the kind of step a word names, none when it names none
+fun step_kind(t: Token) opt[point.Kind] {
+    var i: u32 = 0;
+    for (i::usize < point.rows()) {
+        val opt_row: opt[point.Row] = point.row(i);
+        if (sel opt_row.some && lexer.spelled(t.text, opt_row.some.name)) { ret opt[point.Kind].some{i}; }
+        i = i + 1;
+    }
+    ret opt[point.Kind].none{};
+}
+
+# read an expression a record reads its variable through: a step around an
+# expression, or the operand it starts from, appending its steps innermost
+# first and keeping its operand
+# ---
+# ret: the type the expression has
+fun expression(p: *Parser, f: Function, steps: *vector.Vector[Step], operand: *Value) opt[Type] {
+    val t:        Token           = p.tok;
+    var opt_kind: opt[point.Kind] = opt[point.Kind].none{};
+    if (state.is(p, lexer.WORD) && (state.next_is(p, lexer.LPAREN) || state.next_is(p, lexer.LBRACKET))) { opt_kind = step_kind(t); }
+    if (sel opt_kind.none) {
+        val a: Arg = arg(p);
+        @operand = value(p, f, a, opt[Type].none{});
+        if (!state.ok(p)) { ret opt[Type].none{}; }
+        val opt_value_data: opt[ValueData] = value_data(p, f, @operand, t.line, t.column);
+        if (sel opt_value_data.none) { ret opt[Type].none{}; }
+        ret opt[Type].some{opt_value_data.some.type};
+    }
+    state.advance(p);
+    val opt_row: opt[point.Row] = point.row(opt_kind.some);
+    if (sel opt_row.none) { ret opt[Type].none{}; }
+    var opt_to_type: opt[Type] = opt[Type].none{};
+    if (state.accept(p, lexer.LBRACKET)) {
+        opt_to_type = opt[Type].some{ty.ty(p)};
+        state.expect(p, lexer.RBRACKET, "]");
+    }
+    state.expect(p, lexer.LPAREN, "(");
+    val opt_inner: opt[Type] = expression(p, f, steps, operand);
+    if (!state.ok(p)) { ret opt[Type].none{}; }
+    if (sel opt_row.some.takes.constant) {
+        state.expect(p, lexer.COMMA, ",");
+        val c: Constant = ty.typed(p, opt_inner);
+        state.expect(p, lexer.RPAREN, ")");
+        state.push[Step](p, steps, Step{kind: opt_kind.some, argument: point.Argument.constant{c}});
+        ret opt_inner;
+    }
+    state.expect(p, lexer.RPAREN, ")");
+    if (sel opt_to_type.none) {
+        state.fail_at(p, t.line, t.column, reason.Error.expected{"the type the step converts to, in brackets"});
+        ret opt[Type].none{};
+    }
+    state.push[Step](p, steps, Step{kind: opt_kind.some, argument: point.Argument.to{opt_to_type.some}});
+    ret opt_to_type;
+}
+
+# read what a record gives its variable
+fun reads(p: *Parser, f: Function, at: Record) Reads {
+    if (state.accept_word(p, "unavailable")) { ret Reads.unavailable{}; }
+    var steps: vector.Vector[Step] = vector.init[Step](p.a);
+    fin { vector.dnit[Step](?steps); }
+    var v: Value = state.UNBUILT;
+    expression(p, f, ?steps, ?v);
+    if (!state.ok(p)) { ret Reads.unavailable{}; }
+    val res_expression: res[Expression, module.Error] = module.expression(p.m, Slice[Step]{data: steps.data, size: steps.len});
+    if (sel res_expression.err) {
+        state.fail_at(p, at.line, at.column, reason.Error.ir{res_expression.err});
+        ret Reads.unavailable{};
+    }
+    ret Reads.operand{Operand{value: v, expression: res_expression.ok}};
+}
+
+# bind one record at its point
+fun record(p: *Parser, f: Function, blocks: *vector.Vector[Block], lines: *vector.Vector[Line], r: Record) {
+    state.rewind(p, r.at);
+    state.expect_word(p, "bind");
+    val v:     u32  = debug.ref(p, ?p.vars, "variable");
+    var piece: Bits = point.WHOLE;
+    if (state.accept(p, lexer.LBRACKET)) {
+        piece.offset = state.number32(p);
+        state.expect(p, lexer.COMMA, ",");
+        piece.size = state.number32(p);
+        state.expect(p, lexer.RBRACKET, "]");
+        if (state.ok(p) && piece.size == 0) { state.expected(p, "a piece of at least one bit"); }
+    }
+    state.expect(p, lexer.EQUALS, "=");
+    val gave: Reads = reads(p, f, r);
+    state.expect_end(p);
+    if (!state.ok(p)) { ret; }
+    var ahead: Instruction = NO_INSTRUCTION;
+    if (r.next < lines.len && lines.data[r.next].block == r.block) { ahead = lines.data[r.next].made; }
+    if (ahead == NO_INSTRUCTION)                                   { builder.at_end(?p.b, blocks.data[r.block]); }
+    or                                                             { builder.before(?p.b, ahead); }
+    builder.bind_piece_at(?p.b, v, piece, gave);
+    state.built(p, r.line, r.column);
+    if (!state.ok(p)) { ret; }
+    val res_held: res[*FunctionBody, module.Error] = module.body(p.m, f);
+    if (sel res_held.ok) { state.note(p, r.line, notes.at(notes.RECORD, f, res_held.ok.points.len::u32)); }
+}
+
+# the results of the function a body is of
+fun returns_of(p: *Parser, fn: Function, at: Token) Slice[Type] {
+    val opt_sig: opt[Type] = signature_of(p, fn, at);
+    if (sel opt_sig.none) { ret Slice[Type]{data: nil, size: 0}; }
+    val res_signature: res[type_table.Function, type_table.Error] = type_table.signature(?p.m.types, opt_sig.some);
+    if (sel res_signature.err) {
+        state.fail_at(p, at.line, at.column, reason.Error.types{res_signature.err});
+        ret Slice[Type]{data: nil, size: 0};
+    }
+    ret res_signature.ok.results;
+}
+
+# read the body of a function, from its `{`, its entry's parameters from the
+# function's parameter list, and the places of its entry's parameters from
+# their list when the function is placed
+pub fun function(p: *Parser, at: item.Body) {
+    val f: Function = at.function;
+    p.fn = f;
+    map.clear_by[View, u32](?p.values);
+    map.clear_by[View, u32](?p.blocks);
+    builder.enter(?p.b, f);
+    var blocks:  vector.Vector[Block]  = vector.init[Block](p.a);
+    var lines:   vector.Vector[Line]   = vector.init[Line](p.a);
+    var records: vector.Vector[Record] = vector.init[Record](p.a);
+    fin {
+        vector.dnit[Block](?blocks);
+        vector.dnit[Line](?lines);
+        vector.dnit[Record](?records);
+    }
+    entry(p, at.parameters, ?blocks);
+    state.rewind(p, at.at);
+    val opened: Token = p.tok;
+    state.expect(p, lexer.LBRACE, "{");
+    for (state.ok(p) && !state.is(p, lexer.RBRACE)) {
+        if (state.is(p, lexer.END))                                   { state.expected(p, "}"); }
+        or (at_label(p))                                              { header(p, ?blocks); }
+        or (state.is_word(p, "bind") && state.next_is(p, lexer.WORD)) { note(p, ?blocks, lines.len, ?records); }
+        or {
+            register(p, ?blocks, ?lines);
+        }
+    }
+
+    state.note(p, p.tok.line, notes.at(notes.FUNCTION_END, f, 0));
+    val returns:  Slice[Type] = returns_of(p, f, opened);
+    var left:     usize       = lines.len;
+    var progress: bool        = true;
+    var blame:    Token;
+    for (state.ok(p) && left > 0 && progress) {
+        progress = false;
+        var i: usize = 0;
+        for (i < lines.len && state.ok(p)) {
+            if (lines.data[i].made == NO_INSTRUCTION && ready(p, lines.data[i], ?blame)) {
+                instruction(p, f, returns, ?blocks, ?lines, i);
+                if (state.ok(p)) {
+                    left     = left - 1;
+                    progress = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    if (state.ok(p) && left > 0) {
+        var i: usize = 0;
+        for (lines.data[i].made != NO_INSTRUCTION) { i = i + 1; }
+        ready(p, lines.data[i], ?blame);
+        state.fail_at(p, blame.line, blame.column, reason.Error.unresolved{Named{what: "value", name: blame.raw}});
+    }
+    var r: usize = 0;
+    for (r < records.len && state.ok(p)) {
+        record(p, f, ?blocks, ?lines, records.data[r]);
+        r = r + 1;
+    }
+    if (!state.ok(p)) { ret; }
+    val opt_placed: opt[Mark] = at.placed;
+    if (sel opt_placed.some) {
+        state.rewind(p, opt_placed.some);
+        val line:   u32                   = p.tok.line;
+        val column: u32                   = p.tok.column;
+        var list:   vector.Vector[Placed] = vector.init[Placed](p.a);
+        fin { vector.dnit[Placed](?list); }
+        places(p, ?list);
+        if (!state.ok(p)) { ret; }
+        val err_done: err[module.Error] = body.place_entry(p.m, f, Slice[Placed]{data: list.data, size: list.len});
+        if (sel err_done.err) { state.fail_at(p, line, column, reason.Error.ir{err_done.err}); }
+    }
+}

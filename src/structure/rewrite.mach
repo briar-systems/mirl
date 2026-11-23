@@ -1,0 +1,779 @@
+# the rewrites that mend each flaw of a graph's shape
+#
+# a funnel moves a set of edges to one new block made through the builder,
+# with no location. when the edges enter one block it forwards them there, as
+# a synthetic merge, a loop's synthetic exit or its one latch. when they enter
+# several it is a dispatch: it takes an integer selector naming the target and
+# one parameter for each parameter of every target, and tests the selector
+# against each target in turn. every edge passes its target's case, its own
+# arguments in that target's place and zero in the others. the selector is
+# secret when a branch that chose among the edges branched on a secret. a value
+# a target's code uses that the new block leaves undominated is first made a
+# parameter of the target, except an address step of operands that stay
+# dominated, which is made again at the target's start instead, so an address
+# stays formed from its slot's alloca (`mirl.structure.repair`).
+#
+# a tangle is mended by splitting the blocks reached from its later entries
+# before its first one, when they hold no more instructions than the dispatch
+# that would replace them, hold no cycle, and none of their values is used
+# outside them, and by a dispatch over its entries otherwise. a dispatch over k targets is k - 1
+# tests and k - 1 branches, so splitting never grows code more than the
+# dispatch it saves.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.build.builder.Builder;
+use mirl.build.failure;
+use mirl.build.remap;
+use mirl.build.remap.Remap;
+use mirl.ir.block.BlockData;
+use mirl.ir.body;
+use cfg_copy: mirl.ir.cfg.copy;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use cfg_edge:    mirl.ir.cfg.edge;
+use cfg_failure: mirl.ir.cfg.failure;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.graph.NONE;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.List;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.table;
+use mirl.ir.point;
+use mirl.ir.point.Point;
+use mirl.ir.point.Reads;
+use mirl.ir.pool.Growing;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.ValueData;
+use mirl.pass.refusal;
+use mirl.structure.repair;
+use mirl.structure.shape.Flaw;
+use mirl.structure.shape.Site;
+use mirl.structure.shape.Work;
+
+fun alloc(e: allocator.Error) err[refusal.Error] {
+    ret err[refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+fun ir(e: module.Error) err[refusal.Error] {
+    ret err[refusal.Error].err{refusal.Error.ir{e}};
+}
+
+# a request of an opcode with no immediates
+fun request(code: opcode_row.Opcode, operands: Slice[Value], targets: Slice[Branch]) Request {
+    ret Request{opcode: code, operands: operands, immediates: Slice[opcode_row.Immediate]{data: nil, size: 0}, targets: targets};
+}
+
+# the instruction that ends a block, which holds every edge out of it
+fun terminator(m: *Module, f: Function, k: u32) res[Instruction, refusal.Error] {
+    val res_block_data: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel res_block_data.err)                   { ret res[Instruction, refusal.Error].err{refusal.Error.ir{res_block_data.err}}; }
+    if (res_block_data.ok.last == NO_INSTRUCTION) { ret res[Instruction, refusal.Error].err{refusal.Error.reason{"a block of the graph holds no terminator"}}; }
+    ret res[Instruction, refusal.Error].ok{res_block_data.ok.last};
+}
+
+# rebind value binding records in blocks dominated by root from old to replacement
+fun rebind_in_dominated(m: *Module, f: Function, d: *Dominance, root: u32, old: Value, replacement: Value) err[refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(m, f);
+    if (sel res_body.err) { ret ir(res_body.err); }
+    val b: *Body = res_body.ok;
+    if (b.values.data[old].bound.len == 0) { ret err[refusal.Error].ok{}; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        val bd: *BlockData = ?b.blocks.data[k];
+        if (!bd.erased && dominance.dominates(d, root, k::u32)) {
+            var inst: Instruction = bd.first;
+            for (inst != NO_INSTRUCTION) {
+                val run: point.Run = b.instructions.data[inst].points;
+                var p:   u32       = run.first;
+                for (p != 0) {
+                    val r:     u32   = p - 1;
+                    val pt:    Point = b.points.data[r];
+                    val next:  u32   = pt.next;
+                    val last:  bool  = p == run.last;
+                    val reads: Reads = pt.reads;
+                    if (sel reads.operand) {
+                        if (reads.operand.value == old) {
+                            val err_rebound: err[module.Error] = body.rebind(m, f, r, Reads.operand{point.Operand{value: replacement, expression: reads.operand.expression}});
+                            if (sel err_rebound.err) { ret ir(err_rebound.err); }
+                        }
+                    }
+                    if (last) { brk; }
+                    p = next;
+                }
+                inst = b.instructions.data[inst].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether a block ends in a branch on a secret condition
+fun secret_branch(m: *Module, f: Function, k: u32) res[bool, refusal.Error] {
+    val res_term: res[Instruction, refusal.Error] = terminator(m, f, k);
+    if (sel res_term.err) { ret res[bool, refusal.Error].err{res_term.err}; }
+    val res_instruction_data: res[InstructionData, module.Error] = body.instruction_data(m, f, res_term.ok);
+    if (sel res_instruction_data.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_instruction_data.err}}; }
+    val opt_opcode_at: opt[*opcode_row.Row] = table.at(res_instruction_data.ok.opcode);
+    if (sel opt_opcode_at.none) { ret res[bool, refusal.Error].ok{false}; }
+    val row:   *opcode_row.Row = opt_opcode_at.some;
+    val fixed: u32             = opcode_row.fixed(row);
+    var i:     u32             = 0;
+    for (i < fixed && i::usize < res_instruction_data.ok.operands.len) {
+        if (sel row.operands[i].role.condition) {
+            val res_value_data: res[ValueData, module.Error] = body.value_data(m, f, res_instruction_data.ok.operands.data[i]);
+            if (sel res_value_data.err)   { ret res[bool, refusal.Error].err{refusal.Error.ir{res_value_data.err}}; }
+            if (res_value_data.ok.secret) { ret res[bool, refusal.Error].ok{true}; }
+        }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{false};
+}
+
+# whether any of these blocks, or a source of these edges, branches on a secret
+fun decided_secretly(m: *Module, f: Function, blocks: *vector.Vector[u32], edges: *vector.Vector[Site]) res[bool, refusal.Error] {
+    var i: usize = 0;
+    for (i < blocks.len) {
+        val res_secret_branch: res[bool, refusal.Error] = secret_branch(m, f, blocks.data[i]);
+        if (sel res_secret_branch.err)                        { ret res_secret_branch; }
+        if (sel res_secret_branch.ok && res_secret_branch.ok) { ret res_secret_branch; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < edges.len) {
+        val res_secret_branch: res[bool, refusal.Error] = secret_branch(m, f, edges.data[i].from);
+        if (sel res_secret_branch.err)                        { ret res_secret_branch; }
+        if (sel res_secret_branch.ok && res_secret_branch.ok) { ret res_secret_branch; }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{false};
+}
+
+# a target's parameters, each as declared
+fun declared(m: *Module, f: Function, k: u32, out: *vector.Vector[Declaration]) err[refusal.Error] {
+    val res_block_data: res[BlockData, module.Error] = body.block_data(m, f, k);
+    if (sel res_block_data.err) { ret ir(res_block_data.err); }
+    var i: usize = 0;
+    for (i < res_block_data.ok.parameters.len) {
+        val res_value_data: res[ValueData, module.Error] = body.value_data(m, f, res_block_data.ok.parameters.data[i]);
+        if (sel res_value_data.err) { ret ir(res_value_data.err); }
+        val res_pushed: res[usize, allocator.Error] = vector.push[Declaration](out, Declaration{type: res_value_data.ok.type, secret: res_value_data.ok.secret});
+        if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# a dispatch's lists: each target's parameters laid one after another behind
+# the selector
+# ---
+# decls: the selector, then every target's parameters
+# first: where each target's parameters start among decls
+# zeros: the zero of each of decls, NONE for the selector
+# cases: the value of each target's case
+rec Layout {
+    decls: vector.Vector[Declaration];
+    first: vector.Vector[usize];
+    zeros: vector.Vector[Value];
+    cases: vector.Vector[Value];
+}
+
+# a constant as a value of the function
+fun constant(m: *Module, f: Function, data: ConstantData) res[Value, refusal.Error] {
+    val res_add_constant: res[Constant, module.Error] = module.add_constant(m, data);
+    if (sel res_add_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_add_constant.err}}; }
+    val res_constant: res[Value, module.Error] = body.constant(m, f, res_add_constant.ok);
+    if (sel res_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_constant.err}}; }
+    ret res[Value, refusal.Error].ok{res_constant.ok};
+}
+
+# fill a dispatch's layout over its targets: a 32-bit selector, secret when
+# asked, each target's parameters, its case and one zero per type
+fun lay(m: *Module, f: Function, targets: *vector.Vector[u32], secret: bool, out: *Layout) err[refusal.Error] {
+    val res_word: res[Type, type_table.Error] = type_table.intern(?m.types, type_table.Shape.integer{type_table.Integer{width: 32}});
+    if (sel res_word.err) { ret err[refusal.Error].err{refusal.Error.ir{module.Error.types{res_word.err}}}; }
+    val res_selector: res[usize, allocator.Error] = vector.push[Declaration](?out.decls, Declaration{type: res_word.ok, secret: secret});
+    if (sel res_selector.err) { ret alloc(res_selector.err); }
+    var j: usize = 0;
+    for (j < targets.len) {
+        val res_first_pushed: res[usize, allocator.Error] = vector.push[usize](?out.first, out.decls.len);
+        if (sel res_first_pushed.err) { ret alloc(res_first_pushed.err); }
+        val err_declared: err[refusal.Error] = declared(m, f, targets.data[j], ?out.decls);
+        if (sel err_declared.err) { ret err_declared; }
+        var bits:     [1]u64                    = [1]u64{j::u64};
+        val res_case: res[Value, refusal.Error] = constant(m, f, ConstantData.integer{Bits{type: res_word.ok, words: Slice[u64]{data: ?bits[0], size: 1}}});
+        if (sel res_case.err) { ret err[refusal.Error].err{res_case.err}; }
+        val res_kept: res[usize, allocator.Error] = vector.push[Value](?out.cases, res_case.ok);
+        if (sel res_kept.err) { ret alloc(res_kept.err); }
+        j = j + 1;
+    }
+    val res_none: res[usize, allocator.Error] = vector.push[Value](?out.zeros, NONE);
+    if (sel res_none.err) { ret alloc(res_none.err); }
+    var i: usize = 1;
+    for (i < out.decls.len) {
+        var z: Value = NONE;
+        var k: usize = 1;
+        for (k < i) {
+            if (type_table.same(out.decls.data[k].type, out.decls.data[i].type)) { z = out.zeros.data[k]; }
+            k = k + 1;
+        }
+        if (z == NONE) {
+            val res_made: res[Value, refusal.Error] = constant(m, f, ConstantData.zero{out.decls.data[i].type});
+            if (sel res_made.err) { ret err[refusal.Error].err{res_made.err}; }
+            z = res_made.ok;
+        }
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?out.zeros, z);
+        if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# count parameters from position from, empty when there are none
+fun slots(params: *vector.Vector[Value], from: usize, count: usize) Slice[Value] {
+    if (count == 0) { ret Slice[Value]{data: nil, size: 0}; }
+    ret Slice[Value]{data: ?params.data[from], size: count};
+}
+
+# the number of parameters of target j of a layout
+fun width(l: *Layout, j: usize) usize {
+    if (j + 1 < l.first.len) { ret l.first.data[j + 1] - l.first.data[j]; }
+    ret l.decls.len - l.first.data[j];
+}
+
+# the dispatch block and the blocks of its tests, built through the builder
+fun dispatch(m: *Module, f: Function, targets: *vector.Vector[u32], l: *Layout) res[Block, refusal.Error] {
+    var b: Builder = builder.make(m);
+    builder.enter(?b, f);
+    val head:   Block                = builder.block(?b, Slice[Declaration]{data: l.decls.data, size: l.decls.len});
+    var params: vector.Vector[Value] = vector.init[Value](m.a);
+    fin { vector.dnit[Value](?params); }
+    var i: usize = 0;
+    for (i < l.decls.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?params, builder.parameter(?b, head, i::u32));
+        if (sel res_pushed.err) { ret res[Block, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        i = i + 1;
+    }
+    val k:  usize = targets.len;
+    var at: Block = head;
+    var j:  usize = 0;
+    for (j + 1 < k) {
+        builder.at_end(?b, at);
+        var compared: [2]Value = [2]Value{params.data[0], l.cases.data[j]};
+        var test:     [1]Value = [1]Value{builder.value(?b, request(table.EQ, Slice[Value]{data: ?compared[0], size: 2}, Slice[Branch]{data: nil, size: 0}))};
+        var other:    Branch   = Branch{block: (targets.data[k - 1]), arguments: slots(?params, l.first.data[k - 1], width(l, k - 1))};
+        var next:     Block    = NONE;
+        if (j + 2 < k) {
+            next  = builder.block(?b, Slice[Declaration]{data: nil, size: 0});
+            other = Branch{block: next, arguments: Slice[Value]{data: nil, size: 0}};
+        }
+        var both: [2]Branch = [2]Branch{Branch{block: (targets.data[j]), arguments: slots(?params, l.first.data[j], width(l, j))}, other};
+        builder.emit(?b, request(table.CBR, Slice[Value]{data: ?test[0], size: 1}, Slice[Branch]{data: ?both[0], size: 2}));
+        at = next;
+        j  = j + 1;
+    }
+    val err_built: err[failure.Error] = builder.done(?b);
+    if (sel err_built.err) { ret res[Block, refusal.Error].err{refusal.Error.build{err_built.err}}; }
+    ret res[Block, refusal.Error].ok{head};
+}
+
+# a block that forwards its parameters to one target
+fun forward(m: *Module, f: Function, target: u32, decls: *vector.Vector[Declaration]) res[Block, refusal.Error] {
+    var b: Builder = builder.make(m);
+    builder.enter(?b, f);
+    val head:   Block                = builder.block(?b, Slice[Declaration]{data: decls.data, size: decls.len});
+    var params: vector.Vector[Value] = vector.init[Value](m.a);
+    fin { vector.dnit[Value](?params); }
+    var i: usize = 0;
+    for (i < decls.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?params, builder.parameter(?b, head, i::u32));
+        if (sel res_pushed.err) { ret res[Block, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        i = i + 1;
+    }
+    builder.at_end(?b, head);
+    var to: [1]Branch = [1]Branch{Branch{block: target, arguments: Slice[Value]{data: params.data, size: params.len}}};
+    builder.emit(?b, request(table.BR, Slice[Value]{data: nil, size: 0}, Slice[Branch]{data: ?to[0], size: 1}));
+    val err_built: err[failure.Error] = builder.done(?b);
+    if (sel err_built.err) { ret res[Block, refusal.Error].err{refusal.Error.build{err_built.err}}; }
+    ret res[Block, refusal.Error].ok{head};
+}
+
+# the position of x in a list, the list's length when it is absent
+fun index_of(v: *vector.Vector[u32], x: u32) usize {
+    var i: usize = 0;
+    for (i < v.len && v.data[i] != x) { i = i + 1; }
+    ret i;
+}
+
+# a block's immediate dominator, NONE for the entry
+fun above(d: *Dominance, n: u32) u32 {
+    val opt_idom: opt[u32] = dominance.idom(d, n);
+    if (sel opt_idom.none) { ret NONE; }
+    ret opt_idom.some;
+}
+
+# the nearest block that dominates both
+fun common(d: *Dominance, a: u32, b: u32) u32 {
+    var x: u32 = a;
+    for (!dominance.dominates(d, x, b)) {
+        val opt_idom: opt[u32] = dominance.idom(d, x);
+        if (sel opt_idom.none) { ret x; }
+        x = opt_idom.some;
+    }
+    ret x;
+}
+
+# make a value an argument of every edge into a target, for its uses the
+# target dominates, or make it again at the target's start where it is an
+# address step of operands made where `c`, which dominates every edge the
+# funnel moves, is dominated from (`repair.remakeable`)
+fun pass_in(m: *Module, f: Function, d: *Dominance, c: u32, t: u32, v: Value, uses: *vector.Vector[Instruction]) err[refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(m, f);
+    if (sel res_body.err) { ret ir(res_body.err); }
+    val b: *Body = res_body.ok;
+    vector.truncate[Instruction](uses, 0);
+    val all: *Growing[Instruction] = ?b.values.data[v].uses;
+    var i:   usize                 = 0;
+    for (i < all.len) {
+        val at: Place = b.instructions.data[all.data[i]].place;
+        if (sel at.placed && dominance.dominates(d, t, at.placed)) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](uses, all.data[i]);
+            if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+        }
+        i = i + 1;
+    }
+    if (uses.len == 0) { ret err[refusal.Error].ok{}; }
+    if (repair.remakeable(b, d, v, c, true)) {
+        var bld: Builder = builder.make(m);
+        builder.enter(?bld, f);
+        builder.before(?bld, b.blocks.data[t].first);
+        var r: Remap = remap.init(m.a);
+        fin { remap.dnit(?r); }
+        val res_made: res[Value, refusal.Error] = repair.remade(m, f, ?bld, d, v, c, true, ?r);
+        if (sel res_made.err) { ret err[refusal.Error].err{res_made.err}; }
+        val err_built: err[failure.Error] = builder.done(?bld);
+        if (sel err_built.err) { ret err[refusal.Error].err{refusal.Error.build{err_built.err}}; }
+        i = 0;
+        for (i < uses.len) {
+            val err_put: err[module.Error] = body.substitute(m, f, uses.data[i], v, res_made.ok);
+            if (sel err_put.err) { ret ir(err_put.err); }
+            i = i + 1;
+        }
+        ret err[refusal.Error].ok{};
+    }
+    val vd:       ValueData            = b.values.data[v];
+    val preds:    usize                = b.blocks.data[t].predecessors.len;
+    var incoming: vector.Vector[Value] = vector.init[Value](m.a);
+    fin { vector.dnit[Value](?incoming); }
+    i = 0;
+    for (i < preds) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Value](?incoming, v);
+        if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+        i = i + 1;
+    }
+    val res_add_parameter: res[Value, module.Error] = body.add_parameter(m, f, t, Declaration{type: vd.type, secret: vd.secret}, Slice[Value]{data: incoming.data, size: incoming.len});
+    if (sel res_add_parameter.err) { ret ir(res_add_parameter.err); }
+    val err_rebound: err[refusal.Error] = rebind_in_dominated(m, f, d, t, v, res_add_parameter.ok);
+    if (sel err_rebound.err) { ret err_rebound; }
+    i = 0;
+    for (i < uses.len) {
+        val err_put: err[module.Error] = body.substitute(m, f, uses.data[i], v, res_add_parameter.ok);
+        if (sel err_put.err) { ret ir(err_put.err); }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# pass as arguments of each target the values its block uses that are made
+# where the new block will not be dominated from, so the funnel carries them
+# in that target's place and every other case passes zero, or make the address
+# steps among them again at the target
+fun explicit(m: *Module, f: Function, d: *Dominance, w: *Work) err[refusal.Error] {
+    if (w.edges.len == 0) { ret err[refusal.Error].ok{}; }
+    var c: u32   = w.edges.data[0].from;
+    var i: usize = 1;
+    for (i < w.edges.len) {
+        c = common(d, c, w.edges.data[i].from);
+        i = i + 1;
+    }
+    var made: vector.Vector[Value]       = vector.init[Value](m.a);
+    var uses: vector.Vector[Instruction] = vector.init[Instruction](m.a);
+    fin {
+        vector.dnit[Value](?made);
+        vector.dnit[Instruction](?uses);
+    }
+    var j: usize = 0;
+    for (j < w.targets.len) {
+        val t: u32 = w.targets.data[j];
+        var x: u32 = above(d, t);
+        for (x != NONE) {
+            if (dominance.dominates(d, x, c)) { brk; }
+            vector.truncate[Value](?made, 0);
+            val res_block_data: res[BlockData, module.Error] = body.block_data(m, f, x);
+            if (sel res_block_data.err) { ret ir(res_block_data.err); }
+            var k: usize = 0;
+            for (k < res_block_data.ok.parameters.len) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Value](?made, res_block_data.ok.parameters.data[k]);
+                if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+                k = k + 1;
+            }
+            var i: Instruction = res_block_data.ok.first;
+            for (i != NO_INSTRUCTION) {
+                val res_instruction_data: res[InstructionData, module.Error] = body.instruction_data(m, f, i);
+                if (sel res_instruction_data.err) { ret ir(res_instruction_data.err); }
+                var r: usize = 0;
+                for (r < res_instruction_data.ok.results.len) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[Value](?made, res_instruction_data.ok.results.data[r]);
+                    if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+                    r = r + 1;
+                }
+                i = res_instruction_data.ok.next;
+            }
+            k = 0;
+            for (k < made.len) {
+                val err_passed: err[refusal.Error] = pass_in(m, f, d, c, t, made.data[k], ?uses);
+                if (sel err_passed.err) { ret err_passed; }
+                k = k + 1;
+            }
+            x = above(d, x);
+        }
+        j = j + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# move the work's edges to one new block: a forward when they enter one
+# block, and a dispatch over their targets otherwise
+fun funnel(m: *Module, f: Function, d: *Dominance, w: *Work, secret: bool) err[refusal.Error] {
+    val err_carried: err[refusal.Error] = explicit(m, f, d, w);
+    if (sel err_carried.err) { ret err_carried; }
+    var l:    Layout               = Layout{decls: vector.init[Declaration](m.a), first: vector.init[usize](m.a), zeros: vector.init[Value](m.a), cases: vector.init[Value](m.a)};
+    var args: vector.Vector[Value] = vector.init[Value](m.a);
+    fin {
+        vector.dnit[Declaration](?l.decls);
+        vector.dnit[usize](?l.first);
+        vector.dnit[Value](?l.zeros);
+        vector.dnit[Value](?l.cases);
+        vector.dnit[Value](?args);
+    }
+    val k:        usize = w.targets.len;
+    var res_head: res[Block, refusal.Error];
+    if (k == 1) {
+        val err_declared: err[refusal.Error] = declared(m, f, w.targets.data[0], ?l.decls);
+        if (sel err_declared.err) { ret err_declared; }
+        res_head = forward(m, f, w.targets.data[0], ?l.decls);
+    }
+    or {
+        val err_laid: err[refusal.Error] = lay(m, f, ?w.targets, secret, ?l);
+        if (sel err_laid.err) { ret err_laid; }
+        res_head = dispatch(m, f, ?w.targets, ?l);
+    }
+    if (sel res_head.err) { ret err[refusal.Error].err{res_head.err}; }
+
+    var i: usize = 0;
+    for (i < w.edges.len) {
+        val site:     Site                            = w.edges.data[i];
+        val res_term: res[Instruction, refusal.Error] = terminator(m, f, site.from);
+        if (sel res_term.err) { ret err[refusal.Error].err{res_term.err}; }
+        val res_instruction_data: res[InstructionData, module.Error] = body.instruction_data(m, f, res_term.ok);
+        if (sel res_instruction_data.err)                          { ret ir(res_instruction_data.err); }
+        if (site.edge::usize >= res_instruction_data.ok.edges.len) { ret err[refusal.Error].err{refusal.Error.reason{"an edge of the graph is not its block's terminator's"}}; }
+        val old: *List[Value] = ?res_instruction_data.ok.edges.data[site.edge].arguments;
+        val j:   usize        = index_of(?w.targets, res_instruction_data.ok.edges.data[site.edge].block);
+        vector.truncate[Value](?args, 0);
+        if (k == 1) {
+            var a: usize = 0;
+            for (a < old.len) {
+                val res_pushed: res[usize, allocator.Error] = vector.push[Value](?args, old.data[a]);
+                if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+                a = a + 1;
+            }
+        }
+        or {
+            val res_pushed: res[usize, allocator.Error] = vector.push[Value](?args, l.cases.data[j]);
+            if (sel res_pushed.err) { ret alloc(res_pushed.err); }
+            var s: usize = 1;
+            for (s < l.decls.len) {
+                var a: Value = l.zeros.data[s];
+                if (s >= l.first.data[j] && s < l.first.data[j] + width(?l, j)) { a = old.data[s - l.first.data[j]]; }
+                val res_more: res[usize, allocator.Error] = vector.push[Value](?args, a);
+                if (sel res_more.err) { ret alloc(res_more.err); }
+                s = s + 1;
+            }
+        }
+        val err_moved: err[module.Error] = body.retarget(m, f, res_term.ok, site.edge, res_head.ok, Slice[Value]{data: args.data, size: args.len});
+        if (sel err_moved.err) { ret ir(err_moved.err); }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# extend a flag list by n cleared flags
+fun mark(v: *vector.Vector[bool], n: usize) err[refusal.Error] {
+    val res_room: res[usize, allocator.Error] = vector.reserve[bool](v, n);
+    if (sel res_room.err) { ret alloc(res_room.err); }
+    var i: usize = 0;
+    for (i < n) {
+        vector.push[bool](v, false);
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether a value made in the blocks is used outside them
+fun escapes(b: *Body, inside: *vector.Vector[bool], v: Value) bool {
+    val uses: *Growing[Instruction] = ?b.values.data[v].uses;
+    var i:    usize                 = 0;
+    for (i < uses.len) {
+        val at: Place = b.instructions.data[uses.data[i]].place;
+        if (!(sel at.placed))        { ret true; }
+        if (!inside.data[at.placed]) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the blocks a tangle's later entries reach before its first entry, their
+# instruction count, and whether a value they make is used outside them
+fun reached(m: *Module, f: Function, g: *Graph, w: *Work, inside: *vector.Vector[bool], list: *vector.Vector[Block], cost: *usize) res[bool, refusal.Error] {
+    val res_body: res[*Body, module.Error] = module.body(m, f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    val b:      *Body               = res_body.ok;
+    val n:      usize               = b.blocks.len;
+    var tangle: vector.Vector[bool] = vector.init[bool](m.a);
+    var stack:  vector.Vector[u32]  = vector.init[u32](m.a);
+    fin {
+        vector.dnit[bool](?tangle);
+        vector.dnit[u32](?stack);
+    }
+    val err_outer: err[refusal.Error] = mark(?tangle, n);
+    if (sel err_outer.err) { ret res[bool, refusal.Error].err{err_outer.err}; }
+    val err_inner: err[refusal.Error] = mark(inside, n);
+    if (sel err_inner.err) { ret res[bool, refusal.Error].err{err_inner.err}; }
+    var i: usize = 0;
+    for (i < w.blocks.len) {
+        tangle.data[w.blocks.data[i]] = true;
+        i                             = i + 1;
+    }
+    val first: u32 = w.targets.data[0];
+    i = 1;
+    for (i < w.targets.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[u32](?stack, w.targets.data[i]);
+        if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        i = i + 1;
+    }
+    for (stack.len > 0) {
+        val x: u32 = stack.data[stack.len - 1];
+        vector.truncate[u32](?stack, stack.len - 1);
+        if (x == first || !tangle.data[x] || inside.data[x]) { cnt; }
+        inside.data[x] = true;
+        val res_pushed: res[usize, allocator.Error] = vector.push[Block](list, x);
+        if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        var n: Instruction = b.blocks.data[x].first;
+        for (n != NO_INSTRUCTION) {
+            @cost = @cost + 1;
+            n     = b.instructions.data[n].next;
+        }
+        val succs: Slice[u32] = graph.successors(g, x);
+        var s:     usize      = 0;
+        for (s < succs.size) {
+            val res_more: res[usize, allocator.Error] = vector.push[u32](?stack, succs.data[s]);
+            if (sel res_more.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_more.err}}; }
+            s = s + 1;
+        }
+    }
+    i = 0;
+    for (i < list.len) {
+        val kd: *BlockData = ?b.blocks.data[list.data[i]];
+        var p:  usize      = 0;
+        for (p < kd.parameters.len) {
+            if (escapes(b, inside, kd.parameters.data[p])) { ret res[bool, refusal.Error].ok{true}; }
+            p = p + 1;
+        }
+        var k: Instruction = kd.first;
+        for (k != NO_INSTRUCTION) {
+            val d: *InstructionData = ?b.instructions.data[k];
+            var r: usize            = 0;
+            for (r < d.results.len) {
+                if (escapes(b, inside, d.results.data[r])) { ret res[bool, refusal.Error].ok{true}; }
+                r = r + 1;
+            }
+            k = b.instructions.data[k].next;
+        }
+        i = i + 1;
+    }
+    ret res[bool, refusal.Error].ok{false};
+}
+
+# split the blocks the later entries reach, each edge from outside the tangle
+# into a later entry entering its copy
+fun split(m: *Module, f: Function, w: *Work, inside: *vector.Vector[bool], list: *vector.Vector[Block]) err[refusal.Error] {
+    var r: Remap = remap.init(m.a);
+    fin { remap.dnit(?r); }
+    val err_copied: err[cfg_failure.Error] = cfg_copy.region(m, f, f, Slice[Block]{data: list.data, size: list.len}, ?r);
+    if (sel err_copied.err) { ret err[refusal.Error].err{refusal.Error.cfg{err_copied.err}}; }
+    var tangle: vector.Vector[bool] = vector.init[bool](m.a);
+    fin { vector.dnit[bool](?tangle); }
+    val res_body: res[*Body, module.Error] = module.body(m, f);
+    if (sel res_body.err) { ret ir(res_body.err); }
+    val err_marked: err[refusal.Error] = mark(?tangle, res_body.ok.blocks.len);
+    if (sel err_marked.err) { ret err_marked; }
+    var i: usize = 0;
+    for (i < w.blocks.len) {
+        tangle.data[w.blocks.data[i]] = true;
+        i                             = i + 1;
+    }
+    i = 0;
+    for (i < w.edges.len) {
+        val site: Site = w.edges.data[i];
+        if (!tangle.data[site.from]) {
+            val res_term: res[Instruction, refusal.Error] = terminator(m, f, site.from);
+            if (sel res_term.err) { ret err[refusal.Error].err{res_term.err}; }
+            val res_instruction_data: res[InstructionData, module.Error] = body.instruction_data(m, f, res_term.ok);
+            if (sel res_instruction_data.err) { ret ir(res_instruction_data.err); }
+            val to:       Block      = res_instruction_data.ok.edges.data[site.edge].block;
+            val opt_copy: opt[Block] = remap.block(?r, to);
+            if (sel opt_copy.some) {
+                val clone:     Block             = opt_copy.some;
+                val old:       *List[Value]      = ?res_instruction_data.ok.edges.data[site.edge].arguments;
+                val err_moved: err[module.Error] = body.retarget(m, f, res_term.ok, site.edge, clone, Slice[Value]{data: old.data, size: old.len});
+                if (sel err_moved.err) { ret ir(err_moved.err); }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether the blocks hold a cycle among themselves, by removing every block
+# no other of them enters until none is left or none can go
+fun cyclic(a: *allocator.Allocator, g: *Graph, inside: *vector.Vector[bool], list: *vector.Vector[Block]) res[bool, refusal.Error] {
+    var entering: vector.Vector[u32] = vector.init[u32](a);
+    var ready:    vector.Vector[u32] = vector.init[u32](a);
+    fin {
+        vector.dnit[u32](?entering);
+        vector.dnit[u32](?ready);
+    }
+    val res_room: res[usize, allocator.Error] = vector.reserve[u32](?entering, inside.len);
+    if (sel res_room.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_room.err}}; }
+    var i: usize = 0;
+    for (i < inside.len) {
+        vector.push[u32](?entering, 0);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < list.len) {
+        val succs: Slice[u32] = graph.successors(g, list.data[i]);
+        var s:     usize      = 0;
+        for (s < succs.size) {
+            if (inside.data[succs.data[s]]) { entering.data[succs.data[s]] = entering.data[succs.data[s]] + 1; }
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < list.len) {
+        if (entering.data[list.data[i]] == 0) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[u32](?ready, list.data[i]);
+            if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        i = i + 1;
+    }
+    var gone: usize = 0;
+    for (ready.len > 0) {
+        val x: u32 = ready.data[ready.len - 1];
+        vector.truncate[u32](?ready, ready.len - 1);
+        gone = gone + 1;
+        val succs: Slice[u32] = graph.successors(g, x);
+        var s:     usize      = 0;
+        for (s < succs.size) {
+            val y: u32 = succs.data[s];
+            if (inside.data[y]) {
+                entering.data[y] = entering.data[y] - 1;
+                if (entering.data[y] == 0) {
+                    val res_pushed: res[usize, allocator.Error] = vector.push[u32](?ready, y);
+                    if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                }
+            }
+            s = s + 1;
+        }
+    }
+    ret res[bool, refusal.Error].ok{gone != list.len};
+}
+
+# mend a tangle: split the blocks its later entries reach when that is no
+# larger than a dispatch, keeps every value inside and holds no cycle, and
+# funnel its entries through a dispatch otherwise
+fun untangle(m: *Module, f: Function, g: *Graph, d: *Dominance, w: *Work) err[refusal.Error] {
+    var inside: vector.Vector[bool]  = vector.init[bool](m.a);
+    var list:   vector.Vector[Block] = vector.init[Block](m.a);
+    fin {
+        vector.dnit[bool](?inside);
+        vector.dnit[Block](?list);
+    }
+    var cost:        usize                    = 0;
+    val res_leaking: res[bool, refusal.Error] = reached(m, f, g, w, ?inside, ?list, ?cost);
+    if (sel res_leaking.err) { ret err[refusal.Error].err{res_leaking.err}; }
+    val bound: usize = 2 * (w.targets.len - 1);
+    if (!res_leaking.ok && cost <= bound) {
+        val res_looped: res[bool, refusal.Error] = cyclic(m.a, g, ?inside, ?list);
+        if (sel res_looped.err)                  { ret err[refusal.Error].err{res_looped.err}; }
+        if (sel res_looped.ok && !res_looped.ok) { ret split(m, f, w, ?inside, ?list); }
+    }
+    val res_secret: res[bool, refusal.Error] = decided_secretly(m, f, ?w.blocks, ?w.edges);
+    if (sel res_secret.err) { ret err[refusal.Error].err{res_secret.err}; }
+    ret funnel(m, f, d, w, res_secret.ok);
+}
+
+# mend one flaw
+# ---
+# m:    the module
+# f:    the function
+# g:    its graph, which the flaw was found in
+# d:    the graph's dominance
+# flaw: the flaw
+# w:    the work the flaw names
+# ret:  ok, or why it cannot be mended
+pub fun mend(m: *Module, f: Function, g: *Graph, d: *Dominance, flaw: Flaw, w: *Work) err[refusal.Error] {
+    if (sel flaw.twin) {
+        val res_term: res[Instruction, refusal.Error] = terminator(m, f, flaw.twin.from);
+        if (sel res_term.err) { ret err[refusal.Error].err{res_term.err}; }
+        val res_made: res[Block, cfg_failure.Error] = cfg_edge.split(m, f, res_term.ok, flaw.twin.edge);
+        if (sel res_made.err) { ret err[refusal.Error].err{refusal.Error.cfg{res_made.err}}; }
+        ret err[refusal.Error].ok{};
+    }
+    if (sel flaw.tangle) { ret untangle(m, f, g, d, w); }
+    if (sel flaw.stray)  { ret err[refusal.Error].err{refusal.Error.reason{"an edge reaches a block outside every region it may reach"}}; }
+    val res_secret: res[bool, refusal.Error] = decided_secretly(m, f, ?w.blocks, ?w.edges);
+    if (sel res_secret.err) { ret err[refusal.Error].err{res_secret.err}; }
+    ret funnel(m, f, d, w, res_secret.ok);
+}
