@@ -9,6 +9,16 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-25
+
+### Added
+
+- `target.options.Options.scheduled` names a writer for the module's text once the pass schedule has run, before the constant-time gate and the back end, as `mirl compile --emit ir` prints it. `target.compile.compile` writes it there, and a text that cannot be written is refused as `family.Error.scheduled` before the back end runs (#760).
+
+### Changed
+
+- The manifest requires mach `^7`, and the workflows build with mach 7.0.0.
+
 ## [0.1.0] - 2026-11-23
 
 ### Added
