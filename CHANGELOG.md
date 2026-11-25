@@ -9,6 +9,12 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
+### Added
+
+- A module's debug table states the directory it was compiled in. `ir.debug.place.state_directory` records it, `ir.debug.place.directory` reads it back, and the text form writes it as `directory = "...";` at the head of the debug block. The debug records name it as the unit's directory, its `DW_AT_comp_dir`, or `.` for a module that states none. A text read into a module that already holds others (`ir.text.parse.parse_into`) keeps the module's own directory, and where the text's directory differs, its relative file paths are joined to it (#762).
+
 ## [0.2.0] - 2026-11-25
 
 ### Added
