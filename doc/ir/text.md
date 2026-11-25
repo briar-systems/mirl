@@ -474,7 +474,8 @@ functions
 
 debug table
 
-  debug       = "debug" "{" { entry_of } "}" ;
+  debug       = "debug" "{" [ directory ] { entry_of } "}" ;
+  directory   = "directory" "=" string ";" ;
   entry_of    = "file" ident "=" string ";"
               | "loc" ident "=" ident ":" uint ":" uint ";"
               | "site" ident "=" string "at" ident [ "in" ident ] ";"
@@ -496,6 +497,8 @@ debug table
   enumerator  = string ":" uint ;
   idents      = ident { "," ident } ;
 
+  the directory is the one a relative file path resolves against, the
+  producer's compilation directory, and a block that states it opens with it.
   a location is a file, a line and a column. a site is the inlined
   function's symbol name, the location of the call and the site the call
   was itself inlined at. a type is its key, its source name ("" when
@@ -510,7 +513,7 @@ debug table
   `own` marks a type this module describes for every other, and `outside`
   one another module describes, which is its kind and layout alone. a
   variable is its source name, debug type, declaring
-  location and its position among the parameters when it is one. every
-  file is printed, then every location, site, type and variable, each in
-  order.
+  location and its position among the parameters when it is one. the
+  directory is printed first where the table states one, then every file,
+  location, site, type and variable, each in order.
 ```
