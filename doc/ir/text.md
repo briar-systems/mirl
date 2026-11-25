@@ -43,7 +43,7 @@ Only instructions placed in a block are compared. A detached or erased instructi
 ## An example
 
 ```mach
-mirl "0.1.0";
+mirl "0.2.0";
 target { arch: "riscv64", sys: "linux", env: "gnu", abi: "lp64d", isa: "rv64gc" };
 language { name: "mach", code: 0x804d };
 
