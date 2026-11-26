@@ -9,6 +9,16 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-26
+
+### Changed
+
+- The manifest requires masc `^0.2.0` (#773).
+
+### Fixed
+
+- The wasm back end states each imported function from names the object already holds, with masc's `import_named`, instead of passing a view of its name that interning the module `env` could move out from under it, which gave imports corrupted names (#773).
+
 ## [0.3.1] - 2026-11-26
 
 ### Fixed
