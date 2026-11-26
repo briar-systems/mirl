@@ -9,6 +9,12 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-26
+
+### Fixed
+
+- A SPIR-V build with logical addressing and no `VariablePointers` no longer refuses a pointer the optimiser merges where paths join, as cse and unroll do for a store past a loop. `legal.merges.POINTER_MERGES`, run in the spir-v family once the optimiser is done, takes out each block parameter or select of such a pointer. Where the pointers share one chain of steps from a root it carries the differing indices and rebuilds the address, a select of different bases becomes a branch, and a parameter of different bases has its block's reads copied onto each edge. One it cannot take out is refused as `pass.refusal.Error.merged`, which names why. Promotion no longer keeps a pointer slot whose stores merge, and the verifier's `merged` rule holds the legalised stages to the invariant (#769).
+
 ## [0.3.0] - 2026-11-25
 
 ### Added
