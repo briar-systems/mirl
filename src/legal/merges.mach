@@ -1,0 +1,1524 @@
+# pointers merged where paths join taken out, where the build carries no variable pointer, as spir-v's logical
+# addressing without VariablePointers chooses no pointer at run time
+#
+# a logical pointer is a variable or an access chain into one, so a block parameter or a select of a pointer the
+# build's model holds no address for (`mirl.opt.promote.addressed`) has no representation unless the build carries
+# variable pointers (`mirl.target.basis.variable`). the optimiser merges pointers as it merges any value, as a store
+# past a loop that reuses the address the loop's test computed once unrolling copies that test, so this
+# legalisation, which runs once the optimiser is done, is the one owner of the rule. each merge is taken out by the
+# first of these that holds:
+#
+# - every pointer it takes is one value, or nothing reads it: the merge goes, its readers reading that value
+# - every pointer it takes is the same chain of steps (`ptr.member`, `ptr.index`) from one root, differing only in
+#   indices: it carries each index that differs instead, as a parameter of the index's type where it is a parameter
+#   and a select of the indices where it is a select, and the chain is made again from the root where it stood.
+#   merges that pass one another's pointers on, as a parameter carried round a loop, are taken as one web
+# - a select whose pointers reach different variables or members, in a function that requires no constant time and
+#   on a public condition: its block branches on the condition to a block that takes the pointer as its parameter,
+#   which is then taken out as one
+# - a parameter whose pointers reach different variables or members, read within its block alone: the instructions
+#   of the block up to the last that reads it, or a pointer made from it, are copied onto each edge into the block
+#   but one, which keeps them, each copy reading the pointer its edge passes, and the rest of the block becomes a
+#   block of its own that each copy branches to, passing it what the rest reads of the copies
+#
+# a merge none of them takes out is refused, named, with why it stays. its pointer, or one made from it, is read
+# past its block or passed on an edge, or pointers of different bases come round to it through a cycle or through
+# other merges, or the instructions that read it hold a call, a target op, an assembly block, a slot or another
+# select of pointers, which are never copied onto each path, or it is a select no branch may decide, in a function
+# that requires constant time or on a secret condition. a merge whose root is another merge waits for that one.
+#
+# each round takes out the merges that stand alone, then one web, so every round leaves fewer merges than it found
+# and the walk ends. what it makes computes what the merges computed, each copy runs once on its path as the block
+# did, and a branch it makes decides on a public value of a function that requires no constant time, so it keeps
+# constant time.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mirl.build.builder;
+use mirl.build.builder.Builder;
+use mirl.build.failure;
+use mirl.build.remap;
+use mirl.build.remap.Remap;
+use mirl.ir.body;
+use mirl.ir.body.Records;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use cfg_failure: mirl.ir.cfg.failure;
+use mirl.ir.cfg.prune;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.debug.record.Location;
+use ir_function: mirl.ir.function;
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Constant;
+use mirl.ir.id.Function;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Symbol;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.InstructionData;
+use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.module;
+use mirl.ir.module.Module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.point;
+use mirl.ir.point.Reads;
+use type_table: mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl.ir.value.Declaration;
+use mirl.ir.value.Def;
+use mirl.opt.promote;
+use mirl.pass.analysis;
+use mirl.pass.cache;
+use mirl.pass.record.Context;
+use mirl.pass.record.Ground;
+use mirl.pass.record.Kind;
+use mirl.pass.record.Pass;
+use mirl.pass.record.Scope;
+use mirl.pass.record.Time;
+use mirl.pass.record.Unit;
+use mirl.pass.refusal;
+use mirl.pass.refusal.Merge;
+use mirl.pass.refusal.Unmerged;
+use mirl.target.basis;
+
+# the pass
+# ---
+# it keeps no analysis, since it moves edges and takes unreached blocks out of the graph
+pub val POINTER_MERGES: Pass = Pass{name: "pointer merges", kind: Kind.legalise{}, scope: Scope.function{visit}, needs: analysis.OF_DOMINANCE, preserves: cache.NONE, time: Time.keeps{}, applies: unvaried};
+
+# the build carries no variable pointer. a selection that cannot be read
+# applies the pass, which refuses what it cannot take out
+fun unvaried(g: *Ground) bool {
+    val res_held: res[bool, basis.Error] = basis.variable(g.basis, ?g.t.caps);
+    if (sel res_held.err) { ret true; }
+    ret !res_held.ok;
+}
+
+# no position, in the tables a round keeps by value and by merge
+val NOT: u32 = 0xffffffff;
+
+# a merge: a block parameter or a select of a logical pointer
+# ---
+# value:  the pointer it gives
+# select: the select, NO_INSTRUCTION for a parameter
+# block:  the block whose parameter it is, or where the select stands
+rec Join {
+    value:  Value;
+    select: Instruction;
+    block:  Block;
+}
+
+# one step of an address from its root
+# ---
+# code:   PTR_MEMBER or PTR_INDEX
+# ty:     the aggregate it steps into
+# member: the member a PTR_MEMBER takes
+# index:  the index a PTR_INDEX reads
+rec Step {
+    code:   Opcode;
+    ty:     Type;
+    member: u32;
+    index:  Value;
+}
+
+# a pointer a web takes from outside it, as a root and the steps from it
+# ---
+# value: the pointer
+# root:  the value its steps start from
+# first: its first step among the round's steps
+# count: how many steps it takes
+rec Leaf {
+    value: Value;
+    root:  Value;
+    first: usize;
+    count: usize;
+}
+
+# where a web stands
+# ---
+# ready:   every leaf's root is outside every merge, so the web may be taken
+# waits:   a leaf's root is a merge of another web, taken first
+# circled: a leaf's root is a merge of the web itself, or the web takes nothing from outside
+tag Standing: u8 {
+    ready;
+    waits;
+    circled;
+}
+
+# one function's walk
+# ---
+# c:       the run
+# f:       the function
+# b:       its body
+# tree:    its dominance as the graph stands
+# scratch: storage for one round, given back after it
+# changed: whether the walk changed the function
+# joins:   the round's merges
+# of:      by value, the position of the merge it is, NOT for none
+# parent:  by merge, its parent in the union of webs
+# members: the positions of the merges of the web being read
+# leaves:  the pointers the web takes from outside it
+# steps:   the steps of every leaf
+rec Work {
+    c:       *Context;
+    f:       Function;
+    b:       *Body;
+    tree:    *Dominance;
+    scratch: *allocator.Allocator;
+    changed: bool;
+    joins:   vector.Vector[Join];
+    of:      vector.Vector[u32];
+    parent:  vector.Vector[u32];
+    members: vector.Vector[u32];
+    leaves:  vector.Vector[Leaf];
+    steps:   vector.Vector[Step];
+}
+
+fun lost(e: allocator.Error) err[refusal.Error] {
+    ret err[refusal.Error].err{refusal.Error.alloc{e}};
+}
+
+fun add[T](v: *vector.Vector[T], x: T) err[refusal.Error] {
+    val res_pushed: res[usize, allocator.Error] = vector.push[T](v, x);
+    if (sel res_pushed.err) { ret lost(res_pushed.err); }
+    ret err[refusal.Error].ok{};
+}
+
+# make a vector of n copies of a value
+fun filled[T](a: *allocator.Allocator, n: usize, x: T, out: *vector.Vector[T]) err[refusal.Error] {
+    @out = vector.init[T](a);
+    val res_room: res[usize, allocator.Error] = vector.reserve[T](out, n);
+    if (sel res_room.err) { ret lost(res_room.err); }
+    var i: usize = 0;
+    for (i < n) {
+        vector.push[T](out, x);
+        i = i + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the refusal of a merge that stays, at the location of the select or the first instruction of the parameter's
+# block that reads it, or of any instruction of the block where none that reads it states one
+fun stays(w: *Work, j: Join, why: Merge) err[refusal.Error] {
+    val b:            *Body         = w.b;
+    var opt_location: opt[Location] = opt[Location].none{};
+    if (j.select != NO_INSTRUCTION) { opt_location = ir_function.location(b, j.select); }
+    or {
+        var i: Instruction = b.blocks.data[j.block].first;
+        for (i != NO_INSTRUCTION && sel opt_location.none) {
+            if (reads(b, i, j.value)) { opt_location = ir_function.location(b, i); }
+            i = b.instructions.data[i].next;
+        }
+        i = b.blocks.data[j.block].first;
+        for (i != NO_INSTRUCTION && sel opt_location.none) {
+            opt_location = ir_function.location(b, i);
+            i            = b.instructions.data[i].next;
+        }
+    }
+    ret err[refusal.Error].err{refusal.Error.merged{Unmerged{block: j.block, why: why, location: opt_location}}};
+}
+
+# whether a type is a pointer the build's model holds no address for
+fun logical(w: *Work, ty: Type) bool {
+    val res_shape: res[type_table.Shape, type_table.Error] = type_table.shape(?w.c.m.types, ty);
+    if (sel res_shape.err)           { ret false; }
+    if (!(sel res_shape.ok.pointer)) { ret false; }
+    ret !promote.addressed(w.c, ty);
+}
+
+# whether an instruction reads a value, as an operand or as an argument
+fun reads(b: *Body, i: Instruction, v: Value) bool {
+    val d: *InstructionData = ?b.instructions.data[i];
+    var k: usize            = 0;
+    for (k < d.operands.len) {
+        if (d.operands.data[k] == v) { ret true; }
+        k = k + 1;
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        k = 0;
+        for (k < d.edges.data[e].arguments.len) {
+            if (d.edges.data[e].arguments.data[k] == v) { ret true; }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+    ret false;
+}
+
+# the argument the edge of predecessor entry e of block k passes for its parameter at p
+fun argument(b: *Body, k: Block, e: usize, p: usize) Value {
+    val i: Instruction = b.blocks.data[k].predecessors.data[e];
+    var n: usize       = 0;
+    for (n < b.instructions.data[i].edges.len) {
+        if (b.instructions.data[i].edges.data[n].block == k && b.instructions.data[i].edges.data[n].rank::usize == e) { ret b.instructions.data[i].edges.data[n].arguments.data[p]; }
+        n = n + 1;
+    }
+    ret b.blocks.data[k].parameters.data[p];
+}
+
+# the position of a parameter among its block's
+fun place_of(b: *Body, v: Value) usize {
+    val def: Def = b.values.data[v].def;
+    if (sel def.parameter) { ret def.parameter.index::usize; }
+    ret 0;
+}
+
+# the one value every edge into block k passes for its parameter at p but the parameter itself, none where they pass
+# more than one
+fun sole(b: *Body, k: Block, p: usize) opt[Value] {
+    val v:    Value = b.blocks.data[k].parameters.data[p];
+    var one:  Value = v;
+    var seen: bool  = false;
+    var e:    usize = 0;
+    for (e < b.blocks.data[k].predecessors.len) {
+        val a: Value = argument(b, k, e, p);
+        if (a != v) {
+            if (!seen) {
+                one  = a;
+                seen = true;
+            }
+            or (a != one) { ret opt[Value].none{}; }
+        }
+        e = e + 1;
+    }
+    if (!seen) { ret opt[Value].none{}; }
+    ret opt[Value].some{one};
+}
+
+# the dominance of the function as its graph stands now
+fun fresh(w: *Work) err[refusal.Error] {
+    val err_dropped: err[allocator.Error] = cache.forget(w.c.cache, w.f);
+    if (sel err_dropped.err) { ret lost(err_dropped.err); }
+    val res_again: res[*Dominance, refusal.Error] = analysis.dominance_of(w.c.cache, w.f);
+    if (sel res_again.err) { ret err[refusal.Error].err{res_again.err}; }
+    w.tree = res_again.ok;
+    ret err[refusal.Error].ok{};
+}
+
+# take every block the entry does not reach out of the graph, so each edge into a block is one a path takes
+fun pruned(w: *Work) err[refusal.Error] {
+    val res_first: res[*Dominance, refusal.Error] = analysis.dominance_of(w.c.cache, w.f);
+    if (sel res_first.err) { ret err[refusal.Error].err{res_first.err}; }
+    w.tree = res_first.ok;
+    var k: usize = 0;
+    for (k < w.b.blocks.len) {
+        if (!w.b.blocks.data[k].erased && !dominance.reachable(w.tree, k::u32)) {
+            val err_cut: err[cfg_failure.Error] = prune.unreached(w.c.m, w.f, w.tree);
+            if (sel err_cut.err) { ret err[refusal.Error].err{refusal.Error.cfg{err_cut.err}}; }
+            w.changed = true;
+            ret fresh(w);
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether the function holds a merge, so a function with none is left as it is
+fun any_join(w: *Work) bool {
+    val b: *Body = w.b;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            if (k > 0) {
+                var p: usize = 0;
+                for (p < b.blocks.data[k].parameters.len) {
+                    if (logical(w, b.values.data[b.blocks.data[k].parameters.data[p]].type)) { ret true; }
+                    p = p + 1;
+                }
+            }
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                if (b.instructions.data[i].opcode == opcode_table.SELECT && logical(w, b.values.data[b.instructions.data[i].results.data[0]].type)) { ret true; }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# take out every merge that stands alone: a parameter every edge passes one value for but itself, or that nothing
+# reads, and a select of one value twice, or that nothing reads, until none is left
+fun trivial(w: *Work) err[refusal.Error] {
+    val m:     *Module = w.c.m;
+    val b:     *Body   = w.b;
+    var again: bool    = true;
+    for (again) {
+        again = false;
+        var k: usize = 1;
+        for (k < b.blocks.len) {
+            if (!b.blocks.data[k].erased) {
+                var p: usize = 0;
+                for (p < b.blocks.data[k].parameters.len) {
+                    val v:     Value = b.blocks.data[k].parameters.data[p];
+                    var taken: bool  = false;
+                    if (logical(w, b.values.data[v].type)) {
+                        if (b.values.data[v].uses.len == 0) { taken = true; }
+                        or {
+                            val opt_one: opt[Value] = sole(b, k::u32, p);
+                            if (sel opt_one.some) {
+                                val err_moved: err[refusal.Error] = refusal.edit(body.replace(m, w.f, v, opt_one.some, Records.follow{}));
+                                if (sel err_moved.err) { ret err_moved; }
+                                taken = true;
+                            }
+                        }
+                    }
+                    if (taken) {
+                        val err_gone: err[refusal.Error] = refusal.edit(body.remove_parameter(m, w.f, k::u32, p::u32));
+                        if (sel err_gone.err) { ret err_gone; }
+                        w.changed = true;
+                        again     = true;
+                    }
+                    or { p = p + 1; }
+                }
+            }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < b.blocks.len) {
+            if (!b.blocks.data[k].erased) {
+                var i: Instruction = b.blocks.data[k].first;
+                for (i != NO_INSTRUCTION) {
+                    val next: Instruction = b.instructions.data[i].next;
+                    if (b.instructions.data[i].opcode == opcode_table.SELECT) {
+                        val r: Value = b.instructions.data[i].results.data[0];
+                        if (logical(w, b.values.data[r].type)) {
+                            val x:     Value = b.instructions.data[i].operands.data[1];
+                            var taken: bool  = b.values.data[r].uses.len == 0;
+                            if (!taken && x == b.instructions.data[i].operands.data[2]) {
+                                val err_moved: err[refusal.Error] = refusal.edit(body.replace(m, w.f, r, x, Records.follow{}));
+                                if (sel err_moved.err) { ret err_moved; }
+                                taken = true;
+                            }
+                            if (taken) {
+                                val err_erased: err[refusal.Error] = refusal.edit(body.erase(m, w.f, i));
+                                if (sel err_erased.err) { ret err_erased; }
+                                w.changed = true;
+                                again     = true;
+                            }
+                        }
+                    }
+                    i = next;
+                }
+            }
+            k = k + 1;
+        }
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the merges of the function and the table from each one's pointer to it
+fun collect(w: *Work) err[refusal.Error] {
+    val b: *Body = w.b;
+    w.joins = vector.init[Join](w.scratch);
+    val err_table: err[refusal.Error] = filled[u32](w.scratch, b.values.len, NOT, ?w.of);
+    if (sel err_table.err) { ret err_table; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            if (k > 0) {
+                var p: usize = 0;
+                for (p < b.blocks.data[k].parameters.len) {
+                    val v: Value = b.blocks.data[k].parameters.data[p];
+                    if (logical(w, b.values.data[v].type)) {
+                        w.of.data[v] = w.joins.len::u32;
+                        val err_added: err[refusal.Error] = add[Join](?w.joins, Join{value: v, select: NO_INSTRUCTION, block: (k::u32)});
+                        if (sel err_added.err) { ret err_added; }
+                    }
+                    p = p + 1;
+                }
+            }
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                if (b.instructions.data[i].opcode == opcode_table.SELECT) {
+                    val r: Value = b.instructions.data[i].results.data[0];
+                    if (logical(w, b.values.data[r].type)) {
+                        w.of.data[r] = w.joins.len::u32;
+                        val err_added: err[refusal.Error] = add[Join](?w.joins, Join{value: r, select: i, block: (k::u32)});
+                        if (sel err_added.err) { ret err_added; }
+                    }
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the web a merge belongs to, as the position of the merge that stands for it
+fun find(w: *Work, j: u32) u32 {
+    var x: u32 = j;
+    for (w.parent.data[x] != x) {
+        w.parent.data[x] = w.parent.data[w.parent.data[x]];
+        x                = w.parent.data[x];
+    }
+    ret x;
+}
+
+fun unite(w: *Work, a: u32, b: u32) {
+    val x: u32 = find(w, a);
+    val y: u32 = find(w, b);
+    if (x != y) { w.parent.data[y] = x; }
+}
+
+# join every merge with each merge whose pointer it takes, into webs
+fun webs(w: *Work) err[refusal.Error] {
+    val b:          *Body              = w.b;
+    val err_parent: err[refusal.Error] = filled[u32](w.scratch, w.joins.len, 0, ?w.parent);
+    if (sel err_parent.err) { ret err_parent; }
+    var j: usize = 0;
+    for (j < w.joins.len) {
+        w.parent.data[j] = j::u32;
+        j                = j + 1;
+    }
+    j = 0;
+    for (j < w.joins.len) {
+        val jn: Join = w.joins.data[j];
+        if (jn.select == NO_INSTRUCTION) {
+            val p: usize = place_of(b, jn.value);
+            var e: usize = 0;
+            for (e < b.blocks.data[jn.block].predecessors.len) {
+                val a: Value = argument(b, jn.block, e, p);
+                if (w.of.data[a] != NOT) { unite(w, j::u32, w.of.data[a]); }
+                e = e + 1;
+            }
+        }
+        or {
+            var n: usize = 1;
+            for (n < 3) {
+                val a: Value = b.instructions.data[jn.select].operands.data[n];
+                if (w.of.data[a] != NOT) { unite(w, j::u32, w.of.data[a]); }
+                n = n + 1;
+            }
+        }
+        j = j + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether a value is the result of a step of an address: a placed ptr.member naming its structure and member, or a
+# placed ptr.index naming its array
+fun stepped(b: *Body, v: Value) bool {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.result)) { ret false; }
+    val d: *InstructionData = ?b.instructions.data[def.result.instruction];
+    if (!(sel d.place.placed) || d.immediates.len == 0) { ret false; }
+    val ty: Immediate = d.immediates.data[0];
+    if (!(sel ty.ty)) { ret false; }
+    if (d.opcode == opcode_table.PTR_MEMBER) {
+        if (d.immediates.len < 2) { ret false; }
+        val member: Immediate = d.immediates.data[1];
+        ret sel member.member;
+    }
+    ret d.opcode == opcode_table.PTR_INDEX && d.operands.len == 2;
+}
+
+# the instruction that makes a value, NO_INSTRUCTION for a parameter or a constant
+fun maker(b: *Body, v: Value) Instruction {
+    val def: Def = b.values.data[v].def;
+    if (sel def.result) { ret def.result.instruction; }
+    ret NO_INSTRUCTION;
+}
+
+# a pointer as its root and the steps from it, the steps put on the round's, root first
+fun leaf_of(w: *Work, v: Value) res[Leaf, refusal.Error] {
+    val b:    *Body = w.b;
+    var root: Value = v;
+    var n:    usize = 0;
+    for (stepped(b, root)) {
+        root = b.instructions.data[maker(b, root)].operands.data[0];
+        n    = n + 1;
+    }
+    val first:    usize                       = w.steps.len;
+    val res_room: res[usize, allocator.Error] = vector.reserve[Step](?w.steps, n);
+    if (sel res_room.err) { ret res[Leaf, refusal.Error].err{refusal.Error.alloc{res_room.err}}; }
+    var k: usize = 0;
+    for (k < n) {
+        vector.push[Step](?w.steps, Step{code: 0, ty: 0, member: 0, index: 0});
+        k = k + 1;
+    }
+    var x: Value = v;
+    k = n;
+    for (k > 0) {
+        k = k - 1;
+        val d:  *InstructionData = ?b.instructions.data[maker(b, x)];
+        val ty: Immediate        = d.immediates.data[0];
+        var s:  Step             = Step{code: d.opcode, ty: 0, member: 0, index: 0};
+        if (sel ty.ty) { s.ty = ty.ty; }
+        if (d.opcode == opcode_table.PTR_MEMBER) {
+            val member: Immediate = d.immediates.data[1];
+            if (sel member.member) { s.member = member.member; }
+        }
+        or { s.index = d.operands.data[1]; }
+        w.steps.data[first + k] = s;
+        x                       = d.operands.data[0];
+    }
+    ret res[Leaf, refusal.Error].ok{Leaf{value: v, root: root, first: first, count: n}};
+}
+
+# put a pointer the web takes from outside it among its leaves, once
+fun take_leaf(w: *Work, v: Value) err[refusal.Error] {
+    var n: usize = 0;
+    for (n < w.leaves.len) {
+        if (w.leaves.data[n].value == v) { ret err[refusal.Error].ok{}; }
+        n = n + 1;
+    }
+    val res_leaf: res[Leaf, refusal.Error] = leaf_of(w, v);
+    if (sel res_leaf.err) { ret err[refusal.Error].err{res_leaf.err}; }
+    ret add[Leaf](?w.leaves, res_leaf.ok);
+}
+
+# whether a merge belongs to the web read
+fun inside(w: *Work, root: u32, v: Value) bool {
+    ret w.of.data[v] != NOT && find(w, w.of.data[v]) == root;
+}
+
+# read the web merge `root` stands for: its merges and the pointers it takes from outside it
+fun web(w: *Work, root: u32) err[refusal.Error] {
+    val b: *Body = w.b;
+    w.members = vector.init[u32](w.scratch);
+    w.leaves  = vector.init[Leaf](w.scratch);
+    w.steps   = vector.init[Step](w.scratch);
+    var j: usize = 0;
+    for (j < w.joins.len) {
+        if (find(w, j::u32) == root) {
+            val err_member: err[refusal.Error] = add[u32](?w.members, j::u32);
+            if (sel err_member.err) { ret err_member; }
+            val jn: Join = w.joins.data[j];
+            if (jn.select == NO_INSTRUCTION) {
+                val p: usize = place_of(b, jn.value);
+                var e: usize = 0;
+                for (e < b.blocks.data[jn.block].predecessors.len) {
+                    val a: Value = argument(b, jn.block, e, p);
+                    if (!inside(w, root, a)) {
+                        val err_leaf: err[refusal.Error] = take_leaf(w, a);
+                        if (sel err_leaf.err) { ret err_leaf; }
+                    }
+                    e = e + 1;
+                }
+            }
+            or {
+                var n: usize = 1;
+                for (n < 3) {
+                    val a: Value = b.instructions.data[jn.select].operands.data[n];
+                    if (!inside(w, root, a)) {
+                        val err_leaf: err[refusal.Error] = take_leaf(w, a);
+                        if (sel err_leaf.err) { ret err_leaf; }
+                    }
+                    n = n + 1;
+                }
+            }
+        }
+        j = j + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# where the web read stands
+fun standing(w: *Work, root: u32) Standing {
+    if (w.leaves.len == 0) { ret Standing.circled{}; }
+    var waits: bool  = false;
+    var n:     usize = 0;
+    for (n < w.leaves.len) {
+        val r: Value = w.leaves.data[n].root;
+        if (w.of.data[r] != NOT) {
+            if (find(w, w.of.data[r]) == root) { ret Standing.circled{}; }
+            waits = true;
+        }
+        n = n + 1;
+    }
+    if (waits) { ret Standing.waits{}; }
+    ret Standing.ready{};
+}
+
+# whether two roots are one: the same value, or the values of two constants of one address, as each use of a global
+# may read a constant of its own
+fun same_root(w: *Work, x: Value, y: Value) bool {
+    if (x == y) { ret true; }
+    val dx: Def = w.b.values.data[x].def;
+    val dy: Def = w.b.values.data[y].def;
+    if (!(sel dx.constant))         { ret false; }
+    if (!(sel dy.constant))         { ret false; }
+    if (dx.constant == dy.constant) { ret true; }
+    val res_x: res[ConstantData, module.Error] = module.constant_data(w.c.m, dx.constant);
+    if (sel res_x.err) { ret false; }
+    val res_y: res[ConstantData, module.Error] = module.constant_data(w.c.m, dy.constant);
+    if (sel res_y.err) { ret false; }
+    val a: ConstantData = res_x.ok;
+    val o: ConstantData = res_y.ok;
+    if (!(sel a.address))                                     { ret false; }
+    if (!(sel o.address))                                     { ret false; }
+    if (sel a.address.minus.some || sel o.address.minus.some) { ret false; }
+    if (a.address.offset != o.address.offset)                 { ret false; }
+    if (!type_table.same(a.address.type, o.address.type))     { ret false; }
+    ret same_symbol(a.address.symbol, o.address.symbol);
+}
+
+fun same_symbol(x: Symbol, y: Symbol) bool {
+    if (sel x.function) {
+        if (sel y.function) { ret x.function == y.function; }
+        ret false;
+    }
+    if (sel y.global) { ret x.global == y.global; }
+    ret false;
+}
+
+# whether every leaf of the web read is the same chain of steps from one root, differing only in indices
+fun chained(w: *Work) bool {
+    val b:     *Body = w.b;
+    val first: Leaf  = w.leaves.data[0];
+    var n:     usize = 1;
+    for (n < w.leaves.len) {
+        val l: Leaf = w.leaves.data[n];
+        if (!same_root(w, l.root, first.root) || l.count != first.count) { ret false; }
+        var t: usize = 0;
+        for (t < l.count) {
+            val s: Step = w.steps.data[l.first + t];
+            val o: Step = w.steps.data[first.first + t];
+            if (s.code != o.code || !type_table.same(s.ty, o.ty))                                                               { ret false; }
+            if (s.code == opcode_table.PTR_MEMBER && s.member != o.member)                                                      { ret false; }
+            if (s.code == opcode_table.PTR_INDEX && !type_table.same(b.values.data[s.index].type, b.values.data[o.index].type)) { ret false; }
+            t = t + 1;
+        }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# whether every leaf reads one index at a step of the web read, so the step reads it in each merge and no merge
+# carries it. every merge's pointer comes from its leaves, so a value each leaf reads stands where each merge is
+fun shared(w: *Work, t: usize) bool {
+    val one: Value = w.steps.data[w.leaves.data[0].first + t].index;
+    var n:   usize = 1;
+    for (n < w.leaves.len) {
+        if (w.steps.data[w.leaves.data[n].first + t].index != one) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# the leaf of the web read whose pointer is v
+fun leaf_at(w: *Work, v: Value) Leaf {
+    var n: usize = 0;
+    for (n < w.leaves.len) {
+        if (w.leaves.data[n].value == v) { ret w.leaves.data[n]; }
+        n = n + 1;
+    }
+    ret w.leaves.data[0];
+}
+
+# the indices a web carries in place of its pointers
+# ---
+# carried: by step, whether a merge carries the step's index
+# made:    by merge of the web and step, what carries the index there, NOT until made
+# bld:     the builder
+rec Carry {
+    carried: vector.Vector[bool];
+    made:    vector.Vector[u32];
+    bld:     Builder;
+}
+
+# the index pointer v brings to the step at t of the web read: a leaf's own, or what a merge of the web carries
+fun index_of(w: *Work, cr: *Carry, root: u32, v: Value, t: usize) Value {
+    if (inside(w, root, v)) { ret carrier(w, cr, root, w.of.data[v], t); }
+    val l: Leaf = leaf_at(w, v);
+    ret w.steps.data[l.first + t].index;
+}
+
+# the position of a merge among the web's members
+fun member_of(w: *Work, j: u32) usize {
+    var n: usize = 0;
+    for (n < w.members.len) {
+        if (w.members.data[n] == j) { ret n; }
+        n = n + 1;
+    }
+    ret 0;
+}
+
+# what carries the index at step t for merge j: the parameter added for it, or a select of the indices its pointers
+# bring, made just ahead of it the first time it is asked
+fun carrier(w: *Work, cr: *Carry, root: u32, j: u32, t: usize) Value {
+    val depth: usize = cr.carried.len;
+    val at:    usize = member_of(w, j) * depth + t;
+    if (cr.made.data[at] != NOT) { ret cr.made.data[at]; }
+    val s:   Instruction = w.joins.data[j].select;
+    val c:   Value       = w.b.instructions.data[s].operands.data[0];
+    val x:   Value       = index_of(w, cr, root, w.b.instructions.data[s].operands.data[1], t);
+    val y:   Value       = index_of(w, cr, root, w.b.instructions.data[s].operands.data[2], t);
+    var ops: [3]Value    = [3]Value{c, x, y};
+    builder.derive(?cr.bld, s);
+    builder.secret(?cr.bld, false);
+    builder.before(?cr.bld, s);
+    val made: Value = builder.value(?cr.bld, Request{opcode: opcode_table.SELECT, operands: Slice[Value]{data: ?ops[0], size: 3}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: nil, size: 0}});
+    cr.made.data[at] = made;
+    ret made;
+}
+
+# the zero of an index type, which stands everywhere
+fun zero(w: *Work, ty: Type) res[Value, refusal.Error] {
+    val res_constant: res[Constant, module.Error] = module.add_constant(w.c.m, ConstantData.zero{ty});
+    if (sel res_constant.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_constant.err}}; }
+    val res_value: res[Value, module.Error] = body.constant(w.c.m, w.f, res_constant.ok);
+    if (sel res_value.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_value.err}}; }
+    ret res[Value, refusal.Error].ok{res_value.ok};
+}
+
+# make a web's pointers again from their root: each index a merge carries is a parameter where the merge is one and
+# a select where it is one, every edge into a parameter's block passes the index its pointer brings, and each merge's
+# readers read the chain made again where it stood, before the merges go. every merge's pointer comes from its
+# leaves, so the root stands where each merge is, and a public merge takes only public pointers, whose root and
+# indices are public, so what carries its indices is as secret as the merge and the chain made again no more
+fun chain(w: *Work, root: u32) err[refusal.Error] {
+    val m:           *Module            = w.c.m;
+    val b:           *Body              = w.b;
+    val first:       Leaf               = w.leaves.data[0];
+    val depth:       usize              = first.count;
+    var cr:          Carry;
+    val err_carried: err[refusal.Error] = filled[bool](w.scratch, depth, false, ?cr.carried);
+    if (sel err_carried.err) { ret err_carried; }
+    val err_made: err[refusal.Error] = filled[u32](w.scratch, w.members.len * depth, NOT, ?cr.made);
+    if (sel err_made.err) { ret err_made; }
+    var t: usize = 0;
+    for (t < depth) {
+        val o: Step = w.steps.data[first.first + t];
+        if (o.code == opcode_table.PTR_INDEX && !shared(w, t)) { cr.carried.data[t] = true; }
+        t = t + 1;
+    }
+
+    # a parameter for each index a merge that is a parameter carries, each edge passing a zero until every carrier
+    # is made
+    var n: usize = 0;
+    for (n < w.members.len) {
+        val jn: Join = w.joins.data[w.members.data[n]];
+        if (jn.select == NO_INSTRUCTION) {
+            val preds: usize = b.blocks.data[jn.block].predecessors.len;
+            t = 0;
+            for (t < depth) {
+                if (cr.carried.data[t]) {
+                    val ty:       Type                      = b.values.data[w.steps.data[first.first + t].index].type;
+                    val res_zero: res[Value, refusal.Error] = zero(w, ty);
+                    if (sel res_zero.err) { ret err[refusal.Error].err{res_zero.err}; }
+                    val res_room: res[*Value, allocator.Error] = allocator.zallocate[Value](w.scratch, preds + 1);
+                    if (sel res_room.err) { ret lost(res_room.err); }
+                    var e: usize = 0;
+                    for (e < preds) {
+                        res_room.ok[e] = res_zero.ok;
+                        e              = e + 1;
+                    }
+                    val decl:      Declaration              = Declaration{type: ty, secret: b.values.data[jn.value].secret, name: opt[View].none{}};
+                    val res_added: res[Value, module.Error] = body.add_parameter(m, w.f, jn.block, decl, Slice[Value]{data: res_room.ok, size: preds});
+                    if (sel res_added.err) { ret err[refusal.Error].err{refusal.Error.ir{res_added.err}}; }
+                    cr.made.data[n * depth + t] = res_added.ok;
+                }
+                t = t + 1;
+            }
+        }
+        n = n + 1;
+    }
+
+    cr.bld = builder.make(m);
+    builder.enter(?cr.bld, w.f);
+    n = 0;
+    for (n < w.members.len) {
+        if (w.joins.data[w.members.data[n]].select != NO_INSTRUCTION) {
+            t = 0;
+            for (t < depth) {
+                if (cr.carried.data[t]) { carrier(w, ?cr, root, w.members.data[n], t); }
+                t = t + 1;
+            }
+        }
+        n = n + 1;
+    }
+    val err_selects: err[failure.Error] = builder.done(?cr.bld);
+    if (sel err_selects.err) { ret err[refusal.Error].err{refusal.Error.build{err_selects.err}}; }
+
+    # every edge into a parameter's block passes the indices its pointer brings
+    n = 0;
+    for (n < w.members.len) {
+        val jn: Join = w.joins.data[w.members.data[n]];
+        if (jn.select == NO_INSTRUCTION) {
+            val err_passed: err[refusal.Error] = pass_indices(w, ?cr, root, n, jn);
+            if (sel err_passed.err) { ret err_passed; }
+        }
+        n = n + 1;
+    }
+
+    # each merge's chain, made again from the root where the merge stood. the records at the head of a parameter's
+    # block stand before the chain made there, and go back after it, where what they read stands
+    var remakes: vector.Vector[Value]       = vector.init[Value](w.scratch);
+    var heads:   vector.Vector[Instruction] = vector.init[Instruction](w.scratch);
+    n = 0;
+    for (n < w.members.len) {
+        val err_head: err[refusal.Error] = add[Instruction](?heads, b.blocks.data[w.joins.data[w.members.data[n]].block].first);
+        if (sel err_head.err) { ret err_head; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < w.members.len) {
+        val jn: Join        = w.joins.data[w.members.data[n]];
+        var at: Instruction = jn.select;
+        if (at == NO_INSTRUCTION) { at = b.blocks.data[jn.block].first; }
+        builder.derive(?cr.bld, at);
+        builder.secret(?cr.bld, false);
+        builder.before(?cr.bld, at);
+        var x: Value = first.root;
+        t = 0;
+        for (t < depth) {
+            val o: Step = w.steps.data[first.first + t];
+            if (o.code == opcode_table.PTR_MEMBER) {
+                var ops: [1]Value     = [1]Value{x};
+                var imm: [2]Immediate = [2]Immediate{Immediate.ty{o.ty}, Immediate.member{o.member}};
+                x = builder.value(?cr.bld, Request{opcode: o.code, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: ?imm[0], size: 2}, targets: Slice[Branch]{data: nil, size: 0}});
+            }
+            or {
+                var index: Value = o.index;
+                if (cr.carried.data[t]) { index = cr.made.data[n * depth + t]; }
+                var ops: [2]Value     = [2]Value{x, index};
+                var imm: [1]Immediate = [1]Immediate{Immediate.ty{o.ty}};
+                x = builder.value(?cr.bld, Request{opcode: o.code, operands: Slice[Value]{data: ?ops[0], size: 2}, immediates: Slice[Immediate]{data: ?imm[0], size: 1}, targets: Slice[Branch]{data: nil, size: 0}});
+            }
+            t = t + 1;
+        }
+        val err_remade: err[refusal.Error] = add[Value](?remakes, x);
+        if (sel err_remade.err) { ret err_remade; }
+        n = n + 1;
+    }
+    val err_built: err[failure.Error] = builder.done(?cr.bld);
+    if (sel err_built.err) { ret err[refusal.Error].err{refusal.Error.build{err_built.err}}; }
+    n = 0;
+    for (n < w.members.len) {
+        val jn: Join = w.joins.data[w.members.data[n]];
+        if (jn.select == NO_INSTRUCTION) {
+            val err_handed: err[refusal.Error] = refusal.edit(body.hand(m, w.f, b.blocks.data[jn.block].first, heads.data[n]));
+            if (sel err_handed.err) { ret err_handed; }
+        }
+        n = n + 1;
+    }
+
+    n = 0;
+    for (n < w.members.len) {
+        val err_moved: err[refusal.Error] = refusal.edit(body.replace(m, w.f, w.joins.data[w.members.data[n]].value, remakes.data[n], Records.follow{}));
+        if (sel err_moved.err) { ret err_moved; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < w.members.len) {
+        val jn: Join = w.joins.data[w.members.data[n]];
+        if (jn.select == NO_INSTRUCTION) {
+            val err_gone: err[refusal.Error] = refusal.edit(body.remove_parameter(m, w.f, jn.block, place_of(b, jn.value)::u32));
+            if (sel err_gone.err) { ret err_gone; }
+        }
+        or {
+            val err_erased: err[refusal.Error] = refusal.edit(body.erase(m, w.f, jn.select));
+            if (sel err_erased.err) { ret err_erased; }
+        }
+        n = n + 1;
+    }
+    w.changed = true;
+    ret err[refusal.Error].ok{};
+}
+
+# make every edge into the block of parameter jn, the web's member at n, pass for each index it carries the index
+# its pointer brings
+fun pass_indices(w: *Work, cr: *Carry, root: u32, n: usize, jn: Join) err[refusal.Error] {
+    val b:     *Body = w.b;
+    val depth: usize = cr.carried.len;
+    val p:     usize = place_of(b, jn.value);
+    var j:     usize = 0;
+    for (j < b.blocks.len) {
+        if (!b.blocks.data[j].erased && b.blocks.data[j].last != NO_INSTRUCTION) {
+            val last: Instruction = b.blocks.data[j].last;
+            var e:    usize       = 0;
+            for (e < b.instructions.data[last].edges.len) {
+                if (b.instructions.data[last].edges.data[e].block == jn.block) {
+                    val count:    usize                        = b.instructions.data[last].edges.data[e].arguments.len;
+                    val res_args: res[*Value, allocator.Error] = allocator.zallocate[Value](w.scratch, count);
+                    if (sel res_args.err) { ret lost(res_args.err); }
+                    var a: usize = 0;
+                    for (a < count) {
+                        res_args.ok[a] = b.instructions.data[last].edges.data[e].arguments.data[a];
+                        a              = a + 1;
+                    }
+                    val brought: Value = res_args.ok[p];
+                    var t:       usize = 0;
+                    for (t < depth) {
+                        if (cr.carried.data[t]) {
+                            val carried: Value = cr.made.data[n * depth + t];
+                            res_args.ok[place_of(b, carried)] = index_of(w, cr, root, brought, t);
+                        }
+                        t = t + 1;
+                    }
+                    val err_moved: err[refusal.Error] = refusal.edit(body.retarget(w.c.m, w.f, last, e::u32, jn.block, Slice[Value]{data: res_args.ok, size: count}));
+                    if (sel err_moved.err) { ret err_moved; }
+                }
+                e = e + 1;
+            }
+        }
+        j = j + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether an instruction is never copied onto each path: a call, which may wait for the other invocations as a
+# barrier does, a target op or an assembly block, which may do the same, a slot and the markers of its storage, a
+# value a function's convention places, the timing switch, and a select of pointers, which is a merge of its own
+fun pinned(w: *Work, i: Instruction) bool {
+    val code: Opcode = w.b.instructions.data[i].opcode;
+    if (code == opcode_table.CALL || code == opcode_table.CALL_PLACED || code == opcode_table.ASM)                  { ret true; }
+    if (code == opcode_table.TARGET_OP || code == opcode_table.TARGET_OP_MEMORY)                                    { ret true; }
+    if (code == opcode_table.ALLOCA || code == opcode_table.SLOT_BEGIN || code == opcode_table.SLOT_END)            { ret true; }
+    if (code == opcode_table.ARG_INCOMING || code == opcode_table.ARG_OUTGOING)                                     { ret true; }
+    if (code == opcode_table.TIMING_READ || code == opcode_table.TIMING_SET || code == opcode_table.TIMING_RESTORE) { ret true; }
+    ret code == opcode_table.SELECT && logical(w, w.b.values.data[w.b.instructions.data[i].results.data[0]].type);
+}
+
+# the part of a block a merge's pointer is read in
+# ---
+# last: the last instruction that reads the pointer or a pointer made from it
+# made: the pointers made from it, the pointer first
+rec Head {
+    last: Instruction;
+    made: vector.Vector[Value];
+}
+
+# the head of block k from instruction `from` on for pointer v: the instructions up to the last that reads v or a
+# pointer made from it, none of which is read past that one, nor by an edge, nor outside the block. the refusal is
+# why the head may not be copied onto each path
+fun head_of(w: *Work, j: Join, from: Instruction) res[Head, refusal.Error] {
+    val b:         *Body              = w.b;
+    var h:         Head               = Head{last: NO_INSTRUCTION, made: vector.init[Value](w.scratch)};
+    val err_first: err[refusal.Error] = add[Value](?h.made, j.value);
+    if (sel err_first.err) { ret res[Head, refusal.Error].err{err_first.err}; }
+    var pinned_seen: bool        = false;
+    var held:        bool        = false;
+    var i:           Instruction = from;
+    for (i != NO_INSTRUCTION && i != b.blocks.data[j.block].last) {
+        var read: bool  = false;
+        var k:    usize = 0;
+        for (k < h.made.len && !read) {
+            if (reads(b, i, h.made.data[k])) { read = true; }
+            k = k + 1;
+        }
+        if (pinned(w, i)) { pinned_seen = true; }
+        if (read) {
+            h.last = i;
+            if (pinned_seen) { held = true; }
+            val d: *InstructionData = ?b.instructions.data[i];
+            k = 0;
+            for (k < d.results.len) {
+                if (logical(w, b.values.data[d.results.data[k]].type)) {
+                    val err_made: err[refusal.Error] = add[Value](?h.made, d.results.data[k]);
+                    if (sel err_made.err) { ret res[Head, refusal.Error].err{err_made.err}; }
+                }
+                k = k + 1;
+            }
+        }
+        i = b.instructions.data[i].next;
+    }
+    var k: usize = 0;
+    for (k < h.made.len) {
+        val v: Value = h.made.data[k];
+        if (reads(b, b.blocks.data[j.block].last, v)) { ret res[Head, refusal.Error].err{stays_error(w, j, Merge.passed{})}; }
+        var u: usize = 0;
+        for (u < b.values.data[v].uses.len) {
+            val at: Place = b.instructions.data[b.values.data[v].uses.data[u]].place;
+            if (!(sel at.placed))     { ret res[Head, refusal.Error].err{stays_error(w, j, Merge.passed{})}; }
+            if (at.placed != j.block) { ret res[Head, refusal.Error].err{stays_error(w, j, Merge.passed{})}; }
+            u = u + 1;
+        }
+        k = k + 1;
+    }
+    if (h.last == NO_INSTRUCTION) { ret res[Head, refusal.Error].err{stays_error(w, j, Merge.passed{})}; }
+    if (held)                     { ret res[Head, refusal.Error].err{stays_error(w, j, Merge.held{})}; }
+    ret res[Head, refusal.Error].ok{h};
+}
+
+# the refusal `stays` makes, as a value
+fun stays_error(w: *Work, j: Join, why: Merge) refusal.Error {
+    val err_stays: err[refusal.Error] = stays(w, j, why);
+    if (sel err_stays.err) { ret err_stays.err; }
+    ret refusal.Error.reason{"a merge of pointers stays"};
+}
+
+# whether a list holds a value
+fun among(list: vector.Vector[Value], v: Value) bool {
+    var n: usize = 0;
+    for (n < list.len) {
+        if (list.data[n] == v) { ret true; }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# whether a value made in block k is read past instruction `last`, by an instruction or a record
+fun read_past(b: *Body, k: Block, last: Instruction, v: Value) bool {
+    var u: usize = 0;
+    for (u < b.values.data[v].uses.len) {
+        val user: Instruction = b.values.data[v].uses.data[u];
+        val at:   Place       = b.instructions.data[user].place;
+        if (!(sel at.placed))       { ret true; }
+        if (at.placed != k)         { ret true; }
+        if (!before(b, user, last)) { ret true; }
+        u = u + 1;
+    }
+    if (b.values.data[v].bound.len == 0) { ret false; }
+    var n: usize = 0;
+    for (n < b.blocks.len) {
+        if (!b.blocks.data[n].erased) {
+            if (run_reads(b, b.blocks.data[n].ending, v)) { ret true; }
+            var i: Instruction = b.blocks.data[n].first;
+            if (n::u32 == k) { i = b.instructions.data[last].next; }
+            for (i != NO_INSTRUCTION) {
+                if (run_reads(b, b.instructions.data[i].points, v)) { ret true; }
+                i = b.instructions.data[i].next;
+            }
+        }
+        n = n + 1;
+    }
+    ret false;
+}
+
+# whether instruction i stands at or before instruction `last` of the same block
+fun before(b: *Body, i: Instruction, last: Instruction) bool {
+    var x: Instruction = last;
+    for (x != NO_INSTRUCTION) {
+        if (x == i) { ret true; }
+        x = b.instructions.data[x].prev;
+    }
+    ret false;
+}
+
+# whether a record of a run reads a value
+fun run_reads(b: *Body, run: point.Run, v: Value) bool {
+    var p: u32 = run.first;
+    for (p != 0) {
+        val pt:       point.Point = b.points.data[p - 1];
+        val opt_read: opt[Value]  = point.read(pt.reads);
+        if (sel opt_read.some && opt_read.some == v) { ret true; }
+        if (p == run.last)                           { brk; }
+        p = pt.next;
+    }
+    ret false;
+}
+
+# make the records of a run that read `from` read `to`, or nothing where `to` is none
+fun reread_run(w: *Work, run: point.Run, from: Value, to: opt[Value]) err[refusal.Error] {
+    val b: *Body = w.b;
+    var p: u32   = run.first;
+    for (p != 0) {
+        val pt:    point.Point = b.points.data[p - 1];
+        val reads: Reads       = pt.reads;
+        if (sel reads.operand) {
+            if (reads.operand.value == from) {
+                var now: Reads = Reads.unavailable{};
+                if (sel to.some) { now = Reads.operand{point.Operand{value: to.some, expression: reads.operand.expression}}; }
+                val err_rebound: err[refusal.Error] = refusal.edit(body.rebind(w.c.m, w.f, p - 1, now));
+                if (sel err_rebound.err) { ret err_rebound; }
+            }
+        }
+        if (p == run.last) { brk; }
+        p = pt.next;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# make every reader of `from` outside block k read `to`, its records too, or every record outside k that reads it
+# read nothing where `to` is none
+fun reread(w: *Work, k: Block, from: Value, to: opt[Value]) err[refusal.Error] {
+    val b: *Body = w.b;
+    if (sel to.some) {
+        var users: vector.Vector[Instruction] = vector.init[Instruction](w.scratch);
+        var u:     usize                      = 0;
+        for (u < b.values.data[from].uses.len) {
+            val user: Instruction = b.values.data[from].uses.data[u];
+            val at:   Place       = b.instructions.data[user].place;
+            if (sel at.placed && at.placed != k) {
+                var listed: bool  = false;
+                var n:      usize = 0;
+                for (n < users.len) {
+                    if (users.data[n] == user) { listed = true; }
+                    n = n + 1;
+                }
+                if (!listed) {
+                    val err_listed: err[refusal.Error] = add[Instruction](?users, user);
+                    if (sel err_listed.err) { ret err_listed; }
+                }
+            }
+            u = u + 1;
+        }
+        u = 0;
+        for (u < users.len) {
+            val err_moved: err[refusal.Error] = refusal.edit(body.substitute(w.c.m, w.f, users.data[u], from, to.some));
+            if (sel err_moved.err) { ret err_moved; }
+            u = u + 1;
+        }
+    }
+    if (b.values.data[from].bound.len == 0) { ret err[refusal.Error].ok{}; }
+    var n: usize = 0;
+    for (n < b.blocks.len) {
+        if (!b.blocks.data[n].erased && n::u32 != k) {
+            val err_ending: err[refusal.Error] = reread_run(w, b.blocks.data[n].ending, from, to);
+            if (sel err_ending.err) { ret err_ending; }
+            var i: Instruction = b.blocks.data[n].first;
+            for (i != NO_INSTRUCTION) {
+                val err_points: err[refusal.Error] = reread_run(w, b.instructions.data[i].points, from, to);
+                if (sel err_points.err) { ret err_points; }
+                i = b.instructions.data[i].next;
+            }
+        }
+        n = n + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# a value the rest of a block reads of its head, and the parameter the rest takes for it
+# ---
+# value: what the rest read
+# param: the rest's parameter in its place
+rec Passed {
+    value: Value;
+    param: Value;
+}
+
+# copy the head of parameter jn's block onto each edge into it but one, which keeps it, and make the rest of the
+# block a block of its own each copy branches to, passing what the rest reads of the head. each copy reads the
+# pointer its edge passes, so the parameter takes one pointer on each path, which the next round takes out
+fun spread(w: *Work, jn: Join, h: *Head) err[refusal.Error] {
+    val m: *Module = w.c.m;
+    val b: *Body   = w.b;
+    val k: Block   = jn.block;
+
+    # what the rest reads of the head: the block's other parameters and the head's results but the pointers made from
+    # the merge's, which only records past the head read
+    var passed: vector.Vector[Passed]      = vector.init[Passed](w.scratch);
+    var decls:  vector.Vector[Declaration] = vector.init[Declaration](w.scratch);
+    var p:      usize                      = 0;
+    for (p < b.blocks.data[k].parameters.len) {
+        val v: Value = b.blocks.data[k].parameters.data[p];
+        if (v != jn.value && read_past(b, k, h.last, v)) {
+            val err_passed: err[refusal.Error] = add[Passed](?passed, Passed{value: v, param: v});
+            if (sel err_passed.err) { ret err_passed; }
+        }
+        p = p + 1;
+    }
+    var i: Instruction = b.blocks.data[k].first;
+    for (i != NO_INSTRUCTION) {
+        var r: usize = 0;
+        for (r < b.instructions.data[i].results.len) {
+            val v: Value = b.instructions.data[i].results.data[r];
+            if (!among(h.made, v) && read_past(b, k, h.last, v)) {
+                val err_passed: err[refusal.Error] = add[Passed](?passed, Passed{value: v, param: v});
+                if (sel err_passed.err) { ret err_passed; }
+            }
+            r = r + 1;
+        }
+        if (i == h.last) { brk; }
+        i = b.instructions.data[i].next;
+    }
+    var n: usize = 0;
+    for (n < passed.len) {
+        val v:            Value              = passed.data[n].value;
+        val err_declared: err[refusal.Error] = add[Declaration](?decls, Declaration{type: b.values.data[v].type, secret: b.values.data[v].secret, name: opt[View].none{}});
+        if (sel err_declared.err) { ret err_declared; }
+        n = n + 1;
+    }
+    var params: vector.Vector[Declaration] = vector.init[Declaration](w.scratch);
+    p = 0;
+    for (p < b.blocks.data[k].parameters.len) {
+        val v:            Value              = b.blocks.data[k].parameters.data[p];
+        val err_declared: err[refusal.Error] = add[Declaration](?params, Declaration{type: b.values.data[v].type, secret: b.values.data[v].secret, name: opt[View].none{}});
+        if (sel err_declared.err) { ret err_declared; }
+        p = p + 1;
+    }
+
+    # the edges into the block, each but the first to get a copy
+    var sources: vector.Vector[body.Source] = vector.init[body.Source](w.scratch);
+    var j:       usize                      = 0;
+    for (j < b.blocks.len) {
+        if (!b.blocks.data[j].erased && b.blocks.data[j].last != NO_INSTRUCTION) {
+            val last: Instruction = b.blocks.data[j].last;
+            var e:    usize       = 0;
+            for (e < b.instructions.data[last].edges.len) {
+                if (b.instructions.data[last].edges.data[e].block == k) {
+                    val err_source: err[refusal.Error] = add[body.Source](?sources, body.Source{branch: last, edge: e::u32});
+                    if (sel err_source.err) { ret err_source; }
+                }
+                e = e + 1;
+            }
+        }
+        j = j + 1;
+    }
+
+    # the rest of the block, its own block, entered from the head
+    val ending:   Instruction              = b.blocks.data[k].last;
+    val res_rest: res[Block, module.Error] = body.split_block(m, w.f, b.instructions.data[h.last].next, Slice[Declaration]{data: decls.data, size: decls.len});
+    if (sel res_rest.err) { ret err[refusal.Error].err{refusal.Error.ir{res_rest.err}}; }
+    val rest: Block = res_rest.ok;
+    n = 0;
+    for (n < passed.len) {
+        passed.data[n].param = b.blocks.data[rest].parameters.data[n];
+        n                    = n + 1;
+    }
+    var bld:  Builder              = builder.make(m);
+    var args: vector.Vector[Value] = vector.init[Value](w.scratch);
+    builder.enter(?bld, w.f);
+    builder.derive(?bld, ending);
+    builder.at_end(?bld, k);
+    n = 0;
+    for (n < passed.len) {
+        val err_arg: err[refusal.Error] = add[Value](?args, passed.data[n].value);
+        if (sel err_arg.err) { ret err_arg; }
+        n = n + 1;
+    }
+    var to: [1]Branch = [1]Branch{Branch{block: rest, arguments: Slice[Value]{data: args.data, size: args.len}}};
+    builder.emit(?bld, Request{opcode: opcode_table.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?to[0], size: 1}});
+    val err_kept: err[failure.Error] = builder.done(?bld);
+    if (sel err_kept.err) { ret err[refusal.Error].err{refusal.Error.build{err_kept.err}}; }
+
+    # a copy of the head on each other edge, reading the arguments the edge passes
+    var s: usize = 1;
+    for (s < sources.len) {
+        var r:    Remap = remap.init(w.scratch);
+        val copy: Block = builder.block(?bld, Slice[Declaration]{data: params.data, size: params.len});
+        builder.at_end(?bld, copy);
+        p = 0;
+        for (p < params.len) {
+            val err_bound: err[allocator.Error] = remap.bind_value(?r, b.blocks.data[k].parameters.data[p], builder.parameter(?bld, copy, p::u32));
+            if (sel err_bound.err) { ret lost(err_bound.err); }
+            p = p + 1;
+        }
+        i = b.blocks.data[k].first;
+        for (i != NO_INSTRUCTION) {
+            builder.copy(?bld, w.f, i, ?r);
+            if (i == h.last) { brk; }
+            i = b.instructions.data[i].next;
+        }
+        vector.truncate[Value](?args, 0);
+        n = 0;
+        for (n < passed.len) {
+            var v:         Value      = passed.data[n].value;
+            val opt_bound: opt[Value] = remap.value(?r, v);
+            if (sel opt_bound.some) { v = opt_bound.some; }
+            val err_arg: err[refusal.Error] = add[Value](?args, v);
+            if (sel err_arg.err) { ret err_arg; }
+            n = n + 1;
+        }
+        builder.derive(?bld, ending);
+        var on: [1]Branch = [1]Branch{Branch{block: rest, arguments: Slice[Value]{data: args.data, size: args.len}}};
+        builder.emit(?bld, Request{opcode: opcode_table.BR, operands: Slice[Value]{data: nil, size: 0}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?on[0], size: 1}});
+        val err_copied: err[failure.Error] = builder.done(?bld);
+        if (sel err_copied.err) { ret err[refusal.Error].err{refusal.Error.build{err_copied.err}}; }
+        val src:     body.Source          = sources.data[s];
+        var carried: vector.Vector[Value] = vector.init[Value](w.scratch);
+        val count:   usize                = b.instructions.data[src.branch].edges.data[src.edge].arguments.len;
+        var a:       usize                = 0;
+        for (a < count) {
+            val err_arg: err[refusal.Error] = add[Value](?carried, b.instructions.data[src.branch].edges.data[src.edge].arguments.data[a]);
+            if (sel err_arg.err) { ret err_arg; }
+            a = a + 1;
+        }
+        val err_moved: err[refusal.Error] = refusal.edit(body.retarget(m, w.f, src.branch, src.edge, copy, Slice[Value]{data: carried.data, size: carried.len}));
+        if (sel err_moved.err) { ret err_moved; }
+        s = s + 1;
+    }
+
+    # the rest and every block past it read the rest's parameters, and records past the head read nothing of a
+    # pointer the head made
+    n = 0;
+    for (n < passed.len) {
+        val err_reread: err[refusal.Error] = reread(w, k, passed.data[n].value, opt[Value].some{passed.data[n].param});
+        if (sel err_reread.err) { ret err_reread; }
+        n = n + 1;
+    }
+    n = 0;
+    for (n < h.made.len) {
+        val err_unbound: err[refusal.Error] = reread(w, k, h.made.data[n], opt[Value].none{});
+        if (sel err_unbound.err) { ret err_unbound; }
+        n = n + 1;
+    }
+    w.changed = true;
+    ret fresh(w);
+}
+
+# make a select of pointers of different bases a parameter: its block branches on its condition to a block that
+# takes the pointer each side chose, which holds the select's readers. the refusal is why no branch may decide it
+fun branch(w: *Work, jn: Join) res[Join, refusal.Error] {
+    val m: *Module     = w.c.m;
+    val b: *Body       = w.b;
+    val s: Instruction = jn.select;
+    val c: Value       = b.instructions.data[s].operands.data[0];
+    val x: Value       = b.instructions.data[s].operands.data[1];
+    val y: Value       = b.instructions.data[s].operands.data[2];
+    val r: Value       = jn.value;
+    if (ir_function.in_constant_time(m.functions.data[w.f].data.constant_time) || b.values.data[c].secret) {
+        ret res[Join, refusal.Error].err{stays_error(w, jn, Merge.timed{})};
+    }
+    var decl:     [1]Declaration           = [1]Declaration{Declaration{type: b.values.data[r].type, secret: b.values.data[r].secret, name: opt[View].none{}}};
+    val res_join: res[Block, module.Error] = body.split_block(m, w.f, s, Slice[Declaration]{data: ?decl[0], size: 1});
+    if (sel res_join.err) { ret res[Join, refusal.Error].err{refusal.Error.ir{res_join.err}}; }
+    val joined: Block   = res_join.ok;
+    val q:      Value   = b.blocks.data[joined].parameters.data[0];
+    var bld:    Builder = builder.make(m);
+    builder.enter(?bld, w.f);
+    builder.derive(?bld, s);
+    builder.at_end(?bld, jn.block);
+    var then:  [1]Value  = [1]Value{x};
+    var other: [1]Value  = [1]Value{y};
+    var test:  [1]Value  = [1]Value{c};
+    var both:  [2]Branch = [2]Branch{Branch{block: joined, arguments: Slice[Value]{data: ?then[0], size: 1}}, Branch{block: joined, arguments: Slice[Value]{data: ?other[0], size: 1}}};
+    builder.emit(?bld, Request{opcode: opcode_table.CBR, operands: Slice[Value]{data: ?test[0], size: 1}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: ?both[0], size: 2}});
+    val err_built: err[failure.Error] = builder.done(?bld);
+    if (sel err_built.err) { ret res[Join, refusal.Error].err{refusal.Error.build{err_built.err}}; }
+    val err_moved: err[refusal.Error] = refusal.edit(body.replace(m, w.f, r, q, Records.follow{}));
+    if (sel err_moved.err) { ret res[Join, refusal.Error].err{err_moved.err}; }
+    val err_erased: err[refusal.Error] = refusal.edit(body.erase(m, w.f, s));
+    if (sel err_erased.err) { ret res[Join, refusal.Error].err{err_erased.err}; }
+    w.changed = true;
+    ret res[Join, refusal.Error].ok{Join{value: q, select: NO_INSTRUCTION, block: joined}};
+}
+
+# take out one web, the first that may be taken: one made again from its root, then a select of different bases
+# split into a branch and spread, then a parameter of different bases spread. the refusal names the first merge none
+# of them takes out
+fun take(w: *Work) err[refusal.Error] {
+    val b:    *Body         = w.b;
+    var why:  refusal.Error = refusal.Error.reason{"a merge of pointers stays"};
+    var told: bool          = false;
+    var pass: usize         = 0;
+    for (pass < 3) {
+        var j: usize = 0;
+        for (j < w.joins.len) {
+            if (find(w, j::u32) == j::u32) {
+                val root:     u32                = j::u32;
+                val err_read: err[refusal.Error] = web(w, root);
+                if (sel err_read.err) { ret err_read; }
+                val first: Join     = w.joins.data[w.members.data[0]];
+                val st:    Standing = standing(w, root);
+                if (sel st.circled && !told) {
+                    why  = stays_error(w, first, Merge.circled{});
+                    told = true;
+                }
+                if (sel st.ready) {
+                    val same: bool = chained(w);
+                    if (pass == 0 && same) { ret chain(w, root); }
+                    if (pass > 0 && !same) {
+                        if (w.members.len > 1) {
+                            if (!told) {
+                                why  = stays_error(w, first, Merge.circled{});
+                                told = true;
+                            }
+                        }
+                        or (pass == 1 && first.select != NO_INSTRUCTION) {
+                            val res_head: res[Head, refusal.Error] = head_of(w, first, b.instructions.data[first.select].next);
+                            if (sel res_head.err) {
+                                if (!merged(res_head.err)) { ret err[refusal.Error].err{res_head.err}; }
+                                if (!told) {
+                                    why  = res_head.err;
+                                    told = true;
+                                }
+                            }
+                            or {
+                                val res_branched: res[Join, refusal.Error] = branch(w, first);
+                                if (sel res_branched.err) {
+                                    if (!merged(res_branched.err)) { ret err[refusal.Error].err{res_branched.err}; }
+                                    if (!told) {
+                                        why  = res_branched.err;
+                                        told = true;
+                                    }
+                                }
+                                or {
+                                    val joined:     Join                     = res_branched.ok;
+                                    val res_spread: res[Head, refusal.Error] = head_of(w, joined, b.blocks.data[joined.block].first);
+                                    if (sel res_spread.err) { ret err[refusal.Error].err{res_spread.err}; }
+                                    ret spread(w, joined, ?res_spread.ok);
+                                }
+                            }
+                        }
+                        or (pass == 2 && first.select == NO_INSTRUCTION) {
+                            val res_head: res[Head, refusal.Error] = head_of(w, first, b.blocks.data[first.block].first);
+                            if (sel res_head.err) {
+                                if (!merged(res_head.err)) { ret err[refusal.Error].err{res_head.err}; }
+                                if (!told) {
+                                    why  = res_head.err;
+                                    told = true;
+                                }
+                            }
+                            or { ret spread(w, first, ?res_head.ok); }
+                        }
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        pass = pass + 1;
+    }
+    if (told) { ret err[refusal.Error].err{why}; }
+    ret stays(w, w.joins.data[0], Merge.circled{});
+}
+
+# whether a refusal names a merge that stays, rather than an edit or a read that failed
+fun merged(e: refusal.Error) bool {
+    ret sel e.merged;
+}
+
+# one round: take out every merge that stands alone, then one web. whether a merge was left to take
+fun round(w: *Work) res[bool, refusal.Error] {
+    val err_alone: err[refusal.Error] = trivial(w);
+    if (sel err_alone.err) { ret res[bool, refusal.Error].err{err_alone.err}; }
+    val err_collected: err[refusal.Error] = collect(w);
+    if (sel err_collected.err) { ret res[bool, refusal.Error].err{err_collected.err}; }
+    if (w.joins.len == 0)      { ret res[bool, refusal.Error].ok{false}; }
+    val err_webs: err[refusal.Error] = webs(w);
+    if (sel err_webs.err) { ret res[bool, refusal.Error].err{err_webs.err}; }
+    val err_taken: err[refusal.Error] = take(w);
+    if (sel err_taken.err) { ret res[bool, refusal.Error].err{err_taken.err}; }
+    ret res[bool, refusal.Error].ok{true};
+}
+
+fun visit(u: *Unit) res[bool, refusal.Error] {
+    val c:        *Context                 = u.context;
+    val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
+    if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
+    var w: Work;
+    w.c       = c;
+    w.f       = u.f;
+    w.b       = res_body.ok;
+    w.changed = false;
+    if (!any_join(?w)) { ret res[bool, refusal.Error].ok{false}; }
+    var ar:       arena.Arena;
+    val err_made: err[allocator.Error] = arena.init(?ar, c.m.a, 0);
+    if (sel err_made.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_made.err}}; }
+    fin { arena.dnit(?ar); }
+    var scratch: allocator.Allocator;
+    arena.allocator(?scratch, ?ar);
+    w.scratch = ?scratch;
+    val err_pruned: err[refusal.Error] = pruned(?w);
+    if (sel err_pruned.err) { ret res[bool, refusal.Error].err{err_pruned.err}; }
+    var left: bool = true;
+    for (left) {
+        arena.reset(?ar);
+        val res_round: res[bool, refusal.Error] = round(?w);
+        if (sel res_round.err) { ret res[bool, refusal.Error].err{res_round.err}; }
+        left = res_round.ok;
+    }
+    ret res[bool, refusal.Error].ok{w.changed};
+}
