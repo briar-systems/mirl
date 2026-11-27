@@ -1,14 +1,26 @@
-# load elimination past common subexpressions: a load of the bytes a store of the same block just wrote is the value
+# load elimination past common subexpressions: a load of the bytes a store on its one way in just wrote is the value
 # the store wrote
 #
 # common subexpression elimination merges a load with an earlier load of the same place. this pass takes what it
-# leaves: a load whose bytes an earlier store of its block wrote, with nothing between that may write any of them,
-# becomes the stored value. the blocks are walked one at a time in order, keeping the stores whose bytes still hold
+# leaves: a load whose bytes an earlier store wrote, with nothing between that may write any of them on any path,
+# becomes the stored value. the blocks are walked in reverse postorder, keeping the stores whose bytes still hold
 # what they wrote: a store joins the list, and an instruction that may write a byte a listed store wrote ends that
 # store's place in it, as the memory analysis places both (an access through no address, as a call that may write,
 # ends every one but those of a slot whose address never escapes, and an ordered access ends every one). a load is
 # taken when a listed store's place is exactly its own (`must`), the store wrote a value of the load's type and of
 # its secrecy, both are plain, and the type is a scalar: an integer, a float, a pointer or a vector.
+#
+# a block entered by exactly one edge starts from the list its predecessor ends with, and every other block starts
+# empty. that is sound because the edge is the only way into the block: every run of its first instruction comes
+# straight from the predecessor's terminator, whose own effect the predecessor's walk has already applied, so no
+# instruction runs between the end of the predecessor and the start of the block, and an edge passes values, never
+# memory. a store the list holds at the block's start therefore wrote its bytes on every path to that start with
+# nothing since that may write them, and the value it wrote is defined in the predecessor, which dominates the
+# block, so the load it replaces sees that value. a block entered by two edges or more, or by a back edge, which a
+# reverse postorder walk has not ended yet, starts empty, as a join's paths may write differently. the predecessor
+# comes first in reverse postorder, since it dominates the block. this is the copy of a call the inliner expands:
+# its return block stores the result's case into the slot the result is built in and branches to the block that
+# continues the caller, whose test of the case loads it straight back.
 #
 # an aggregate is never forwarded, since no value of one is in hand: the aggregate legalisation holds it as its
 # leaves or in a slot of its own, and moves a load whose only use is a store from memory to memory. forwarding one
@@ -20,10 +32,12 @@
 # the rule by which a load is left alone: it is volatile, ordered or kept, it loads an aggregate, no listed store
 # covers exactly its bytes (a wider or a narrower store, or one whose place only may be the same), the stored value's
 # type or secrecy is not the load's, or the store is kept, volatile or ordered, since a kept write is a fixed fact
-# nothing forwards away. a store in another block is never forwarded, so a block's list starts empty.
+# nothing forwards away.
 #
-# it costs, per block, its instructions times the stores still listed. it reads the memory analysis (and through it
-# ranges, loops, slots and inductions). it removes a load, which can change when a function's memory traffic
+# it costs, per block, its instructions times the stores still listed, a chain of blocks each entered by one edge
+# costing what the one block it could be merged into costs, and a copy of the list for each block entered by one
+# edge. it reads the memory analysis (and through it ranges, loops, slots and inductions) and the graph and
+# dominance, for the reverse postorder. it removes a load, which can change when a function's memory traffic
 # happens, so it is held to no constant-time proof of its own and breaks constant time: every function that
 # requires it is skipped.
 
@@ -36,10 +50,16 @@ use std.types.result.res;
 use std.types.size.usize;
 
 use std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
 use std.collections.vector;
 
 use mirl.ir.body;
 use mirl.ir.body.Records;
+use mirl.ir.cfg.dominance;
+use mirl.ir.cfg.dominance.Dominance;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
 use mirl.ir.function.Body;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.NO_INSTRUCTION;
@@ -66,7 +86,7 @@ use mirl.pass.refusal;
 use mirl.pass.refusal.edit;
 
 # the pass: it removes loads in place and changes no edge
-pub val FORWARD: Pass = Pass{name: "forward", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_MEMORY, preserves: analysis.FLOW, time: Time.breaks{}};
+pub val FORWARD: Pass = Pass{name: "forward", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_MEMORY | analysis.OF_GRAPH | analysis.OF_DOMINANCE, preserves: analysis.FLOW, time: Time.breaks{}};
 
 # a store whose bytes still hold what it wrote
 # ---
@@ -124,9 +144,8 @@ fun given(b: *Body, held: *vector.Vector[Held], place: Place, result: Value) opt
     ret opt[Value].none{};
 }
 
-# forward the stores of one block to its loads, answering whether a load went
+# forward the stores `held` lists and those of one block to its loads, answering whether a load went
 fun block(c: *Context, mem: *Memory, b: *Body, held: *vector.Vector[Held], first: Instruction) res[bool, refusal.Error] {
-    vector.truncate[Held](held, 0);
     var changed: bool        = false;
     var i:       Instruction = first;
     for (i != NO_INSTRUCTION) {
@@ -170,7 +189,58 @@ fun block(c: *Context, mem: *Memory, b: *Body, held: *vector.Vector[Held], first
     ret res[bool, refusal.Error].ok{changed};
 }
 
-# forward the stores of each block of one function
+# the list a block ends with, kept for the blocks it is the one way into
+# ---
+# held: the stores
+# left: how many of those blocks have not started from it yet
+rec Saved {
+    held: vector.Vector[Held];
+    left: u32;
+}
+
+# whether a block is entered by exactly one edge, which is not its own
+fun one_way_in(g: *Graph, n: u32) bool {
+    val preds: Slice[u32] = graph.predecessors(g, n);
+    ret preds.size == 1 && preds.data[0] != n;
+}
+
+# how many of a block's successors it is the one way into
+fun ways_out(g: *Graph, n: u32) u32 {
+    val succs: Slice[u32] = graph.successors(g, n);
+    var count: u32        = 0;
+    var k:     usize      = 0;
+    for (k < succs.size) {
+        if (one_way_in(g, succs.data[k])) { count = count + 1; }
+        k = k + 1;
+    }
+    ret count;
+}
+
+# copy a list into another, emptied first
+fun copy(into: *vector.Vector[Held], from: *vector.Vector[Held]) err[allocator.Error] {
+    vector.truncate[Held](into, 0);
+    var k: usize = 0;
+    for (k < from.len) {
+        val res_pushed: res[usize, allocator.Error] = vector.push[Held](into, from.data[k]);
+        if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        k = k + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+fun saved_dnit(saved: *map.Map[u32, Saved], order: Slice[u32]) {
+    var k: usize = 0;
+    for (k < order.size) {
+        var key:       u32         = order.data[k];
+        val opt_saved: opt[*Saved] = map.get[u32, Saved](saved, ?key);
+        if (sel opt_saved.some) { vector.dnit[Held](?opt_saved.some.held); }
+        k = k + 1;
+    }
+    map.dnit[u32, Saved](saved);
+}
+
+# forward the stores of each reachable block of one function, in reverse postorder, a block entered by one edge
+# starting from the list its predecessor ended with
 fun visit(u: *Unit) res[bool, refusal.Error] {
     val c:        *Context                 = u.context;
     val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
@@ -178,15 +248,52 @@ fun visit(u: *Unit) res[bool, refusal.Error] {
     val b:             *Body                       = res_body.ok;
     val res_memory_of: res[*Memory, refusal.Error] = analysis.memory_of(c.cache, u.f);
     if (sel res_memory_of.err) { ret res[bool, refusal.Error].err{res_memory_of.err}; }
-    var held: vector.Vector[Held] = vector.init[Held](c.m.a);
-    fin { vector.dnit[Held](?held); }
+    val res_graph_of: res[*Graph, refusal.Error] = analysis.graph_of(c.cache, u.f);
+    if (sel res_graph_of.err) { ret res[bool, refusal.Error].err{res_graph_of.err}; }
+    val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, u.f);
+    if (sel res_dominance_of.err) { ret res[bool, refusal.Error].err{res_dominance_of.err}; }
+    val g:     *Graph              = res_graph_of.ok;
+    val order: Slice[u32]          = dominance.order(res_dominance_of.ok);
+    var held:  vector.Vector[Held] = vector.init[Held](c.m.a);
+    var saved: map.Map[u32, Saved] = map.init[u32, Saved](c.m.a);
+    fin {
+        vector.dnit[Held](?held);
+        saved_dnit(?saved, order);
+    }
     var changed: bool  = false;
     var k:       usize = 0;
-    for (k < b.blocks.len) {
-        if (!b.blocks.data[k].erased) {
-            val res_block: res[bool, refusal.Error] = block(c, res_memory_of.ok, b, ?held, b.blocks.data[k].first);
-            if (sel res_block.err) { ret res_block; }
-            if (res_block.ok)      { changed = true; }
+    for (k < order.size) {
+        val n: u32 = order.data[k];
+        vector.truncate[Held](?held, 0);
+        if (one_way_in(g, n)) {
+            var from:      u32         = graph.predecessors(g, n).data[0];
+            val opt_saved: opt[*Saved] = map.get[u32, Saved](?saved, ?from);
+            if (sel opt_saved.some) {
+                val err_copied: err[allocator.Error] = copy(?held, ?opt_saved.some.held);
+                if (sel err_copied.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_copied.err}}; }
+                opt_saved.some.left = opt_saved.some.left - 1;
+                if (opt_saved.some.left == 0) {
+                    vector.dnit[Held](?opt_saved.some.held);
+                    map.remove[u32, Saved](?saved, ?from);
+                }
+            }
+        }
+        val res_block: res[bool, refusal.Error] = block(c, res_memory_of.ok, b, ?held, b.blocks.data[n].first);
+        if (sel res_block.err) { ret res_block; }
+        if (res_block.ok)      { changed = true; }
+        val left: u32 = ways_out(g, n);
+        if (left > 0) {
+            var kept:       vector.Vector[Held]  = vector.init[Held](c.m.a);
+            val err_copied: err[allocator.Error] = copy(?kept, ?held);
+            if (sel err_copied.err) {
+                vector.dnit[Held](?kept);
+                ret res[bool, refusal.Error].err{refusal.Error.alloc{err_copied.err}};
+            }
+            val res_set: res[bool, allocator.Error] = map.insert[u32, Saved](?saved, n, Saved{held: kept, left: left});
+            if (sel res_set.err) {
+                vector.dnit[Held](?kept);
+                ret res[bool, refusal.Error].err{refusal.Error.alloc{res_set.err}};
+            }
         }
         k = k + 1;
     }
