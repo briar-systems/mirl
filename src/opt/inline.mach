@@ -3,9 +3,17 @@
 # the functions are taken bottom up over the unit's call graph (`mirl.pass.analysis.calls`), so a callee is expanded
 # into before any caller copies it, and the copy is of the callee as its own calls left it. a call is expanded when
 # the callee states `always` (`mirl.ir.function.Inlining`), or states nothing and its size as promotion leaves it
-# (`mirl.opt.promote.size`) is at most TINY, or under SMALL at a call inside a loop of the caller. a call stays a call
-# where the callee states `never`, where caller or callee is scalar (`FunctionData.scalar`, so neither the statement nor
-# a loop it governs moves across the call), where caller and callee are in one strongly connected group (a recursion, which is
+# (`mirl.opt.promote.size`) is at most TINY, or is under SMALL at a call standing in a loop: inside a loop of the
+# caller, or made by a caller carried into a loop. a function is carried into a loop when a call of it stands in one
+# and it is copied where such a call is expanded, by its declaration and its size before any expansion: it states
+# `always`, or states nothing, is not scalar and measures under SMALL. which functions are carried is read from the
+# call graph and each caller's loops before any expansion, the functions taken top down, so a helper a loop reaches
+# through a chain of small functions is expanded into each of them in turn and the chain reaches the loop as one copy
+# wherever its sizes, grown by their own expansions, stay under SMALL. a call within a recursion is never expanded, so
+# it carries nothing, and a call through a pointer or from another unit is no edge of the graph. TINY alone decides a
+# call standing in no loop, which runs too seldom for a copy much larger than the call to repay its size. a call stays
+# a call where the callee states `never`, where caller or callee is scalar (`FunctionData.scalar`, so neither the
+# statement nor a loop it governs moves across the call), where caller and callee are in one strongly connected group (a recursion, which is
 # never expanded), where the call is kept or volatile, where the callee's function names an extension the caller's
 # does not, where its entry is already placed, where it makes a slot outside its entry block or of a size an operand
 # gives, where the call's arguments are not one per entry parameter of the parameter's type and no more secret, where a
@@ -66,9 +74,10 @@
 # holding the call result's, so rules 1 and 2 hold, a kept or volatile access is copied, never moved or merged (rule 3),
 # and the pass runs on open ir before any timing row exists (rule 4).
 #
-# cost: one scan of every body for its direct calls, one walk of the call graph, and per expansion the callee's
-# instructions and records copied, its dominance read and the moved part of the caller's block given its new block.
-# a caller's loops are read once, before any expansion into it.
+# cost: one scan of every body for its direct calls, one walk of the call graph, one more scan of the body and one
+# reading of the loops of each function that calls and is not carried, a size measure of each function a call standing
+# in a loop reaches, and per expansion the callee's instructions and records copied, its dominance read and the moved
+# part of the caller's block given its new block. a caller's loops are read once, before any expansion into it.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -154,7 +163,7 @@ pub val INLINE: Pass = Pass{name: "inline", kind: Kind.optimise{}, scope: Scope.
 # a callee this size or smaller is expanded at every call
 pub val TINY: usize = 5;
 
-# a callee smaller than this is expanded at a call inside a loop
+# a callee smaller than this is expanded at a call standing in a loop
 pub val SMALL: usize = 25;
 
 # no size worked out yet
@@ -162,13 +171,17 @@ val UNSIZED: usize = 0 - 1;
 
 # one run over the unit
 # ---
-# calls:  the direct calls of functions the unit follows
-# groups: their strongly connected groups, in closing order
-# sizes:  each callee's size as promotion leaves it, once worked out, which it is only after its own expansions
+# calls:   the direct calls of functions the unit follows
+# groups:  their strongly connected groups, in closing order
+# sizes:   each callee's size as promotion leaves it, once worked out, which it is only after its own expansions
+# raw:     each function's size before any expansion, once worked out
+# carried: whether each function is carried into a loop, a call of it standing in one copying it there
 rec Run {
-    calls:  calls.Calls;
-    groups: calls.Groups;
-    sizes:  vector.Vector[usize];
+    calls:   calls.Calls;
+    groups:  calls.Groups;
+    sizes:   vector.Vector[usize];
+    raw:     vector.Vector[usize];
+    carried: vector.Vector[bool];
 }
 
 # a call chosen for expansion
@@ -345,8 +358,74 @@ pub fun offered(m: *Module, f: Function) res[bool, refusal.Error] {
     ret res[bool, refusal.Error].ok{res_size.ok < SMALL};
 }
 
+# whether a function is copied where a call of it standing in a loop is expanded, by its declaration and its size
+# before any expansion: it states always, or states nothing, is not scalar and measures under SMALL
+fun carries(c: *Context, x: *Run, h: Function) res[bool, refusal.Error] {
+    val d: *FunctionData = ?c.m.functions.data[h].data;
+    if (sel d.inlining.always)            { ret res[bool, refusal.Error].ok{true}; }
+    if (sel d.inlining.never || d.scalar) { ret res[bool, refusal.Error].ok{false}; }
+    if (x.raw.data[h] == UNSIZED) {
+        val res_size: res[usize, refusal.Error] = promote.size(c.m, ?c.m.functions.data[h].body);
+        if (sel res_size.err) { ret res[bool, refusal.Error].err{res_size.err}; }
+        x.raw.data[h] = res_size.ok;
+    }
+    ret res[bool, refusal.Error].ok{x.raw.data[h] < SMALL};
+}
+
+# mark `h`, called by `f` at a call standing in a loop, carried into the loop where it carries and is outside the group
+# of `f`, since a call within a recursion is never expanded
+fun carry(c: *Context, x: *Run, f: Function, h: Function) err[refusal.Error] {
+    if (x.carried.data[h] || x.groups.group.data[h] == x.groups.group.data[f]) { ret err[refusal.Error].ok{}; }
+    val res_carries: res[bool, refusal.Error] = carries(c, x, h);
+    if (sel res_carries.err) { ret err[refusal.Error].err{res_carries.err}; }
+    x.carried.data[h] = res_carries.ok;
+    ret err[refusal.Error].ok{};
+}
+
+# mark every function of the unit carried into a loop, the functions taken top down so the callers of each outside its
+# group are decided before it: every call of a carried function stands in a loop, and of any other function each call
+# inside one of its loops
+fun heat(c: *Context, x: *Run) err[refusal.Error] {
+    val m: *Module = c.m;
+    var n: usize   = x.groups.order.len;
+    for (n > 0) {
+        n = n - 1;
+        val f: Function = x.groups.order.data[n];
+        if (x.calls.first.data[f] == x.calls.first.data[f + 1]) { cnt; }
+        if (x.carried.data[f]) {
+            var k: usize = x.calls.first.data[f]::usize;
+            for (k < x.calls.first.data[f + 1]) {
+                val err_carried: err[refusal.Error] = carry(c, x, f, x.calls.callees.data[k]);
+                if (sel err_carried.err) { ret err_carried; }
+                k = k + 1;
+            }
+            cnt;
+        }
+        val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, f);
+        if (sel res_loops_of.err) { ret err[refusal.Error].err{res_loops_of.err}; }
+        val b: *Body = ?m.functions.data[f].body;
+        var k: usize = 0;
+        for (k < b.blocks.len) {
+            if (!b.blocks.data[k].erased && loops.depth(res_loops_of.ok, k::u32) > 0) {
+                var i: Instruction = b.blocks.data[k].first;
+                for (i != NO_INSTRUCTION) {
+                    val opt_callee: opt[Function] = calls.direct(m, b, i);
+                    if (sel opt_callee.some) {
+                        val err_carried: err[refusal.Error] = carry(c, x, f, opt_callee.some);
+                        if (sel err_carried.err) { ret err_carried; }
+                    }
+                    i = b.instructions.data[i].next;
+                }
+            }
+            k = k + 1;
+        }
+    }
+    ret err[refusal.Error].ok{};
+}
+
 # the calls of `f` to expand, in the order its blocks and their instructions stand: the rules admit them, and the
-# callee states always, or its size is at most TINY, or under SMALL where the call stands in a loop of `f`
+# callee states always, or its size is at most TINY, or under SMALL where the call stands in a loop: inside a loop of
+# `f`, or `f` is carried into one
 fun choose(c: *Context, x: *Run, f: Function, out: *vector.Vector[Chosen]) err[refusal.Error] {
     val m:     *Module                  = c.m;
     var found: vector.Vector[Candidate] = vector.init[Candidate](m.a);
@@ -381,6 +460,7 @@ fun choose(c: *Context, x: *Run, f: Function, out: *vector.Vector[Chosen]) err[r
             val res_size: res[usize, refusal.Error] = size_of(c, x, at.callee);
             if (sel res_size.err) { ret err[refusal.Error].err{res_size.err}; }
             take = res_size.ok <= TINY;
+            if (!take && res_size.ok < SMALL) { take = x.carried.data[f]; }
             if (!take && res_size.ok < SMALL) {
                 if (l == nil) {
                     val res_loops_of: res[*Loops, refusal.Error] = analysis.loops_of(c.cache, f);
@@ -933,18 +1013,24 @@ fun dnit(x: *Run) {
     calls.dnit(?x.calls);
     calls.groups_dnit(?x.groups);
     vector.dnit[usize](?x.sizes);
+    vector.dnit[usize](?x.raw);
+    vector.dnit[bool](?x.carried);
 }
 
 # expand the chosen calls of every function of the unit, callees first, marking each caller it rewrote
 fun run(c: *Context, ch: *Changed) res[bool, refusal.Error] {
     val m: *Module              = c.m;
     val a: *allocator.Allocator = m.a;
-    var x: Run                  = Run{calls: calls.init(a), groups: calls.groups_init(a), sizes: vector.init[usize](a)};
+    var x: Run                  = Run{calls: calls.init(a), groups: calls.groups_init(a), sizes: vector.init[usize](a), raw: vector.init[usize](a), carried: vector.init[bool](a)};
     fin { dnit(?x); }
     var err_failed: err[allocator.Error] = calls.of(m, ?x.calls);
     if (!(sel err_failed.err)) { err_failed = calls.groups(a, m, ?x.calls, ?x.groups); }
     if (!(sel err_failed.err)) { err_failed = slice.fill[usize](?x.sizes, m.functions.len, UNSIZED); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[usize](?x.raw, m.functions.len, UNSIZED); }
+    if (!(sel err_failed.err)) { err_failed = slice.fill[bool](?x.carried, m.functions.len, false); }
     if (sel err_failed.err)    { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_failed.err}}; }
+    val err_heated: err[refusal.Error] = heat(c, ?x);
+    if (sel err_heated.err) { ret res[bool, refusal.Error].err{err_heated.err}; }
     var chosen: vector.Vector[Chosen] = vector.init[Chosen](a);
     fin { vector.dnit[Chosen](?chosen); }
     var any: bool  = false;
