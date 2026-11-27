@@ -10,17 +10,24 @@
 # taken when a listed store's place is exactly its own (`must`), the store wrote a value of the load's type and of
 # its secrecy, both are plain, and the type is a scalar: an integer, a float, a pointer or a vector.
 #
-# a block entered by exactly one edge starts from the list its predecessor ends with, and every other block starts
-# empty. that is sound because the edge is the only way into the block: every run of its first instruction comes
-# straight from the predecessor's terminator, whose own effect the predecessor's walk has already applied, so no
-# instruction runs between the end of the predecessor and the start of the block, and an edge passes values, never
-# memory. a store the list holds at the block's start therefore wrote its bytes on every path to that start with
-# nothing since that may write them, and the value it wrote is defined in the predecessor, which dominates the
-# block, so the load it replaces sees that value. a block entered by two edges or more, or by a back edge, which a
-# reverse postorder walk has not ended yet, starts empty, as a join's paths may write differently. the predecessor
-# comes first in reverse postorder, since it dominates the block. this is the copy of a call the inliner expands:
-# its return block stores the result's case into the slot the result is built in and branches to the block that
-# continues the caller, whose test of the case loads it straight back.
+# a block starts from what the lists its predecessors end with agree on, when every edge into it leaves a block the
+# walk has already ended, and empty otherwise: a block a back edge enters starts empty, since the walk has not ended
+# that edge's source. every run of a block's first instruction comes straight from the terminator of one of its
+# predecessors, whose own effect that predecessor's walk has already applied, so no instruction runs between the end of
+# a predecessor and the start of the block, and an edge passes values, never memory. a block whose edges all leave one
+# predecessor starts from that predecessor's list as it is: a store it holds wrote its bytes on every path to the
+# block's start with nothing since that may write them, and the value it wrote is available at the end of the
+# predecessor, which dominates the block. a block entered from two predecessors or more starts with a place only where
+# every predecessor's list holds a store of exactly that place (`must`) whose value has one type and one secrecy: on
+# every path the bytes hold the value the predecessor the path leaves stored. where all those values are one value the
+# block takes it as it is. otherwise a load the block reads them by becomes a new parameter of the block, each edge
+# passing the value its source's store wrote, which is available at that source's end, so on every path the parameter
+# is what the bytes hold. the parameter is made only when a load is taken, once per such place. the place's offset
+# bounds (`Place.starts`) are the hull of the predecessors' bounds, each true on the paths through its own
+# predecessor. this is the copy of a call the inliner expands: each of its return blocks stores the result's case into
+# the slot the result is built in, as a constant, and branches to the block that continues the caller, whose test of
+# the case loads it straight back. the load becomes a parameter each return passes a constant, and jump threading
+# (`mirl.opt.thread`) takes each edge straight to the arm the constant decides.
 #
 # an aggregate is never forwarded, since no value of one is in hand: the aggregate legalisation holds it as its
 # leaves or in a slot of its own, and moves a load whose only use is a store from memory to memory. forwarding one
@@ -48,6 +55,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.view.View;
 
 use std.allocator;
 use std.collections.map;
@@ -61,21 +69,26 @@ use mirl.ir.cfg.dominance.Dominance;
 use mirl.ir.cfg.graph;
 use mirl.ir.cfg.graph.Graph;
 use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Function;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.NO_INSTRUCTION;
 use mirl.ir.id.Value;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.module;
+use mirl.ir.module.Error;
 use mirl.ir.opcode.table;
 use type_table: mirl.ir.type.table;
 use mirl.ir.type.table.Type;
 use mirl.ir.type.table.same;
+use mirl.ir.value.Declaration;
 use mirl.pass.analysis;
 use mirl.pass.analysis.memory;
 use mirl.pass.analysis.memory.Alias;
 use mirl.pass.analysis.memory.Effect;
 use mirl.pass.analysis.memory.Memory;
 use mirl.pass.analysis.memory.Place;
+use mirl.pass.analysis.memory.Span;
 use mirl.pass.record.Context;
 use mirl.pass.record.Kind;
 use mirl.pass.record.Pass;
@@ -85,16 +98,71 @@ use mirl.pass.record.Unit;
 use mirl.pass.refusal;
 use mirl.pass.refusal.edit;
 
-# the pass: it removes loads in place and changes no edge
+# the pass: it removes loads in place, adds a parameter to a block and an argument to each edge into it, and changes no
+# edge
 pub val FORWARD: Pass = Pass{name: "forward", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_MEMORY | analysis.OF_GRAPH | analysis.OF_DOMINANCE, preserves: analysis.FLOW, time: Time.breaks{}};
 
 # a store whose bytes still hold what it wrote
 # ---
 # place: where it wrote
-# value: what it wrote
+# value: what it wrote, where `join` is none
+# join:  the join that gives what the stores of a block's predecessors wrote, by its position in `Walk.joins`, none
+#        for a store's own value
 rec Held {
     place: Place;
     value: Value;
+    join:  u32;
+}
+
+# no join
+val NO_JOIN: u32 = 0xffffffff;
+
+# the stores of a block's predecessors at one place, which a load in the block reads as a parameter of the block
+# ---
+# block:  the block
+# first:  where the values each edge into the block passes start in `Walk.incoming`, one per entry of the block's
+#         predecessor list and in its order
+# type:   the type of every value
+# secret: the secrecy of every value
+# made:   the parameter is made
+# value:  the parameter, where it is made
+rec Join {
+    block:  Block;
+    first:  usize;
+    type:   Type;
+    secret: bool;
+    made:   bool;
+    value:  Value;
+}
+
+# the list a block ends with, kept for the blocks that start from it
+# ---
+# held: the stores
+# left: how many of those blocks have not started from it yet
+rec Saved {
+    held: vector.Vector[Held];
+    left: u32;
+}
+
+# one run over a function
+# ---
+# c, mem, b, f: the context, the memory analysis, the body and the function
+# g, d:         the graph and the dominance, valid for the whole run, since the pass changes no edge
+# held:     the stores the block being walked holds
+# saved:    the lists of the blocks ended so far that a block not yet started will start from
+# joins:    every join made so far
+# incoming: the values the edges of each join pass
+rec Walk {
+    c:        *Context;
+    mem:      *Memory;
+    b:        *Body;
+    f:        Function;
+    g:        *Graph;
+    d:        *Dominance;
+    held:     vector.Vector[Held];
+    saved:    map.Map[u32, Saved];
+    joins:    vector.Vector[Join];
+    incoming: vector.Vector[Value];
 }
 
 # whether an instruction is a plain access: not volatile, kept or ordered
@@ -130,90 +198,260 @@ fun scalar(c: *Context, ty: Type) bool {
     ret !(sel res_kind.ok.structure || sel res_kind.ok.array || sel res_kind.ok.union);
 }
 
-# the value a held store gives the load at `place` of `ty` and secrecy `secret`, none where none does
-fun given(b: *Body, held: *vector.Vector[Held], place: Place, result: Value) opt[Value] {
+# the value of a held store, making its join's parameter when it has none yet
+fun value_of(w: *Walk, h: *Held) res[Value, refusal.Error] {
+    if (h.join == NO_JOIN) { ret res[Value, refusal.Error].ok{h.value}; }
+    val j: *Join = ?w.joins.data[h.join];
+    if (j.made) { ret res[Value, refusal.Error].ok{j.value}; }
+    val count:    usize             = w.b.blocks.data[j.block].predecessors.len;
+    val incoming: Slice[Value]      = Slice[Value]{data: ?w.incoming.data[j.first], size: count};
+    val res_made: res[Value, Error] = body.add_parameter(w.c.m, w.f, j.block, Declaration{type: j.type, secret: j.secret, name: opt[View].none{}}, incoming);
+    if (sel res_made.err) { ret res[Value, refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+    val k: *Join = ?w.joins.data[h.join];
+    k.made  = true;
+    k.value = res_made.ok;
+    ret res[Value, refusal.Error].ok{res_made.ok};
+}
+
+# the type and secrecy of what a held store wrote
+fun typed(w: *Walk, h: *Held, ty: *Type, secret: *bool) {
+    if (h.join == NO_JOIN) {
+        @ty     = w.b.values.data[h.value].type;
+        @secret = w.b.values.data[h.value].secret;
+        ret;
+    }
+    @ty     = w.joins.data[h.join].type;
+    @secret = w.joins.data[h.join].secret;
+}
+
+# the value a held store gives the load at `place` whose result is `result`, none where none does
+fun given(w: *Walk, place: Place, result: Value) res[opt[Value], refusal.Error] {
     var k: usize = 0;
-    for (k < held.len) {
-        val al: Alias = memory.alias(held.data[k].place, place);
+    for (k < w.held.len) {
+        val al: Alias = memory.alias(w.held.data[k].place, place);
         if (sel al.must) {
-            val v: Value = held.data[k].value;
-            if (same(b.values.data[v].type, b.values.data[result].type) && b.values.data[v].secret == b.values.data[result].secret) { ret opt[Value].some{v}; }
+            var ty:     Type = w.b.values.data[result].type;
+            var secret: bool = false;
+            typed(w, ?w.held.data[k], ?ty, ?secret);
+            if (same(ty, w.b.values.data[result].type) && secret == w.b.values.data[result].secret) {
+                val res_value: res[Value, refusal.Error] = value_of(w, ?w.held.data[k]);
+                if (sel res_value.err) { ret res[opt[Value], refusal.Error].err{res_value.err}; }
+                ret res[opt[Value], refusal.Error].ok{opt[Value].some{res_value.ok}};
+            }
         }
         k = k + 1;
     }
-    ret opt[Value].none{};
+    ret res[opt[Value], refusal.Error].ok{opt[Value].none{}};
 }
 
-# forward the stores `held` lists and those of one block to its loads, answering whether a load went
-fun block(c: *Context, mem: *Memory, b: *Body, held: *vector.Vector[Held], first: Instruction) res[bool, refusal.Error] {
+# forward the stores `w.held` lists and those of one block to its loads, answering whether a load went
+fun block(w: *Walk, first: Instruction) res[bool, refusal.Error] {
+    val b:       *Body       = w.b;
     var changed: bool        = false;
     var i:       Instruction = first;
     for (i != NO_INSTRUCTION) {
         val next:       Instruction                = b.instructions.data[i].next;
         val d:          *InstructionData           = ?b.instructions.data[i];
-        var res_effect: res[Effect, refusal.Error] = memory.effect_of(mem, i);
+        var res_effect: res[Effect, refusal.Error] = memory.effect_of(w.mem, i);
         if (sel res_effect.err) { ret res[bool, refusal.Error].err{res_effect.err}; }
-        var e:     Effect = res_effect.ok;
-        var taken: bool   = false;
-        if (d.opcode == table.LOAD && d.results.len == 1 && scalar(c, b.values.data[d.results.data[0]].type) && e.places.len == 1 && e.places.data[0].sized && plain(d, ?e)) {
-            val result:    Value      = d.results.data[0];
-            val opt_given: opt[Value] = given(b, held, e.places.data[0], result);
-            if (sel opt_given.some) {
-                val err_replaced: err[refusal.Error] = edit(body.replace(c.m, mem.f, result, opt_given.some, Records.follow{}));
-                if (sel err_replaced.err) {
-                    memory.dnit(?e);
-                    ret res[bool, refusal.Error].err{err_replaced.err};
-                }
-                val err_erased: err[refusal.Error] = edit(body.erase(c.m, mem.f, i));
-                if (sel err_erased.err) {
-                    memory.dnit(?e);
-                    ret res[bool, refusal.Error].err{err_erased.err};
-                }
+        var e: Effect = res_effect.ok;
+        fin { memory.dnit(?e); }
+        var taken: bool = false;
+        if (d.opcode == table.LOAD && d.results.len == 1 && scalar(w.c, b.values.data[d.results.data[0]].type) && e.places.len == 1 && e.places.data[0].sized && plain(d, ?e)) {
+            val result:    Value                          = d.results.data[0];
+            val res_given: res[opt[Value], refusal.Error] = given(w, e.places.data[0], result);
+            if (sel res_given.err) { ret res[bool, refusal.Error].err{res_given.err}; }
+            if (sel res_given.ok.some) {
+                val err_replaced: err[refusal.Error] = edit(body.replace(w.c.m, w.f, result, res_given.ok.some, Records.follow{}));
+                if (sel err_replaced.err) { ret res[bool, refusal.Error].err{err_replaced.err}; }
+                val err_erased: err[refusal.Error] = edit(body.erase(w.c.m, w.f, i));
+                if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
                 taken   = true;
                 changed = true;
             }
         }
         if (!taken) {
-            written(held, ?e);
+            written(?w.held, ?e);
             if (d.opcode == table.STORE && d.operands.len == 2 && e.places.len == 1 && e.places.data[0].sized && plain(d, ?e)) {
-                val res_pushed: res[usize, allocator.Error] = vector.push[Held](held, Held{place: e.places.data[0], value: d.operands.data[1]});
-                if (sel res_pushed.err) {
-                    memory.dnit(?e);
-                    ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}};
-                }
+                val res_pushed: res[usize, allocator.Error] = vector.push[Held](?w.held, Held{place: e.places.data[0], value: d.operands.data[1], join: NO_JOIN});
+                if (sel res_pushed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
             }
         }
-        memory.dnit(?e);
         i = next;
     }
     ret res[bool, refusal.Error].ok{changed};
 }
 
-# the list a block ends with, kept for the blocks it is the one way into
-# ---
-# held: the stores
-# left: how many of those blocks have not started from it yet
-rec Saved {
-    held: vector.Vector[Held];
-    left: u32;
+# whether the walk has ended every block an edge into `n` leaves before it starts `n`: each is reached and comes
+# before `n` in reverse postorder, so no back edge enters `n`
+fun ready(w: *Walk, n: u32) bool {
+    val preds: Slice[u32] = graph.predecessors(w.g, n);
+    if (preds.size == 0) { ret false; }
+    var k: usize = 0;
+    for (k < preds.size) {
+        val p: u32 = preds.data[k];
+        if (!dominance.reachable(w.d, p) || dominance.rank(w.d, p) >= dominance.rank(w.d, n)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
 }
 
-# whether a block is entered by exactly one edge, which is not its own
-fun one_way_in(g: *Graph, n: u32) bool {
-    val preds: Slice[u32] = graph.predecessors(g, n);
-    ret preds.size == 1 && preds.data[0] != n;
+# whether `n` appears in `list` before position `upto`
+fun listed(list: Slice[u32], upto: usize, n: u32) bool {
+    var k: usize = 0;
+    for (k < upto) {
+        if (list.data[k] == n) { ret true; }
+        k = k + 1;
+    }
+    ret false;
 }
 
-# how many of a block's successors it is the one way into
-fun ways_out(g: *Graph, n: u32) u32 {
-    val succs: Slice[u32] = graph.successors(g, n);
+# how many distinct blocks start from the list a block ends with
+fun ways_out(w: *Walk, n: u32) u32 {
+    val succs: Slice[u32] = graph.successors(w.g, n);
     var count: u32        = 0;
     var k:     usize      = 0;
     for (k < succs.size) {
-        if (one_way_in(g, succs.data[k])) { count = count + 1; }
+        if (!listed(succs, k, succs.data[k]) && ready(w, succs.data[k])) { count = count + 1; }
         k = k + 1;
     }
     ret count;
+}
+
+# the list a block ended with, which it must have kept
+fun saved_of(w: *Walk, n: u32) *Saved {
+    var key:       u32         = n;
+    val opt_saved: opt[*Saved] = map.get[u32, Saved](?w.saved, ?key);
+    if (sel opt_saved.some) { ret opt_saved.some; }
+    ret nil;
+}
+
+# the value a held store wrote where it is in hand, none for a join whose parameter is not made, which a later join
+# does not read, so a join no load takes makes no parameter
+fun concrete(w: *Walk, h: *Held) opt[Value] {
+    if (h.join == NO_JOIN)         { ret opt[Value].some{h.value}; }
+    if (w.joins.data[h.join].made) { ret opt[Value].some{w.joins.data[h.join].value}; }
+    ret opt[Value].none{};
+}
+
+# a held store of a list at exactly `place` whose value is in hand and has a type and secrecy, none where the list
+# holds none
+fun matching(w: *Walk, list: *vector.Vector[Held], place: Place, ty: Type, secret: bool) opt[usize] {
+    var k: usize = 0;
+    for (k < list.len) {
+        val al:     Alias      = memory.alias(list.data[k].place, place);
+        val opt_in: opt[Value] = concrete(w, ?list.data[k]);
+        if (sel al.must && sel opt_in.some) {
+            var t: Type = ty;
+            var s: bool = false;
+            typed(w, ?list.data[k], ?t, ?s);
+            if (same(t, ty) && s == secret) { ret opt[usize].some{k}; }
+        }
+        k = k + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the hull of two offset bounds, none where either is none
+fun hull(a: opt[Span], b: opt[Span]) opt[Span] {
+    if (sel a.none) { ret opt[Span].none{}; }
+    if (sel b.none) { ret opt[Span].none{}; }
+    var lo: i128 = a.some.lo;
+    var hi: i128 = a.some.hi;
+    if (b.some.lo < lo) { lo = b.some.lo; }
+    if (b.some.hi > hi) { hi = b.some.hi; }
+    ret opt[Span].some{Span{lo: lo, hi: hi}};
+}
+
+# start block `n` from what the lists of its predecessors agree on, into `w.held`, emptied first
+fun start(w: *Walk, n: u32) err[refusal.Error] {
+    vector.truncate[Held](?w.held, 0);
+    if (!ready(w, n)) { ret err[refusal.Error].ok{}; }
+    val preds: Slice[u32] = graph.predecessors(w.g, n);
+    var one:   bool       = true;
+    var k:     usize      = 1;
+    for (k < preds.size) {
+        if (preds.data[k] != preds.data[0]) { one = false; }
+        k = k + 1;
+    }
+    if (one) {
+        val err_copied: err[allocator.Error] = copy(?w.held, ?saved_of(w, preds.data[0]).held);
+        if (sel err_copied.err) { ret err[refusal.Error].err{refusal.Error.alloc{err_copied.err}}; }
+        ret err[refusal.Error].ok{};
+    }
+    val entries: *vector.Vector[Instruction] = ?w.b.blocks.data[n].predecessors;
+    val first:   *vector.Vector[Held]        = ?saved_of(w, preds.data[0]).held;
+    var h:       usize                       = 0;
+    for (h < first.len) {
+        val opt_own: opt[Value] = concrete(w, ?first.data[h]);
+        if (sel opt_own.none) {
+            h = h + 1;
+            cnt;
+        }
+        val place:  Place = first.data[h].place;
+        var ty:     Type  = w.b.values.data[0].type;
+        var secret: bool  = false;
+        typed(w, ?first.data[h], ?ty, ?secret);
+        var all:    bool      = true;
+        var starts: opt[Span] = place.starts;
+        k = 1;
+        for (k < preds.size && all) {
+            val opt_at: opt[usize] = matching(w, ?saved_of(w, preds.data[k]).held, place, ty, secret);
+            if (sel opt_at.none) { all = false; }
+            or                   { starts = hull(starts, saved_of(w, preds.data[k]).held.data[opt_at.some].place.starts); }
+            k = k + 1;
+        }
+        if (all) {
+            val at:   usize = w.incoming.len;
+            var same: bool  = true;
+            var e:    usize = 0;
+            for (e < entries.len) {
+                val spot: *InstructionData = ?w.b.instructions.data[entries.data[e]];
+                if (!(sel spot.place.placed)) { ret err[refusal.Error].err{refusal.Error.reason{"an edge into a block from an instruction placed in no block"}}; }
+                val list:   *vector.Vector[Held] = ?saved_of(w, spot.place.placed).held;
+                val opt_at: opt[usize]           = matching(w, list, place, ty, secret);
+                if (sel opt_at.none) { ret err[refusal.Error].err{refusal.Error.reason{"a predecessor's list lost a place it held"}}; }
+                val opt_value: opt[Value] = concrete(w, ?list.data[opt_at.some]);
+                if (sel opt_value.none)                             { ret err[refusal.Error].err{refusal.Error.reason{"a predecessor's list lost a value it held"}}; }
+                if (e > 0 && opt_value.some != w.incoming.data[at]) { same = false; }
+                val res_pushed: res[usize, allocator.Error] = vector.push[Value](?w.incoming, opt_value.some);
+                if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+                e = e + 1;
+            }
+            var joined: Place = place;
+            joined.starts = starts;
+            var held: Held = Held{place: joined, value: w.incoming.data[at], join: NO_JOIN};
+            if (same) { vector.truncate[Value](?w.incoming, at); }
+            or {
+                held.join = w.joins.len::u32;
+                val res_join: res[usize, allocator.Error] = vector.push[Join](?w.joins, Join{block: n, first: at, type: ty, secret: secret, made: false, value: held.value});
+                if (sel res_join.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_join.err}}; }
+            }
+            val res_pushed: res[usize, allocator.Error] = vector.push[Held](?w.held, held);
+            if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
+        }
+        h = h + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# give back what the blocks that started from a block's list took of it, freeing it when the last has
+fun release(w: *Walk, n: u32) {
+    if (!ready(w, n)) { ret; }
+    val preds: Slice[u32] = graph.predecessors(w.g, n);
+    var k:     usize      = 0;
+    for (k < preds.size) {
+        if (!listed(preds, k, preds.data[k])) {
+            var key: u32    = preds.data[k];
+            val s:   *Saved = saved_of(w, key);
+            s.left = s.left - 1;
+            if (s.left == 0) {
+                vector.dnit[Held](?s.held);
+                map.remove[u32, Saved](?w.saved, ?key);
+            }
+        }
+        k = k + 1;
+    }
 }
 
 # copy a list into another, emptied first
@@ -228,68 +466,53 @@ fun copy(into: *vector.Vector[Held], from: *vector.Vector[Held]) err[allocator.E
     ret err[allocator.Error].ok{};
 }
 
-fun saved_dnit(saved: *map.Map[u32, Saved], order: Slice[u32]) {
+fun walk_dnit(w: *Walk, order: Slice[u32]) {
     var k: usize = 0;
     for (k < order.size) {
-        var key:       u32         = order.data[k];
-        val opt_saved: opt[*Saved] = map.get[u32, Saved](saved, ?key);
-        if (sel opt_saved.some) { vector.dnit[Held](?opt_saved.some.held); }
+        val s: *Saved = saved_of(w, order.data[k]);
+        if (s != nil) { vector.dnit[Held](?s.held); }
         k = k + 1;
     }
-    map.dnit[u32, Saved](saved);
+    map.dnit[u32, Saved](?w.saved);
+    vector.dnit[Held](?w.held);
+    vector.dnit[Join](?w.joins);
+    vector.dnit[Value](?w.incoming);
 }
 
-# forward the stores of each reachable block of one function, in reverse postorder, a block entered by one edge
-# starting from the list its predecessor ended with
+# forward the stores of each reachable block of one function, in reverse postorder, each block starting from what
+# the lists of its predecessors agree on
 fun visit(u: *Unit) res[bool, refusal.Error] {
     val c:        *Context                 = u.context;
     val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
     if (sel res_body.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_body.err}}; }
-    val b:             *Body                       = res_body.ok;
     val res_memory_of: res[*Memory, refusal.Error] = analysis.memory_of(c.cache, u.f);
     if (sel res_memory_of.err) { ret res[bool, refusal.Error].err{res_memory_of.err}; }
     val res_graph_of: res[*Graph, refusal.Error] = analysis.graph_of(c.cache, u.f);
     if (sel res_graph_of.err) { ret res[bool, refusal.Error].err{res_graph_of.err}; }
     val res_dominance_of: res[*Dominance, refusal.Error] = analysis.dominance_of(c.cache, u.f);
     if (sel res_dominance_of.err) { ret res[bool, refusal.Error].err{res_dominance_of.err}; }
-    val g:     *Graph              = res_graph_of.ok;
-    val order: Slice[u32]          = dominance.order(res_dominance_of.ok);
-    var held:  vector.Vector[Held] = vector.init[Held](c.m.a);
-    var saved: map.Map[u32, Saved] = map.init[u32, Saved](c.m.a);
-    fin {
-        vector.dnit[Held](?held);
-        saved_dnit(?saved, order);
-    }
+    var w:     Walk       = Walk{c: c, mem: res_memory_of.ok, b: res_body.ok, f: u.f, g: res_graph_of.ok, d: res_dominance_of.ok, held: vector.init[Held](c.m.a), saved: map.init[u32, Saved](c.m.a), joins: vector.init[Join](c.m.a), incoming: vector.init[Value](c.m.a)};
+    val order: Slice[u32] = dominance.order(w.d);
+    fin { walk_dnit(?w, order); }
     var changed: bool  = false;
     var k:       usize = 0;
     for (k < order.size) {
-        val n: u32 = order.data[k];
-        vector.truncate[Held](?held, 0);
-        if (one_way_in(g, n)) {
-            var from:      u32         = graph.predecessors(g, n).data[0];
-            val opt_saved: opt[*Saved] = map.get[u32, Saved](?saved, ?from);
-            if (sel opt_saved.some) {
-                val err_copied: err[allocator.Error] = copy(?held, ?opt_saved.some.held);
-                if (sel err_copied.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_copied.err}}; }
-                opt_saved.some.left = opt_saved.some.left - 1;
-                if (opt_saved.some.left == 0) {
-                    vector.dnit[Held](?opt_saved.some.held);
-                    map.remove[u32, Saved](?saved, ?from);
-                }
-            }
-        }
-        val res_block: res[bool, refusal.Error] = block(c, res_memory_of.ok, b, ?held, b.blocks.data[n].first);
+        val n:         u32                = order.data[k];
+        val err_start: err[refusal.Error] = start(?w, n);
+        if (sel err_start.err) { ret res[bool, refusal.Error].err{err_start.err}; }
+        release(?w, n);
+        val res_block: res[bool, refusal.Error] = block(?w, w.b.blocks.data[n].first);
         if (sel res_block.err) { ret res_block; }
         if (res_block.ok)      { changed = true; }
-        val left: u32 = ways_out(g, n);
+        val left: u32 = ways_out(?w, n);
         if (left > 0) {
             var kept:       vector.Vector[Held]  = vector.init[Held](c.m.a);
-            val err_copied: err[allocator.Error] = copy(?kept, ?held);
+            val err_copied: err[allocator.Error] = copy(?kept, ?w.held);
             if (sel err_copied.err) {
                 vector.dnit[Held](?kept);
                 ret res[bool, refusal.Error].err{refusal.Error.alloc{err_copied.err}};
             }
-            val res_set: res[bool, allocator.Error] = map.insert[u32, Saved](?saved, n, Saved{held: kept, left: left});
+            val res_set: res[bool, allocator.Error] = map.insert[u32, Saved](?w.saved, n, Saved{held: kept, left: left});
             if (sel res_set.err) {
                 vector.dnit[Held](?kept);
                 ret res[bool, refusal.Error].err{refusal.Error.alloc{res_set.err}};
