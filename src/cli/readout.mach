@@ -1,0 +1,652 @@
+# what a command writes for a person while it runs, in the toolchain's one output language:
+# a result on stdout for what it did, the same at every level; under -v a log line on stderr for
+# each stage as it closes, and under -vv a line for each function a stage finished and the
+# target's facts; each diagnostic a block on stderr with a blank line owed after it; and on a
+# terminal a live line saying what runs now
+#
+# a log line is a stamp, the seconds since the command began to a hundredth, then the stage's
+# label in LABEL_W columns, its time right-aligned in TIME_W, and what it did:
+#
+#   [  0.07] select      2.4ms  41 functions
+#
+# an item's line is indented two inside the label's column and names the function after its
+# time. a fact sits at FACT_LEAD, its key in FACT_KEY_W columns. the live line takes a log line's
+# columns with the stamp left blank, and is drawn only where stderr is a terminal whose TERM is
+# set and not `dumb`: redrawn every LIVE_PERIOD when it changes, cut to the terminal's width, and
+# erased before anything else is written on either stream. a blank line owed after a diagnostic
+# is written before whatever is written next on either stream, and dropped when nothing is.
+#
+# the library's stages reach the readout through the progress hooks of mirl.base.stats; the
+# command's own stages, reading the file, settling the target and writing the output, through
+# begin and end. mach's `doc/language/readout.md` is the contract, and mirl's lines read as
+# mach's do.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use std.chrono.duration.Duration;
+use std.chrono.time;
+use std.chrono.time.Instant;
+use fs: std.filesystem;
+use std.format;
+use io: std.io.writer;
+use std.process.env;
+use std.sync.condition;
+use std.sync.mutex;
+use std.sync.thread;
+use std.terminal;
+
+use mirl.base.stats;
+use mirl.base.stats.Progress;
+use mirl.base.stats.Stage;
+use mirl.base.stats.Stats;
+use mirl.cli.layout;
+
+# the levels -v sets: results alone, then a log line per stage, then a line per item and the
+# target's facts
+pub val RESULTS: u8 = 0;
+pub val STAGES:  u8 = 1;
+pub val ITEMS:   u8 = 2;
+
+# the columns of a log line: the label's, the time's, where a fact starts and its key's, and the
+# stamp's with its brackets and the space after
+val LABEL_W:    usize = 11;
+val TIME_W:     usize = 6;
+val FACT_LEAD:  usize = 28;
+val FACT_KEY_W: usize = 12;
+val STAMP_W:    usize = 9;
+
+# how often the live line is redrawn, which is also how long a stage runs before it shows
+val LIVE_PERIOD: Duration = 50000000;
+
+# the most bytes of the live line kept, of the name it shows, and the width a terminal is taken
+# to have when COLUMNS names none
+val LIVE_LINE:    usize = 320;
+val LIVE_NAME:    usize = 256;
+val LIVE_COLUMNS: usize = 80;
+
+# one of the library's stages while the readout follows it
+# ---
+# open:  it opened and has not closed
+# from:  when it opened, none when the clock refused
+# total: the items it opened to finish, 0 for a stage that works whole
+# done:  the items it finished
+rec Row {
+    open:  bool;
+    from:  opt[Instant];
+    total: u32;
+    done:  u32;
+}
+
+# a command's readout, made in place by `init`, as its writers and hooks point into it, and
+# closed by `close`
+# ---
+# level:     RESULTS, STAGES or ITEMS, as -v and -vv set it
+# origin:    when the command began, which a stamp and a result's time count from
+# err:       stderr for log lines
+# diag:      stderr for diagnostics, each write of which opens a block
+# out:       stdout for results and the command's output
+# unwritten: the first write stdout refused, which fails the command at its close
+# progress:  the hooks the library calls, pointing back at the readout
+# stats:     the compilation's sink the readout follows, nil while it follows none
+# rows:      the library's stages, indexed by mirl.base.stats.index
+#
+# the console both streams share with the live line: `lock` serialises their writes, the live
+# slot and the drawer; `err_bare` and `out_bare` say the last byte written to stderr, and to
+# stdout, ended a line; `open` that a diagnostic's block is being written; `owed` that a blank
+# line is owed before the next write
+#
+# the live line: its label, nil when nothing runs, when it began, its count, the name it shows,
+# whether the drawer runs and is told to stop, what wakes it, its thread, the terminal's width
+# and the line on screen, none when shown_len is 0
+pub rec Readout {
+    level:     u8;
+    origin:    opt[Instant];
+    err:       io.Writer;
+    diag:      io.Writer;
+    out:       io.Writer;
+    unwritten: opt[io.WriteError];
+    progress:  Progress;
+    stats:     *Stats;
+    rows:      [stats.STAGE_COUNT]Row;
+    lock:      mutex.Mutex;
+    err_bare:  bool;
+    out_bare:  bool;
+    out_tty:   bool;
+    open:      bool;
+    owed:      bool;
+    label:     str;
+    started:   opt[Instant];
+    done:      u32;
+    total:     u32;
+    name:      [LIVE_NAME]u8;
+    name_len:  usize;
+    drawing:   bool;
+    stop:      bool;
+    wake:      condition.Condition;
+    drawer:    thread.Thread;
+    width:     usize;
+    shown:     [LIVE_LINE]u8;
+    shown_len: usize;
+}
+
+# the instant now, none when the clock refused
+pub fun sample() opt[Instant] {
+    val res_now: time.InstantClock = time.instant();
+    if (sel res_now.ok) { ret opt[Instant].some{res_now.ok}; }
+    ret opt[Instant].none{};
+}
+
+# the time since `from`, zero when either read is absent
+pub fun since(from: opt[Instant]) Duration {
+    if (sel from.none) { ret 0; }
+    val res_now: time.InstantClock = time.instant();
+    if (sel res_now.err) { ret 0; }
+    ret time.instant_sub(res_now.ok, from.some);
+}
+
+# start a readout in place, its command beginning now
+# ---
+# rd:    the readout, which stays where it is until `close`
+# level: RESULTS, STAGES or ITEMS
+pub fun init(rd: *Readout, level: u8) {
+    rd.level     = level;
+    rd.origin    = sample();
+    rd.err       = io.Writer{ctx: rd::ptr, fn_write: err_write};
+    rd.diag      = io.Writer{ctx: rd::ptr, fn_write: diag_write};
+    rd.out       = io.Writer{ctx: rd::ptr, fn_write: out_write};
+    rd.unwritten = opt[io.WriteError].none{};
+    rd.progress  = Progress{ctx: rd::ptr, opened: opened, grew: grew, begun: begun, finished: finished, closed: closed};
+    rd.stats     = nil;
+    var i: usize = 0;
+    for (i < stats.STAGE_COUNT) {
+        rd.rows[i] = Row{open: false, from: opt[Instant].none{}, total: 0, done: 0};
+        i          = i + 1;
+    }
+    rd.lock      = mutex.make();
+    rd.err_bare  = true;
+    rd.out_bare  = true;
+    rd.out_tty   = false;
+    rd.open      = false;
+    rd.owed      = false;
+    rd.label     = nil;
+    rd.started   = opt[Instant].none{};
+    rd.done      = 0;
+    rd.total     = 0;
+    rd.name_len  = 0;
+    rd.drawing   = false;
+    rd.stop      = false;
+    rd.wake      = condition.make();
+    rd.width     = LIVE_COLUMNS;
+    rd.shown_len = 0;
+}
+
+# the readout is done: the live line stopped and erased
+pub fun close(rd: *Readout) {
+    if (!rd.drawing) { ret; }
+    mutex.lock(?rd.lock);
+    rd.stop = true;
+    condition.signal(?rd.wake);
+    mutex.unlock(?rd.lock);
+    val err_joined: thread.Operation = thread.join(?rd.drawer);
+    mutex.lock(?rd.lock);
+    erase(rd);
+    mutex.unlock(?rd.lock);
+    rd.drawing = false;
+}
+
+# follow a compilation's stats: the library calls the readout's hooks as it runs, and the
+# readout reads the stats when a stage closes
+pub fun follow(rd: *Readout, s: *Stats) {
+    rd.stats   = s;
+    s.progress = opt[*Progress].some{?rd.progress};
+}
+
+# the time since the command began, a result's `time`
+pub fun elapsed(rd: *Readout) Duration {
+    ret since(rd.origin);
+}
+
+# one of the command's own stages begins: the live line shows it running from now
+# ---
+# rd:    the readout
+# label: the stage, a word of at most LABEL_W bytes, which outlives the stage
+# ret:   when it began, which `end` measures from
+pub fun begin(rd: *Readout, label: str) opt[Instant] {
+    val from: opt[Instant] = sample();
+    live(rd, label, from, 0, 0, View{data: nil, len: 0});
+    ret from;
+}
+
+# one of the command's own stages closed: the live line goes, and under -v its log line
+# ---
+# rd:     the readout
+# label:  the stage
+# from:   what `begin` gave
+# detail: what it did, as `41 functions`, nil for nothing
+pub fun end(rd: *Readout, label: str, from: opt[Instant], detail: str) {
+    unlive(rd);
+    if (rd.level < STAGES) { ret; }
+    var t: layout.Text;
+    line(rd, false, label, layout.took(?t, since(from)), detail);
+}
+
+# one of the target's facts beneath its log line, under -vv: its key in a column, then its value
+pub fun fact(rd: *Readout, key: str, value: View) {
+    if (rd.level < ITEMS) { ret; }
+    layout.spaces(?rd.err, FACT_LEAD);
+    layout.left(?rd.err, key, FACT_KEY_W);
+    format.write_bytes(?rd.err, value.data::*u8, value.len);
+    format.write_newline(?rd.err);
+}
+
+# a result on stdout, the same at every level: its verb and what it acted on, then its fields
+# ---
+# rd:      the readout
+# v:       what was done
+# subject: what it was done to, a path dropping its leading `./`
+# fields:  the result's fields in the order they show, n of them, one with nothing left out
+pub fun result(rd: *Readout, v: layout.Verb, subject: str, fields: *layout.Field, n: usize) {
+    layout.result(?rd.out, v, shown_path(subject), fields, n);
+}
+
+# a path as a result shows it, its leading `./` dropped
+pub fun shown_path(p: str) str {
+    if (p != nil && p[0] == '.' && p[1] == '/' && p[2] != 0) { ret ?p[2]; }
+    ret p;
+}
+
+# a diagnostic's block is whole: a blank line is owed before whatever is written next
+pub fun settled(rd: *Readout) {
+    mutex.lock(?rd.lock);
+    if (rd.open) {
+        rd.open = false;
+        rd.owed = true;
+    }
+    mutex.unlock(?rd.lock);
+}
+
+# the first write stdout refused, none when it refused none
+pub fun refused(rd: *Readout) opt[io.WriteError] {
+    ret rd.unwritten;
+}
+
+# the label a library stage's log line and live line give it: the family's lowering rows and
+# the neutral passes are one schedule, which mach's readout calls `passes` too
+fun label_of(k: Stage) str {
+    if (sel k.lower)  { ret "passes"; }
+    or (sel k.verify) { ret "verify"; }
+    or (sel k.passes) { ret "passes"; }
+    or (sel k.select) { ret "select"; }
+    or (sel k.alloc)  { ret "alloc"; }
+    or (sel k.frame)  { ret "frame"; }
+    ret "emit";
+}
+
+fun opened(ctx: ptr, k: Stage, total: u32) {
+    val rd:  *Readout = ctx::*Readout;
+    val row: *Row     = ?rd.rows[stats.index(k)];
+    row.open  = true;
+    row.from  = sample();
+    row.total = total;
+    row.done  = 0;
+    if (total == 0) { live(rd, label_of(k), row.from, 0, 0, View{data: nil, len: 0}); }
+}
+
+fun grew(ctx: ptr, k: Stage, more: u32) {
+    val rd: *Readout = ctx::*Readout;
+    rd.rows[stats.index(k)].total = rd.rows[stats.index(k)].total + more;
+}
+
+fun begun(ctx: ptr, k: Stage, name: View) {
+    val rd:  *Readout = ctx::*Readout;
+    val row: *Row     = ?rd.rows[stats.index(k)];
+    live(rd, label_of(k), row.from, row.done, row.total, name);
+}
+
+fun finished(ctx: ptr, k: Stage, name: View, ns: u64) {
+    val rd:  *Readout = ctx::*Readout;
+    val row: *Row     = ?rd.rows[stats.index(k)];
+    row.done = row.done + 1;
+    if (rd.level < ITEMS) { ret; }
+    var t: layout.Text;
+    lead(rd, true, label_of(k), layout.nanoseconds(?t, ns));
+    if (name.len > 0) {
+        format.write_str(?rd.err, "  ");
+        format.write_bytes(?rd.err, name.data::*u8, name.len);
+    }
+    format.write_newline(?rd.err);
+}
+
+fun closed(ctx: ptr, k: Stage) {
+    val rd:  *Readout = ctx::*Readout;
+    val row: *Row     = ?rd.rows[stats.index(k)];
+    row.open = false;
+    rest(rd);
+    if (rd.level < STAGES || rd.stats == nil) { ret; }
+    val s: *Stats = rd.stats;
+    var t: layout.Text;
+    var c: layout.Text;
+    if (sel k.lower)  { ret; }
+    or (sel k.verify) { line(rd, false, "verify", layout.nanoseconds(?t, s.verify), layout.counted(?c, s.verified, "run", "runs")); }
+    or (sel k.passes) { line(rd, false, "passes", layout.nanoseconds(?t, s.lower + s.passes), functions(?c, s.functions)); }
+    or (sel k.select) { line(rd, false, "select", layout.nanoseconds(?t, s.select), functions(?c, row.done::u64)); }
+    or (sel k.alloc)  { line(rd, false, "alloc", layout.nanoseconds(?t, s.alloc), functions(?c, row.done::u64)); }
+    or (sel k.frame)  { line(rd, false, "frame", layout.nanoseconds(?t, s.frame), functions(?c, row.done::u64)); }
+    or {
+        # masc's layout and encoding are timed inside emission, and have lines of their own
+        val masc: u64 = s.masc.layout + s.masc.encode;
+        var own:  u64 = 0;
+        if (s.emit > masc) { own = s.emit - masc; }
+        line(rd, false, "emit", layout.nanoseconds(?t, own), functions(?c, row.done::u64));
+        if (s.masc.layout > 0) { line(rd, false, "layout", layout.nanoseconds(?t, s.masc.layout), nil); }
+        if (s.masc.encode > 0) { line(rd, false, "encode", layout.nanoseconds(?t, s.masc.encode), nil); }
+    }
+}
+
+# `n functions`, nil for none, which leaves the detail out
+fun functions(t: *layout.Text, n: u64) str {
+    if (n == 0) { ret nil; }
+    ret layout.counted(t, n, "function", "functions");
+}
+
+# a log line: its lead, then what the stage did
+fun line(rd: *Readout, item: bool, label: str, time: str, detail: str) {
+    lead(rd, item, label, time);
+    if (detail != nil) {
+        format.write_str(?rd.err, "  ");
+        format.write_str(?rd.err, detail);
+    }
+    format.write_newline(?rd.err);
+}
+
+# a log line's lead: the stamp, the label, an item's indented, and the time, each in its column
+fun lead(rd: *Readout, item: bool, label: str, time: str) {
+    val w: *io.Writer = ?rd.err;
+    stamp(w, since(rd.origin));
+    var used: usize = str_len(label);
+    if (item) {
+        format.write_str(w, "  ");
+        used = used + 2;
+    }
+    format.write_str(w, label);
+    if (used < LABEL_W) { layout.spaces(w, LABEL_W - used); }
+    layout.right(w, time, TIME_W);
+}
+
+# `[  0.07] `: a duration in seconds to two places, right-aligned in its brackets
+fun stamp(w: *io.Writer, d: Duration) {
+    var cs: u64 = 0;
+    if (d > 0) { cs = (d::u64 + 5000000) / 10000000; }
+    var t:  layout.Text;
+    var tw: io.Writer = layout.text_writer(?t);
+    format.write_u64(?tw, cs / 100);
+    format.write_byte(?tw, '.');
+    if (cs % 100 < 10) { format.write_byte(?tw, '0'); }
+    format.write_u64(?tw, cs % 100);
+    format.write_str(w, "[");
+    layout.right(w, layout.text_end(?t), STAMP_W - 3);
+    format.write_str(w, "] ");
+}
+
+# the live line shows `label` running since `from`, `done` of `total` and `name`, starting the
+# drawer on the first stage shown
+fun live(rd: *Readout, label: str, from: opt[Instant], done: u32, total: u32, name: View) {
+    if (!start(rd)) { ret; }
+    mutex.lock(?rd.lock);
+    rd.label   = label;
+    rd.started = from;
+    rd.done    = done;
+    rd.total   = total;
+    var n: usize = name.len;
+    if (n > LIVE_NAME) { n = LIVE_NAME; }
+    var i: usize = 0;
+    for (i < n) {
+        rd.name[i] = name.data[i];
+        i          = i + 1;
+    }
+    rd.name_len = n;
+    mutex.unlock(?rd.lock);
+}
+
+# nothing runs now, and the live line goes
+fun unlive(rd: *Readout) {
+    if (!rd.drawing) { ret; }
+    mutex.lock(?rd.lock);
+    rd.label = nil;
+    erase(rd);
+    mutex.unlock(?rd.lock);
+}
+
+# a library stage closed: the live line shows the latest stage still open, or goes
+fun rest(rd: *Readout) {
+    var i: usize = stats.STAGE_COUNT;
+    for (i > 0) {
+        i = i - 1;
+        val row: *Row = ?rd.rows[i];
+        if (row.open) {
+            live(rd, label_at(i), row.from, row.done, row.total, View{data: nil, len: 0});
+            ret;
+        }
+    }
+    unlive(rd);
+}
+
+# the label of the stage at index i
+fun label_at(i: usize) str {
+    val labels: [stats.STAGE_COUNT]str = [stats.STAGE_COUNT]str{"passes", "verify", "passes", "select", "alloc", "frame", "emit"};
+    ret labels[i];
+}
+
+# start the drawer, where stderr is a terminal it can draw on; one already drawing goes on
+# ---
+# ret: whether the live line is drawn
+fun start(rd: *Readout) bool {
+    if (rd.drawing) { ret true; }
+    if (rd.stop)    { ret false; }
+    if (!capable()) {
+        rd.stop = true;
+        ret false;
+    }
+    rd.width     = columns();
+    rd.out_tty   = terminal.is_terminal(1);
+    rd.shown_len = 0;
+    val err_spawned: thread.Operation = thread.spawn_with(drawer, rd::*u8, ?rd.drawer);
+    if (sel err_spawned.err) {
+        rd.stop = true;
+        ret false;
+    }
+    rd.drawing = true;
+    ret true;
+}
+
+# whether stderr is a terminal the live line can be drawn on, one whose TERM is set and not `dumb`
+fun capable() bool {
+    if (!terminal.is_terminal(2)) { ret false; }
+    var buf:     [64]u8;
+    val res_get: res[opt[usize], env.EnvError] = env.get("TERM", ?buf[0], 64);
+    if (sel res_get.err) { ret false; }
+    val opt_len: opt[usize] = res_get.ok;
+    if (sel opt_len.none)   { ret false; }
+    if (opt_len.some >= 64) { ret true; }
+    ret opt_len.some > 0 && !str_equals((?buf[0])::str, "dumb");
+}
+
+# the terminal's width as COLUMNS gives it, LIVE_COLUMNS when it gives none
+fun columns() usize {
+    var buf:     [16]u8;
+    val res_get: res[opt[usize], env.EnvError] = env.get("COLUMNS", ?buf[0], 16);
+    if (sel res_get.err) { ret LIVE_COLUMNS; }
+    val opt_len: opt[usize] = res_get.ok;
+    if (sel opt_len.none)                        { ret LIVE_COLUMNS; }
+    if (opt_len.some == 0 || opt_len.some >= 16) { ret LIVE_COLUMNS; }
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < opt_len.some) {
+        if (buf[i] < '0' || buf[i] > '9') { ret LIVE_COLUMNS; }
+        n = n * 10 + (buf[i] - '0')::usize;
+        i = i + 1;
+    }
+    if (n < 2) { ret LIVE_COLUMNS; }
+    ret n;
+}
+
+# the drawer: every LIVE_PERIOD, the live line as the slot stands, until the readout stops it
+fun drawer(arg: *u8) {
+    val rd: *Readout = arg::*Readout;
+    mutex.lock(?rd.lock);
+    for (!rd.stop) {
+        val res_now: time.InstantClock = time.instant();
+        if (sel res_now.err) { brk; }
+        val status: condition.WaitStatus = condition.wait_until(?rd.wake, ?rd.lock, time.instant_add(res_now.ok, LIVE_PERIOD));
+        if (sel status.invalid || sel status.failed) { brk; }
+        if (!rd.stop)                                { draw(rd); }
+    }
+    mutex.unlock(?rd.lock);
+}
+
+# a line built in place, cut at LIVE_LINE bytes
+rec Line {
+    bytes: [LIVE_LINE]u8;
+    len:   usize;
+}
+
+fun line_writer(l: *Line) io.Writer {
+    l.len = 0;
+    ret io.Writer{ctx: l::ptr, fn_write: line_write};
+}
+
+fun line_write(ctx: ptr, buf: *u8, len: usize) res[usize, io.WriteError] {
+    val l: *Line = ctx::*Line;
+    var i: usize = 0;
+    for (i < len && l.len < LIVE_LINE) {
+        l.bytes[l.len] = buf[i];
+        l.len          = l.len + 1;
+        i              = i + 1;
+    }
+    ret res[usize, io.WriteError].ok{len};
+}
+
+# draw the live line where the cursor stands at the start of a line, the lock held: the stage,
+# its time so far, its count and the function it is on, in a log line's columns with the stamp
+# left blank, cut to the terminal's width
+fun draw(rd: *Readout) {
+    if (!rd.err_bare || (rd.out_tty && !rd.out_bare)) { ret; }
+    if (rd.label == nil) {
+        erase(rd);
+        ret;
+    }
+    var l:  Line;
+    var lw: io.Writer = line_writer(?l);
+    layout.spaces(?lw, STAMP_W);
+    layout.left(?lw, rd.label, LABEL_W);
+    var t: layout.Text;
+    layout.right(?lw, layout.took(?t, since(rd.started)), TIME_W);
+    if (rd.total > 0) {
+        format.write_str(?lw, "  ");
+        format.write_u64(?lw, rd.done::u64);
+        format.write_byte(?lw, '/');
+        format.write_u64(?lw, rd.total::u64);
+    }
+    if (rd.name_len > 0) {
+        format.write_str(?lw, "  ");
+        format.write_bytes(?lw, ?rd.name[0], rd.name_len);
+    }
+    var n: usize = l.len;
+    if (n > rd.width - 1)                                        { n = rd.width - 1; }
+    if (n == rd.shown_len && same(?rd.shown[0], ?l.bytes[0], n)) { ret; }
+    var host: io.Writer = fs.writer(fs.STDERR);
+    format.write_str(?host, "\r");
+    format.write_bytes(?host, ?l.bytes[0], n);
+    if (rd.shown_len > n) { layout.spaces(?host, rd.shown_len - n); }
+    format.write_str(?host, "\r");
+    var i: usize = 0;
+    for (i < n) {
+        rd.shown[i] = l.bytes[i];
+        i           = i + 1;
+    }
+    rd.shown_len = n;
+}
+
+fun same(a: *u8, b: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# erase the live line where one is drawn, the lock held
+fun erase(rd: *Readout) {
+    if (rd.shown_len == 0) { ret; }
+    var host: io.Writer = fs.writer(fs.STDERR);
+    format.write_str(?host, "\r");
+    layout.spaces(?host, rd.shown_len);
+    format.write_str(?host, "\r");
+    rd.shown_len = 0;
+}
+
+# make way for a write, the lock held: the live line erased, then an owed blank line written.
+# a write that is not a diagnostic's ends the block one was writing
+fun make_way(rd: *Readout, diagnostic: bool) {
+    erase(rd);
+    if (!diagnostic && rd.open) {
+        rd.open = false;
+        rd.owed = true;
+    }
+    if (!rd.owed) { ret; }
+    rd.owed = false;
+    var host: io.Writer = fs.writer(fs.STDERR);
+    format.write_str(?host, "\n");
+    rd.err_bare = true;
+}
+
+# a write to stderr, a log line's or a diagnostic's
+fun stderr(rd: *Readout, buf: *u8, len: usize, diagnostic: bool) res[usize, io.WriteError] {
+    mutex.lock(?rd.lock);
+    make_way(rd, diagnostic);
+    if (diagnostic && len > 0) { rd.open = true; }
+    var host:        io.Writer                 = fs.writer(fs.STDERR);
+    val res_written: res[usize, io.WriteError] = io.write(?host, buf, len);
+    if (len > 0) { rd.err_bare = buf[len - 1] == '\n'; }
+    mutex.unlock(?rd.lock);
+    ret res_written;
+}
+
+fun err_write(ctx: ptr, buf: *u8, len: usize) res[usize, io.WriteError] {
+    ret stderr(ctx::*Readout, buf, len, false);
+}
+
+fun diag_write(ctx: ptr, buf: *u8, len: usize) res[usize, io.WriteError] {
+    ret stderr(ctx::*Readout, buf, len, true);
+}
+
+# a write to stdout, a result's or the command's output: the first refusal is kept
+fun out_write(ctx: ptr, buf: *u8, len: usize) res[usize, io.WriteError] {
+    val rd: *Readout = ctx::*Readout;
+    mutex.lock(?rd.lock);
+    make_way(rd, false);
+    var host:        io.Writer                 = fs.writer(fs.STDOUT);
+    val res_written: res[usize, io.WriteError] = io.write(?host, buf, len);
+    if (len > 0) { rd.out_bare = buf[len - 1] == '\n'; }
+    if (sel res_written.err) {
+        if (!kept(rd.unwritten)) { rd.unwritten = opt[io.WriteError].some{res_written.err}; }
+    }
+    mutex.unlock(?rd.lock);
+    ret res_written;
+}
+
+# whether a refusal is already kept
+fun kept(o: opt[io.WriteError]) bool {
+    if (sel o.some) { ret true; }
+    ret false;
+}

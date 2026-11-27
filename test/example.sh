@@ -106,11 +106,11 @@ example() {
     fi
     { printf 'mirl "%s";\n%s\n' "$version" "$line"; tail -n +2 "$src"; } >"$at.mirl"
     src=$at.mirl
-    if ! "$mirl" compile "$src" "$flag" --verify --emit obj -o "$at.o" 2>"$at.emit"; then
+    if ! "$mirl" compile "$src" "$flag" --verify --emit obj -o "$at.o" >"$at.emit" 2>&1; then
         fail "$target $name" "mirl compile refuses it: $(cat "$at.emit")"
         return
     fi
-    if ! "$mirl" compile "$src" "$flag" --verify --emit asm -o "$at.s" 2>"$at.emit"; then
+    if ! "$mirl" compile "$src" "$flag" --verify --emit asm -o "$at.s" >"$at.emit" 2>&1; then
         fail "$target $name" "mirl compile refuses its listing: $(cat "$at.emit")"
         return
     fi
