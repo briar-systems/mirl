@@ -55,7 +55,7 @@ program() {
     read -r target arch system env isa abi <<<"$lane"
     # the case is a body, so it is read under the library's own version statement
     { printf 'mirl "%s";\n' "$("$mirl" --version)"; cat "$src"; } >"$at.text.mirl"
-    if ! "$mirl" compile "$at.text.mirl" $([ "${OPTIMIZE:-0}" = 1 ] && echo -O) --verify --emit obj -o "$at.o" 2>"$at.emit"; then
+    if ! "$mirl" compile "$at.text.mirl" $([ "${OPTIMIZE:-0}" = 1 ] && echo -O) --verify --emit obj -o "$at.o" >"$at.emit" 2>&1; then
         echo "mirl compile refuses it: $(cat "$at.emit")"
         return 1
     fi
