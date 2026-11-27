@@ -9,6 +9,16 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-27
+
+### Added
+
+- `base.stats.Stats.progress` takes a `Progress` that follows a compilation as it runs: `opened` when a stage begins with how many functions it knows it will take, `grew` when it learns of more, `begun` and `finished` around each function, and `closed` when the stage is done. The neutral prefix, the register machine and the wasm and SPIR-V families call it (#768).
+
+### Changed
+
+- `mirl compile`, `mirl verify` and `mirl fmt` write mach 7.2.0's output language. A result on stdout says `built`, `verified`, `formatted`, `unchanged` or `failed` with its fields, and never shares stdout with output written there. `-v` logs each stage to stderr as it closes, `-vv` adds each function and the target's facts, warnings and errors are blocks with a blank line after each, and on a terminal a live line names the stage that runs (#768).
+
 ## [0.3.2] - 2026-11-26
 
 ### Changed

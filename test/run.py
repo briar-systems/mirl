@@ -13,9 +13,9 @@
 # own, as `-t` spells them, as a case the walk of constant-time code must accept on each
 # architecture that runs it at emission.
 # a `# flags:` line adds its words to every compile of the file.
-# a `# refuse:` line states that every compile of the file is refused, its report, its lines
-# joined by spaces, holding the line's text, as a case the walk of constant-time code must
-# refuse on each target it names.
+# a `# refuse:` line states that every compile of the file is refused, its error blocks on
+# stderr, their lines joined by spaces, holding the line's text, as a case the walk of
+# constant-time code must refuse on each target it names.
 # exit 0: nothing failed.
 import argparse, concurrent.futures, os, re, subprocess, sys
 
@@ -35,6 +35,21 @@ def header(path):
         if not m:
             break
         out[m.group(1)] = m.group(2)
+    return out
+
+
+def said_of(stderr):
+    # the lines of the error blocks on stderr, each stripped: a block runs from its headline at
+    # the margin to the blank line after it, and a warning's block is left out
+    out, warning = [], False
+    for line in stderr.splitlines():
+        if not line.strip():
+            warning = False
+            continue
+        if not line[0].isspace():
+            warning = line.startswith('warning')
+        if not warning:
+            out.append(line.strip())
     return out
 
 
@@ -65,7 +80,7 @@ def one(cfg, version, path):
                 cmd += ['-t', t]
             p = subprocess.run(cmd, capture_output=True, text=True)
             done += 1
-            said = [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip() and not l.startswith('warning')]
+            said = said_of(p.stderr)
             refuse = h.get('refuse')
             if refuse is not None:
                 if p.returncode == 0:
