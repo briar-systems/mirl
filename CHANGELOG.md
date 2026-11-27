@@ -9,6 +9,50 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
+### Added
+
+- `mirl.ir.opcode.table.named` answers an operation's name with its opcode, read from the table's own row names, and the text parser looks an operation up through it (#788).
+- `mirl.target.steps` is the one owner of the walk from an address to what it is formed from and of how far each step moves it (`past`, `from`, `former`, `root_of`, `moved_by`, `formed`, `add`, `gap`, `wrap`, `element_offset`), and `mirl.target.layout.address` answers a space's address size, none for a pointer with no representation in memory. `layout.pointer` reads it, with the same answers and errors as before (#803).
+- `mirl.legal.handover` holds the rule by which a call's aggregate result is built in place, which the abi legalisation and the inliner both judge by (#794).
+- `mirl.ir.cfg.rounds` visits the changed nodes of a graph in the order rounds over a block order would, and `mirl.ir.cfg.flow.forward` is the forward mirror of `flow.backward` (#793).
+- `mirl.pass.analysis.memory.contained` says whether an access at a constant offset inside a global the module defines cannot fault (#784).
+
+### Changed
+
+#### Dependencies and the library contract
+
+- The manifest requires mink `^0.2.0`, and mirl builds against mink 0.2.0 and masc 0.2.2.
+- Breaking: `mirl.machine.alloc.remade.of` takes an allocator first, for its worklist, and replaces what `out` held in place of appending to it (#793).
+- Breaking: `mirl.ct.global.secret_at` and `of_secret` are replaced by `reads_secret`, which takes the read's type and sizes the global in the space of the address that reaches it. `mirl.ct.global.size` is no longer public, and `mirl.ct.global.Reach` gains a `space` field (#803).
+- Breaking: `mirl.legal.overlap.root_of` moves to `mirl.target.steps.root_of` (#803).
+- Breaking: `mirl.machine.inline.Inline` has no `reads` field, since an asm block states no read beyond its operands (#782).
+- Breaking: `mirl.pass.analysis.memory.Place` gains `starts`, the least and greatest offset the access may start at (#784).
+
+#### IR a front end builds, and the verifier
+
+- Breaking: an address's offsets are read as the machine adds them: an offset or index is signed at its own width, and an index times its stride and every sum of steps wraps at the width of the root's pointer. On a target with 32-bit pointers (riscv32, wasm32) this changes what the verifier, the constant-time walk, the slots analysis and the copy-overlap order see for a very large constant index or offset. A read that states no secrecy and reaches a global's secret bytes only once wrapped is now refused with `verify.secret` where it was accepted, and it is refused where it stands in the input, where `--verify` refused it after the address legalisation and blamed that pass. 64-bit targets are unchanged (#803).
+- The verifier accepts a read the front end states `#[public]` even where its address reaches a global's secret bytes, taking the statement as the front end's word, and still refuses a read that states nothing and gives a public result. The verdict no longer depends on whether a pass such as `promote` exposed that the address came from the global, and the constant-time walk is unchanged (briar-systems/mach#5054).
+
+#### What the optimizer does to code
+
+- The inliner expands a callee under the small size at every call standing in a loop, where a call stands in a loop when it is inside a loop of its caller or its caller is carried into one. A function is carried when it is called from such a call and is small enough to be copied there, so a chain of small helpers a loop reaches is expanded at every level (#783).
+- The inliner measures a callee by what its expansion costs: the size promotion leaves less the slot every return hands back whole and the loads of it only a return reads. The size rule, the cross-module offer and the carried-into-a-loop rule all decide on that measure (#804).
+- An expanded call returning an aggregate builds its result in the destination the call's result is stored to, as the abi does for a call, where the result lived in two slots with a whole copy between them. The register and wasm families run `split` and `promote` again after the aggregates and vectors are taken apart, so a slot an aggregate went through is promoted leaf by leaf. A byte the callee never wrote now reads as the destination's old contents (#794).
+- The alias analysis holds two accesses apart by the offsets the value ranges bound, and the range analysis recognises a counted loop in the shape rotation leaves. LICM moves a loop-invariant load whose place no group holds when no barrier touches it, and treats an access at a constant offset inside a defined, not replaceable, not thread-local and not placed global as one that cannot fault (#784).
+- An expansion gives every copied slot whose markers it does not keep the copy's own extent, begun at the copy of the entry and ended at every return, so those slots share frame storage where they lasted the whole caller (#802).
+- The back end's `alloc.remade`, `addressed`, `frame.share` and `alloc.value` passes read a function once or revisit only what changed, where they swept it until nothing changed. The code they produce is unchanged and a release build of mach takes about 10% fewer instructions (#793).
+
+### Fixed
+
+- An asm block is stated to read no register beyond its operands, so a data directive with a `writes` clause is no longer refused with "values no location holds and no split helps", and argument and callee-saved registers a block reads are no longer held live from the entry (#782).
+- x86-64 and SPIR-V with `Int8` select a one-byte `bswap`, which x86-64 refused and SPIR-V left unselected.
+- mirl builds for a host whose `usize` and pointers are 32 bits (#796).
+- The alias analysis takes two accesses apart by an exact offset compare only when each ends below 2^(bits-1), since an access crossing it wraps onto the most negative offsets, and an access of no stated size is never held apart by offsets (#784).
+- Frame sharing never lets a slot only markers name head a group, which dropped the storage of the group's other slots (#802).
+- A check that an access lies within a slot, in selection, the bulk legalisation and the slots analysis, cannot wrap for an offset near 2^64, which took a load below a slot as an access of the slot in place.
+
 ## [0.3.4] - 2026-11-27
 
 ### Fixed
