@@ -1,0 +1,197 @@
+# a result handed over once: the stack slot every return of a function hands back whole, and the store a call's
+# result is handed to, which may be one memory
+#
+# a function that builds its result in a stack slot and returns it whole, read just before each return with nothing
+# touching memory in between, may build it in the memory its caller stores the result to instead, where the caller
+# stores it whole, with nothing touching memory between the call and the store, at an address that stands before the
+# call, aligned at least as the slot is, into memory the callee cannot name by any other route. then no copy of the
+# result is made on either side. the abi legalisation builds a result returned by reference so, the callee's slot
+# becoming the memory its carrier addresses and the caller handing the store's destination as that address
+# (`mirl.legal.abi`), and the inliner builds the result of a call it expands so, the callee's slot becoming the
+# destination (`mirl.opt.inline`). both judge by this module.
+#
+# what a program can observe changes in one place, and only by refinement. a byte of the result the callee never
+# writes, its padding or a member it leaves alone, was a byte of the slot no store reached, so the store of the whole
+# copied an unspecified value into the destination (the ir's rule that a load no store reaches gives an unspecified
+# value, any bit pattern, doc/ir.md). built in the destination, that byte holds what the destination held before.
+# that is one of the bit patterns the unspecified value could have been, so every behaviour the handed over result
+# gives the program could already have, and none is new.
+#
+# memory the callee cannot name is a stack slot of the caller's whose address goes nowhere but its own accesses and
+# storage markers (`mirl.legal.overlap.contained`), which no argument, global or pointer reaches, or the caller's own
+# carrier, handed to nothing but its own accesses and the returns that hand it back, which its own caller gave as
+# memory the function cannot otherwise name.
+#
+# cost: per return or call, a walk of the instructions between the load or the call and the return or the store, in
+# one block.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use std.collections.slice.Slice;
+
+use mirl.ir.function.Body;
+use mirl.ir.id.Block;
+use mirl.ir.id.Instruction;
+use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.InstructionData;
+use Spot:       mirl.ir.instruction.Place;
+use opcode_row: mirl.ir.opcode.row;
+use mirl.ir.opcode.row.Immediate;
+use opcode_table: mirl.ir.opcode.table;
+use mirl.ir.type.table;
+use mirl.ir.value.Def;
+use mirl.legal.overlap;
+use mirl.target.steps;
+
+# whether an instruction reads or writes memory, as its opcode row states, an opcode with no row taken to do both
+pub fun touches(b: *Body, i: Instruction) bool {
+    val opt_row: opt[*opcode_row.Row] = opcode_table.at(b.instructions.data[i].opcode);
+    if (sel opt_row.none) { ret true; }
+    ret opt_row.some.effects.reads || opt_row.some.effects.writes;
+}
+
+# the block an instruction is placed in, none for one that is not
+fun block_of(b: *Body, i: Instruction) opt[Block] {
+    val at: Spot = b.instructions.data[i].place;
+    if (sel at.placed) { ret opt[Block].some{at.placed}; }
+    ret opt[Block].none{};
+}
+
+# whether `last` follows `first` in its block with nothing between them reading or writing memory
+pub fun untouched_between(b: *Body, first: Instruction, last: Instruction) bool {
+    var p: Instruction = b.instructions.data[first].next;
+    for (p != last) {
+        if (p == NO_INSTRUCTION || touches(b, p)) { ret false; }
+        p = b.instructions.data[p].next;
+    }
+    ret true;
+}
+
+# whether a value stands before an instruction it is used at in that instruction's block: a parameter or constant, a
+# result of another block, which dominates every use there, or one earlier in the block
+pub fun stands_before(b: *Body, v: Value, at: Instruction) bool {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.result)) { ret true; }
+    val i:     Instruction = def.result.instruction;
+    val opt_k: opt[Block]  = block_of(b, i);
+    val opt_j: opt[Block]  = block_of(b, at);
+    if (sel opt_k.none)           { ret false; }
+    if (sel opt_j.none)           { ret false; }
+    if (opt_k.some != opt_j.some) { ret true; }
+    var p: Instruction = b.instructions.data[i].next;
+    for (p != NO_INSTRUCTION) {
+        if (p == at) { ret true; }
+        p = b.instructions.data[p].next;
+    }
+    ret false;
+}
+
+# the load a value is the result of, placed and neither volatile nor kept, none for another value
+pub fun loaded(b: *Body, v: Value) opt[Instruction] {
+    val def: Def = b.values.data[v].def;
+    if (!(sel def.result)) { ret opt[Instruction].none{}; }
+    val i: Instruction      = def.result.instruction;
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (d.opcode != opcode_table.LOAD)                      { ret opt[Instruction].none{}; }
+    if (d.metadata.flags.volatile || d.metadata.flags.kept) { ret opt[Instruction].none{}; }
+    if (!(sel d.place.placed))                              { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{i};
+}
+
+# the alignment an instruction's immediates state, 0 for none
+pub fun stated_align(d: *InstructionData) u64 {
+    var i: usize = 0;
+    for (i < d.immediates.len) {
+        val imm: Immediate = d.immediates.data[i];
+        if (sel imm.alignment) { ret imm.alignment; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the stack slot every return of a body hands back whole as its operand `at`: each return's operand is a load of the
+# slot's address in the return's block, with nothing touching memory between the two, of the type the slot holds. the
+# slot is not kept and its address goes nowhere but its own accesses and storage markers. none where there is no
+# return or no such slot
+# ---
+# b:    the body
+# rets: its returns
+# at:   which operand of each
+# ret:  the slot's alloca
+pub fun home(b: *Body, rets: Slice[Instruction], at: usize) opt[Instruction] {
+    if (rets.size == 0) { ret opt[Instruction].none{}; }
+    var opt_home: opt[Value] = opt[Value].none{};
+    var i:        usize      = 0;
+    for (i < rets.size) {
+        val rd: *InstructionData = ?b.instructions.data[rets.data[i]];
+        if (at >= rd.operands.len) { ret opt[Instruction].none{}; }
+        val opt_loaded: opt[Instruction] = loaded(b, rd.operands.data[at]);
+        if (sel opt_loaded.none)                                  { ret opt[Instruction].none{}; }
+        if (!untouched_between(b, opt_loaded.some, rets.data[i])) { ret opt[Instruction].none{}; }
+        val address: Value = b.instructions.data[opt_loaded.some].operands.data[0];
+        if (sel opt_home.some) {
+            if (opt_home.some != address) { ret opt[Instruction].none{}; }
+        }
+        opt_home = opt[Value].some{address};
+        i        = i + 1;
+    }
+    if (sel opt_home.none) { ret opt[Instruction].none{}; }
+    val def: Def = b.values.data[opt_home.some].def;
+    if (!(sel def.result)) { ret opt[Instruction].none{}; }
+    val slot: Instruction      = def.result.instruction;
+    val sd:   *InstructionData = ?b.instructions.data[slot];
+    if (sd.opcode != opcode_table.ALLOCA || sd.immediates.len == 0 || sd.metadata.flags.kept) { ret opt[Instruction].none{}; }
+    val held: Immediate = sd.immediates.data[0];
+    if (!(sel held.ty)) { ret opt[Instruction].none{}; }
+    val returned: Value = b.instructions.data[rets.data[0]].operands.data[at];
+    if (!table.same(held.ty, b.values.data[returned].type)) { ret opt[Instruction].none{}; }
+    if (!overlap.contained(b, opt_home.some))               { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{slot};
+}
+
+# whether a callee cannot name the memory at `root` by any route but the result address it is passed: a stack slot
+# of the function's whose address goes nowhere but its own accesses and storage markers, or the function's own
+# carrier, handed to nothing but its own accesses and the returns that hand it back
+fun unreached(b: *Body, root: Value, carrier: opt[Value]) bool {
+    val def: Def = b.values.data[root].def;
+    if (sel def.result) {
+        if (b.instructions.data[def.result.instruction].opcode == opcode_table.ALLOCA) { ret overlap.contained(b, root); }
+    }
+    if (sel carrier.some) {
+        if (carrier.some == root) { ret overlap.returned(b, root); }
+    }
+    ret false;
+}
+
+# the store a call's result `at` is handed to: its one use, unbound, a store of it whole, neither volatile nor kept,
+# stating an alignment of at least `align`, with nothing touching memory between the call and the store, at an
+# address that stands before the call, in memory the callee cannot name by any other route (`unreached`). none keeps
+# the result a value of its own
+# ---
+# b:       the caller's body
+# c:       the call
+# at:      which of its results
+# align:   the alignment the callee builds the result at
+# carrier: the caller's own carrier, none for none
+# ret:     the store
+pub fun destination(b: *Body, c: Instruction, at: usize, align: u64, carrier: opt[Value]) opt[Instruction] {
+    if (at >= b.instructions.data[c].results.len) { ret opt[Instruction].none{}; }
+    val old: Value = b.instructions.data[c].results.data[at];
+    if (b.values.data[old].uses.len != 1 || b.values.data[old].bound.len != 0) { ret opt[Instruction].none{}; }
+    val s:  Instruction      = b.values.data[old].uses.data[0];
+    val sd: *InstructionData = ?b.instructions.data[s];
+    if (sd.opcode != opcode_table.STORE || sd.operands.len != 2)  { ret opt[Instruction].none{}; }
+    if (sd.operands.data[1] != old || sd.operands.data[0] == old) { ret opt[Instruction].none{}; }
+    if (sd.metadata.flags.volatile || sd.metadata.flags.kept)     { ret opt[Instruction].none{}; }
+    if (stated_align(sd) < align)                                 { ret opt[Instruction].none{}; }
+    if (!untouched_between(b, c, s))                              { ret opt[Instruction].none{}; }
+    val dest: Value = sd.operands.data[0];
+    if (!stands_before(b, dest, c))                     { ret opt[Instruction].none{}; }
+    if (!unreached(b, steps.root_of(b, dest), carrier)) { ret opt[Instruction].none{}; }
+    ret opt[Instruction].some{s};
+}

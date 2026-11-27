@@ -27,9 +27,10 @@
 # follows it to its group's first. markers are neither reads nor writes of
 # their slot.
 #
-# with s candidate slots, i instructions and b blocks, the gathering is O(i),
-# each dataflow O(b s) per pass, the interference O(i s) and the grouping
-# O(s s) over s s bits.
+# with s candidate slots, i instructions, b blocks and e edges, the gathering
+# and each block's sets are O(i), each dataflow O((b + e) s / 64) per pass,
+# the interference O(i + (k + 1) s / 64) for k spills and begins plus one per
+# interference it finds, and the grouping O(s g) for g groups, over s s bits.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -42,6 +43,7 @@ use std.allocator;
 use std.collections.slice.Slice;
 use std.collections.sort;
 use std.collections.vector;
+use std.math.bits;
 
 use mirl.base.fail.keep;
 use mirl.base.slice;
@@ -72,18 +74,23 @@ val NONE: u32 = 0xffffffff;
 # index:    each slot's candidate number, NONE for a slot that is not one
 # slots:    each candidate's slot
 # escaped:  whether each slot lets its address out
+# named:    whether an instruction other than a marker names each slot, or a slot within it
 # scoped:   whether each slot lets its address out and a marker names it
 # reached:  where each slot is reached through a register
 # gen:      what each block reads before it writes, by candidate
 # kill:     what each block writes whole
 # live_in:  what is live into each block
 # live_out: what is live out of each block
+# opens:    what each block's last marker of a scoped candidate begins
+# marks:    the scoped candidates a marker of each block names
+# begin_in: the scoped candidates begun into each block on some path
 # begun:    the scoped candidates begun out of each block on some path
 # live:     what is live at the instruction the walk is at
 # meets:    each candidate's row of words, whether it interferes with each other
 # groups:   each candidate's row of words, for the first of a group the
 #           interference of the group's members
 # group:    each candidate's group, by its first candidate
+# heads:    the first candidate of each group, ascending
 # order:    the blocks, in order
 # rep:      each slot's slot after sharing
 # lists:    the module's lists of public byte ranges, by id
@@ -91,6 +98,7 @@ rec Work {
     index:    vector.Vector[u32];
     slots:    vector.Vector[u32];
     escaped:  vector.Vector[bool];
+    named:    vector.Vector[bool];
     scoped:   vector.Vector[bool];
     reached:  vector.Vector[Reach];
     at:       vector.Vector[u32];
@@ -98,11 +106,15 @@ rec Work {
     kill:     vector.Vector[u64];
     live_in:  vector.Vector[u64];
     live_out: vector.Vector[u64];
+    opens:    vector.Vector[u64];
+    marks:    vector.Vector[u64];
+    begin_in: vector.Vector[u64];
     begun:    vector.Vector[u64];
     live:     vector.Vector[u64];
     meets:    vector.Vector[u64];
     groups:   vector.Vector[u64];
     group:    vector.Vector[u32];
+    heads:    vector.Vector[u32];
     order:    vector.Vector[u32];
     rep:      vector.Vector[u32];
     lists:    Slice[Slice[global.Range]];
@@ -113,6 +125,7 @@ fun work_init(a: *allocator.Allocator, lists: Slice[Slice[global.Range]]) Work {
         index:    vector.init[u32](a),
         slots:    vector.init[u32](a),
         escaped:  vector.init[bool](a),
+        named:    vector.init[bool](a),
         scoped:   vector.init[bool](a),
         reached:  vector.init[Reach](a),
         at:       vector.init[u32](a),
@@ -120,11 +133,15 @@ fun work_init(a: *allocator.Allocator, lists: Slice[Slice[global.Range]]) Work {
         kill:     vector.init[u64](a),
         live_in:  vector.init[u64](a),
         live_out: vector.init[u64](a),
+        opens:    vector.init[u64](a),
+        marks:    vector.init[u64](a),
+        begin_in: vector.init[u64](a),
         begun:    vector.init[u64](a),
         live:     vector.init[u64](a),
         meets:    vector.init[u64](a),
         groups:   vector.init[u64](a),
         group:    vector.init[u32](a),
+        heads:    vector.init[u32](a),
         order:    vector.init[u32](a),
         rep:      vector.init[u32](a),
         lists:    lists,
@@ -135,6 +152,7 @@ fun work_dnit(w: *Work) {
     vector.dnit[u32](?w.index);
     vector.dnit[u32](?w.slots);
     vector.dnit[bool](?w.escaped);
+    vector.dnit[bool](?w.named);
     vector.dnit[bool](?w.scoped);
     vector.dnit[Reach](?w.reached);
     vector.dnit[u32](?w.at);
@@ -142,11 +160,15 @@ fun work_dnit(w: *Work) {
     vector.dnit[u64](?w.kill);
     vector.dnit[u64](?w.live_in);
     vector.dnit[u64](?w.live_out);
+    vector.dnit[u64](?w.opens);
+    vector.dnit[u64](?w.marks);
+    vector.dnit[u64](?w.begin_in);
     vector.dnit[u64](?w.begun);
     vector.dnit[u64](?w.live);
     vector.dnit[u64](?w.meets);
     vector.dnit[u64](?w.groups);
     vector.dnit[u32](?w.group);
+    vector.dnit[u32](?w.heads);
     vector.dnit[u32](?w.order);
     vector.dnit[u32](?w.rep);
 }
@@ -163,11 +185,45 @@ fun clear(words: *u64, n: u32) {
     words[(n / 64)::usize] = words[(n / 64)::usize] & ~((1::u64) << (n % 64)::u64);
 }
 
-# whether a slot may share: a local of fixed size whose address stays in and
-# that no slot lies within, or whose storage is scoped
+# whether a slot may share: a local of fixed size that something names, whose address stays in and that no slot lies
+# within, or whose storage is scoped. a slot only markers name takes no space, so it never heads a group
 fun candidate(w: *Work, s: *SlotData, n: usize) bool {
-    if (!(sel s.area.local) || s.per != 0 || s.size == 0) { ret false; }
+    if (!(sel s.area.local) || s.per != 0 || s.size == 0 || !w.named.data[n]) { ret false; }
     ret !w.escaped.data[n] || w.scoped.data[n];
+}
+
+# each slot an instruction other than a marker names, and each slot one named lies within, as the frame lays out only
+# those (`mirl.machine.frame.scan`)
+fun names(w: *Work, f: *Function) err[allocator.Error] {
+    val err_filled: err[allocator.Error] = slice.fill[bool](?w.named, f.slots.len, false);
+    if (sel err_filled.err) { ret err_filled; }
+    var b: usize = 0;
+    for (b < f.blocks.len) {
+        val list: Slice[Instruction] = function.instructions(f, b::u32);
+        var i:    usize              = 0;
+        for (i < list.size) {
+            val d: *InstructionData = function.data(f, list.data[i]);
+            if (!marker(d)) {
+                var n: usize = 0;
+                for (n < d.operands.size) {
+                    val o: u32 = slot_of(?d.operands.data[n]);
+                    if (o::usize < w.named.len) { w.named.data[o::usize] = true; }
+                    n = n + 1;
+                }
+            }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    var s: usize = f.slots.len;
+    for (s > 0) {
+        s = s - 1;
+        val area: function.Area = f.slots.data[s].area;
+        if (sel area.within) {
+            if (w.named.data[s] && area.within.slot::usize < w.named.len) { w.named.data[area.within.slot::usize] = true; }
+        }
+    }
+    ret err[allocator.Error].ok{};
 }
 
 # whether an instruction marks where its slot's storage begins or ends
@@ -257,13 +313,16 @@ fun index_reaches(w: *Work, count: usize) err[allocator.Error] {
     ret err[allocator.Error].ok{};
 }
 
-# block `b`'s gen and kill, walked from its end
+# block `b`'s gen and kill, and what its markers begin and name, walked from its end, so the last marker of a
+# candidate is the first the walk meets
 fun transfer(w: *Work, f: *Function, b: u32, words: usize) {
-    val base: usize              = b::usize * words;
-    val gen:  *u64               = ?w.gen.data[base];
-    val kill: *u64               = ?w.kill.data[base];
-    val list: Slice[Instruction] = function.instructions(f, b);
-    var i:    usize              = list.size;
+    val base:  usize              = b::usize * words;
+    val gen:   *u64               = ?w.gen.data[base];
+    val kill:  *u64               = ?w.kill.data[base];
+    val opens: *u64               = ?w.opens.data[base];
+    val marks: *u64               = ?w.marks.data[base];
+    val list:  Slice[Instruction] = function.instructions(f, b);
+    var i:     usize              = list.size;
     for (i > 0) {
         i = i - 1;
         val d: *InstructionData = function.data(f, list.data[i]);
@@ -273,6 +332,10 @@ fun transfer(w: *Work, f: *Function, b: u32, words: usize) {
             clear(gen, c);
         }
         val s: u32 = scoped_by(w, d);
+        if (s != NONE && !bit(marks, s)) {
+            set(marks, s);
+            if (begins(d)) { set(opens, s); }
+        }
         if (s != NONE && begins(d)) {
             set(kill, s);
             clear(gen, s);
@@ -282,67 +345,31 @@ fun transfer(w: *Work, f: *Function, b: u32, words: usize) {
     }
 }
 
-# the scoped candidates begun out of each block on some path, to the fixed point
-fun begin_flow(w: *Work, f: *Function, g: *Graph, words: usize) {
-    var changed: bool = true;
-    for (changed) {
-        changed = false;
-        var b: usize = 0;
-        for (b < f.blocks.len) {
-            var k: usize = 0;
-            for (k < words) {
-                w.live.data[k] = 0;
-                k              = k + 1;
-            }
-            val preds: Slice[u32] = graph.predecessors(g, b::u32);
-            var p:     usize      = 0;
-            for (p < preds.size) {
-                k = 0;
-                for (k < words) {
-                    w.live.data[k] = w.live.data[k] | w.begun.data[preds.data[p]::usize * words + k];
-                    k              = k + 1;
-                }
-                p = p + 1;
-            }
-            val list: Slice[Instruction] = function.instructions(f, b::u32);
-            var i:    usize              = 0;
-            for (i < list.size) {
-                val d: *InstructionData = function.data(f, list.data[i]);
-                val s: u32              = scoped_by(w, d);
-                if (s != NONE && begins(d)) { set(?w.live.data[0], s); }
-                or (s != NONE)              { clear(?w.live.data[0], s); }
-                i = i + 1;
-            }
-            k = 0;
-            for (k < words) {
-                if (w.begun.data[b * words + k] != w.live.data[k]) {
-                    w.begun.data[b * words + k] = w.live.data[k];
-                    changed                     = true;
-                }
-                k = k + 1;
-            }
-            b = b + 1;
-        }
-    }
-}
-
 fun meet(w: *Work, words: usize, x: u32, y: u32) {
     if (x == y) { ret; }
     set(?w.meets.data[x::usize * words], y);
     set(?w.meets.data[y::usize * words], x);
 }
 
-# every candidate live in `live` made to interfere with `c`
-fun meet_live(w: *Work, m: u32, words: usize, c: u32) {
-    var t: u32 = 0;
-    for (t < m) {
-        if (bit(?w.live.data[0], t)) { meet(w, words, c, t); }
-        t = t + 1;
+# every candidate of `members` made to interfere with `c`, a word at a time, the candidates of each word found by their bits
+fun meet_set(w: *Work, words: usize, c: u32, members: *u64) {
+    val row: usize = c::usize * words;
+    var k:   usize = 0;
+    for (k < words) {
+        var left: u64 = members[k];
+        w.meets.data[row + k] = w.meets.data[row + k] | left;
+        for (left != 0) {
+            val t: u32 = (k * 64 + bits.ctz(left)::usize)::u32;
+            set(?w.meets.data[t::usize * words], c);
+            left = left & (left - 1);
+        }
+        k = k + 1;
     }
+    clear(?w.meets.data[row], c);
 }
 
 # the interference of block `b`, walked from its end with what is live out of it
-fun interfere(w: *Work, f: *Function, b: u32, m: u32, words: usize) {
+fun interfere(w: *Work, f: *Function, b: u32, words: usize) {
     var k: usize = 0;
     for (k < words) {
         w.live.data[k] = w.live_out.data[b::usize * words + k] | w.begun.data[b::usize * words + k];
@@ -355,12 +382,12 @@ fun interfere(w: *Work, f: *Function, b: u32, m: u32, words: usize) {
         val d: *InstructionData = function.data(f, list.data[i]);
         val c: u32              = written(w, d);
         if (c != NONE) {
-            meet_live(w, m, words, c);
+            meet_set(w, words, c, ?w.live.data[0]);
             clear(?w.live.data[0], c);
         }
         val s: u32 = scoped_by(w, d);
         if (s != NONE && begins(d)) {
-            meet_live(w, m, words, s);
+            meet_set(w, words, s, ?w.live.data[0]);
             clear(?w.live.data[0], s);
         }
         or (s != NONE) { set(?w.live.data[0], s); }
@@ -398,19 +425,23 @@ fun alike(w: *Work, f: *Function, s: u32, q: u32) bool {
 # each candidate put in the first earlier group of its kind none of whose
 # members it interferes with, or a group of its own, and each slot given its
 # group's first slot
-fun colour(w: *Work, f: *Function, m: u32, words: usize) {
+fun colour(w: *Work, f: *Function, m: u32, words: usize) err[allocator.Error] {
     var c: u32 = 0;
     for (c < m) {
-        val s:    u32 = w.slots.data[c::usize];
-        var head: u32 = c;
-        var r:    u32 = 0;
-        for (r < c) {
-            val q: u32 = w.slots.data[r::usize];
-            if (w.group.data[r::usize] == r && alike(w, f, s, q) && !bit(?w.groups.data[r::usize * words], c)) {
+        val s:    u32   = w.slots.data[c::usize];
+        var head: u32   = c;
+        var h:    usize = 0;
+        for (h < w.heads.len) {
+            val r: u32 = w.heads.data[h];
+            if (alike(w, f, s, w.slots.data[r::usize]) && !bit(?w.groups.data[r::usize * words], c)) {
                 head = r;
                 brk;
             }
-            r = r + 1;
+            h = h + 1;
+        }
+        if (head == c) {
+            val res_pushed: res[usize, allocator.Error] = vector.push[u32](?w.heads, c);
+            if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
         }
         w.group.data[c::usize] = head;
         var k: usize = 0;
@@ -421,13 +452,13 @@ fun colour(w: *Work, f: *Function, m: u32, words: usize) {
         w.rep.data[s::usize] = w.slots.data[head::usize];
         c                    = c + 1;
     }
+    ret err[allocator.Error].ok{};
 }
 
-fun renamed(w: *Work, o: Operand) Operand {
-    if (sel o.slot) {
-        if (o.slot::usize < w.rep.len) { ret Operand.slot{w.rep.data[o.slot::usize]}; }
-    }
-    ret o;
+# the slot operand `o` names, NONE for any other operand
+fun slot_of(o: *Operand) u32 {
+    if (sel o.slot) { ret o.slot; }
+    ret NONE;
 }
 
 # every operand, extent, record and slot within naming a shared slot made to
@@ -450,8 +481,9 @@ fun rename(w: *Work, f: *Function) {
         val d: *InstructionData = ?f.instructions.data[i];
         var n: usize            = 0;
         for (n < d.operands.size) {
-            d.operands.data[n] = renamed(w, d.operands.data[n]);
-            n                  = n + 1;
+            val named: u32 = slot_of(?d.operands.data[n]);
+            if (named::usize < w.rep.len) { d.operands.data[n] = Operand.slot{w.rep.data[named::usize]}; }
+            n = n + 1;
         }
         if (metadata.states_extent(?d.metadata) && d.metadata.extent.slot::usize < w.rep.len) { d.metadata.extent.slot = w.rep.data[d.metadata.extent.slot::usize]; }
         i = i + 1;
@@ -472,6 +504,7 @@ fun shared(a: *allocator.Allocator, w: *Work, f: *Function) err[allocator.Error]
     var err_failed: err[allocator.Error] = slice.fill[u32](?w.index, f.slots.len, NONE);
     keep(?err_failed, slice.fill[u32](?w.rep, f.slots.len, 0));
     keep(?err_failed, slice.fill[bool](?w.scoped, f.slots.len, false));
+    keep(?err_failed, names(w, f));
     if (sel err_failed.err) { ret err_failed; }
     var s: usize = 0;
     for (s < f.slots.len) {
@@ -512,6 +545,9 @@ fun shared(a: *allocator.Allocator, w: *Work, f: *Function) err[allocator.Error]
     keep(?err_sized, slice.fill[u64](?w.kill, blocks * words, 0));
     keep(?err_sized, slice.fill[u64](?w.live_in, blocks * words, 0));
     keep(?err_sized, slice.fill[u64](?w.live_out, blocks * words, 0));
+    keep(?err_sized, slice.fill[u64](?w.opens, blocks * words, 0));
+    keep(?err_sized, slice.fill[u64](?w.marks, blocks * words, 0));
+    keep(?err_sized, slice.fill[u64](?w.begin_in, blocks * words, 0));
     keep(?err_sized, slice.fill[u64](?w.begun, blocks * words, 0));
     keep(?err_sized, slice.fill[u64](?w.live, words, 0));
     keep(?err_sized, slice.fill[u64](?w.meets, m::usize * words, 0));
@@ -530,25 +566,20 @@ fun shared(a: *allocator.Allocator, w: *Work, f: *Function) err[allocator.Error]
     var g: Graph = res_graph.ok;
     fin { graph.dnit(?g); }
     flow.backward(?g, Slice[u32]{data: w.order.data, size: w.order.len}, flow.Sets{words: words::u32, gen: ?w.gen, kill: ?w.kill, live_in: ?w.live_in, live_out: ?w.live_out});
-    begin_flow(w, f, ?g, words);
+    flow.forward(?g, Slice[u32]{data: w.order.data, size: w.order.len}, flow.Sets{words: words::u32, gen: ?w.opens, kill: ?w.marks, live_in: ?w.begin_in, live_out: ?w.begun});
     b = 0;
     for (b < blocks) {
-        interfere(w, f, b::u32, m, words);
+        interfere(w, f, b::u32, words);
         b = b + 1;
     }
     val entry: usize = graph.entry(?g)::usize;
     var x:     u32   = 0;
     for (x < m) {
-        if (bit(?w.live_in.data[entry * words], x)) {
-            var y: u32 = x + 1;
-            for (y < m) {
-                if (bit(?w.live_in.data[entry * words], y)) { meet(w, words, x, y); }
-                y = y + 1;
-            }
-        }
+        if (bit(?w.live_in.data[entry * words], x)) { meet_set(w, words, x, ?w.live_in.data[entry * words]); }
         x = x + 1;
     }
-    colour(w, f, m, words);
+    val err_coloured: err[allocator.Error] = colour(w, f, m, words);
+    if (sel err_coloured.err) { ret err_coloured; }
     rename(w, f);
     ret err[allocator.Error].ok{};
 }
