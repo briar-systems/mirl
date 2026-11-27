@@ -302,6 +302,8 @@ A function's body may be **available**, `FunctionData.available`: a copy of the 
 
 A value may be marked **secret**. Secrecy is stated once for each value and only moves in one direction.
 
+A mark is stated in every function, so the secrecy typing below and every access statement hold wherever a value goes, but it binds a pass only in a function that requires constant time (section 7.1), the one the walk of its code proves. Elsewhere a pass treats a secret value as any other and keeps only the typing: a result stays as secret as its row gives, no edge passes a secret to a public parameter and no use is given a more secret value. A pass asks the one question `mirl.ir.module.secret_in` of a mark, and a pass that declares it breaks constant time never meets such a function and asks it nothing.
+
 - A block parameter is secret as it is declared.
 - A constant is public.
 - An instruction result is secret as its row's secrecy rule gives. **Propagates** means a result is secret when any operand is. **Declared** means a result is secret when the instruction's own secrecy mark is set, which is how a front end marks a value read from secret memory, returned by a call or given by an atomic access. **Declassifies** means every result is public. **None** means the row has no results.
