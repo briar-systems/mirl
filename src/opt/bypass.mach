@@ -12,8 +12,17 @@
 # kept or volatile, it or its `br` holds a value binding record or a record reads one of its parameters, so no
 # description of a variable is dropped, or it stands in a loop's shape that a pass after it reads: it or its target
 # is a loop's header (a preheader or a latch: licm, the vectoriser and the unroller read them), or an edge leaving a
-# loop enters it (the unroller takes a loop whose exits leave to a block nothing outside the loop enters). a block
-# holding a slot marker holds an instruction and is no forwarder. an edge stays where it leaves an instruction other
+# loop enters it (the unroller takes a loop whose exits leave to a block nothing outside the loop enters).
+#
+# a block that holds slot markers (`slot.begin`, `slot.end`) and then its `br` is a forwarder where every edge into
+# it is the one edge of a `br` from a block it does not dominate (`lone_ways_in`): the markers move, in their order, to
+# the end of each predecessor before its `br` (`hoist`), and the block is then bypassed as any other. each path
+# through the block runs the same markers once with nothing between their old point and their new one, so no access
+# crosses a marker and their alternation on every path is the one the verifier checked (doc/ir.md). where one edge
+# into the block leaves a `cbr` or a multi-way branch, a marker appended there would run on its other edges too, so the
+# block keeps its markers and stays. the pass runs in a function that requires constant time as in any other: the
+# events each path runs are the same, in the same order, so the stale stack check (`mirl.pass.analysis.slots`) and
+# the frame's storage dataflow read the same on every path. an edge stays where it leaves an instruction other
 # than `br` or `cbr`, or a `cbr` whose other edge already enters the target, or where it leaves a `cbr`, the `br` passes
 # arguments and the target is entered from elsewhere: the forwarder is then where that path gives the target's
 # parameters their values, which an edge of a conditional branch into a block it does not alone enter has no place for
@@ -50,9 +59,14 @@ use mirl.ir.id.Function;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.NO_INSTRUCTION;
 use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Metadata;
 use mirl.ir.module;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Row;
 use mirl.ir.opcode.table;
 use mirl.ir.value.Def;
 use mirl.pass.analysis;
@@ -108,12 +122,42 @@ fun exit(x: *Run, k: Block) bool {
     ret false;
 }
 
-# the `br` of block `k` where it is a forwarder the pass bypasses, NO_INSTRUCTION where it stays
+# whether every instruction of block `k` before its last, `jump`, is a slot marker no record stands before, which the
+# pass may move to the predecessors (`hoist`)
+fun markers_only(b: *Body, k: Block, jump: Instruction) bool {
+    var i: Instruction = b.blocks.data[k].first;
+    for (i != jump) {
+        val d: *InstructionData = ?b.instructions.data[i];
+        if (!table.marks(d.opcode) || d.points.first != 0 || d.metadata.flags.kept || d.metadata.flags.volatile) { ret false; }
+        i = d.next;
+    }
+    ret true;
+}
+
+# whether every edge into block `k` is the one edge of a `br`, from a block `k` does not dominate, so a marker appended
+# to each such block before its `br` runs on exactly the paths that entered `k`, and no back edge enters `k`
+fun lone_ways_in(x: *Run, k: Block) bool {
+    val b: *Body = x.b;
+    if (b.blocks.data[k].predecessors.len == 0) { ret false; }
+    var p: usize = 0;
+    for (p < b.blocks.data[k].predecessors.len) {
+        val d: *InstructionData = ?b.instructions.data[b.blocks.data[k].predecessors.data[p]];
+        if (d.opcode != table.BR || d.edges.len != 1 || d.metadata.flags.kept || d.metadata.flags.volatile) { ret false; }
+        if (!(sel d.place.placed))                                                                          { ret false; }
+        if (dominance.dominates(x.d, k, d.place.placed))                                                    { ret false; }
+        p = p + 1;
+    }
+    ret true;
+}
+
+# the `br` of block `k` where it is a forwarder the pass bypasses, NO_INSTRUCTION where it stays. a block that holds
+# slot markers before its `br` is one where every edge into it may take them (`lone_ways_in`)
 fun forwarder(x: *Run, k: Block) Instruction {
     val b: *Body = x.b;
     if (k == 0 || !dominance.reachable(x.d, k)) { ret NO_INSTRUCTION; }
-    val jump: Instruction = b.blocks.data[k].first;
-    if (jump == NO_INSTRUCTION || jump != b.blocks.data[k].last) { ret NO_INSTRUCTION; }
+    val jump: Instruction = b.blocks.data[k].last;
+    if (jump == NO_INSTRUCTION || !markers_only(b, k, jump))   { ret NO_INSTRUCTION; }
+    if (jump != b.blocks.data[k].first && !lone_ways_in(x, k)) { ret NO_INSTRUCTION; }
     val d: *InstructionData = ?b.instructions.data[jump];
     if (d.opcode != table.BR || d.edges.len != 1)                  { ret NO_INSTRUCTION; }
     if (d.metadata.flags.kept || d.metadata.flags.volatile)        { ret NO_INSTRUCTION; }
@@ -200,6 +244,42 @@ fun bypass(x: *Run, k: Block, jump: Instruction) res[bool, refusal.Error] {
     ret res[bool, refusal.Error].ok{moved};
 }
 
+# move the slot markers of forwarder `k`, which stand before its `br`, to the end of each predecessor, before its own
+# `br`, in their order, so `k` holds its `br` alone. every edge into `k` is a lone `br` (`lone_ways_in`), so each path
+# through `k` runs the same markers at the same point relative to every access, now just before the edge rather than
+# just after it
+fun hoist(x: *Run, k: Block, jump: Instruction) err[refusal.Error] {
+    val b: *Body = x.b;
+    var p: usize = 0;
+    for (p < b.blocks.data[k].predecessors.len) {
+        val at: Instruction = b.blocks.data[k].predecessors.data[p];
+        var i:  Instruction = b.blocks.data[k].first;
+        for (i != jump) {
+            val next: Instruction = b.instructions.data[i].next;
+            var ops:  [1]Value    = [1]Value{b.instructions.data[i].operands.data[0]};
+            var md:   Metadata;
+            md.location = b.instructions.data[i].metadata.location;
+            md.site     = b.instructions.data[i].metadata.site;
+            val opt_row: opt[*Row] = table.at(b.instructions.data[i].opcode);
+            if (sel opt_row.none) { ret err[refusal.Error].err{refusal.Error.reason{"a slot marker has no opcode row"}}; }
+            val res_made: res[Instruction, module.Error] = body.builder_make(x.c.m, x.f, opt_row.some, Request{opcode: b.instructions.data[i].opcode, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: nil, size: 0}}, md);
+            if (sel res_made.err) { ret err[refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+            val err_placed: err[refusal.Error] = edit(body.insert(x.c.m, x.f, at, res_made.ok));
+            if (sel err_placed.err) { ret err_placed; }
+            i = next;
+        }
+        p = p + 1;
+    }
+    var i: Instruction = b.blocks.data[k].first;
+    for (i != jump) {
+        val next:       Instruction        = b.instructions.data[i].next;
+        val err_erased: err[refusal.Error] = edit(body.erase(x.c.m, x.f, i));
+        if (sel err_erased.err) { ret err_erased; }
+        i = next;
+    }
+    ret err[refusal.Error].ok{};
+}
+
 # bypass every forwarder of one function
 fun visit(u: *Unit) res[bool, refusal.Error] {
     val c:        *Context                 = u.context;
@@ -223,6 +303,11 @@ fun visit(u: *Unit) res[bool, refusal.Error] {
         if (!b.blocks.data[k].erased) {
             arena.reset(?ar);
             val jump: Instruction = forwarder(?x, k::u32);
+            if (jump != NO_INSTRUCTION && jump != b.blocks.data[k].first) {
+                val err_hoisted: err[refusal.Error] = hoist(?x, k::u32, jump);
+                if (sel err_hoisted.err) { ret res[bool, refusal.Error].err{err_hoisted.err}; }
+                changed = true;
+            }
             if (jump != NO_INSTRUCTION) {
                 val res_moved: res[bool, refusal.Error] = bypass(?x, k::u32, jump);
                 if (sel res_moved.err) { ret res_moved; }
