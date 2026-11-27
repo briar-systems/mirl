@@ -9,6 +9,12 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-27
+
+### Fixed
+
+- A frame under `win64` or `aapcs64win` states its call frame rules as the unwind table of its object's format takes them. In an object whose format writes no Windows unwind codes, as a freestanding ELF image, it states every rule of its prologue and of its epilogues and marks neither a prologue's end nor an epilogue's scope, where it stated them as the codes take them whatever the format. `--emit asm` of such an object was refused as an internal error, and on x86-64 its `.eh_frame` held the body's frame address through every epilogue. The code of a function is unchanged, and so is every PE, Mach-O and other ELF object (#780).
+
 ## [0.3.3] - 2026-11-27
 
 ### Added
