@@ -25,20 +25,29 @@
 #
 # the rule every moved edge keeps: each block it no longer passes through runs nothing whose effect or result is needed
 # on its path. the deciding block holds, besides its branch, only the compare the branch reads as its condition and the
-# `extract` the compare reads, both decided for the edge and read by nothing outside the block or on an edge, and
-# instructions of no stated effect whose results nothing reads (the front end's dead widening of a test). a forwarder
-# holds only its `br`. no argument of a moved edge is a value defined in a block it skips, and each skipped block's
-# parameter is either read in that block alone, its value going on in the moved edge's arguments, or passed on as above.
-# a record a skipped block holds describes no point of the moved edge's path.
+# `extract` the compare reads, both decided for the edge and read by nothing outside the block or on an edge,
+# instructions of no stated effect whose results nothing reads (the front end's dead widening of a test), instructions
+# that touch no memory, never trap and read only values defined above the block (an address the block and the blocks
+# after it share, which common subexpression elimination left in the block), and slot markers (`slot.begin`, `slot.end`)
+# no record stands before. before any edge moves, the movable instructions go, in their order, to the end of the block's
+# immediate dominator (`hoist`), which dominates every block the block does and is dominated by every definition they
+# read, so each of their readers still finds them and they run on more paths with no effect. a block that holds markers
+# moves only an edge that is the one edge of a `br`, and copies its markers, in their order, to just before that `br`
+# first (`remark`): the path then runs the same markers once, with no access between their old point and their new one,
+# as forwarder bypass moves them (`mirl.opt.bypass`, doc/ir.md), and the block keeps them for the edges that stay. an
+# edge of a conditional or multi-way branch stays, since a marker before it would run on the other edges too. a
+# forwarder holds only its `br`. no argument of a moved edge is a value defined in a block it skips, and each skipped
+# block's parameter is either read in that block alone, its value going on in the moved edge's arguments, or passed on
+# as above. a record a skipped block holds describes no point of the moved edge's path.
 #
-# the rule by which an edge is left alone: the block holds anything else (a store, a call, a second compare), its branch
-# reads no parameter or passes the member it tests or the compare's result on an edge, a reader of one of its parameters
-# outside it stands where no target of the block entered by its edge alone dominates (as after the targets join again),
-# the edge passes no constant the folder can decide the branch by, the edge leaves a branch other than `br` or `cbr`, or
-# a branch whose other edge already enters the target, or the block or a forwarder on the way is a loop's header (a
-# predecessor it dominates enters it), since moving an edge from outside a loop past its header into its body would give
-# the loop a second way in. the compare is decided by the folder, so any compare it computes on two constants is taken.
-# it copies no instruction.
+# the rule by which an edge is left alone: the block holds anything else (a store, a call, a second compare, an
+# instruction that reads one of its parameters or may trap), its branch reads no parameter or passes the member it tests
+# or the compare's result on an edge, a reader of one of its parameters outside it stands where no target of the block
+# entered by its edge alone dominates (as after the targets join again), the edge passes no constant the folder can
+# decide the branch by, the edge leaves a branch other than `br` or `cbr`, or a branch whose other edge already enters
+# the target, or the block or a forwarder on the way is a loop's header (a predecessor it dominates enters it), since
+# moving an edge from outside a loop past its header into its body would give the loop a second way in. the compare is
+# decided by the folder, so any compare it computes on two constants is taken. it copies no instruction but a marker.
 #
 # it costs each block its predecessors and those of the forwarders before it, and a block whose parameters are passed on
 # the function's records once per parameter. it reads the dominator tree. it moves edges, which changes which branches a
@@ -68,8 +77,11 @@ use mirl.ir.id.Function;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.NO_INSTRUCTION;
 use mirl.ir.id.Value;
+use mirl.ir.instruction.Branch;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.instruction.Place;
+use mirl.ir.instruction.Request;
+use mirl.ir.metadata.Metadata;
 use mirl.ir.module;
 use mirl.ir.opcode.row.Immediate;
 use mirl.ir.opcode.row.Row;
@@ -168,10 +180,8 @@ fun idle(b: *Body, i: Instruction) bool {
     val d: *InstructionData = ?b.instructions.data[i];
     if (d.metadata.flags.kept || d.metadata.flags.volatile || d.results.len == 0) { ret false; }
     val opt_row: opt[*Row] = table.at(d.opcode);
-    if (sel opt_row.none) { ret false; }
-    val r: *Row = opt_row.some;
-    if (r.terminator || r.effects.reads || r.effects.writes)                      { ret false; }
-    if (!(sel r.effects.traps[0].unstated) || !(sel r.effects.traps[1].unstated)) { ret false; }
+    if (sel opt_row.none)                                              { ret false; }
+    if (opt_row.some.terminator || !opt_row.some.effects.speculatable) { ret false; }
     var n: usize = 0;
     for (n < d.results.len) {
         if (b.values.data[d.results.data[n]].uses.len != 0) { ret false; }
@@ -180,21 +190,112 @@ fun idle(b: *Body, i: Instruction) bool {
     ret true;
 }
 
-# whether block `k` holds nothing but its compare and pick (NO_INSTRUCTION for none), its branch and idle instructions
+# whether instruction `i` of block `k` may run where its result is not needed (its row's `speculatable`), gives
+# results and reads only values defined above the block, so it can stand at the end of the block's immediate dominator instead, as an address the block and
+# the blocks after it share does (`hoist`)
+fun movable(b: *Body, k: Block, i: Instruction) bool {
+    val d: *InstructionData = ?b.instructions.data[i];
+    if (d.metadata.flags.kept || d.metadata.flags.volatile || d.results.len == 0 || d.edges.len != 0) { ret false; }
+    val opt_row: opt[*Row] = table.at(d.opcode);
+    if (sel opt_row.none)                                              { ret false; }
+    if (opt_row.some.terminator || !opt_row.some.effects.speculatable) { ret false; }
+    var n: usize = 0;
+    for (n < d.operands.len) {
+        val def: Def = b.values.data[d.operands.data[n]].def;
+        if (sel def.parameter && def.parameter.block == k) { ret false; }
+        if (sel def.result) {
+            val at: Place = b.instructions.data[def.result.instruction].place;
+            if (!(sel at.placed)) { ret false; }
+            if (at.placed == k)   { ret false; }
+        }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# whether instruction `i` is a slot marker no record stands before, which a moved edge runs again (`remark`)
+fun marker(b: *Body, i: Instruction) bool {
+    val d: *InstructionData = ?b.instructions.data[i];
+    ret table.marks(d.opcode) && d.points.first == 0 && !d.metadata.flags.kept && !d.metadata.flags.volatile;
+}
+
+# whether block `k` holds a slot marker
+fun marked(b: *Body, k: Block) bool {
+    var i: Instruction = b.blocks.data[k].first;
+    for (i != NO_INSTRUCTION) {
+        if (table.marks(b.instructions.data[i].opcode)) { ret true; }
+        i = b.instructions.data[i].next;
+    }
+    ret false;
+}
+
+# whether instruction `from` is a `br` a copy of the markers of a block may stand before: its one edge is the only way
+# out of its block, so a marker there runs on exactly the paths that take the edge
+fun lone_br(b: *Body, from: Instruction) bool {
+    val d: *InstructionData = ?b.instructions.data[from];
+    ret d.opcode == table.BR && d.edges.len == 1 && !d.metadata.flags.kept && !d.metadata.flags.volatile;
+}
+
+# copy the slot markers of block `k`, in their order, to just before `br` `from`, so an edge moved past `k` runs them
+fun remark(x: *Run, k: Block, from: Instruction) err[refusal.Error] {
+    val b: *Body       = x.b;
+    var i: Instruction = b.blocks.data[k].first;
+    for (i != NO_INSTRUCTION) {
+        val next: Instruction = b.instructions.data[i].next;
+        if (table.marks(b.instructions.data[i].opcode)) {
+            var ops: [1]Value = [1]Value{b.instructions.data[i].operands.data[0]};
+            var md:  Metadata;
+            md.location = b.instructions.data[i].metadata.location;
+            md.site     = b.instructions.data[i].metadata.site;
+            val opcode:  u32       = b.instructions.data[i].opcode;
+            val opt_row: opt[*Row] = table.at(opcode);
+            if (sel opt_row.none) { ret err[refusal.Error].err{refusal.Error.reason{"a slot marker has no opcode row"}}; }
+            val res_made: res[Instruction, module.Error] = body.builder_make(x.c.m, x.f, opt_row.some, Request{opcode: opcode, operands: Slice[Value]{data: ?ops[0], size: 1}, immediates: Slice[Immediate]{data: nil, size: 0}, targets: Slice[Branch]{data: nil, size: 0}}, md);
+            if (sel res_made.err) { ret err[refusal.Error].err{refusal.Error.ir{res_made.err}}; }
+            # a load forwarding left before `from` now stands ahead of these markers, of other slots, which frame
+            # sharing reads from the final code
+            val err_placed: err[refusal.Error] = edit(body.insert(x.c.m, x.f, from, res_made.ok));
+            if (sel err_placed.err) { ret err_placed; }
+        }
+        i = next;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# whether block `k` holds nothing but its compare and pick (NO_INSTRUCTION for none), its branch, idle instructions,
+# movable ones and slot markers
 fun only(b: *Body, k: Block, compare: Instruction, pick: Instruction, branch: Instruction) bool {
     var i: Instruction = b.blocks.data[k].first;
     for (i != NO_INSTRUCTION) {
-        if (i != compare && i != pick && i != branch && !idle(b, i)) { ret false; }
+        if (i != compare && i != pick && i != branch && !idle(b, i) && !movable(b, k, i) && !marker(b, i)) { ret false; }
         i = b.instructions.data[i].next;
     }
     ret true;
+}
+
+# move each movable instruction of block `k` that is not idle, in its order, to the end of the block's immediate
+# dominator, so an edge that no longer passes the block still finds what it gave its readers after it
+fun hoist(x: *Run, d: *Dominance, k: Block, dc: Decision) err[refusal.Error] {
+    val b:       *Body    = x.b;
+    val opt_top: opt[u32] = dominance.idom(d, k);
+    if (sel opt_top.none) { ret err[refusal.Error].err{refusal.Error.reason{"jump threading decided a block with no immediate dominator"}}; }
+    var i: Instruction = b.blocks.data[k].first;
+    for (i != NO_INSTRUCTION) {
+        val next: Instruction = b.instructions.data[i].next;
+        if (i != dc.compare && i != dc.pick && i != dc.branch && !idle(b, i) && movable(b, k, i)) {
+            val err_moved: err[refusal.Error] = edit(body.relocate(x.c.m, x.f, i, b.blocks.data[opt_top.some].last));
+            if (sel err_moved.err) { ret err_moved; }
+        }
+        i = next;
+    }
+    ret err[refusal.Error].ok{};
 }
 
 # whether value `v`, defined in block `k`, is read by `reader` and idle instructions of the block alone
 fun read_by(b: *Body, k: Block, v: Value, reader: Instruction) bool {
     var u: usize = 0;
     for (u < b.values.data[v].uses.len) {
-        val user:  Instruction = b.values.data[v].uses.data[u];
+        val user:  Instruction = b.values.data[v].uses.data[u].instruction;
         val place: Place       = b.instructions.data[user].place;
         if (!(sel place.placed))              { ret false; }
         if (place.placed != k)                { ret false; }
@@ -228,7 +329,7 @@ fun tested(b: *Body, k: Block, v: Value, reader: Instruction) opt[Tested] {
     val pick: Instruction      = def.result.instruction;
     val d:    *InstructionData = ?b.instructions.data[pick];
     if (d.opcode != table.EXTRACT || d.operands.len != 1 || d.immediates.len != 1 || d.results.len != 1) { ret opt[Tested].none{}; }
-    if (d.metadata.flags.kept || d.metadata.flags.volatile || d.metadata.secret)                         { ret opt[Tested].none{}; }
+    if (d.metadata.flags.kept || d.metadata.flags.volatile)                                              { ret opt[Tested].none{}; }
     val at: Place = d.place;
     if (!(sel at.placed))                            { ret opt[Tested].none{}; }
     if (at.placed != k || !read_by(b, k, v, reader)) { ret opt[Tested].none{}; }
@@ -266,8 +367,8 @@ fun decision_of(x: *Run, k: Block) res[opt[Decision], refusal.Error] {
     if (at.placed != k || !read_by(b, k, cond, branch)) { ret nothing(); }
     if (passes(b, branch, cond))                        { ret nothing(); }
     val c: *InstructionData = ?b.instructions.data[compare];
-    if (c.operands.len != 2 || c.results.len != 1 || c.immediates.len != 0)      { ret nothing(); }
-    if (c.metadata.flags.kept || c.metadata.flags.volatile || c.metadata.secret) { ret nothing(); }
+    if (c.operands.len != 2 || c.results.len != 1 || c.immediates.len != 0) { ret nothing(); }
+    if (c.metadata.flags.kept || c.metadata.flags.volatile)                 { ret nothing(); }
     val opt_left: opt[Tested] = tested(b, k, c.operands.data[0], compare);
     if (sel opt_left.some) {
         val right: Def = b.values.data[c.operands.data[1]].def;
@@ -345,7 +446,7 @@ fun taken(x: *Run, dc: Decision, a: Value) res[opt[usize], refusal.Error] {
 fun header(b: *Body, d: *Dominance, k: Block) bool {
     var p: usize = 0;
     for (p < b.blocks.data[k].predecessors.len) {
-        val place: Place = b.instructions.data[b.blocks.data[k].predecessors.data[p]].place;
+        val place: Place = b.instructions.data[b.blocks.data[k].predecessors.data[p].instruction].place;
         if (sel place.placed && dominance.dominates(d, k, place.placed)) { ret true; }
         p = p + 1;
     }
@@ -397,7 +498,7 @@ fun separable(x: *Run, d: *Dominance, k: Block, branch: Instruction) bool {
         val v: Value = b.blocks.data[k].parameters.data[j];
         var u: usize = 0;
         for (u < b.values.data[v].uses.len) {
-            val place: Place = b.instructions.data[b.values.data[v].uses.data[u]].place;
+            val place: Place = b.instructions.data[b.values.data[v].uses.data[u].instruction].place;
             if (!(sel place.placed)) { ret false; }
             if (place.placed != k) {
                 val opt_owner: opt[usize] = owner(x, d, k, branch, place.placed);
@@ -461,7 +562,7 @@ fun separate(x: *Run, d: *Dominance, k: Block, branch: Instruction) err[refusal.
         var users: vector.Vector[Instruction] = vector.init[Instruction](x.scratch);
         var u:     usize                      = 0;
         for (u < b.values.data[v].uses.len) {
-            val i:     Instruction = b.values.data[v].uses.data[u];
+            val i:     Instruction = b.values.data[v].uses.data[u].instruction;
             val place: Place       = b.instructions.data[i].place;
             if (sel place.placed && place.placed != k) {
                 val res_pushed: res[usize, allocator.Error] = vector.push[Instruction](?users, i);
@@ -540,7 +641,7 @@ fun lone(b: *Body, d: *Dominance, f: Block) Instruction {
         if (b.values.data[v].bound.len != 0) { ret NO_INSTRUCTION; }
         var u: usize = 0;
         for (u < b.values.data[v].uses.len) {
-            if (b.values.data[v].uses.data[u] != jump) { ret NO_INSTRUCTION; }
+            if (b.values.data[v].uses.data[u].instruction != jump) { ret NO_INSTRUCTION; }
             u = u + 1;
         }
         n = n + 1;
@@ -556,7 +657,7 @@ fun gather(x: *Run, d: *Dominance, dc: Decision, into: Block, index: usize, move
     val b: *Body = x.b;
     var p: usize = 0;
     for (p < b.blocks.data[into].predecessors.len) {
-        val from: Instruction = b.blocks.data[into].predecessors.data[p];
+        val from: Instruction = b.blocks.data[into].predecessors.data[p].instruction;
         val op:   u32         = b.instructions.data[from].opcode;
         var e:    usize       = 0;
         for ((op == table.BR || op == table.CBR) && from != dc.branch && e < b.instructions.data[from].edges.len) {
@@ -626,17 +727,37 @@ fun thread_into(x: *Run, d: *Dominance, k: Block, dc: Decision) res[bool, refusa
     if (sel err_gather.err)             { ret res[bool, refusal.Error].err{err_gather.err}; }
     if (moves.len == 0)                 { ret res[bool, refusal.Error].ok{false}; }
     if (!separable(x, d, k, dc.branch)) { ret res[bool, refusal.Error].ok{false}; }
-    val err_separated: err[refusal.Error] = separate(x, d, k, dc.branch);
-    if (sel err_separated.err) { ret res[bool, refusal.Error].err{err_separated.err}; }
-
-    var args:  vector.Vector[Value] = vector.init[Value](x.scratch);
-    var hops:  vector.Vector[Move]  = vector.init[Move](x.scratch);
-    var moved: bool                 = false;
-    var m:     usize                = 0;
+    # every edit comes after the moves are decided, so the pass reports a change exactly where it made one
+    val marks: bool                = marked(b, k);
+    var taken: vector.Vector[Move] = vector.init[Move](x.scratch);
+    var m:     usize               = 0;
     for (m < moves.len) {
         val mv: Move  = moves.data[m];
         val to: Block = b.instructions.data[dc.branch].edges.data[mv.take].block;
-        if (to != k && !enters(b, mv.from, to)) {
+        if (to != k && !enters(b, mv.from, to) && (!marks || lone_br(b, mv.from))) {
+            val res_taken: res[usize, allocator.Error] = vector.push[Move](?taken, mv);
+            if (sel res_taken.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_taken.err}}; }
+        }
+        m = m + 1;
+    }
+    if (taken.len == 0) { ret res[bool, refusal.Error].ok{false}; }
+    val err_hoisted: err[refusal.Error] = hoist(x, d, k, dc);
+    if (sel err_hoisted.err) { ret res[bool, refusal.Error].err{err_hoisted.err}; }
+    val err_separated: err[refusal.Error] = separate(x, d, k, dc.branch);
+    if (sel err_separated.err) { ret res[bool, refusal.Error].err{err_separated.err}; }
+
+    var args: vector.Vector[Value] = vector.init[Value](x.scratch);
+    var hops: vector.Vector[Move]  = vector.init[Move](x.scratch);
+    m = 0;
+    for (m < taken.len) {
+        val mv: Move  = taken.data[m];
+        val to: Block = b.instructions.data[dc.branch].edges.data[mv.take].block;
+        # an earlier move from the same branch may have made it enter the target already
+        if (!enters(b, mv.from, to)) {
+            if (marks) {
+                val err_marked: err[refusal.Error] = remark(x, k, mv.from);
+                if (sel err_marked.err) { ret res[bool, refusal.Error].err{err_marked.err}; }
+            }
             vector.truncate[Value](?args, 0);
             var n: usize = 0;
             for (n < b.instructions.data[dc.branch].edges.data[mv.take].arguments.len) {
@@ -648,11 +769,9 @@ fun thread_into(x: *Run, d: *Dominance, k: Block, dc: Decision) res[bool, refusa
             }
             val err_moved: err[refusal.Error] = edit(body.retarget(x.c.m, x.f, mv.from, mv.edge::u32, to, Slice[Value]{data: args.data, size: args.len}));
             if (sel err_moved.err) { ret res[bool, refusal.Error].err{err_moved.err}; }
-            moved = true;
         }
         m = m + 1;
     }
-    if (!moved) { ret res[bool, refusal.Error].ok{false}; }
     # a forwarder no edge enters goes, which may leave the next one, or the block, entered by none
     val res_held: res[usize, allocator.Error] = vector.push[Block](?through, k);
     if (sel res_held.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{res_held.err}}; }

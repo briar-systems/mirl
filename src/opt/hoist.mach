@@ -62,6 +62,7 @@ use std.collections.slice.Slice;
 use std.collections.vector;
 
 use mirl.ir.body;
+use mirl.ir.cfg.graph;
 use mirl.ir.cfg.graph.NONE;
 use mirl.ir.cfg.loops;
 use mirl.ir.cfg.loops.Loops;
@@ -124,7 +125,7 @@ rec Use {
 
 # whether constant `v` of a scalar integer type no signed 32-bit immediate holds, read at its width
 fun wide(m: *module.Module, b: *Body, v: Value) res[bool, refusal.Error] {
-    if (!(sel b.values.data[v].def.constant) || b.values.data[v].secret) { ret res[bool, refusal.Error].ok{false}; }
+    if (!(sel b.values.data[v].def.constant)) { ret res[bool, refusal.Error].ok{false}; }
     val res_lane: res[opt[Lane], refusal.Error] = emit.lane_of(m, b.values.data[v].type);
     if (sel res_lane.err)     { ret res[bool, refusal.Error].err{res_lane.err}; }
     if (sel res_lane.ok.none) { ret res[bool, refusal.Error].ok{false}; }
@@ -243,7 +244,7 @@ fun registers(c: *Context, scratch: *allocator.Allocator, out: *u32) err[refusal
 # whether value `v` is one the liveness holds: defined by a block or an instruction, and known to it
 fun tracked(b: *Body, live: *Liveness, v: Value) bool {
     val def: Def = b.values.data[v].def;
-    ret !(sel def.constant) && !(sel def.removed) && v::u32 < live.words * 64;
+    ret !(sel def.constant) && !(sel def.removed) && v::u32 < live.values;
 }
 
 # the most values of each bank live at once at any point of a loop's blocks, by a walk back through each block from
@@ -251,28 +252,26 @@ fun tracked(b: *Body, live: *Liveness, v: Value) bool {
 fun peak(m: *module.Module, b: *Body, live: *Liveness, blocks: Slice[u32], scratch: *allocator.Allocator, out: *u32) err[refusal.Error] {
     out[GENERAL] = 0;
     out[OTHER]   = 0;
-    val words:   usize                      = live.words::usize;
+    val words:   usize                      = ((live.values + 63) / 64)::usize;
     val res_set: res[*u64, allocator.Error] = allocator.zallocate[u64](scratch, words + 1);
     if (sel res_set.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_set.err}}; }
-    val set: *u64  = res_set.ok;
-    var k:   usize = 0;
+    val set:  *u64               = res_set.ok;
+    var seen: vector.Vector[u32] = vector.init[u32](scratch);
+    var k:    usize              = 0;
     for (k < blocks.size) {
-        val base: usize  = blocks.data[k]::usize * words;
-        var n:    [2]u32 = [2]u32{0, 0};
-        var w:    usize  = 0;
-        for (w < words) {
-            set[w] = live.live_out.data[base + w];
-            var bits: u64 = set[w];
-            var at:   u64 = 0;
-            for (bits != 0) {
-                if ((bits & 1) != 0) {
-                    val bank: usize = bank_of(m, b.values.data[(w * 64)::u32 + at::u32].type);
-                    n[bank] = n[bank] + 1;
-                }
-                bits = bits >> 1;
-                at   = at + 1;
-            }
-            w = w + 1;
+        var c: usize = 0;
+        for (c < seen.len) {
+            set[(seen.data[c] / 64)::usize] = 0;
+            c                               = c + 1;
+        }
+        vector.clear[u32](?seen);
+        var n:    [2]u32     = [2]u32{0, 0};
+        val held: Slice[u32] = graph.list[u32](?live.live_out, blocks.data[k]);
+        var h:    usize      = 0;
+        for (h < held.size) {
+            val err_read: err[refusal.Error] = read(m, b, live, set, ?seen, ?n[0], held.data[h]);
+            if (sel err_read.err) { ret err_read; }
+            h = h + 1;
         }
         var i: Instruction = b.blocks.data[blocks.data[k]].last;
         for {
@@ -296,14 +295,16 @@ fun peak(m: *module.Module, b: *Body, live: *Liveness, blocks: Slice[u32], scrat
             }
             var o: usize = 0;
             for (o < d.operands.len) {
-                read(m, b, live, set, ?n[0], d.operands.data[o]);
+                val err_read: err[refusal.Error] = read(m, b, live, set, ?seen, ?n[0], d.operands.data[o]);
+                if (sel err_read.err) { ret err_read; }
                 o = o + 1;
             }
             var e: usize = 0;
             for (e < d.edges.len) {
                 var x: usize = 0;
                 for (x < d.edges.data[e].arguments.len) {
-                    read(m, b, live, set, ?n[0], d.edges.data[e].arguments.data[x]);
+                    val err_read: err[refusal.Error] = read(m, b, live, set, ?seen, ?n[0], d.edges.data[e].arguments.data[x]);
+                    if (sel err_read.err) { ret err_read; }
                     x = x + 1;
                 }
                 e = e + 1;
@@ -315,15 +316,19 @@ fun peak(m: *module.Module, b: *Body, live: *Liveness, blocks: Slice[u32], scrat
     ret err[refusal.Error].ok{};
 }
 
-# a read of value `v` in the walk back: live from here up, counted in its bank when it was not
-fun read(m: *module.Module, b: *Body, live: *Liveness, set: *u64, n: *u32, v: Value) {
-    if (!tracked(b, live, v)) { ret; }
+# a read of value `v` in the walk back: live from here up, counted in its bank when it was not, and its word listed in
+# `seen` for the next block's walk to clear
+fun read(m: *module.Module, b: *Body, live: *Liveness, set: *u64, seen: *vector.Vector[u32], n: *u32, v: Value) err[refusal.Error] {
+    if (!tracked(b, live, v)) { ret err[refusal.Error].ok{}; }
     val slot: usize = (v / 64)::usize;
     val mask: u64   = 1::u64 << (v % 64)::u64;
-    if ((set[slot] & mask) != 0) { ret; }
+    if ((set[slot] & mask) != 0) { ret err[refusal.Error].ok{}; }
     set[slot] = set[slot] | mask;
+    val res_pushed: res[usize, allocator.Error] = vector.push[u32](seen, v);
+    if (sel res_pushed.err) { ret err[refusal.Error].err{refusal.Error.alloc{res_pushed.err}}; }
     val bank: usize = bank_of(m, b.values.data[v].type);
     n[bank] = n[bank] + 1;
+    ret err[refusal.Error].ok{};
 }
 
 # carry each constant the blocks of loop `n` read that the target makes again at each read, as the loop's pressure
@@ -348,7 +353,7 @@ fun carry(c: *Context, f: Function, l: *Loops, n: u32, scratch: *allocator.Alloc
             val opt_row: opt[*Row]        = table.at(d.opcode);
             var r:       *Row             = nil;
             if (sel opt_row.some) { r = opt_row.some; }
-            if (r != nil && !d.metadata.secret) {
+            if (r != nil) {
                 var o: usize = 0;
                 for (o < d.operands.len) {
                     val res_made: res[bool, refusal.Error] = made(c, f, b, d, r, o);
@@ -431,12 +436,12 @@ fun carry(c: *Context, f: Function, l: *Loops, n: u32, scratch: *allocator.Alloc
                 res_room.ok[p] = v;
                 p              = p + 1;
             }
-            val res_param: res[Value, module.Error] = body.add_parameter(c.m, f, head, Declaration{type: b.values.data[v].type, secret: false}, Slice[Value]{data: res_room.ok, size: preds});
+            val res_param: res[Value, module.Error] = body.add_parameter(c.m, f, head, Declaration{type: b.values.data[v].type, secret: b.values.data[v].secret}, Slice[Value]{data: res_room.ok, size: preds});
             if (sel res_param.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{res_param.err}}; }
             val param: Value = res_param.ok;
             p = 0;
             for (p < b.blocks.data[head].predecessors.len) {
-                val from:  Instruction = b.blocks.data[head].predecessors.data[p];
+                val from:  Instruction = b.blocks.data[head].predecessors.data[p].instruction;
                 val place: Place       = b.instructions.data[from].place;
                 if (sel place.placed && loops.contains(l, n, place.placed)) {
                     val err_back: err[refusal.Error] = edit(body.substitute(c.m, f, from, v, param));
