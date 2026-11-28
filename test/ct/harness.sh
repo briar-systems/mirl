@@ -25,13 +25,20 @@
 # the null control runs every case first with both classes the fixed input,
 # sampled the same way, so it is cost-matched to the case. a null |t| above
 # $NOISE (4.5 by default) says the host is too noisy to judge, and the harness
-# declines, with no verdict, rather than flake. the planted control
-# test/ct/leak/branch.mirl must be flagged, or the harness is blind and fails,
-# and a leak in every case is a broken harness, not a defect, since real
-# leaks are selective.
+# declines, with no verdict, rather than flake. a null is quiet whenever load
+# swells the variance without moving the means, so it cannot see load that
+# hides a leak: the planted control test/ct/leak/branch.mirl is timed before
+# the cases and again after them, and a run that misses it either time measured
+# nothing. that run declines, printing the control's |t|, its null's and each
+# class's mean and spread, and withholds every case verdict timed between, a
+# pass or a leak, since its controls do not vouch for them. the means tell a
+# hidden leak (they differ) from a harness that cannot see one (they agree),
+# and the harness never retries. a leak in every case is a broken harness, not
+# a defect, since real leaks are selective.
 #
-# the exit status is 0 when no case leaks, 3 when the harness declines and 1
-# otherwise
+# the exit status is 0 when the controls hold and no case leaks, 1 when a case
+# leaks or a run is not whole or does not build, and 3 when the run declines:
+# it measured nothing, so it is neither a pass nor a leak
 set -u
 
 [ $# -eq 1 ] || { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -70,15 +77,16 @@ welch() {
             t = 0; if (se > 0) t = (ma - mb) / sqrt(se)
             if (t < 0) t = -t
             if (ma < 0 || mb < 0 || t != t) { print "malformed"; exit }
-            printf "%.3f %.1f %.1f\n", t, ma, mb
+            printf "%.3f %.1f %.1f %.1f %.1f\n", t, ma, mb, sqrt(va), sqrt(vb)
         }'
 }
 
-# the |t| line of one run of the case built as `$1` with drawn inputs or not
-# as `$2` says, into `$3`
+# the line of one run of the case built as `$1` with drawn inputs or not as
+# `$2` says, into `$3`: |t|, each class's mean and each class's spread
 timed() {
     local src=$1 drawn=$2 dir=$3 name
     name=$(basename "$src" .mirl)
+    mkdir -p "$dir"
     local at=$dir/$name.$drawn.mirl
     local batch
     batch=$(stated batch 8 "$src")
@@ -105,11 +113,20 @@ fails=0
 leaks=0
 cases=0
 declined=0
-fail() { echo "FAIL $1: $2"; fails=$((fails + 1)); }
+verdicts=()
+fail() { verdicts+=("FAIL $1: $2"); fails=$((fails + 1)); }
 
-# judge one case `$1`, a leak expected or not as `$2` says
+# a run's measures as the report states them: its |t|, then each class's mean
+# and spread in ticks
+measured() {
+    local t ma mb sa sb
+    read -r t ma mb sa sb <<<"$1"
+    echo "|t| = $t, fixed $ma (spread $sa), drawn $mb (spread $sb)"
+}
+
+# judge one case `$1` into `$out`, its verdict added to the report
 judge() {
-    local src=$1 planted=$2 name null test t
+    local src=$1 name null test t
     name=$(basename "$src" .mirl)
     null=$(timed "$src" 0 "$out")
     case "$null" in
@@ -118,7 +135,7 @@ judge() {
     esac
     t=${null%% *}
     if awk -v t="$t" -v n="$noise" 'BEGIN { exit !(t > n) }'; then
-        echo "declined $name: the null control gives |t| = $t, the host is too noisy"
+        verdicts+=("declined $name: the null control gives $(measured "$null"), the host is too noisy")
         declined=$((declined + 1))
         return
     fi
@@ -129,23 +146,51 @@ judge() {
     esac
     t=${test%% *}
     if awk -v t="$t" -v l="$leak" 'BEGIN { exit !(t > l) }'; then
-        if [ "$planted" = yes ]; then echo "ok   $name: the planted leak is flagged, |t| = $t"; return; fi
-        fail "$name" "leaks, |t| = $t (null $null)"
+        fail "$name" "leaks, $(measured "$test") (null |t| = ${null%% *})"
         leaks=$((leaks + 1))
         return
     fi
-    if [ "$planted" = yes ]; then
-        fail "$name" "the planted leak is not flagged, |t| = $t, the harness is blind"
-        return
-    fi
-    echo "ok   $name: |t| = $t (null ${null%% *})"
+    verdicts+=("ok   $name: |t| = $t (null ${null%% *})")
 }
 
-judge "$here/leak/branch.mirl" yes
+# time the planted control into `$1`, named `$2` in the report: return when it
+# is flagged, and otherwise end the run, failing where a run is not whole or
+# does not build and declining where the control's noise or a missed leak says
+# the run measured nothing
+control() {
+    local dir=$1 when=$2 null test t withheld=""
+    [ "${#verdicts[@]}" -gt 0 ] && withheld=", and the ${#verdicts[@]} case verdicts timed before it are withheld"
+    null=$(timed "$here/leak/branch.mirl" 0 "$dir")
+    case "$null" in
+        unbuilt*|unrun*) echo "FAIL branch $when: ${null#* }"; exit 1 ;;
+        malformed) echo "FAIL branch $when: the null control's run is not whole"; exit 1 ;;
+    esac
+    t=${null%% *}
+    if awk -v t="$t" -v n="$noise" 'BEGIN { exit !(t > n) }'; then
+        echo "declined: the planted control's null $when the cases gives $(measured "$null"), the host is too noisy$withheld"
+        exit 3
+    fi
+    test=$(timed "$here/leak/branch.mirl" 1 "$dir")
+    case "$test" in
+        unbuilt*|unrun*) echo "FAIL branch $when: ${test#* }"; exit 1 ;;
+        malformed) echo "FAIL branch $when: the run is not whole"; exit 1 ;;
+    esac
+    t=${test%% *}
+    if awk -v t="$t" -v l="$leak" 'BEGIN { exit !(t > l) }'; then
+        echo "ok   branch $when: the planted leak is flagged, |t| = $t"
+        return
+    fi
+    echo "declined: the planted leak $when the cases is not flagged, $(measured "$test") (null |t| = ${null%% *}), so this run measured nothing$withheld"
+    exit 3
+}
+
+control "$out/before" before
 for src in "$here"/case/*.mirl; do
     cases=$((cases + 1))
-    judge "$src" no
+    judge "$src"
 done
+control "$out/after" after
+printf '%s\n' "${verdicts[@]}"
 if [ "$declined" -gt 0 ]; then
     echo "declined: $declined runs found the host too noisy, so the harness gives no verdict"
     exit 3
