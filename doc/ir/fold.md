@@ -44,7 +44,7 @@ Every row that reads or writes memory, transfers control, computes an address fr
 
 ## Secrecy
 
-An operand carries a flag saying whether it is secret, and `folded` says whether the results are secret by the row's secrecy rule. A caller that places the results as constants never places a public constant over a secret result: folding never produces a public value from a secret computation, so the constant folding pass leaves such an instruction in place.
+An operand carries a flag saying whether it is secret, and `folded` says whether the results are secret by the row's secrecy rule. A caller that places the results as constants in a function that requires constant time never places a public constant over a secret result: folding never produces a public value from a secret computation there, so the constant folding pass leaves such an instruction in place. Anywhere else a secrecy mark binds no pass (`mirl.ir.module.secret_in`), and the pass folds it as any other.
 
 ## Formats the build does not hold
 
