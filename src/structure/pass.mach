@@ -7,6 +7,19 @@
 # for the emitter, so it is always read from the graph as it is and no side
 # table can drift from it.
 #
+# it keeps every frame access along every path a run takes: it adds no access
+# to a slot of the function's own frame, drops none and reorders none along any
+# such path, and every path of its output a run takes is a path of its input.
+# a dispatch's selector is a parameter of the block it makes, never a slot, and
+# threading a value passes it through parameters, so neither is an access. a
+# split copies an access onto the copy of its block, and a path a dispatch adds
+# that no run takes joins accesses of paths that never meet. so the stale rule,
+# which asks of every path from the entry, judges the body ahead of it
+# (`mirl.ct.fresh`), and its verdict stands for the code. for a function that
+# requires constant time the pass holds the part of this it can check: the
+# distinct accesses the stale rule reads are one set before and after it, a
+# copy allowed, and a dropped or a new one refused.
+#
 # it keeps constant time. a function that requires it branches on no secret,
 # so every branch a dispatch replaces is public, every selector is public and
 # every test of one is a branch on public data, of fixed latency and taken
@@ -23,15 +36,21 @@ use std.types.result.res;
 use std.types.size.usize;
 
 use std.allocator;
+use std.collections.vector;
 
 use mirl.ir.cfg.dominance.Dominance;
 use mirl.ir.cfg.graph;
 use mirl.ir.cfg.graph.Graph;
 use mirl.ir.cfg.loops.Loops;
+use mirl.ir.function.in_constant_time;
 use mirl.ir.id.Function;
+use mirl.ir.module;
 use mirl.ir.module.Module;
 use mirl.pass.analysis;
+use mirl.pass.analysis.slots;
+use mirl.pass.analysis.slots.Access;
 use mirl.pass.cache;
+use mirl.pass.record.Frames;
 use mirl.pass.record.Ground;
 use mirl.pass.record.Kind;
 use mirl.pass.record.Pass;
@@ -46,10 +65,13 @@ use mirl.structure.rewrite;
 use mirl.structure.shape;
 use mirl.structure.shape.Flaw;
 use mirl.structure.shape.Work;
+use mirl.target.basis;
+use mirl.target.layout;
+use mirl.target.layout.Layout;
 
 # the pass: it reshapes the graph, recomputes every analysis after its last
 # edit and leaves them all, the structure among them, valid
-pub val STRUCTURIZE: Pass = Pass{name: "structure", kind: Kind.legalise{}, scope: Scope.function{visit}, needs: analysis.OF_GRAPH | analysis.OF_DOMINANCE | analysis.OF_LOOPS | analysis.OF_STRUCTURE, preserves: cache.ALL, time: Time.keeps{}, applies: structured};
+pub val STRUCTURIZE: Pass = Pass{name: "structure", kind: Kind.legalise{}, scope: Scope.function{visit}, needs: analysis.OF_GRAPH | analysis.OF_DOMINANCE | analysis.OF_LOOPS | analysis.OF_STRUCTURE, preserves: cache.ALL, time: Time.keeps{}, applies: structured, frames: Frames.kept{}};
 
 # whether a target needs structured control flow
 fun structured(g: *Ground) bool {
@@ -99,9 +121,11 @@ fun step(u: *Unit, w: *Work) res[opt[bool], refusal.Error] {
 # and a later rewrite unsettles it again only by mending a construct nested
 # in it, which it does at most once for each of the b constructs around an
 # edge's source. so every edge is moved at most b + 1 times, every move is a
-# round, and a round that threads values follows each one.
+# round, and at most two rounds that thread values follow each one: one that
+# makes addresses again, leaving an index short of its use, and one that
+# threads that index, which is no address step.
 fun rounds(b: usize, e: usize) usize {
-    ret 2 * (b + e + 1) * (b + 2) + 64;
+    ret 3 * (b + e + 1) * (b + 2) + 64;
 }
 
 # the number of edges of a graph, counted over every block's successors
@@ -126,6 +150,16 @@ fun visit(u: *Unit) res[bool, refusal.Error] {
     var changed: bool  = false;
     var w:       Work  = shape.init(m.a);
     fin { shape.dnit(?w); }
+    val held: bool                  = in_constant_time(m.functions.data[u.f].data.constant_time);
+    var l:    Layout                = layout.of(u.context.t, ?m.types, basis.context_of(u.context.build));
+    var was:  vector.Vector[Access] = vector.init[Access](m.a);
+    fin { vector.dnit[Access](?was); }
+    var now: vector.Vector[Access] = vector.init[Access](m.a);
+    fin { vector.dnit[Access](?now); }
+    if (held) {
+        val err_was: err[module.Error] = slots.accesses_of(m, ?l, u.f, ?was);
+        if (sel err_was.err) { ret res[bool, refusal.Error].err{refusal.Error.ir{err_was.err}}; }
+    }
     for {
         val res_stepped: res[opt[bool], refusal.Error] = step(u, ?w);
         if (sel res_stepped.err)     { ret res[bool, refusal.Error].err{res_stepped.err}; }
@@ -136,7 +170,26 @@ fun visit(u: *Unit) res[bool, refusal.Error] {
         rounds = rounds + 1;
         if (rounds > limit) { ret res[bool, refusal.Error].err{refusal.Error.reason{"the graph did not settle into a structured shape"}}; }
     }
+    if (held && changed) {
+        val err_now: err[module.Error] = slots.accesses_of(m, ?l, u.f, ?now);
+        if (sel err_now.err)   { ret res[bool, refusal.Error].err{refusal.Error.ir{err_now.err}}; }
+        if (!same(?was, ?now)) { ret res[bool, refusal.Error].err{refusal.Error.reason{"the structurizer changed the frame accesses of a function that requires constant time, which the stale rule judged ahead of it"}}; }
+    }
     val res_structure_of: res[*Structure, refusal.Error] = analysis.structure_of(u.context.cache, u.f);
     if (sel res_structure_of.err) { ret res[bool, refusal.Error].err{res_structure_of.err}; }
     ret res[bool, refusal.Error].ok{changed};
+}
+
+# whether two sorted lists of accesses hold the same distinct accesses, each as often as it likes
+fun same(x: *vector.Vector[Access], y: *vector.Vector[Access]) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    for (i < x.len || j < y.len) {
+        if (i >= x.len || j >= y.len)                            { ret false; }
+        if (slots.compare_accesses(?x.data[i], ?y.data[j]) != 0) { ret false; }
+        val at: Access = x.data[i];
+        for (i < x.len && slots.compare_accesses(?x.data[i], ?at) == 0) { i = i + 1; }
+        for (j < y.len && slots.compare_accesses(?y.data[j], ?at) == 0) { j = j + 1; }
+    }
+    ret true;
 }
