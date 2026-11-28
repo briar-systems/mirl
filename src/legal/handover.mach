@@ -49,11 +49,18 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;
 
+use std.allocator;
 use std.collections.slice.Slice;
+use std.collections.vector;
 use std.types.result.res;
+
+use mirl.base.slice;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
 
 use mirl.ir.debug.record.Binding;
 use mirl.ir.function.Body;
@@ -69,6 +76,7 @@ use mirl.ir.module;
 use mirl.ir.module.Module;
 use opcode_row: mirl.ir.opcode.row;
 use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
 use opcode_table: mirl.ir.opcode.table;
 use mirl.ir.type.table;
 use mirl.ir.value.Def;
@@ -124,9 +132,9 @@ pub fun stands_before(b: *Body, v: Value, at: Instruction) bool {
 }
 
 # whether the memory load `l` read still holds what it read at a later instruction `at` of its block: nothing between
-# the two writes memory but into a call's outgoing argument area, which no load reads, or marks the storage of another
-# slot whose address goes nowhere but its own accesses and markers (`marks_apart`). the abi legalisation reads an
-# argument at its call by it, and the inliner an argument's memory in its copy
+# the two writes memory but into a call's outgoing argument area, which no load reads, or into another slot whose
+# address goes nowhere but its own accesses and markers (`writes_apart`). the abi legalisation reads an argument at
+# its call by it, and the inliner an argument's memory in its copy
 pub fun stands_until(b: *Body, l: Instruction, at: Instruction) bool {
     val opt_k: opt[Block] = block_of(b, l);
     val opt_j: opt[Block] = block_of(b, at);
@@ -137,8 +145,8 @@ pub fun stands_until(b: *Body, l: Instruction, at: Instruction) bool {
     for (i != at) {
         if (i == NO_INSTRUCTION) { ret false; }
         val opt_row: opt[*opcode_row.Row] = opcode_table.at(b.instructions.data[i].opcode);
-        if (sel opt_row.none)                                                          { ret false; }
-        if (opt_row.some.effects.writes && !fills_area(b, i) && !marks_apart(b, i, l)) { ret false; }
+        if (sel opt_row.none)                                                           { ret false; }
+        if (opt_row.some.effects.writes && !fills_area(b, i) && !writes_apart(b, i, l)) { ret false; }
         i = b.instructions.data[i].next;
     }
     ret true;
@@ -154,19 +162,118 @@ fun fills_area(b: *Body, i: Instruction) bool {
     ret b.instructions.data[def.result.instruction].opcode == opcode_table.ARG_OUTGOING;
 }
 
-# whether instruction `i` marks where the storage of a slot begins or ends that the load `l` cannot read: a slot other
-# than the root of the load's address, whose address goes nowhere but its own accesses and markers
-# (`overlap.contained`), so no address the load is formed from reaches it. a marker is the write of its own slot's
-# storage alone, as a statement's temporary begun ahead of the call it serves is (mach's lowering)
-fun marks_apart(b: *Body, i: Instruction, l: Instruction) bool {
+# whether instruction `i` writes only the memory of a slot the load `l` cannot read: a store to it, a copy or a fill
+# into it, or a marker of its storage, of a slot other than the root of the load's address whose address goes nowhere
+# but its own accesses and markers (`overlap.contained`), so no address the load is formed from reaches it. so a
+# statement's temporary begun ahead of the call it serves (mach's lowering), or another argument the abi legalisation
+# lays in a slot of its own for the same call, leaves the load's memory as it was
+fun writes_apart(b: *Body, i: Instruction, l: Instruction) bool {
     val d: *InstructionData = ?b.instructions.data[i];
-    if (!opcode_table.marks(d.opcode) || d.operands.len != 1) { ret false; }
-    val slot: Value = d.operands.data[0];
+    if (d.operands.len == 0) { ret false; }
+    val code: Opcode = d.opcode;
+    if (opcode_table.marks(code)) {
+        if (d.operands.len != 1) { ret false; }
+    }
+    or (code != opcode_table.STORE && code != opcode_table.MEM_COPY && code != opcode_table.MEM_FILL) { ret false; }
+    val slot: Value = steps.root_of(b, d.operands.data[0]);
     if (slot == steps.root_of(b, b.instructions.data[l].operands.data[0])) { ret false; }
     val def: Def = b.values.data[slot].def;
     if (!(sel def.result))                                                         { ret false; }
     if (b.instructions.data[def.result.instruction].opcode != opcode_table.ALLOCA) { ret false; }
     ret overlap.contained(b, slot);
+}
+
+# whether the memory load `l` read still holds what it read at an instruction `at` the load dominates, in any block.
+# in the load's block it does by `stands_until`. in another, the load's address must be formed from a stack slot whose
+# address goes nowhere but its own accesses and markers, so only an access through that slot can write it
+# (`overlap.writers`), and no such write, a marker of its storage among them, may lie where a path leaves the load and
+# later reaches `at`: past the load in its block or in a block a path from the load's block enters, and ahead of `at`
+# in its block or in a block from which a path enters the block of `at`. a load the path runs again only reads what
+# stands then, so the test asks more than it needs and never less
+# ---
+# a:   the allocator the walk takes
+# b:   the body
+# g:   the graph of its blocks
+# l:   the load
+# at:  the instruction its memory is read at
+# ret: whether that memory stands there
+pub fun stands_across(a: *allocator.Allocator, b: *Body, g: *Graph, l: Instruction, at: Instruction) res[bool, allocator.Error] {
+    val no:    res[bool, allocator.Error] = res[bool, allocator.Error].ok{false};
+    val opt_k: opt[Block]                 = block_of(b, l);
+    val opt_j: opt[Block]                 = block_of(b, at);
+    if (sel opt_k.none)           { ret no; }
+    if (sel opt_j.none)           { ret no; }
+    if (opt_k.some == opt_j.some) { ret res[bool, allocator.Error].ok{stands_until(b, l, at)}; }
+    val root: Value = steps.root_of(b, b.instructions.data[l].operands.data[0]);
+    val def:  Def   = b.values.data[root].def;
+    if (!(sel def.result))                                                         { ret no; }
+    if (b.instructions.data[def.result.instruction].opcode != opcode_table.ALLOCA) { ret no; }
+    var written: vector.Vector[Instruction] = vector.init[Instruction](a);
+    var ahead:   vector.Vector[bool]        = vector.init[bool](a);
+    var behind:  vector.Vector[bool]        = vector.init[bool](a);
+    fin {
+        vector.dnit[Instruction](?written);
+        vector.dnit[bool](?ahead);
+        vector.dnit[bool](?behind);
+    }
+    val res_found: res[bool, allocator.Error] = overlap.writers(b, root, ?written);
+    if (sel res_found.err) { ret res_found; }
+    if (!res_found.ok)     { ret no; }
+    if (written.len == 0)  { ret res[bool, allocator.Error].ok{true}; }
+    val err_ahead: err[allocator.Error] = reach(g, opt_k.some, true, ?ahead);
+    if (sel err_ahead.err) { ret res[bool, allocator.Error].err{err_ahead.err}; }
+    val err_behind: err[allocator.Error] = reach(g, opt_j.some, false, ?behind);
+    if (sel err_behind.err) { ret res[bool, allocator.Error].err{err_behind.err}; }
+    var n: usize = 0;
+    for (n < written.len) {
+        val w:     Instruction = written.data[n];
+        val opt_x: opt[Block]  = block_of(b, w);
+        if (sel opt_x.none) { ret no; }
+        val x:     Block = opt_x.some;
+        val after: bool  = ahead.data[x::usize] || (x == opt_k.some && follows(b, l, w));
+        val until: bool  = behind.data[x::usize] || (x == opt_j.some && follows(b, w, at));
+        if (after && until) { ret no; }
+        n = n + 1;
+    }
+    ret res[bool, allocator.Error].ok{true};
+}
+
+# whether instruction `last` follows `first` in their one block
+fun follows(b: *Body, first: Instruction, last: Instruction) bool {
+    var p: Instruction = b.instructions.data[first].next;
+    for (p != NO_INSTRUCTION) {
+        if (p == last) { ret true; }
+        p = b.instructions.data[p].next;
+    }
+    ret false;
+}
+
+# the blocks a path of one or more edges reaches from block `k`, `forward`, or from which such a path reaches it, each
+# marked in `out`
+fun reach(g: *Graph, k: Block, forward: bool, out: *vector.Vector[bool]) err[allocator.Error] {
+    val err_filled: err[allocator.Error] = slice.fill[bool](out, g.count::usize, false);
+    if (sel err_filled.err) { ret err_filled; }
+    var todo: vector.Vector[u32] = vector.init[u32](out.a);
+    fin { vector.dnit[u32](?todo); }
+    val res_first: res[usize, allocator.Error] = vector.push[u32](?todo, k::u32);
+    if (sel res_first.err) { ret err[allocator.Error].err{res_first.err}; }
+    for (todo.len > 0) {
+        val n: u32 = todo.data[todo.len - 1];
+        vector.truncate[u32](?todo, todo.len - 1);
+        var next: Slice[u32] = graph.predecessors(g, n);
+        if (forward) { next = graph.successors(g, n); }
+        var e: usize = 0;
+        for (e < next.size) {
+            val y: u32 = next.data[e];
+            if (!out.data[y::usize]) {
+                out.data[y::usize] = true;
+                val res_pushed: res[usize, allocator.Error] = vector.push[u32](?todo, y);
+                if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+            }
+            e = e + 1;
+        }
+    }
+    ret err[allocator.Error].ok{};
 }
 
 # the load a value is the result of, placed and neither volatile nor kept, none for another value
