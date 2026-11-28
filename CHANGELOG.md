@@ -9,6 +9,21 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-28
+
+### Added
+
+- mirl builds for `wasi-wasm32`, and a release carries the static library for it as `mirl-<version>-wasi-wasm32.tar.gz`. The cli and the opcode generator stay on the six hosted targets (#851).
+
+### Changed
+
+- The manifest requires masc `^0.2.3`, and mirl builds against masc 0.2.3.
+
+### Fixed
+
+- On x86-64 a scalar float held in a stack slot and then written to lane 0 of a float vector no longer comes out with the vector's other lanes zeroed. masc's table stated register-to-register `movss` and `movsd` as writing their whole destination, so the allocator could place the reload feeding the insert in the live vector's register. masc 0.2.3 states them as keeping the upper lanes. Every earlier mirl release has the defect, and 0.5.0 reached it in more code because it keeps more values live across calls (briar-systems/masc#723).
+- A legalisation that changes a value's type, the carried widths of `narrow` and the f16 encodings of `half`, now changes the debug records that read the value with it, through `mirl.ir.body.retype`. A record left reading a value through an expression made for its old type made `-O --verify` refuse a valid SPIR-V program with an internal error. Generated code was never wrong (#853).
+
 ## [0.5.0] - 2026-11-27
 
 ### Added
