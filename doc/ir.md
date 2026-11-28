@@ -302,7 +302,7 @@ A function's body may be **available**, `FunctionData.available`: a copy of the 
 
 A value may be marked **secret**. Secrecy is stated once for each value and only moves in one direction.
 
-A mark is stated in every function, so the secrecy typing below and every access statement hold wherever a value goes, but it binds a pass only in a function that requires constant time (section 7.1), the one the walk of its code proves. Elsewhere a pass treats a secret value as any other and keeps only the typing: a result stays as secret as its row gives, no edge passes a secret to a public parameter and no use is given a more secret value. A pass asks the one question `mirl.ir.module.secret_in` of a mark, and a pass that declares it breaks constant time never meets such a function and asks it nothing.
+A mark is stated in every function, so the secrecy typing below and every access statement hold wherever a value goes, but it binds a pass only in a function that requires constant time (section 7.1), the one the walk of its code proves. Elsewhere a pass treats a secret value as any other and keeps only the typing: no edge passes a secret to a public parameter and no use is given a more secret value. A use may be given a less secret one, as a fold of `xor(x, x)` gives zero, and the edit then lowers each result it leaves more secret than its row gives, and onward through what uses it (`mirl.ir.body.replace`, `substitute` and `supplant`), so every result stays as secret as its row gives. A pass asks the one question `mirl.ir.module.secret_in` of a mark, and a pass that declares it breaks constant time never meets such a function and asks it nothing.
 
 - A block parameter is secret as it is declared.
 - A constant is public.
