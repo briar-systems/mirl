@@ -1,13 +1,44 @@
 # the storage rule: every `slot.begin` and `slot.end` names an alloca of its
-# function, and on every path from the entry a slot's markers alternate, a
-# begin where the slot is begun on no path and an end where it is begun on
+# function, on every path from the entry a slot's markers alternate, a begin
+# where the slot is begun on no path and an end where it is begun on every
+# path, and every use of a slot's address stands where the slot is begun on
 # every path
 #
 # begun on some path and begun on every path are the forward dataflows of
 # `mirl.ir.cfg.storage` over the graph view of the blocks the entry reaches.
-# a slot no marker names is not checked, and neither is a block the entry
-# does not reach.
+# a slot no marker names lasts the whole function and is not checked, and
+# neither is a block the entry does not reach.
+#
+# an address of a slot is the alloca's result, a step past one
+# (`mirl.target.steps`), a `select` whose two choices are addresses of that
+# one slot, or a block parameter every edge into its block passes an address
+# of that one slot for. a step of an address of a slot, and an edge passing
+# one to a parameter that is one, form an address and touch nothing, so they
+# stand anywhere, as an address hoisted above a loop. every other use is an
+# access or lets the address out, and stands where the slot is begun on every
+# path, so on no path is it not yet begun or ended there: a load, store, copy
+# or fill through it, an argument of a call or of an assembly block, a stored
+# value, a conversion to an integer, a compare, a `select` or a parameter that
+# may give the address of something else, at the edge or the `select` that
+# makes it so. a marker's operand is the slot it marks.
+#
+# what is past the rule: once an address is out, through a call, a store, an
+# integer or a value that may name more than one thing, the verifier sees
+# where it went out and nothing after. a call that is given it returns before
+# the next marker of the slot runs, so every access the callee makes while it
+# runs is inside the slot's storage, but an address stored, kept by a callee
+# or carried through an integer may be used after the slot ends, and keeping
+# that from happening is the producer's, as the ir spec's storage rule states.
+#
+# cost: one pass over the operands and edge arguments of the body finds the
+# addresses, each value rising at most twice (to one slot, then to more than
+# one), plus a pass over the parameters and selects, and the check is one walk
+# of the reached blocks with the dataflow's state, a test per operand and edge
+# argument.
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -16,7 +47,9 @@ use std.types.string.str;
 
 use std.allocator;
 use std.collections.slice.Slice;
+use std.collections.vector;
 
+use mirl.base.slice;
 use mirl.ir.cfg.dominance;
 use mirl.ir.cfg.dominance.Dominance;
 use mirl.ir.cfg.graph;
@@ -25,12 +58,17 @@ use cfg_storage: mirl.ir.cfg.storage;
 use mirl.ir.cfg.storage.Storage;
 use mirl.ir.cfg.storage.Stray;
 use mirl.ir.function.Body;
+use mirl.ir.id.Block;
 use mirl.ir.id.Function;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.NO_INSTRUCTION;
+use mirl.ir.id.Value;
+use mirl.ir.instruction.Edge;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.module.Module;
 use mirl.ir.opcode.table;
+use mirl.ir.value.Def;
+use address_steps: mirl.target.steps;
 use mirl.verify.failure.Error;
 use mirl.verify.failure.Run;
 use mirl.verify.failure.at_instruction;
@@ -48,8 +86,143 @@ pub val BEGUN: str = "a slot.begin where its slot may be begun already";
 # the finding of an end where its slot may not be begun
 pub val UNBEGUN: str = "a slot.end where its slot may not be begun";
 
-# block `k` walked from the state into it, each marker checked before it moves the state
-fun across(run: *Run, s: *Storage, f: Function, b: *Body, k: u32) err[Error] {
+# the finding of a use of a slot's address where the slot may not be begun
+pub val OUTSIDE: str = "a use of a slot's address where the slot may not be begun, on some path not yet begun or already ended";
+
+# the value no marked slot's address is, or not yet known to be
+val NONE: u32 = cfg_storage.NONE;
+
+# the value that may be the address of a marked slot or of something else
+val MANY: u32 = 0xfffffffe;
+
+# the addresses of the marked slots of one body
+# ---
+# root: each value's slot where it is an address of that one marked slot's alloca, MANY where it may be one and may
+#       be something else, NONE where it is none
+# work: the values whose root rose and whose uses are still to be read
+rec Addresses {
+    root: vector.Vector[u32];
+    work: vector.Vector[Value];
+}
+
+fun join(x: u32, y: u32) u32 {
+    if (x == NONE)           { ret y; }
+    if (y == NONE || x == y) { ret x; }
+    ret MANY;
+}
+
+fun rise(ad: *Addresses, v: Value, r: u32) err[allocator.Error] {
+    val now: u32 = join(ad.root.data[v], r);
+    if (now == ad.root.data[v]) { ret err[allocator.Error].ok{}; }
+    ad.root.data[v] = now;
+    val res_pushed: res[usize, allocator.Error] = vector.push[Value](?ad.work, v);
+    if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+    ret err[allocator.Error].ok{};
+}
+
+# the address value `v` gives to what use `d` makes of it: its step's result, its select's, or each parameter an edge
+# of it passes `v` to
+fun carry(ad: *Addresses, b: *Body, d: *InstructionData, v: Value) err[allocator.Error] {
+    val r: u32 = ad.root.data[v];
+    if (address_steps.from(d, v) && d.results.len == 1) { ret rise(ad, d.results.data[0], r); }
+    if (d.opcode == table.SELECT && d.results.len == 1 && d.operands.len == 3 && (d.operands.data[1] == v || d.operands.data[2] == v)) {
+        ret rise(ad, d.results.data[0], r);
+    }
+    var e: usize = 0;
+    for (e < d.edges.len) {
+        val edge: *Edge = ?d.edges.data[e];
+        var n:    usize = 0;
+        for (n < edge.arguments.len) {
+            if (edge.arguments.data[n] == v) {
+                val err_risen: err[allocator.Error] = rise(ad, b.blocks.data[edge.block].parameters.data[n], r);
+                if (sel err_risen.err) { ret err_risen; }
+            }
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+fun drain(ad: *Addresses, b: *Body) err[allocator.Error] {
+    for (ad.work.len > 0) {
+        val v: Value = ad.work.data[ad.work.len - 1];
+        vector.truncate[Value](?ad.work, ad.work.len - 1);
+        var u: usize = 0;
+        for (u < b.values.data[v].uses.len) {
+            val err_carried: err[allocator.Error] = carry(ad, b, ?b.instructions.data[b.values.data[v].uses.data[u]], v);
+            if (sel err_carried.err) { ret err_carried; }
+            u = u + 1;
+        }
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# whether value `v`, an address of one slot, is joined with a value that is none: a parameter some edge passes such
+# a value for, or a select with such a choice
+fun mixed(ad: *Addresses, b: *Body, v: Value) bool {
+    val def: Def = b.values.data[v].def;
+    if (sel def.parameter) {
+        val k: Block = def.parameter.block;
+        var p: usize = 0;
+        for (p < b.blocks.data[k].predecessors.len) {
+            val d: *InstructionData = ?b.instructions.data[b.blocks.data[k].predecessors.data[p]];
+            var e: usize            = 0;
+            for (e < d.edges.len) {
+                if (d.edges.data[e].block == k && ad.root.data[d.edges.data[e].arguments.data[def.parameter.index]] == NONE) { ret true; }
+                e = e + 1;
+            }
+            p = p + 1;
+        }
+        ret false;
+    }
+    if (sel def.result) {
+        val d: *InstructionData = ?b.instructions.data[def.result.instruction];
+        if (d.opcode == table.SELECT && d.operands.len == 3) { ret ad.root.data[d.operands.data[1]] == NONE || ad.root.data[d.operands.data[2]] == NONE; }
+    }
+    ret false;
+}
+
+# the addresses of the marked slots of body `b`: rising from each marked alloca through the uses that form an address
+# with every value not yet reached taken as none of them, then each parameter or select one of whose inputs stayed
+# none taken as more than one thing, which rises through its uses in turn
+fun addresses(ad: *Addresses, s: *Storage, b: *Body) err[allocator.Error] {
+    vector.clear[u32](?ad.root);
+    vector.clear[Value](?ad.work);
+    val err_filled: err[allocator.Error] = slice.fill[u32](?ad.root, b.values.len, NONE);
+    if (sel err_filled.err) { ret err_filled; }
+    var i: usize = 0;
+    for (i < b.instructions.len) {
+        if (cfg_storage.marked(s, i::u32) && b.instructions.data[i].results.len == 1) {
+            val err_risen: err[allocator.Error] = rise(ad, b.instructions.data[i].results.data[0], i::u32);
+            if (sel err_risen.err) { ret err_risen; }
+        }
+        i = i + 1;
+    }
+    val err_drained: err[allocator.Error] = drain(ad, b);
+    if (sel err_drained.err) { ret err_drained; }
+    var v: usize = 0;
+    for (v < b.values.len) {
+        val r: u32 = ad.root.data[v];
+        if (r != NONE && r != MANY && mixed(ad, b, v::u32)) {
+            ad.root.data[v] = MANY;
+            val res_pushed: res[usize, allocator.Error] = vector.push[Value](?ad.work, v::u32);
+            if (sel res_pushed.err) { ret err[allocator.Error].err{res_pushed.err}; }
+        }
+        v = v + 1;
+    }
+    ret drain(ad, b);
+}
+
+# whether use `d` of value `v`, an address of slot `r`, forms an address of that one slot and touches nothing
+fun forms(ad: *Addresses, d: *InstructionData, v: Value, r: u32) bool {
+    if (address_steps.from(d, v)) { ret true; }
+    ret d.opcode == table.SELECT && d.results.len == 1 && d.operands.len == 3 && d.operands.data[0] != v && ad.root.data[d.results.data[0]] == r;
+}
+
+# block `k` walked from the state into it, each marker and each use of a slot's address checked before the
+# instruction moves the state
+fun across(run: *Run, s: *Storage, ad: *Addresses, f: Function, b: *Body, k: u32) err[Error] {
     var i: Instruction = b.blocks.data[k].first;
     for (i != NO_INSTRUCTION) {
         val d: *InstructionData = ?b.instructions.data[i];
@@ -58,13 +231,35 @@ fun across(run: *Run, s: *Storage, f: Function, b: *Body, k: u32) err[Error] {
             if (d.opcode == table.SLOT_BEGIN && cfg_storage.may(s, x)) { ret broken(at_instruction(run.m, f, k, i), BEGUN); }
             if (d.opcode == table.SLOT_END && !cfg_storage.must(s, x)) { ret broken(at_instruction(run.m, f, k, i), UNBEGUN); }
         }
+        or {
+            var j: usize = 0;
+            for (j < d.operands.len) {
+                val v: Value = d.operands.data[j];
+                val r: u32   = ad.root.data[v];
+                if (r != NONE && r != MANY && !forms(ad, d, v, r) && !cfg_storage.must(s, r)) { ret broken(at_instruction(run.m, f, k, i), OUTSIDE); }
+                j = j + 1;
+            }
+            var e: usize = 0;
+            for (e < d.edges.len) {
+                val edge: *Edge = ?d.edges.data[e];
+                var n:    usize = 0;
+                for (n < edge.arguments.len) {
+                    val r: u32 = ad.root.data[edge.arguments.data[n]];
+                    if (r != NONE && r != MANY && ad.root.data[b.blocks.data[edge.block].parameters.data[n]] != r && !cfg_storage.must(s, r)) {
+                        ret broken(at_instruction(run.m, f, k, i), OUTSIDE);
+                    }
+                    n = n + 1;
+                }
+                e = e + 1;
+            }
+        }
         cfg_storage.step(s, b, d);
         i = d.next;
     }
     ret err[Error].ok{};
 }
 
-fun function_of(run: *Run, s: *Storage, f: Function) err[Error] {
+fun function_of(run: *Run, s: *Storage, ad: *Addresses, f: Function) err[Error] {
     val m: *Module = run.m;
     val b: *Body   = ?m.functions.data[f].body;
     if (b.blocks.len == 0) { ret err[Error].ok{}; }
@@ -82,26 +277,34 @@ fun function_of(run: *Run, s: *Storage, f: Function) err[Error] {
     }
     val err_solved: err[allocator.Error] = cfg_storage.solve(s, b, ?g, ?dom);
     if (sel err_solved.err) { ret exhausted(err_solved.err); }
+    val err_found: err[allocator.Error] = addresses(ad, s, b);
+    if (sel err_found.err) { ret exhausted(err_found.err); }
     val order: Slice[u32] = dominance.order(?dom);
     var n:     usize      = 0;
     for (n < order.size) {
         cfg_storage.enter(s, ?g, ?dom, order.data[n]);
-        val err_checked: err[Error] = across(run, s, f, b, order.data[n]);
+        val err_checked: err[Error] = across(run, s, ad, f, b, order.data[n]);
         if (sel err_checked.err) { ret err_checked; }
         n = n + 1;
     }
     ret err[Error].ok{};
 }
 
-# every marker names an alloca of its function, and a slot's markers
-# alternate on every path, as the module header says
+# every marker names an alloca of its function, a slot's markers alternate on
+# every path, and every use of a slot's address stands inside its storage, as
+# the module header says
 pub fun storage(run: *Run) err[Error] {
-    var s: Storage = cfg_storage.init(run.m.a);
-    fin { cfg_storage.dnit(?s); }
+    var s:  Storage   = cfg_storage.init(run.m.a);
+    var ad: Addresses = Addresses{root: vector.init[u32](run.m.a), work: vector.init[Value](run.m.a)};
+    fin {
+        cfg_storage.dnit(?s);
+        vector.dnit[u32](?ad.root);
+        vector.dnit[Value](?ad.work);
+    }
     var f: usize = 0;
     for (f < run.m.functions.len) {
         if (walks(run, f)) {
-            val err_function: err[Error] = function_of(run, ?s, f::u32);
+            val err_function: err[Error] = function_of(run, ?s, ?ad, f::u32);
             if (sel err_function.err) { ret err_function; }
         }
         f = f + 1;
