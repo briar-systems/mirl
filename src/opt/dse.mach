@@ -1,6 +1,6 @@
 # dead store elimination: a store whose bytes a later store of its block writes again, with nothing between that may
-# read them, is removed, and so is one into a slot whose address never escapes that nothing reads before its block
-# returns
+# read them, is removed, and so is one into a slot whose address never escapes that nothing reads on any path before
+# the slot's storage ends or the function returns
 #
 # the blocks are walked one at a time in order, keeping the stores whose bytes nothing has read since: a store joins
 # the list, and an instruction that may read a byte a listed store wrote takes that store off it, as the memory
@@ -9,12 +9,25 @@
 # listed store's (`must`) ends that store, which goes. where the block ends in a return, every listed store into a
 # slot whose address never escapes goes too, since nothing can read that slot once the function has returned.
 #
+# across blocks, a slot whose address never escapes is reached only by accesses whose address is formed from it
+# (`mirl.pass.analysis.slots`). the memory analysis places such an access in the slot, or, where it cannot follow
+# the address, in no known base, which its alias rule lets reach any slot, so whether a later instruction may read a
+# slot is a fact of the slot and of those unresolved reads. a slot is live where some path reads it before a marker of its own storage
+# (`slot.begin` or `slot.end`) or the function's end: a backward problem over the blocks (`mirl.ir.cfg.flow`), whose
+# facts are the slots some removable store writes. a block gens a slot it may read before a marker of it, and kills
+# a slot it marks. an ordered access, which may read anything, gens every slot. each block is then walked from its
+# end, the slots live out of it in hand, and a plain store into a slot not live just after it goes: on no path does
+# anything read what it wrote before the slot's storage ends, the function returns, or the path never leaves a loop.
+# a read through no address never reaches such a slot, and a call that is handed its address makes it escape, so
+# neither keeps a store.
+#
 # the rule by which a store is left alone: it is volatile, ordered or kept (a kept write is a fixed fact no pass
 # removes), it is overwritten only in part or by a store whose place only may be its own, a read that may reach its
 # bytes comes first, or its block ends in anything but a return while the store is listed, since a later block may
 # read it. a write that is no plain store, as a call or a fill, ends nothing.
 #
-# it costs, per block, its instructions times the stores still listed. it reads the memory analysis (and through it
+# it costs, per block, its instructions times the stores still listed, and across blocks one walk of the body to
+# gather what each block gens and kills, one solve of the problem, and one walk back of each block. it reads the memory analysis (and through it
 # ranges, loops, slots and inductions). it removes stores, which changes when a function's memory traffic happens,
 # so it breaks constant time and every function that requires it is skipped.
 
@@ -26,15 +39,23 @@ use std.types.result.res;
 use std.types.size.usize;
 
 use std.allocator;
+use std.collections.slice.Slice;
 use std.collections.vector;
 
+use mirl.base.fail.keep;
+use mirl.base.slice;
 use mirl.ir.body;
+use mirl.ir.cfg.flow;
+use mirl.ir.cfg.graph;
+use mirl.ir.cfg.graph.Graph;
+use mirl.ir.cfg.graph.Lists;
 use mirl.ir.function.Body;
 use mirl.ir.id.Instruction;
 use mirl.ir.id.NO_INSTRUCTION;
 use mirl.ir.instruction.InstructionData;
 use mirl.ir.module;
 use mirl.ir.opcode.table;
+use mirl.ir.value.Def;
 use mirl.pass.analysis;
 use mirl.pass.analysis.memory;
 use mirl.pass.analysis.memory.Alias;
@@ -52,7 +73,7 @@ use mirl.pass.refusal;
 use mirl.pass.refusal.edit;
 
 # the pass: it removes stores in place and changes no edge
-pub val DSE: Pass = Pass{name: "dse", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_MEMORY, preserves: analysis.FLOW, time: Time.breaks{}, counts: "stores removed"};
+pub val DSE: Pass = Pass{name: "dse", kind: Kind.optimise{}, scope: Scope.function{visit}, needs: analysis.OF_MEMORY | analysis.OF_GRAPH, preserves: analysis.FLOW, time: Time.breaks{}, counts: "stores removed"};
 
 # a store nothing has read since
 # ---
@@ -151,7 +172,227 @@ fun block(c: *Context, mem: *Memory, b: *Body, list: *vector.Vector[Pending], fi
     ret res[bool, refusal.Error].ok{changed};
 }
 
-# remove the dead stores of each block of one function
+# no slot
+val NONE: u32 = 0xffffffff;
+
+# the slots whose stores the walk across blocks may remove, and what it keeps while it runs
+# ---
+# fact:  by instruction, the number of the slot its alloca makes, NONE for one no removable store writes
+# count: how many slots are numbered
+# gen:   per block, the slots it may read before it marks them
+# kill:  per block, the slots it marks
+# out:   per block, the slots live out of it
+# live:  by slot, the stamp of the block walk it is live in, so a walk starts with none live at no cost
+rec Across {
+    fact:  vector.Vector[u32];
+    count: u32;
+    gen:   Lists[u32];
+    kill:  Lists[u32];
+    out:   Lists[u32];
+    live:  vector.Vector[u32];
+}
+
+# whether instruction `d`, of effect `e`, is a store the walk may remove: plain, of one sized place in a slot whose
+# address never escapes
+fun removable(d: *InstructionData, e: *Effect) bool {
+    if (d.opcode != table.STORE || d.metadata.flags.volatile || d.metadata.flags.kept || e.ordered || e.kept) { ret false; }
+    if (e.places.len != 1 || !e.places.data[0].sized || !e.places.data[0].private)                            { ret false; }
+    ret sel e.places.data[0].base.slot;
+}
+
+# the slot of a store the walk may remove, its number in `x.fact`
+fun slot_of(e: *Effect) Instruction {
+    val base: memory.Base = e.places.data[0].base;
+    if (sel base.slot) { ret base.slot; }
+    ret NO_INSTRUCTION;
+}
+
+# the numbered slot a marker `d` marks, NONE for one of no numbered slot
+fun marked_slot(b: *Body, x: *Across, d: *InstructionData) u32 {
+    if (!table.marks(d.opcode) || d.operands.len != 1) { ret NONE; }
+    val def: Def = b.values.data[d.operands.data[0]].def;
+    if (!(sel def.result)) { ret NONE; }
+    ret x.fact.data[def.result.instruction];
+}
+
+# number each slot a removable store writes
+fun number(mem: *Memory, b: *Body, x: *Across) err[refusal.Error] {
+    val err_sized: err[allocator.Error] = slice.reset[u32](?x.fact, b.instructions.len, NONE);
+    if (sel err_sized.err) { ret err[refusal.Error].err{refusal.Error.alloc{err_sized.err}}; }
+    x.count = 0;
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                if (b.instructions.data[i].opcode == table.STORE) {
+                    var res_effect: res[Effect, refusal.Error] = memory.effect_of(mem, i);
+                    if (sel res_effect.err) { ret err[refusal.Error].err{res_effect.err}; }
+                    var e: Effect = res_effect.ok;
+                    if (removable(?b.instructions.data[i], ?e)) {
+                        val slot: Instruction = slot_of(?e);
+                        if (x.fact.data[slot] == NONE) {
+                            x.fact.data[slot] = x.count;
+                            x.count           = x.count + 1;
+                        }
+                    }
+                    memory.dnit(?e);
+                }
+                i = b.instructions.data[i].next;
+            }
+        }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# the numbered slots effect `e` may read, into `each`, emptied first, as the memory analysis's alias rule has them: a
+# place in a slot reads that slot, one in a symbol none, and one whose base the analysis did not resolve to either (a
+# pointer value, or an address it could not follow, as an index into an index) may read every one. an ordered access
+# reads every one
+fun reads_of(x: *Across, e: *Effect, each: *vector.Vector[u32]) err[allocator.Error] {
+    vector.truncate[u32](each, 0);
+    if (!e.reads && !e.ordered) { ret err[allocator.Error].ok{}; }
+    var all: bool  = e.ordered;
+    var j:   usize = 0;
+    for (j < e.places.len && !all) {
+        val base: memory.Base = e.places.data[j].base;
+        if (sel base.unknown || sel base.value) { all = true; }
+        j = j + 1;
+    }
+    if (all) {
+        var n: u32 = 0;
+        for (n < x.count) {
+            val res_all: res[usize, allocator.Error] = vector.push[u32](each, n);
+            if (sel res_all.err) { ret err[allocator.Error].err{res_all.err}; }
+            n = n + 1;
+        }
+        ret err[allocator.Error].ok{};
+    }
+    j = 0;
+    for (j < e.places.len) {
+        val base: memory.Base = e.places.data[j].base;
+        if (sel base.slot) {
+            if (x.fact.data[base.slot] != NONE) {
+                val res_one: res[usize, allocator.Error] = vector.push[u32](each, x.fact.data[base.slot]);
+                if (sel res_one.err) { ret err[allocator.Error].err{res_one.err}; }
+            }
+        }
+        j = j + 1;
+    }
+    ret err[allocator.Error].ok{};
+}
+
+# each block's gen, the numbered slots it may read before it marks them, and kill, the slots it marks
+fun local(mem: *Memory, b: *Body, x: *Across, each: *vector.Vector[u32]) err[refusal.Error] {
+    # by slot, one more than the block that marked it, so a read after its marker in the block gens nothing
+    var marked: vector.Vector[u32] = vector.init[u32](mem.m.a);
+    fin { vector.dnit[u32](?marked); }
+    var err_failed: err[allocator.Error] = slice.reset[u32](?marked, x.count::usize, 0);
+    keep(?err_failed, flow.rows(?x.gen));
+    keep(?err_failed, flow.rows(?x.kill));
+    if (sel err_failed.err) { ret err[refusal.Error].err{refusal.Error.alloc{err_failed.err}}; }
+    var k: usize = 0;
+    for (k < b.blocks.len) {
+        val mark: u32 = (k + 1)::u32;
+        if (!b.blocks.data[k].erased) {
+            var i: Instruction = b.blocks.data[k].first;
+            for (i != NO_INSTRUCTION) {
+                val d: *InstructionData = ?b.instructions.data[i];
+                val s: u32              = marked_slot(b, x, d);
+                if (s != NONE) {
+                    if (marked.data[s] != mark) {
+                        marked.data[s] = mark;
+                        keep(?err_failed, flow.fact(?x.kill, s));
+                    }
+                }
+                or {
+                    var res_effect: res[Effect, refusal.Error] = memory.effect_of(mem, i);
+                    if (sel res_effect.err) { ret err[refusal.Error].err{res_effect.err}; }
+                    var e: Effect = res_effect.ok;
+                    keep(?err_failed, reads_of(x, ?e, each));
+                    memory.dnit(?e);
+                    var n: usize = 0;
+                    for (n < each.len) {
+                        if (marked.data[each.data[n]] != mark) { keep(?err_failed, flow.fact(?x.gen, each.data[n])); }
+                        n = n + 1;
+                    }
+                }
+                i = d.next;
+            }
+        }
+        keep(?err_failed, flow.next(?x.gen));
+        keep(?err_failed, flow.next(?x.kill));
+        if (sel err_failed.err) { ret err[refusal.Error].err{refusal.Error.alloc{err_failed.err}}; }
+        k = k + 1;
+    }
+    ret err[refusal.Error].ok{};
+}
+
+# remove each store into a numbered slot that no path reads before the slot's storage ends or the function returns,
+# walking each block back from the slots live out of it, answering whether one went
+fun across(c: *Context, mem: *Memory, b: *Body, g: *Graph, x: *Across) res[bool, refusal.Error] {
+    var each: vector.Vector[u32] = vector.init[u32](c.m.a);
+    var w:    flow.Work          = flow.work(c.m.a);
+    fin {
+        vector.dnit[u32](?each);
+        flow.work_dnit(?w);
+    }
+    val err_numbered: err[refusal.Error] = number(mem, b, x);
+    if (sel err_numbered.err) { ret res[bool, refusal.Error].err{err_numbered.err}; }
+    if (x.count == 0)         { ret res[bool, refusal.Error].ok{false}; }
+    val err_local: err[refusal.Error] = local(mem, b, x, ?each);
+    if (sel err_local.err) { ret res[bool, refusal.Error].err{err_local.err}; }
+    var err_failed: err[allocator.Error] = flow.backward(?w, g, flow.Problem{facts: x.count, gen: ?x.gen, kill: ?x.kill}, nil, ?x.out);
+    keep(?err_failed, slice.reset[u32](?x.live, x.count::usize, 0));
+    if (sel err_failed.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_failed.err}}; }
+    var changed: bool  = false;
+    var k:       usize = 0;
+    for (k < b.blocks.len) {
+        val stamp: u32 = (k + 1)::u32;
+        if (!b.blocks.data[k].erased) {
+            val outs: Slice[u32] = flow.row(?x.out, k::u32);
+            var n:    usize      = 0;
+            for (n < outs.size) {
+                x.live.data[outs.data[n]] = stamp;
+                n                         = n + 1;
+            }
+            var i: Instruction = b.blocks.data[k].last;
+            for (i != NO_INSTRUCTION) {
+                val prev: Instruction      = b.instructions.data[i].prev;
+                val d:    *InstructionData = ?b.instructions.data[i];
+                val s:    u32              = marked_slot(b, x, d);
+                if (s != NONE) { x.live.data[s] = 0; }
+                or {
+                    var res_effect: res[Effect, refusal.Error] = memory.effect_of(mem, i);
+                    if (sel res_effect.err) { ret res[bool, refusal.Error].err{res_effect.err}; }
+                    var e:    Effect = res_effect.ok;
+                    var dead: bool   = false;
+                    if (removable(d, ?e)) { dead = x.live.data[x.fact.data[slot_of(?e)]] != stamp; }
+                    val err_read: err[allocator.Error] = reads_of(x, ?e, ?each);
+                    memory.dnit(?e);
+                    if (sel err_read.err) { ret res[bool, refusal.Error].err{refusal.Error.alloc{err_read.err}}; }
+                    if (dead) {
+                        val err_erased: err[refusal.Error] = edit(body.erase(c.m, mem.f, i));
+                        if (sel err_erased.err) { ret res[bool, refusal.Error].err{err_erased.err}; }
+                        did(c, mem.f, 1);
+                        changed = true;
+                    }
+                    var r: usize = 0;
+                    for (r < each.len) {
+                        x.live.data[each.data[r]] = stamp;
+                        r                         = r + 1;
+                    }
+                }
+                i = prev;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[bool, refusal.Error].ok{changed};
+}
+
+# remove the dead stores of each block of one function, then those no path reads across blocks
 fun visit(u: *Unit) res[bool, refusal.Error] {
     val c:        *Context                 = u.context;
     val res_body: res[*Body, module.Error] = module.body(c.m, u.f);
@@ -171,5 +412,18 @@ fun visit(u: *Unit) res[bool, refusal.Error] {
         }
         k = k + 1;
     }
+    val res_graph_of: res[*Graph, refusal.Error] = analysis.graph_of(c.cache, u.f);
+    if (sel res_graph_of.err) { ret res[bool, refusal.Error].err{res_graph_of.err}; }
+    var x: Across = Across{fact: vector.init[u32](c.m.a), count: 0, gen: graph.lists_init[u32](c.m.a), kill: graph.lists_init[u32](c.m.a), out: graph.lists_init[u32](c.m.a), live: vector.init[u32](c.m.a)};
+    fin {
+        vector.dnit[u32](?x.fact);
+        graph.lists_dnit[u32](?x.gen);
+        graph.lists_dnit[u32](?x.kill);
+        graph.lists_dnit[u32](?x.out);
+        vector.dnit[u32](?x.live);
+    }
+    val res_across: res[bool, refusal.Error] = across(c, res_memory_of.ok, b, res_graph_of.ok, ?x);
+    if (sel res_across.err) { ret res_across; }
+    if (res_across.ok)      { changed = true; }
     ret res[bool, refusal.Error].ok{changed};
 }
