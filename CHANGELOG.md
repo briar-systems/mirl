@@ -9,6 +9,48 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-27
+
+### Added
+
+- `mirl.machine.lifetime` checks a machine function's slot markers: they alternate on every path, and every instruction that names a marked slot, or reaches it through a register that surely holds its address, stands inside the slot's lifetime. `mirl.machine.verify.storage` runs it (#838).
+- `mirl.ir.module.secret_in` is the one question a pass asks of a secret mark: the mark says secret and the function requires constant time (briar-systems/mach#5071).
+- `mirl.legal.handover` gains `lent`, `stands_until`, `stands_across`, `own_before`, `unwritten`, `stored` and `stored_whole`, so the abi legalisation and the inliner judge a value handed over, in either direction, by one rule (#811, #829). `mirl.legal.overlap.writers` lists the writers of a contained slot (#829).
+- `mirl.pass.analysis.MOVES` and `GATHERS` name the analyses an instruction move and a preheader gather keep (#822).
+- `mirl.machine.pseudo.copies` says which pseudo-instructions are copies, and `mirl.base.slice.reset` sizes a vector to a length, clearing it first (#805, #838).
+
+### Changed
+
+#### The library contract
+
+- Breaking: a use entry is a `mirl.ir.value.Use`, the instruction and the operand (`edge = OPERAND`) or edge argument that names the value, and a predecessor entry is a `mirl.ir.block.Predecessor`, the instruction and the edge. `BlockData.predecessors` holds `Predecessor`, `mirl.ir.body.uses` answers `Slice[Use]`, use lists live in their own pool `Body.uses`, and `mirl.ir.module.Error` gains `listed` and `preceded` (#844).
+- Breaking: `mirl.ir.cfg.flow` takes each block's gen and kill as lists and answers each block's live sets as ascending lists. `Sets` is replaced by `Problem` and `Work`, and `backward` and `forward` take a work, a problem and the output lists and can fail on allocation. `mirl.pass.analysis.live.compute` no longer takes dominance (#801).
+- Breaking: the facts of which slots escape, move and are touched are their own analysis, `mirl.pass.analysis.ADDRESSES` (`slots.Addresses`, `addresses_of`), and the analyses after it renumber with their `OF_` sets. `slots.compute`, `slots.of` and `memory.make` take the addresses, and `escaped`, `moved` and `touched` read them, answering yes for an instruction past what they cover. `slots.readable` and `slots.secret` are removed (#822, #826).
+- Breaking: `mirl.machine.frame.share.share` takes whether the function requires constant time, and `mirl.machine.verify.function` takes whether the function's markers still state its slots' storage (#805, #838).
+
+#### IR a front end builds, and the verifier
+
+- Breaking: the verifier refuses a use of a marked slot's address where the slot may not be begun on some path, not yet begun or already ended. The uses checked are an operand of an instruction that reads or writes memory and a return, of the alloca or of any value derived from its address. Forming an address above the begin stays legal, and an access of no bytes counts as an access. `--verify` also checks the machine form from selection until frame sharing, and a refusal from a machine step names the step and the fact (#838).
+- Use and predecessor lists are kept consistent by construction. Taking an entry out updates the one entry it moves through its own back-pointer, every build checks the entries an edit touches, and an inconsistent list refuses the compile with `listed` or `preceded` where it went on with wrong positions. The verifier checks that every entry is named back by its operand or edge and the other way round (#844).
+
+#### What the optimizer does to code
+
+- A `^` (secret) value is optimized as any other value outside a function that requires constant time. Marks, access statements, kept stores, `$zeroize` and the call contract are unchanged, and inside constant-time functions nothing changes. A public value that takes a secret one's place, as a fold of `xor(x, x)` does, lowers the secrecy of what it feeds, and a secret division outside constant time runs the target's divide (briar-systems/mach#5071).
+- Frame slots of different sizes that are never live together share one storage outside constant-time functions. Slots are taken largest first, so a group never grows. A constant-time function keeps its rule of one size, one secrecy and the same public bytes, and its code is unchanged (#805).
+- The slots the abi legalisation makes for one call are begun and ended inside the call's block, so they are live only for that call and share frame storage with other slots. A by-value stack argument is copied once, straight from the memory it was loaded from into the outgoing area, wherever that memory is proven unchanged until the call, including across blocks (#829).
+- An expanded call hands its aggregate arguments and results over as the call does. An argument the callee only reads is read in place, one it may write is copied once with a `mem.copy`, and a result stored into memory the callee may name is copied out once at each return, where each crossed a block edge word by word. A release build of mach has 89% fewer word moves (#811).
+- Store-to-load forwarding crosses block edges. A constant stored on every edge into a join reaches a load there, differing constants become a parameter of the join, a load leaves its bytes known like a store, a compare against a constant refines a value across that branch's edge, and a `mem.copy` between frame slots carries what its source held. Bypass and jump threading move slot markers out of the way, so the test of a case an expanded call's returns stored is threaded to the arm each return decides (#812, #823).
+- On wasm the globals that name one section share one data segment, so the link keeps or drops them together as it does a section on ELF, COFF and Mach-O. A global that names no section keeps a segment of its own (#814).
+
+#### Compile time
+
+- The liveness the allocator, frame sharing, the slots analysis and hoisting read is solved fact by fact over lists, where every function filled tables of blocks by values. Its time follows the input and the solution, not the square of the function (#801).
+- LICM keeps the ranges, the addresses and the memory analysis across the loops it edits, so a large function no longer solves the slots analysis again after every loop. A release build of mach takes about 3.5% fewer instructions (#822).
+
+### Fixed
+
+- Taking an instruction or an edge out that names one value in several operands or arguments, as the wide legalisation's split edges do, no longer leaves stale positions in the value's use list, which could stop a compile with an internal error under `--verify`, as in a constant-time 128-bit accumulator (#835).
+- mirl builds again for a host whose `usize` is 32 bits, such as mach built for wasm32-wasi, where a wasm data segment offset was converted to `usize` before being passed as the `u64` it is (#841).
 ## [0.4.0] - 2026-11-27
 
 ### Added
